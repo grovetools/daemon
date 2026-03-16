@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/grovetools/core/pkg/models"
@@ -92,7 +93,10 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	// State API endpoints
 	mux.HandleFunc("/api/state", s.handleGetState)
 	mux.HandleFunc("/api/workspaces", s.handleGetWorkspaces)
-	mux.HandleFunc("/api/sessions", s.handleGetSessions)
+	mux.HandleFunc("/api/sessions", s.handleSessions)
+	mux.HandleFunc("/api/sessions/", s.handleSessionByID)
+	mux.HandleFunc("/api/sessions/intent", s.handleSessionIntent)
+	mux.HandleFunc("/api/sessions/confirm", s.handleSessionConfirm)
 	mux.HandleFunc("/api/stream", s.handleStreamState)
 	mux.HandleFunc("/api/config", s.handleGetConfig)
 	mux.HandleFunc("/api/focus", s.handleFocus)
@@ -138,16 +142,183 @@ func (s *Server) handleGetWorkspaces(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(workspaces)
 }
 
-// handleGetSessions returns all active sessions as JSON.
-func (s *Server) handleGetSessions(w http.ResponseWriter, r *http.Request) {
+// handleSessions handles GET for all sessions (path: /api/sessions).
+func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	sessions := s.engine.Store().GetSessions()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(sessions)
+}
+
+// handleSessionByID handles session-specific operations (path: /api/sessions/{id}/*).
+func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Parse the session ID and optional action from path
+	// Paths: /api/sessions/{id}, /api/sessions/{id}/status, /api/sessions/{id}/end
+	path := r.URL.Path[len("/api/sessions/"):]
+	parts := splitPath(path)
+	if len(parts) == 0 {
+		http.Error(w, "session ID required", http.StatusBadRequest)
+		return
+	}
+
+	sessionID := parts[0]
+	action := ""
+	if len(parts) > 1 {
+		action = parts[1]
+	}
+
+	switch action {
+	case "":
+		// GET /api/sessions/{id} - get single session
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		session := s.engine.Store().GetSession(sessionID)
+		if session == nil {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(session)
+
+	case "status":
+		// PATCH /api/sessions/{id}/status - update status
+		if r.Method != http.MethodPatch {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Status string `json:"status"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		s.engine.Store().ApplyUpdate(store.Update{
+			Type:   store.UpdateSessionStatus,
+			Source: "api",
+			Payload: &store.SessionStatusPayload{
+				JobID:  sessionID,
+				Status: req.Status,
+			},
+		})
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+
+	case "end":
+		// POST /api/sessions/{id}/end - end session
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Outcome string `json:"outcome"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		s.engine.Store().ApplyUpdate(store.Update{
+			Type:   store.UpdateSessionEnd,
+			Source: "api",
+			Payload: &store.SessionEndPayload{
+				JobID:   sessionID,
+				Outcome: req.Outcome,
+			},
+		})
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ended"})
+
+	default:
+		http.Error(w, "unknown action", http.StatusNotFound)
+	}
+}
+
+// handleSessionIntent handles POST /api/sessions/intent - pre-register session intent.
+func (s *Server) handleSessionIntent(w http.ResponseWriter, r *http.Request) {
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var intent store.SessionIntentPayload
+	if err := json.NewDecoder(r.Body).Decode(&intent); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:    store.UpdateSessionIntent,
+		Source:  "api",
+		Payload: &intent,
+	})
+
+	s.logger.WithField("job_id", intent.JobID).Debug("Session intent registered")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"status": "registered", "job_id": intent.JobID})
+}
+
+// handleSessionConfirm handles POST /api/sessions/confirm - confirm session with PID.
+func (s *Server) handleSessionConfirm(w http.ResponseWriter, r *http.Request) {
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var confirmation store.SessionConfirmationPayload
+	if err := json.NewDecoder(r.Body).Decode(&confirmation); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:    store.UpdateSessionConfirmation,
+		Source:  "api",
+		Payload: &confirmation,
+	})
+
+	s.logger.WithFields(logrus.Fields{
+		"job_id": confirmation.JobID,
+		"pid":    confirmation.PID,
+	}).Debug("Session confirmed")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "confirmed"})
+}
+
+// splitPath splits a URL path by "/" and removes empty parts.
+func splitPath(path string) []string {
+	var parts []string
+	for _, p := range strings.Split(path, "/") {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	return parts
 }
 
 // handleStreamState provides Server-Sent Events (SSE) for real-time state updates.
@@ -281,6 +452,14 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 	case store.UpdateSkillSync:
 		return &apiStateUpdate{
 			UpdateType: "skill_sync",
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
+	// Session lifecycle updates - broadcast as session changes
+	case store.UpdateSessionIntent, store.UpdateSessionConfirmation,
+		store.UpdateSessionStatus, store.UpdateSessionEnd:
+		return &apiStateUpdate{
+			UpdateType: "session",
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}

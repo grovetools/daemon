@@ -2,6 +2,7 @@ package store
 
 import (
 	"sync"
+	"time"
 
 	"github.com/grovetools/core/pkg/models"
 )
@@ -57,6 +58,18 @@ func (s *Store) GetSessions() []*models.Session {
 	return result
 }
 
+// GetSession returns a specific session by ID, or nil if not found.
+func (s *Store) GetSession(sessionID string) *models.Session {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if sess, ok := s.state.Sessions[sessionID]; ok {
+		// Return a copy to prevent mutation
+		sessCopy := *sess
+		return &sessCopy
+	}
+	return nil
+}
+
 // ApplyUpdate modifies the state and notifies subscribers.
 func (s *Store) ApplyUpdate(u Update) {
 	s.mu.Lock()
@@ -76,6 +89,24 @@ func (s *Store) ApplyUpdate(u Update) {
 			}
 			s.state.Sessions = newMap
 		}
+
+	// Session lifecycle updates
+	case UpdateSessionIntent:
+		if payload, ok := u.Payload.(*SessionIntentPayload); ok {
+			s.applySessionIntent(payload)
+		}
+	case UpdateSessionConfirmation:
+		if payload, ok := u.Payload.(*SessionConfirmationPayload); ok {
+			s.applySessionConfirmation(payload)
+		}
+	case UpdateSessionStatus:
+		if payload, ok := u.Payload.(*SessionStatusPayload); ok {
+			s.applySessionStatus(payload)
+		}
+	case UpdateSessionEnd:
+		if payload, ok := u.Payload.(*SessionEndPayload); ok {
+			s.applySessionEnd(payload)
+		}
 	}
 
 	// Broadcast to subscribers
@@ -86,6 +117,69 @@ func (s *Store) ApplyUpdate(u Update) {
 			// Non-blocking send to prevent slow clients from stalling the daemon
 		}
 	}
+}
+
+// applySessionIntent creates a new session entry from an intent (before agent launch).
+func (s *Store) applySessionIntent(payload *SessionIntentPayload) {
+	session := &models.Session{
+		ID:               payload.JobID,
+		Type:             "interactive_agent",
+		Provider:         payload.Provider,
+		PID:              0, // Not yet known
+		WorkingDirectory: payload.WorkDir,
+		Status:           "pending", // Waiting for confirmation
+		StartedAt:        time.Now(),
+		LastActivity:     time.Now(),
+		PlanName:         payload.PlanName,
+		JobTitle:         payload.Title,
+		JobFilePath:      payload.JobFilePath,
+	}
+	s.state.Sessions[payload.JobID] = session
+}
+
+// applySessionConfirmation updates a pending session with actual process info.
+func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload) {
+	session, exists := s.state.Sessions[payload.JobID]
+	if !exists {
+		// Create a new session if intent was missed
+		session = &models.Session{
+			ID:        payload.JobID,
+			Type:      "interactive_agent",
+			StartedAt: time.Now(),
+		}
+		s.state.Sessions[payload.JobID] = session
+	}
+
+	// Update with confirmation data
+	session.ClaudeSessionID = payload.NativeID
+	session.PID = payload.PID
+	session.Status = "running"
+	session.LastActivity = time.Now()
+	// Note: TranscriptPath is not currently in models.Session but could be added
+}
+
+// applySessionStatus updates the status of an active session.
+func (s *Store) applySessionStatus(payload *SessionStatusPayload) {
+	session, exists := s.state.Sessions[payload.JobID]
+	if !exists {
+		return // Session not found
+	}
+
+	session.Status = payload.Status
+	session.LastActivity = time.Now()
+}
+
+// applySessionEnd marks a session as ended.
+func (s *Store) applySessionEnd(payload *SessionEndPayload) {
+	session, exists := s.state.Sessions[payload.JobID]
+	if !exists {
+		return // Session not found
+	}
+
+	session.Status = payload.Outcome
+	now := time.Now()
+	session.EndedAt = &now
+	session.LastActivity = now
 }
 
 // Subscribe creates a new subscription channel for state updates.

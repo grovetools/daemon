@@ -20,6 +20,13 @@ const (
 	UpdateFocus         UpdateType = "focus"
 	UpdateConfigReload  UpdateType = "config_reload"
 	UpdateSkillSync     UpdateType = "skill_sync"
+
+	// Session lifecycle update types for the consolidated session tracking system.
+	// These enable race-free session management by the daemon.
+	UpdateSessionIntent       UpdateType = "session_intent"       // Pre-register session before agent launch
+	UpdateSessionConfirmation UpdateType = "session_confirmation" // Link intent with actual PID
+	UpdateSessionStatus       UpdateType = "session_status"       // Update session status (running/idle/pending_user)
+	UpdateSessionEnd          UpdateType = "session_end"          // Mark session as completed/interrupted/failed
 )
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation
@@ -28,6 +35,36 @@ type SkillSyncPayload struct {
 	SyncedSkills []string `json:"synced_skills"`
 	DestPaths    []string `json:"dest_paths"`
 	Error        string   `json:"error,omitempty"`
+}
+
+// SessionIntentPayload contains data for pre-registering a session.
+type SessionIntentPayload struct {
+	JobID       string `json:"job_id"`
+	Provider    string `json:"provider"`
+	JobFilePath string `json:"job_file_path"`
+	PlanName    string `json:"plan_name"`
+	Title       string `json:"title"`
+	WorkDir     string `json:"work_dir"`
+}
+
+// SessionConfirmationPayload contains data for confirming a session after agent startup.
+type SessionConfirmationPayload struct {
+	JobID          string `json:"job_id"`
+	NativeID       string `json:"native_id"`
+	PID            int    `json:"pid"`
+	TranscriptPath string `json:"transcript_path"`
+}
+
+// SessionStatusPayload contains data for updating a session's status.
+type SessionStatusPayload struct {
+	JobID  string `json:"job_id"`
+	Status string `json:"status"` // "running", "idle", "pending_user"
+}
+
+// SessionEndPayload contains data for ending a session.
+type SessionEndPayload struct {
+	JobID   string `json:"job_id"`
+	Outcome string `json:"outcome"` // "completed", "interrupted", "failed"
 }
 
 // Update represents a change to the state.
