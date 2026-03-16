@@ -409,12 +409,15 @@ func (c *SessionCollector) loadSession(dirName string) {
 	}
 
 	// Check liveness
-	isAlive := process.IsProcessAlive(pid)
+	// PID=0 means the session was pre-registered (intent) but not yet confirmed
 	status := "running"
 	var endedAt *time.Time
 	lastActivity := metadata.StartedAt
 
-	if !isAlive {
+	if pid == 0 {
+		// Session intent registered but not yet confirmed with actual PID
+		status = "pending"
+	} else if !process.IsProcessAlive(pid) {
 		status = "interrupted"
 		now := time.Now()
 		endedAt = &now
@@ -454,8 +457,12 @@ func (c *SessionCollector) verifyPIDs() bool {
 
 	changed := false
 	for dirName, session := range c.registry {
-		// Only check sessions we think are active
+		// Only check sessions we think are active (skip pending - PID=0)
 		if session.Status == "running" || session.Status == "idle" || session.Status == "pending_user" {
+			// Skip sessions with PID=0 - they're still pending confirmation
+			if session.PID == 0 {
+				continue
+			}
 			if !process.IsProcessAlive(session.PID) {
 				c.logger.WithFields(logrus.Fields{
 					"session_id": session.ID,
