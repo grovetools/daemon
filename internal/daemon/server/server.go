@@ -11,10 +11,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	"github.com/grovetools/core/pkg/enrichment"
-	"github.com/grovetools/core/pkg/models"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -184,7 +183,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	// Send current state immediately so client has data right away
 	state := s.engine.Store().Get()
 	if len(state.Workspaces) > 0 {
-		workspaces := make([]*enrichment.EnrichedWorkspace, 0, len(state.Workspaces))
+		workspaces := make([]*models.EnrichedWorkspace, 0, len(state.Workspaces))
 		for _, ws := range state.Workspaces {
 			workspaces = append(workspaces, ws)
 		}
@@ -224,21 +223,21 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 
 // apiStateUpdate matches the daemon.StateUpdate type for SSE streaming.
 type apiStateUpdate struct {
-	Workspaces []*enrichment.EnrichedWorkspace `json:"workspaces,omitempty"`
-	Sessions   []*models.Session               `json:"sessions,omitempty"`
-	UpdateType string                          `json:"update_type"`
-	Source     string                          `json:"source,omitempty"`
-	Scanned    int                             `json:"scanned,omitempty"`
-	ConfigFile string                          `json:"config_file,omitempty"`
-	Payload    interface{}                     `json:"payload,omitempty"`
+	Workspaces []*models.EnrichedWorkspace `json:"workspaces,omitempty"`
+	Sessions   []*models.Session           `json:"sessions,omitempty"`
+	UpdateType string                      `json:"update_type"`
+	Source     string                      `json:"source,omitempty"`
+	Scanned    int                         `json:"scanned,omitempty"`
+	ConfigFile string                      `json:"config_file,omitempty"`
+	Payload    interface{}                 `json:"payload,omitempty"`
 }
 
 // convertToAPIUpdate converts internal store.Update to the public API format.
 func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 	switch u.Type {
 	case store.UpdateWorkspaces:
-		if wsMap, ok := u.Payload.(map[string]*enrichment.EnrichedWorkspace); ok {
-			workspaces := make([]*enrichment.EnrichedWorkspace, 0, len(wsMap))
+		if wsMap, ok := u.Payload.(map[string]*models.EnrichedWorkspace); ok {
+			workspaces := make([]*models.EnrichedWorkspace, 0, len(wsMap))
 			for _, ws := range wsMap {
 				workspaces = append(workspaces, ws)
 			}

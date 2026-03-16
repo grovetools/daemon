@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/grovetools/daemon/internal/daemon/store"
-	"github.com/grovetools/core/pkg/enrichment"
+	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/sirupsen/logrus"
 )
 
@@ -55,10 +55,10 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 		// 2. Convert to EnrichedWorkspace (initially empty enrichment)
 		// Preserve existing enrichment data if available in the store
 		currentState := st.Get() // Read lock
-		enrichedMap := make(map[string]*enrichment.EnrichedWorkspace)
+		enrichedMap := make(map[string]*models.EnrichedWorkspace)
 
 		for _, node := range nodes {
-			ew := &enrichment.EnrichedWorkspace{WorkspaceNode: node}
+			ew := &models.EnrichedWorkspace{WorkspaceNode: node}
 
 			// Preserve existing data if we have it
 			if existing, ok := currentState.Workspaces[node.Path]; ok {

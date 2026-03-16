@@ -3,7 +3,6 @@ package store
 import (
 	"sync"
 
-	"github.com/grovetools/core/pkg/enrichment"
 	"github.com/grovetools/core/pkg/models"
 )
 
@@ -20,7 +19,7 @@ type Store struct {
 func New() *Store {
 	return &Store{
 		state: &State{
-			Workspaces: make(map[string]*enrichment.EnrichedWorkspace),
+			Workspaces: make(map[string]*models.EnrichedWorkspace),
 			Sessions:   make(map[string]*models.Session),
 		},
 		subscribers: make(map[chan Update]struct{}),
@@ -37,10 +36,10 @@ func (s *Store) Get() State {
 }
 
 // GetWorkspaces returns a slice of all enriched workspaces.
-func (s *Store) GetWorkspaces() []*enrichment.EnrichedWorkspace {
+func (s *Store) GetWorkspaces() []*models.EnrichedWorkspace {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	result := make([]*enrichment.EnrichedWorkspace, 0, len(s.state.Workspaces))
+	result := make([]*models.EnrichedWorkspace, 0, len(s.state.Workspaces))
 	for _, ws := range s.state.Workspaces {
 		result = append(result, ws)
 	}
@@ -65,7 +64,7 @@ func (s *Store) ApplyUpdate(u Update) {
 
 	switch u.Type {
 	case UpdateWorkspaces:
-		if workspaces, ok := u.Payload.(map[string]*enrichment.EnrichedWorkspace); ok {
+		if workspaces, ok := u.Payload.(map[string]*models.EnrichedWorkspace); ok {
 			s.state.Workspaces = workspaces
 		}
 	case UpdateSessions:

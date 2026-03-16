@@ -5,9 +5,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/core/logging"
-	"github.com/grovetools/core/pkg/enrichment"
+	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/daemon/internal/enrichment"
 )
 
 // planBackgroundInterval is how often to update non-focused workspaces.
@@ -69,7 +70,7 @@ func (c *PlanCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 		}
 
 		// Clone existing workspaces and update plan stats
-		newWorkspaces := make(map[string]*enrichment.EnrichedWorkspace)
+		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
 		scanned := 0
 
 		for k, v := range state.Workspaces {

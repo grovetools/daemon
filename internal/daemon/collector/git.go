@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/grovetools/core/git"
-	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/core/logging"
-	"github.com/grovetools/core/pkg/enrichment"
+	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/daemon/internal/daemon/store"
 )
 
 // gitWorkers is the number of parallel git status workers.
@@ -75,14 +75,14 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		focus := st.GetFocus()
 
 		// Clone existing state
-		newWorkspaces := make(map[string]*enrichment.EnrichedWorkspace)
+		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
 		for k, v := range state.Workspaces {
 			cpy := *v
 			newWorkspaces[k] = &cpy
 		}
 
 		// Determine which workspaces to scan this tick
-		var toScan []*enrichment.EnrichedWorkspace
+		var toScan []*models.EnrichedWorkspace
 		doFullScan := len(focus) == 0 || time.Since(lastFullScan) >= backgroundScanInterval
 
 		if doFullScan {
@@ -117,7 +117,7 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 
 		for _, ws := range toScan {
 			wg.Add(1)
-			go func(ws *enrichment.EnrichedWorkspace) {
+			go func(ws *models.EnrichedWorkspace) {
 				defer wg.Done()
 				sem <- struct{}{}        // Acquire
 				defer func() { <-sem }() // Release
