@@ -439,6 +439,42 @@ func newGrovedMonitorCmd() *cobra.Command {
 								timestamp, workspace, len(skillsList), p["dest_paths"])
 						}
 					}
+				case "session":
+					// Session lifecycle event - display details from payload
+					if p, ok := update.Payload.(map[string]interface{}); ok {
+						jobID, _ := p["job_id"].(string)
+						if jobID == "" {
+							// Try session_id for backwards compat
+							jobID, _ = p["session_id"].(string)
+						}
+
+						// Detect event type from payload fields
+						if _, hasNativeID := p["native_id"]; hasNativeID {
+							// Confirmation event
+							pid, _ := p["pid"].(float64)
+							nativeID, _ := p["native_id"].(string)
+							fmt.Printf("[%s] \033[32mSession Confirmed\033[0m: %s (PID: %.0f, native: %s)\n",
+								timestamp, jobID, pid, truncateID(nativeID))
+						} else if status, hasStatus := p["status"].(string); hasStatus {
+							// Status update event
+							fmt.Printf("[%s] \033[33mSession Status\033[0m: %s → %s\n",
+								timestamp, jobID, status)
+						} else if outcome, hasOutcome := p["outcome"].(string); hasOutcome {
+							// End event
+							fmt.Printf("[%s] \033[31mSession Ended\033[0m: %s (%s)\n",
+								timestamp, jobID, outcome)
+						} else if title, hasTitle := p["title"].(string); hasTitle {
+							// Intent event
+							planName, _ := p["plan_name"].(string)
+							fmt.Printf("[%s] \033[36mSession Intent\033[0m: %s [%s] %s\n",
+								timestamp, jobID, planName, title)
+						} else {
+							// Generic session event
+							fmt.Printf("[%s] Session Event: %v\n", timestamp, p)
+						}
+					} else {
+						fmt.Printf("[%s] Session: %s\n", timestamp, update.Source)
+					}
 				default:
 					fmt.Printf("[%s] Update: %s\n", timestamp, update.UpdateType)
 				}
@@ -467,4 +503,12 @@ func formatSource(source string) string {
 	default:
 		return source
 	}
+}
+
+// truncateID truncates a UUID or long ID for display (first 8 chars).
+func truncateID(id string) string {
+	if len(id) > 8 {
+		return id[:8] + "..."
+	}
+	return id
 }
