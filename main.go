@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/mattsolo1/daemon/cmd"
+	"github.com/grovetools/daemon/cmd"
 )
 
 func main() {
