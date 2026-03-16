@@ -20,10 +20,10 @@ func FindBinary() (string, error) {
 
 	// Try common locations relative to test execution directory
 	candidates := []string{
-		"./bin/daemon",
-		"../bin/daemon",
-		"../../bin/daemon",
-		"../../../bin/daemon",
+		"./bin/groved",
+		"../bin/groved",
+		"../../bin/groved",
+		"../../../bin/groved",
 	}
 
 	for _, candidate := range candidates {
@@ -37,9 +37,9 @@ func FindBinary() (string, error) {
 	}
 
 	// Try to find in PATH
-	if path, err := exec.LookPath("daemon"); err == nil {
+	if path, err := exec.LookPath("groved"); err == nil {
 		return path, nil
 	}
 
-	return "", fmt.Errorf("could not find daemon binary - please set DAEMON_BINARY environment variable or ensure daemon is built and in PATH")
+	return "", fmt.Errorf("could not find groved binary - please set DAEMON_BINARY environment variable or ensure groved is built and in PATH")
 }

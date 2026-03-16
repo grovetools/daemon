@@ -2,8 +2,8 @@ name = "daemon"
 description = "Grove ecosystem background daemon"
 
 [binary]
-name = "daemon"
-path = "./bin/daemon"
+name = "groved"
+path = "./bin/groved"
 
 [logging]
 report_caller = true
