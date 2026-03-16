@@ -10,6 +10,13 @@ var rootCmd *cobra.Command
 func init() {
 	rootCmd = cli.NewStandardCommand("groved", "Grove ecosystem background daemon")
 
+	// Set long description
+	rootCmd.Long = `The Grove daemon runs in the background to provide:
+  • Automatic skill synchronization when config or skill files change
+  • Workspace discovery and state tracking
+  • Git status monitoring and session collection
+  • Event hooks for custom automation`
+
 	// Add commands
 	rootCmd.AddCommand(newVersionCmd())
 
@@ -22,5 +29,5 @@ func init() {
 }
 
 func Execute() error {
-	return rootCmd.Execute()
+	return cli.Execute(rootCmd)
 }
