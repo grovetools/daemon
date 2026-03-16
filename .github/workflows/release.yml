@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  GO_VERSION: "1.24"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Configure Git LFS
+      run: |
+        # Disable Git LFS to avoid permission issues with dependencies
+        git config --global filter.lfs.process ""
+        git config --global filter.lfs.required false
+        git config --global filter.lfs.clean ""
+        git config --global filter.lfs.smudge ""
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    - name: Configure git for private modules
+      run: |
+        git config --global url."https://${{ secrets.GROVE_PAT }}@github.com/".insteadOf "https://github.com/"
+        go env -w GOPRIVATE=github.com/grovetools/*
+        go env -w GOPROXY=direct
+    
+    - name: Update dependencies
+      run: |
+        rm -f go.sum
+        go mod download
+        go mod tidy
+    
+    - name: Run tests
+      run: make test
+    
+    - name: Build binaries
+      run: |
+        VERSION=$${GITHUB_REF_NAME#v}
+        make build-all VERSION=$VERSION
+    
+    - name: Create release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          dist/daemon-darwin-amd64
+          dist/daemon-darwin-arm64
+          dist/daemon-linux-amd64
+          dist/daemon-linux-arm64
+        generate_release_notes: true

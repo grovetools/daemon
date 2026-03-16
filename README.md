@@ -1,0 +1,40 @@
+# daemon
+
+A new Grove tool - daemon
+
+## Installation
+
+```bash
+grove install daemon
+```
+
+## Usage
+
+```bash
+daemon --help
+```
+
+## Development
+
+### Building
+
+```bash
+make build
+```
+
+### Testing
+
+```bash
+make test
+make test-e2e
+```
+
+### Linting
+
+```bash
+make lint
+```
+
+## Contributing
+
+This is a private repository. Please ensure all contributions follow the Grove ecosystem conventions.

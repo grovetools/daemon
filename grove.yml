@@ -1,0 +1,14 @@
+name: daemon
+description: A new Grove tool - daemon
+binary:
+  name: daemon
+  path: ./bin/daemon
+
+logging:
+  file:
+    enabled: true
+    format: json
+  report_caller: true
+
+context:
+  default_rules_path: .cx/dev-no-tests.rules

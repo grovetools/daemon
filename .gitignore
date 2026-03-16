@@ -1,0 +1,54 @@
+# Binaries
+/bin/
+/daemon
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+coverage.xml
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# Local configuration
+config.local.yaml
+.env
+
+# Grove ecosystem
+.grove
+.grove-worktrees
+
+# Distribution directory
+dist/
+
+!CLAUDE.md
