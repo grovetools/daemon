@@ -14,6 +14,16 @@ func main() {
 	scenarios := []*harness.Scenario{
 		// Basic Scenarios
 		BasicScenario(),
+
+		// Daemon Lifecycle Tests
+		DaemonLifecycleScenario(),
+
+		// Skill Watcher Tests
+		DaemonSkillWatcherScenario(),
+		DaemonSkillWatcherPruneScenario(),
+
+		// Daemon Hooks Tests
+		DaemonHooksScenario(),
 	}
 
 	// Execute the custom tend application with our scenarios

@@ -39,8 +39,8 @@ func BasicScenario() *harness.Scenario {
 				if result.ExitCode != 0 {
 					return result.Error
 				}
-				if !strings.Contains(result.Stdout, "A new Grove tool - daemon") {
-					return fmt.Errorf("expected help output to contain 'A new Grove tool - daemon'")
+				if !strings.Contains(result.Stdout, "Grove ecosystem background daemon") {
+					return fmt.Errorf("expected help output to contain 'Grove ecosystem background daemon', got: %s", result.Stdout)
 				}
 				return nil
 			}),
