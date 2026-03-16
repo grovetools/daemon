@@ -93,10 +93,11 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	// State API endpoints
 	mux.HandleFunc("/api/state", s.handleGetState)
 	mux.HandleFunc("/api/workspaces", s.handleGetWorkspaces)
-	mux.HandleFunc("/api/sessions", s.handleSessions)
-	mux.HandleFunc("/api/sessions/", s.handleSessionByID)
+	// Session endpoints - order matters! Most specific routes first.
 	mux.HandleFunc("/api/sessions/intent", s.handleSessionIntent)
 	mux.HandleFunc("/api/sessions/confirm", s.handleSessionConfirm)
+	mux.HandleFunc("/api/sessions/", s.handleSessionByID)
+	mux.HandleFunc("/api/sessions", s.handleSessions)
 	mux.HandleFunc("/api/stream", s.handleStreamState)
 	mux.HandleFunc("/api/config", s.handleGetConfig)
 	mux.HandleFunc("/api/focus", s.handleFocus)
