@@ -9,6 +9,7 @@ import (
 type State struct {
 	Workspaces map[string]*models.EnrichedWorkspace `json:"workspaces"` // Keyed by path
 	Sessions   map[string]*models.Session           `json:"sessions"`   // Keyed by ID
+	Jobs       map[string]*models.JobInfo           `json:"jobs"`       // Keyed by job ID
 }
 
 // UpdateType defines what kind of data changed.
@@ -28,6 +29,13 @@ const (
 	UpdateSessionConfirmation UpdateType = "session_confirmation" // Link intent with actual PID
 	UpdateSessionStatus       UpdateType = "session_status"       // Update session status (running/idle/pending_user)
 	UpdateSessionEnd          UpdateType = "session_end"          // Mark session as completed/interrupted/failed
+
+	// Job lifecycle update types for the daemon's JobRunner.
+	UpdateJobSubmitted UpdateType = "job_submitted"
+	UpdateJobStarted   UpdateType = "job_started"
+	UpdateJobCompleted UpdateType = "job_completed"
+	UpdateJobFailed    UpdateType = "job_failed"
+	UpdateJobCancelled UpdateType = "job_cancelled"
 )
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation

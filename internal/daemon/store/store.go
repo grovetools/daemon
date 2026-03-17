@@ -22,6 +22,7 @@ func New() *Store {
 		state: &State{
 			Workspaces: make(map[string]*models.EnrichedWorkspace),
 			Sessions:   make(map[string]*models.Session),
+			Jobs:       make(map[string]*models.JobInfo),
 		},
 		subscribers: make(map[chan Update]struct{}),
 		focus:       make(map[string]struct{}),
@@ -70,6 +71,29 @@ func (s *Store) GetSession(sessionID string) *models.Session {
 	return nil
 }
 
+// GetJob returns a specific job by ID, or nil if not found.
+func (s *Store) GetJob(jobID string) *models.JobInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if job, ok := s.state.Jobs[jobID]; ok {
+		jobCopy := *job
+		return &jobCopy
+	}
+	return nil
+}
+
+// GetJobs returns a slice of all jobs.
+func (s *Store) GetJobs() []*models.JobInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*models.JobInfo, 0, len(s.state.Jobs))
+	for _, job := range s.state.Jobs {
+		jobCopy := *job
+		result = append(result, &jobCopy)
+	}
+	return result
+}
+
 // ApplyUpdate modifies the state and notifies subscribers.
 func (s *Store) ApplyUpdate(u Update) {
 	s.mu.Lock()
@@ -106,6 +130,12 @@ func (s *Store) ApplyUpdate(u Update) {
 	case UpdateSessionEnd:
 		if payload, ok := u.Payload.(*SessionEndPayload); ok {
 			s.applySessionEnd(payload)
+		}
+
+	// Job lifecycle updates
+	case UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed, UpdateJobCancelled:
+		if job, ok := u.Payload.(*models.JobInfo); ok {
+			s.state.Jobs[job.ID] = job
 		}
 	}
 

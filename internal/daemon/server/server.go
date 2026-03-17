@@ -14,6 +14,7 @@ import (
 
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/engine"
+	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
@@ -37,6 +38,7 @@ type Server struct {
 	server        *http.Server
 	engine        *engine.Engine
 	runningConfig *RunningConfig
+	jobRunner     *jobrunner.JobRunner
 }
 
 // New creates a new Server instance.
@@ -54,6 +56,11 @@ func (s *Server) SetEngine(eng *engine.Engine) {
 // SetRunningConfig sets the running configuration for the server.
 func (s *Server) SetRunningConfig(cfg *RunningConfig) {
 	s.runningConfig = cfg
+}
+
+// SetJobRunner sets the job runner for the server.
+func (s *Server) SetJobRunner(jr *jobrunner.JobRunner) {
+	s.jobRunner = jr
 }
 
 // ListenAndServe starts the daemon on the given unix socket path.
@@ -101,6 +108,9 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/stream", s.handleStreamState)
 	mux.HandleFunc("/api/config", s.handleGetConfig)
 	mux.HandleFunc("/api/focus", s.handleFocus)
+	// Job management endpoints
+	mux.HandleFunc("/api/jobs/", s.handleJobByID)
+	mux.HandleFunc("/api/jobs", s.handleJobs)
 
 	s.server = &http.Server{
 		Handler: h2c.NewHandler(mux, &http2.Server{}),
@@ -470,6 +480,15 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
+
+	// Job lifecycle updates
+	case store.UpdateJobSubmitted, store.UpdateJobStarted,
+		store.UpdateJobCompleted, store.UpdateJobFailed, store.UpdateJobCancelled:
+		return &apiStateUpdate{
+			UpdateType: string(u.Type),
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
 	}
 	return nil
 }
@@ -515,6 +534,91 @@ func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string][]string{"paths": paths})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleJobs handles POST (submit) and GET (list) for /api/jobs.
+func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
+	if s.jobRunner == nil {
+		http.Error(w, "job runner not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		var req models.JobSubmitRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		info, err := s.jobRunner.Submit(r.Context(), req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(info)
+
+	case http.MethodGet:
+		statusFilter := r.URL.Query().Get("status")
+		jobs := s.engine.Store().GetJobs()
+		var results []*models.JobInfo
+		for _, j := range jobs {
+			if statusFilter == "" || j.Status == statusFilter {
+				results = append(results, j)
+			}
+		}
+		if results == nil {
+			results = []*models.JobInfo{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(results)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleJobByID handles GET (info) and DELETE (cancel) for /api/jobs/{id}.
+func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	path := r.URL.Path[len("/api/jobs/"):]
+	parts := splitPath(path)
+	if len(parts) == 0 {
+		http.Error(w, "job ID required", http.StatusBadRequest)
+		return
+	}
+	jobID := parts[0]
+
+	switch r.Method {
+	case http.MethodGet:
+		info := s.engine.Store().GetJob(jobID)
+		if info == nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(info)
+
+	case http.MethodDelete:
+		if s.jobRunner == nil {
+			http.Error(w, "job runner not initialized", http.StatusServiceUnavailable)
+			return
+		}
+		if err := s.jobRunner.Cancel(jobID); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "cancelled", "job_id": jobID})
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

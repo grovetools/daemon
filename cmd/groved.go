@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/grovetools/core/command"
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/daemon"
@@ -19,10 +20,12 @@ import (
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/engine"
+	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
 	"github.com/grovetools/daemon/internal/daemon/server"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
+	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/spf13/cobra"
 )
 
@@ -169,9 +172,59 @@ func newGrovedStartCmd() *cobra.Command {
 				eng.Register(collector.NewNoteCollector(noteInterval))
 			}
 
+			// 3.5 Setup context early (needed by JobRunner and Engine)
+			ctx, cancel := context.WithCancel(context.Background())
+
+			// 3.6 Setup JobRunner
+			jobsEnabled := true
+			if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.Enabled != nil {
+				jobsEnabled = *cfg.Daemon.Jobs.Enabled
+			}
+
+			var jr *jobrunner.JobRunner
+			if jobsEnabled {
+				workers := 4
+				if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.MaxConcurrent > 0 {
+					workers = cfg.Daemon.Jobs.MaxConcurrent
+				}
+
+				execTimeout := 30 * time.Minute
+				if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.DefaultTimeout != "" {
+					if d, err := time.ParseDuration(cfg.Daemon.Jobs.DefaultTimeout); err == nil {
+						execTimeout = d
+					}
+				}
+
+				execConfig := &orchestration.ExecutorConfig{
+					MaxPromptLength: 1000000,
+					Timeout:         execTimeout,
+					RetryCount:      2,
+					Model:           "default",
+				}
+				localRuntime := orchestration.NewLocalRuntime(
+					execConfig,
+					&command.RealExecutor{},
+					&noopStatusUpdater{},
+					orchestration.NewDefaultLogger(),
+				)
+
+				var persistDir string
+				if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.PersistDir != "" {
+					persistDir = cfg.Daemon.Jobs.PersistDir
+				}
+				persister := jobrunner.NewPersistenceWithDir(persistDir)
+
+				jr = jobrunner.New(st, localRuntime, workers, persister)
+				go jr.Start(ctx)
+				logger.WithField("workers", workers).Info("JobRunner started")
+			}
+
 			// 4. Setup Server with engine
 			srv := server.New(logger)
 			srv.SetEngine(eng)
+			if jr != nil {
+				srv.SetJobRunner(jr)
+			}
 
 			// Set running config for introspection
 			srv.SetRunningConfig(&server.RunningConfig{
@@ -184,7 +237,6 @@ func newGrovedStartCmd() *cobra.Command {
 			})
 
 			// 5. Handle Signals
-			ctx, cancel := context.WithCancel(context.Background())
 			stop := make(chan os.Signal, 1)
 			signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
@@ -761,4 +813,12 @@ func truncateID(id string) string {
 		return id[:8] + "..."
 	}
 	return id
+}
+
+// noopStatusUpdater satisfies orchestration.StatusUpdater without doing anything.
+// The daemon's JobRunner manages status updates via the store, not via this callback.
+type noopStatusUpdater struct{}
+
+func (n *noopStatusUpdater) UpdateJobStatus(job *orchestration.Job, status orchestration.JobStatus) error {
+	return nil
 }
