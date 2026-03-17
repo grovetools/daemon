@@ -275,6 +275,15 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 	targetNode := node
 	executor := h.hooksExecutor
 	h.timers[debounceKey] = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
+		// Skip workspaces whose paths no longer exist (deleted worktrees, removed repos)
+		if _, err := os.Stat(targetNode.Path); err != nil {
+			h.log.WithFields(logrus.Fields{
+				"workspace": targetNode.Name,
+				"path":      targetNode.Path,
+			}).Debug("Skipping skill sync for workspace with missing path")
+			return
+		}
+
 		h.log.WithField("target", debounceKey).Info("Executing skill sync")
 
 		opts := skills.SyncOptions{Prune: true, DryRun: false}
