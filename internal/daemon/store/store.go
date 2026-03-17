@@ -226,15 +226,19 @@ func (s *Store) applySessionStatus(payload *SessionStatusPayload) {
 
 // applySessionEnd marks a session as ended.
 func (s *Store) applySessionEnd(payload *SessionEndPayload) {
-	session, exists := s.state.Sessions[payload.JobID]
-	if !exists {
-		return // Session not found
+	now := time.Now()
+
+	if session, exists := s.state.Sessions[payload.JobID]; exists {
+		session.Status = payload.Outcome
+		session.EndedAt = &now
+		session.LastActivity = now
 	}
 
-	session.Status = payload.Outcome
-	now := time.Now()
-	session.EndedAt = &now
-	session.LastActivity = now
+	// Also update the job if it exists in the Jobs map (from JobCollector discovery)
+	if job, exists := s.state.Jobs[payload.JobID]; exists {
+		job.Status = payload.Outcome
+		job.CompletedAt = &now
+	}
 }
 
 // Subscribe creates a new subscription channel for state updates.
