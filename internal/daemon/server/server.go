@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
@@ -235,6 +236,19 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 				Status: req.Status,
 			},
 		})
+
+		// Write-through to filesystem crash-recovery metadata so status
+		// survives daemon restarts (e.g., "idle" is preserved, not lost).
+		if registry, err := sessions.NewFileSystemRegistry(); err == nil {
+			// Look up the native session ID for the filesystem directory name
+			session := s.engine.Store().GetSession(sessionID)
+			dirName := sessionID
+			if session != nil && session.ClaudeSessionID != "" {
+				dirName = session.ClaudeSessionID
+			}
+			_ = registry.UpdateStatus(dirName, req.Status)
+		}
+
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 
