@@ -1,4 +1,4 @@
-name = "daemon"
+name = "groved"
 description = "Grove ecosystem background daemon"
 
 [binary]

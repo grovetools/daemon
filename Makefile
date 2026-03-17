@@ -1,6 +1,6 @@
 # Makefile for daemon (daemon)
 
-BINARY_NAME=daemon
+BINARY_NAME=groved
 BIN_DIR=bin
 VERSION_PKG=github.com/grovetools/core/version
 
