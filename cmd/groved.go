@@ -423,15 +423,15 @@ func newGrovedMonitorCmd() *cobra.Command {
 				return fmt.Errorf("failed to connect to stream: %w", err)
 			}
 
-			emit := monitorEmitter("groved.monitor", format, compact)
+			emit, ms := monitorEmitter("groved.monitor", format, compact)
 			emit("info", "Monitoring daemon activity", nil)
 
 			for update := range stream {
 				switch update.UpdateType {
 				case "initial":
+					ms.lastWorkspaces = len(update.Workspaces)
 					emit("info", "Connected", map[string]interface{}{
 						"workspaces": len(update.Workspaces),
-						"status":     "success",
 					})
 				case "workspaces":
 					source := update.Source
@@ -445,7 +445,12 @@ func newGrovedMonitorCmd() *cobra.Command {
 					if update.Scanned > 0 && update.Scanned != len(update.Workspaces) {
 						fields["scanned"] = update.Scanned
 					}
-					emit("info", formatSource(source), fields)
+					level := "debug"
+					if len(update.Workspaces) != ms.lastWorkspaces {
+						level = "info"
+						ms.lastWorkspaces = len(update.Workspaces)
+					}
+					emit(level, formatSource(source), fields)
 				case "sessions":
 					var interactive, flowJobs, openCode, running, pending int
 					for _, s := range update.Sessions {
@@ -463,7 +468,13 @@ func newGrovedMonitorCmd() *cobra.Command {
 							pending++
 						}
 					}
-					emit("info", "Session", map[string]interface{}{
+					summary := fmt.Sprintf("%d/%d/%d/%d/%d/%d", len(update.Sessions), running, pending, interactive, flowJobs, openCode)
+					level := "debug"
+					if summary != ms.lastSessions {
+						level = "info"
+						ms.lastSessions = summary
+					}
+					emit(level, "Session", map[string]interface{}{
 						"total":       len(update.Sessions),
 						"running":     running,
 						"pending":     pending,
@@ -472,7 +483,12 @@ func newGrovedMonitorCmd() *cobra.Command {
 						"opencode":    openCode,
 					})
 				case "focus":
-					emit("info", "Focus", map[string]interface{}{
+					level := "debug"
+					if update.Scanned != ms.lastFocus {
+						level = "info"
+						ms.lastFocus = update.Scanned
+					}
+					emit(level, "Focus", map[string]interface{}{
 						"workspaces": update.Scanned,
 					})
 				case "config_reload":
@@ -524,12 +540,21 @@ func newGrovedMonitorCmd() *cobra.Command {
 	return cmd
 }
 
+// monitorState tracks previous values for change detection.
+type monitorState struct {
+	lastWorkspaces int
+	lastSessions   string // serialized summary for comparison
+	lastFocus      int
+}
+
 // monitorEmitter returns a function that writes structured JSON to the system log
 // and prints formatted output to stdout in the requested format.
-func monitorEmitter(component, format string, compact bool) func(level, msg string, fields map[string]interface{}) {
+// Routine polling events are emitted at DEBUG unless values changed.
+func monitorEmitter(component, format string, compact bool) (func(level, msg string, fields map[string]interface{}), *monitorState) {
 	ulog := logging.NewUnifiedLogger(component)
+	state := &monitorState{}
 
-	return func(level, msg string, fields map[string]interface{}) {
+	emit := func(level, msg string, fields map[string]interface{}) {
 		// Build the structured entry and write to log file only
 		entry := ulog.Info(msg).StructuredOnly()
 		switch level {
@@ -545,6 +570,11 @@ func monitorEmitter(component, format string, compact bool) func(level, msg stri
 		}
 		entry.Emit()
 
+		// Don't print debug events to terminal (they still go to log file)
+		if level == "debug" {
+			return
+		}
+
 		// Build a log map for the format function
 		logMap := map[string]interface{}{
 			"time":      time.Now().Format(time.RFC3339),
@@ -558,12 +588,14 @@ func monitorEmitter(component, format string, compact bool) func(level, msg stri
 
 		fmt.Print(logutil.FormatLogLine(logMap, "system", format, compact))
 	}
+
+	return emit, state
 }
 
 // runInlineMonitor subscribes to the store directly and prints updates to stdout.
 // This avoids the need to connect via the HTTP client and captures events from startup.
 func runInlineMonitor(ctx context.Context, st *store.Store, format string, compact bool) {
-	emit := monitorEmitter("groved.monitor", format, compact)
+	emit, ms := monitorEmitter("groved.monitor", format, compact)
 
 	sub := st.Subscribe()
 	defer st.Unsubscribe(sub)
@@ -582,14 +614,21 @@ func runInlineMonitor(ctx context.Context, st *store.Store, format string, compa
 				if source == "" {
 					source = "unknown"
 				}
+				wsCount := 0
 				fields := map[string]interface{}{"source": source}
 				if wsMap, ok := update.Payload.(map[string]*models.EnrichedWorkspace); ok {
-					fields["workspaces"] = len(wsMap)
-					if update.Scanned > 0 && update.Scanned != len(wsMap) {
+					wsCount = len(wsMap)
+					fields["workspaces"] = wsCount
+					if update.Scanned > 0 && update.Scanned != wsCount {
 						fields["scanned"] = update.Scanned
 					}
 				}
-				emit("info", formatSource(source), fields)
+				level := "debug"
+				if wsCount != ms.lastWorkspaces {
+					level = "info"
+					ms.lastWorkspaces = wsCount
+				}
+				emit(level, formatSource(source), fields)
 			case store.UpdateSessions:
 				if sessions, ok := update.Payload.([]*models.Session); ok {
 					var interactive, flowJobs, openCode, running, pending int
@@ -608,7 +647,13 @@ func runInlineMonitor(ctx context.Context, st *store.Store, format string, compa
 							pending++
 						}
 					}
-					emit("info", "Session", map[string]interface{}{
+					summary := fmt.Sprintf("%d/%d/%d/%d/%d/%d", len(sessions), running, pending, interactive, flowJobs, openCode)
+					level := "debug"
+					if summary != ms.lastSessions {
+						level = "info"
+						ms.lastSessions = summary
+					}
+					emit(level, "Session", map[string]interface{}{
 						"total":       len(sessions),
 						"running":     running,
 						"pending":     pending,
@@ -618,7 +663,12 @@ func runInlineMonitor(ctx context.Context, st *store.Store, format string, compa
 					})
 				}
 			case store.UpdateFocus:
-				emit("info", "Focus", map[string]interface{}{
+				level := "debug"
+				if update.Scanned != ms.lastFocus {
+					level = "info"
+					ms.lastFocus = update.Scanned
+				}
+				emit(level, "Focus", map[string]interface{}{
 					"workspaces": update.Scanned,
 				})
 			case store.UpdateConfigReload:
