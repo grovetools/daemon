@@ -21,6 +21,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
+	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
 	"github.com/grovetools/daemon/internal/daemon/server"
 	"github.com/grovetools/daemon/internal/daemon/store"
@@ -219,12 +220,19 @@ func newGrovedStartCmd() *cobra.Command {
 				logger.WithField("workers", workers).Info("JobRunner started")
 			}
 
+			// 3.7 Setup LogStreamer
+			logBufSize := 1000
+			logMaxSubs := 10
+			logPollInterval := 500 * time.Millisecond
+			streamer := logstreamer.New(st, logBufSize, logMaxSubs, logPollInterval)
+
 			// 4. Setup Server with engine
 			srv := server.New(logger)
 			srv.SetEngine(eng)
 			if jr != nil {
 				srv.SetJobRunner(jr)
 			}
+			srv.SetLogStreamer(streamer)
 
 			// Set running config for introspection
 			srv.SetRunningConfig(&server.RunningConfig{
@@ -243,7 +251,8 @@ func newGrovedStartCmd() *cobra.Command {
 			go func() {
 				<-stop
 				logger.Info("Received stop signal")
-				cancel() // Stop the engine
+				streamer.Stop() // Stop all log tailing goroutines
+				cancel()        // Stop the engine
 
 				// Create shutdown context with timeout
 				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -15,6 +15,7 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
+	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
@@ -39,6 +40,7 @@ type Server struct {
 	engine        *engine.Engine
 	runningConfig *RunningConfig
 	jobRunner     *jobrunner.JobRunner
+	logStreamer   *logstreamer.LogStreamer
 }
 
 // New creates a new Server instance.
@@ -61,6 +63,11 @@ func (s *Server) SetRunningConfig(cfg *RunningConfig) {
 // SetJobRunner sets the job runner for the server.
 func (s *Server) SetJobRunner(jr *jobrunner.JobRunner) {
 	s.jobRunner = jr
+}
+
+// SetLogStreamer sets the log streamer for the server.
+func (s *Server) SetLogStreamer(ls *logstreamer.LogStreamer) {
+	s.logStreamer = ls
 }
 
 // ListenAndServe starts the daemon on the given unix socket path.
@@ -583,7 +590,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleJobByID handles GET (info) and DELETE (cancel) for /api/jobs/{id}.
+// handleJobByID handles GET (info), DELETE (cancel), and log sub-routes for /api/jobs/{id}[/logs[/stream]].
 func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
@@ -597,6 +604,16 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobID := parts[0]
+
+	// Route sub-paths: /api/jobs/{id}/logs and /api/jobs/{id}/logs/stream
+	if len(parts) >= 2 && parts[1] == "logs" {
+		if len(parts) >= 3 && parts[2] == "stream" {
+			s.handleStreamJobLogs(w, r, jobID)
+		} else {
+			s.handleGetJobLogs(w, r, jobID)
+		}
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -623,4 +640,130 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleGetJobLogs returns historical log content for a job as a JSON array.
+func (s *Server) handleGetJobLogs(w http.ResponseWriter, r *http.Request, jobID string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.logStreamer == nil {
+		http.Error(w, "log streamer not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	info := s.engine.Store().GetJob(jobID)
+	if info == nil {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+
+	lines := s.logStreamer.GetLogs(jobID)
+	if lines == nil {
+		lines = []models.LogLine{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(lines)
+}
+
+// handleStreamJobLogs provides SSE streaming of log lines for a specific job.
+func (s *Server) handleStreamJobLogs(w http.ResponseWriter, r *http.Request, jobID string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.logStreamer == nil {
+		http.Error(w, "log streamer not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	info := s.engine.Store().GetJob(jobID)
+	if info == nil {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Determine the log file path from the job
+	logFilePath := resolveLogFilePath(info)
+	if logFilePath == "" {
+		http.Error(w, "no log file available for this job", http.StatusNotFound)
+		return
+	}
+
+	history, ch, err := s.logStreamer.Subscribe(jobID, logFilePath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+		return
+	}
+	defer s.logStreamer.Unsubscribe(jobID, ch)
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Send connection confirmation
+	fmt.Fprintf(w, ": connected to job %s log stream\n\n", jobID)
+	flusher.Flush()
+
+	// Send historical buffer
+	for _, line := range history {
+		data, err := json.Marshal(line)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
+	}
+	flusher.Flush()
+
+	// Stream new events
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event, ok := <-ch:
+			if !ok {
+				return // Stream closed (job completed)
+			}
+			switch event.Event {
+			case "log":
+				if event.Line != nil {
+					data, err := json.Marshal(event.Line)
+					if err != nil {
+						continue
+					}
+					fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
+				}
+			case "status":
+				data, err := json.Marshal(map[string]string{
+					"status": event.Status,
+					"error":  event.Error,
+				})
+				if err != nil {
+					continue
+				}
+				fmt.Fprintf(w, "event: status\ndata: %s\n\n", data)
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// resolveLogFilePath determines the log file path for a job.
+// For now, it constructs the path from the plan directory and job file.
+// TODO: This should be stored in JobInfo when the job starts.
+func resolveLogFilePath(info *models.JobInfo) string {
+	if info.PlanDir == "" || info.JobFile == "" {
+		return ""
+	}
+	// Convention: job logs are stored in .artifacts/<job-name>/job.log within the plan dir
+	jobName := strings.TrimSuffix(info.JobFile, ".md")
+	return filepath.Join(info.PlanDir, ".artifacts", jobName, "job.log")
 }
