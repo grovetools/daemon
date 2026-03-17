@@ -20,6 +20,7 @@ const (
 	UpdateFocus         UpdateType = "focus"
 	UpdateConfigReload  UpdateType = "config_reload"
 	UpdateSkillSync     UpdateType = "skill_sync"
+	UpdateWatcherStatus UpdateType = "watcher_status"
 
 	// Session lifecycle update types for the consolidated session tracking system.
 	// These enable race-free session management by the daemon.

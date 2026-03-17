@@ -456,6 +456,12 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
+	case store.UpdateWatcherStatus:
+		return &apiStateUpdate{
+			UpdateType: "watcher_status",
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
 	// Session lifecycle updates - broadcast as session changes
 	case store.UpdateSessionIntent, store.UpdateSessionConfirmation,
 		store.UpdateSessionStatus, store.UpdateSessionEnd:

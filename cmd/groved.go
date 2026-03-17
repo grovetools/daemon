@@ -14,6 +14,7 @@ import (
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/daemon"
+	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/engine"
@@ -201,6 +202,11 @@ func newGrovedStartCmd() *cobra.Command {
 				os.Exit(0)
 			}()
 
+			// 5.5. Start inline monitor early so it captures all events from boot
+			if monitor, _ := cmd.Flags().GetBool("monitor"); monitor {
+				go runInlineMonitor(ctx, st)
+			}
+
 			// 6. Start Engine in background
 			go eng.Start(ctx)
 
@@ -219,25 +225,48 @@ func newGrovedStartCmd() *cobra.Command {
 				}
 			}
 
-			// 7.5. Start SkillWatcher if enabled
-			autoSync := true
-			if cfg.Daemon != nil && cfg.Daemon.AutoSyncSkills != nil {
-				autoSync = *cfg.Daemon.AutoSyncSkills
-			}
-
-			if autoSync {
-				debounceMs := 1000
-				if cfg.Daemon != nil && cfg.Daemon.SkillSyncDebounceMs > 0 {
-					debounceMs = cfg.Daemon.SkillSyncDebounceMs
+			// 7.5. Start UnifiedWatcher with registered domain handlers
+			unifiedWatcher, err := watcher.NewUnifiedWatcher(st, 100*time.Millisecond, logger)
+			if err != nil {
+				logger.WithError(err).Warn("Failed to start unified watcher, continuing without it")
+			} else {
+				// Register SkillHandler if auto-sync is enabled
+				autoSync := true
+				if cfg.Daemon != nil && cfg.Daemon.AutoSyncSkills != nil {
+					autoSync = *cfg.Daemon.AutoSyncSkills
 				}
 
-				skillWatcher, err := watcher.NewSkillWatcher(st, cfg, debounceMs)
-				if err != nil {
-					logger.WithError(err).Warn("Failed to start skill watcher, continuing without it")
-				} else {
-					logger.Info("Skill watcher started")
-					go skillWatcher.Start(ctx)
+				if autoSync {
+					debounceMs := 1000
+					if cfg.Daemon != nil && cfg.Daemon.SkillSyncDebounceMs > 0 {
+						debounceMs = cfg.Daemon.SkillSyncDebounceMs
+					}
+
+					skillHandler, err := watcher.NewSkillHandler(st, cfg, debounceMs)
+					if err != nil {
+						logger.WithError(err).Warn("Failed to initialize skill handler")
+					} else {
+						unifiedWatcher.Register(skillHandler)
+						logger.Info("Skill handler registered with unified watcher")
+					}
 				}
+
+				// Register FlowHandler for plan directory watching
+				if isEnabled("plan") {
+					flowHandler := watcher.NewFlowHandler(st, cfg, 2000)
+					unifiedWatcher.Register(flowHandler)
+					logger.Info("Flow handler registered with unified watcher")
+				}
+
+				// Register NoteHandler for note directory watching
+				if isEnabled("note") {
+					noteHandler := watcher.NewNoteHandler(st, cfg, 3000)
+					unifiedWatcher.Register(noteHandler)
+					logger.Info("Note handler registered with unified watcher")
+				}
+
+				logger.Info("Unified watcher started")
+				go unifiedWatcher.Start(ctx)
 			}
 
 			// 8. Start Server (Blocking)
@@ -251,6 +280,7 @@ func newGrovedStartCmd() *cobra.Command {
 
 	cmd.Flags().StringSlice("collectors", []string{"all"}, "Comma-separated list of collectors to enable (git, session, workspace, plan, note)")
 	cmd.Flags().Int("pprof-port", 0, "Port to start pprof server on (0 to disable)")
+	cmd.Flags().Bool("monitor", false, "Stream daemon activity to stdout")
 
 	return cmd
 }
@@ -426,6 +456,26 @@ func newGrovedMonitorCmd() *cobra.Command {
 						configFile = "unknown"
 					}
 					fmt.Printf("[%s] Config Reload: %s\n", timestamp, configFile)
+				case "watcher_status":
+					if p, ok := update.Payload.(map[string]interface{}); ok {
+						event, _ := p["event"].(string)
+						switch event {
+						case "handler_registered":
+							handler, _ := p["handler"].(string)
+							fmt.Printf("[%s] \033[34mWatcher\033[0m: registered handler %q\n", timestamp, handler)
+						case "started":
+							handlers, _ := p["handlers"].([]interface{})
+							pathCount, _ := p["paths"].(float64)
+							names := make([]string, len(handlers))
+							for i, h := range handlers {
+								names[i], _ = h.(string)
+							}
+							fmt.Printf("[%s] \033[34mWatcher\033[0m: unified watcher started with %v (%d paths)\n",
+								timestamp, names, int(pathCount))
+						default:
+							fmt.Printf("[%s] \033[34mWatcher\033[0m: %v\n", timestamp, p)
+						}
+					}
 				case "skill_sync":
 					// Payload is a generic map after JSON unmarshaling over the stream
 					if p, ok := update.Payload.(map[string]interface{}); ok {
@@ -482,6 +532,118 @@ func newGrovedMonitorCmd() *cobra.Command {
 
 			return nil
 		},
+	}
+}
+
+// runInlineMonitor subscribes to the store directly and prints updates to stdout.
+// This avoids the need to connect via the HTTP client and captures events from startup.
+func runInlineMonitor(ctx context.Context, st *store.Store) {
+	sub := st.Subscribe()
+	defer st.Unsubscribe(sub)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case update, ok := <-sub:
+			if !ok {
+				return
+			}
+			ts := time.Now().Format("15:04:05")
+			switch update.Type {
+			case store.UpdateWorkspaces:
+				source := update.Source
+				if source == "" {
+					source = "unknown"
+				}
+				if wsMap, ok := update.Payload.(map[string]*models.EnrichedWorkspace); ok {
+					if update.Scanned > 0 && update.Scanned != len(wsMap) {
+						fmt.Printf("[%s] %s: scanned %d/%d\n", ts, formatSource(source), update.Scanned, len(wsMap))
+					} else {
+						fmt.Printf("[%s] %s: %d workspaces\n", ts, formatSource(source), len(wsMap))
+					}
+				} else {
+					fmt.Printf("[%s] %s: workspaces updated\n", ts, formatSource(source))
+				}
+			case store.UpdateSessions:
+				if sessions, ok := update.Payload.([]*models.Session); ok {
+					var interactive, flowJobs, openCode, running, pending int
+					for _, s := range sessions {
+						switch s.Type {
+						case "opencode_session":
+							openCode++
+						case "interactive_agent", "agent", "oneshot", "chat", "headless_agent", "shell":
+							flowJobs++
+						default:
+							interactive++
+						}
+						if s.Status == "running" {
+							running++
+						} else if s.Status == "pending_user" || s.Status == "idle" {
+							pending++
+						}
+					}
+					fmt.Printf("[%s] Session: %d total (%d running, %d pending) [interactive:%d flow:%d opencode:%d]\n",
+						ts, len(sessions), running, pending, interactive, flowJobs, openCode)
+				} else {
+					fmt.Printf("[%s] Session: sessions updated\n", ts)
+				}
+			case store.UpdateFocus:
+				fmt.Printf("[%s] Focus: %d workspaces\n", ts, update.Scanned)
+			case store.UpdateConfigReload:
+				file, _ := update.Payload.(string)
+				fmt.Printf("[%s] Config Reload: %s\n", ts, file)
+			case store.UpdateWatcherStatus:
+				if p, ok := update.Payload.(map[string]string); ok {
+					switch p["event"] {
+					case "handler_registered":
+						fmt.Printf("[%s] \033[34mWatcher\033[0m: registered handler %q\n", ts, p["handler"])
+					default:
+						fmt.Printf("[%s] \033[34mWatcher\033[0m: %s\n", ts, p["event"])
+					}
+				} else if p, ok := update.Payload.(map[string]interface{}); ok {
+					event, _ := p["event"].(string)
+					switch event {
+					case "started":
+						handlers, _ := p["handlers"].([]string)
+						pathCount, _ := p["paths"].(int)
+						fmt.Printf("[%s] \033[34mWatcher\033[0m: unified watcher started with %v (%d paths)\n",
+							ts, handlers, pathCount)
+					default:
+						fmt.Printf("[%s] \033[34mWatcher\033[0m: %v\n", ts, p)
+					}
+				}
+			case store.UpdateSkillSync:
+				if p, ok := update.Payload.(store.SkillSyncPayload); ok {
+					if p.Error != "" {
+						fmt.Printf("[%s] Skill Sync Error: %s - %s\n", ts, p.Workspace, p.Error)
+					} else if len(p.SyncedSkills) > 0 {
+						fmt.Printf("[%s] Skill Sync: %s synced %d skills to %v\n",
+							ts, p.Workspace, len(p.SyncedSkills), p.DestPaths)
+					}
+				}
+			case store.UpdateSessionIntent:
+				if p, ok := update.Payload.(*store.SessionIntentPayload); ok {
+					fmt.Printf("[%s] \033[36mSession Intent\033[0m: %s [%s] %s\n",
+						ts, p.JobID, p.PlanName, p.Title)
+				}
+			case store.UpdateSessionConfirmation:
+				if p, ok := update.Payload.(*store.SessionConfirmationPayload); ok {
+					fmt.Printf("[%s] \033[32mSession Confirmed\033[0m: %s (PID: %d, native: %s)\n",
+						ts, p.JobID, p.PID, truncateID(p.NativeID))
+				}
+			case store.UpdateSessionStatus:
+				if p, ok := update.Payload.(*store.SessionStatusPayload); ok {
+					fmt.Printf("[%s] \033[33mSession Status\033[0m: %s → %s\n",
+						ts, p.JobID, p.Status)
+				}
+			case store.UpdateSessionEnd:
+				if p, ok := update.Payload.(*store.SessionEndPayload); ok {
+					fmt.Printf("[%s] \033[31mSession Ended\033[0m: %s (%s)\n",
+						ts, p.JobID, p.Outcome)
+				}
+			}
+		}
 	}
 }
 
