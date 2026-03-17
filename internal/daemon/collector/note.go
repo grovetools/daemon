@@ -45,7 +45,7 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 200*time.Millisecond {
-				logger.WithField("duration", d).Warn("Slow note scan detected")
+				logger.WithField("duration", d).Debug("Slow note scan detected")
 			}
 		}()
 

@@ -42,7 +42,7 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 500*time.Millisecond {
-				c.logger.WithField("duration", d).Warn("Slow workspace discovery detected")
+				c.logger.WithField("duration", d).Debug("Slow workspace discovery detected")
 			}
 		}()
 

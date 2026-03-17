@@ -14,6 +14,7 @@ import (
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/daemon"
+	"github.com/grovetools/core/pkg/logging/logutil"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/daemon/internal/daemon/collector"
@@ -65,6 +66,9 @@ func newGrovedStartCmd() *cobra.Command {
 		Short: "Start the daemon",
 		Long:  "Start the grove daemon in foreground mode.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Route all daemon logs to central system log
+			logging.SetGlobalScope(logging.ScopeSystem)
+
 			logger := logging.NewLogger("groved")
 			pidPath := paths.PidFilePath()
 			sockPath := paths.SocketPath()
@@ -204,7 +208,9 @@ func newGrovedStartCmd() *cobra.Command {
 
 			// 5.5. Start inline monitor early so it captures all events from boot
 			if monitor, _ := cmd.Flags().GetBool("monitor"); monitor {
-				go runInlineMonitor(ctx, st)
+				monitorFormat, _ := cmd.Flags().GetString("monitor-format")
+				monitorCompact, _ := cmd.Flags().GetBool("monitor-compact")
+				go runInlineMonitor(ctx, st, monitorFormat, monitorCompact)
 			}
 
 			// 6. Start Engine in background
@@ -281,6 +287,8 @@ func newGrovedStartCmd() *cobra.Command {
 	cmd.Flags().StringSlice("collectors", []string{"all"}, "Comma-separated list of collectors to enable (git, session, workspace, plan, note)")
 	cmd.Flags().Int("pprof-port", 0, "Port to start pprof server on (0 to disable)")
 	cmd.Flags().Bool("monitor", false, "Stream daemon activity to stdout")
+	cmd.Flags().String("monitor-format", "full", "Output format for --monitor: text, json, full, rich, pretty")
+	cmd.Flags().Bool("monitor-compact", true, "Disable spacing between monitor log entries")
 
 	return cmd
 }
@@ -381,11 +389,16 @@ func newGrovedConfigCmd() *cobra.Command {
 }
 
 func newGrovedMonitorCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "monitor",
 		Short: "Monitor daemon activity in real-time",
 		Long:  "Subscribe to the daemon event stream and print activity logs.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			logging.SetGlobalScope(logging.ScopeSystem)
+
+			format, _ := cmd.Flags().GetString("format")
+			compact, _ := cmd.Flags().GetBool("compact")
+
 			client := daemon.New()
 			defer client.Close()
 
@@ -410,26 +423,30 @@ func newGrovedMonitorCmd() *cobra.Command {
 				return fmt.Errorf("failed to connect to stream: %w", err)
 			}
 
-			fmt.Println("Monitoring daemon activity (Ctrl+C to stop)...")
-			fmt.Println("==============================================")
+			emit := monitorEmitter("groved.monitor", format, compact)
+			emit("info", "Monitoring daemon activity", nil)
 
 			for update := range stream {
-				timestamp := time.Now().Format("15:04:05")
 				switch update.UpdateType {
 				case "initial":
-					fmt.Printf("[%s] Connected: %d workspaces loaded\n", timestamp, len(update.Workspaces))
+					emit("info", "Connected", map[string]interface{}{
+						"workspaces": len(update.Workspaces),
+						"status":     "success",
+					})
 				case "workspaces":
 					source := update.Source
 					if source == "" {
 						source = "unknown"
 					}
-					if update.Scanned > 0 && update.Scanned != len(update.Workspaces) {
-						fmt.Printf("[%s] %s: scanned %d/%d\n", timestamp, formatSource(source), update.Scanned, len(update.Workspaces))
-					} else {
-						fmt.Printf("[%s] %s: %d workspaces\n", timestamp, formatSource(source), len(update.Workspaces))
+					fields := map[string]interface{}{
+						"source":     source,
+						"workspaces": len(update.Workspaces),
 					}
+					if update.Scanned > 0 && update.Scanned != len(update.Workspaces) {
+						fields["scanned"] = update.Scanned
+					}
+					emit("info", formatSource(source), fields)
 				case "sessions":
-					// Count sessions by type/status
 					var interactive, flowJobs, openCode, running, pending int
 					for _, s := range update.Sessions {
 						switch s.Type {
@@ -446,98 +463,108 @@ func newGrovedMonitorCmd() *cobra.Command {
 							pending++
 						}
 					}
-					fmt.Printf("[%s] Session: %d total (%d running, %d pending) [interactive:%d flow:%d opencode:%d]\n",
-						timestamp, len(update.Sessions), running, pending, interactive, flowJobs, openCode)
+					emit("info", "Session", map[string]interface{}{
+						"total":       len(update.Sessions),
+						"running":     running,
+						"pending":     pending,
+						"interactive": interactive,
+						"flow":        flowJobs,
+						"opencode":    openCode,
+					})
 				case "focus":
-					fmt.Printf("[%s] Focus: %d workspaces\n", timestamp, update.Scanned)
+					emit("info", "Focus", map[string]interface{}{
+						"workspaces": update.Scanned,
+					})
 				case "config_reload":
 					configFile := update.ConfigFile
 					if configFile == "" {
 						configFile = "unknown"
 					}
-					fmt.Printf("[%s] Config Reload: %s\n", timestamp, configFile)
+					emit("info", "Config Reload", map[string]interface{}{
+						"file": configFile,
+					})
 				case "watcher_status":
 					if p, ok := update.Payload.(map[string]interface{}); ok {
-						event, _ := p["event"].(string)
-						switch event {
-						case "handler_registered":
-							handler, _ := p["handler"].(string)
-							fmt.Printf("[%s] \033[34mWatcher\033[0m: registered handler %q\n", timestamp, handler)
-						case "started":
-							handlers, _ := p["handlers"].([]interface{})
-							pathCount, _ := p["paths"].(float64)
-							names := make([]string, len(handlers))
-							for i, h := range handlers {
-								names[i], _ = h.(string)
-							}
-							fmt.Printf("[%s] \033[34mWatcher\033[0m: unified watcher started with %v (%d paths)\n",
-								timestamp, names, int(pathCount))
-						default:
-							fmt.Printf("[%s] \033[34mWatcher\033[0m: %v\n", timestamp, p)
-						}
+						emit("info", "Watcher", p)
 					}
 				case "skill_sync":
-					// Payload is a generic map after JSON unmarshaling over the stream
 					if p, ok := update.Payload.(map[string]interface{}); ok {
-						workspace, _ := p["workspace"].(string)
-						errStr, _ := p["error"].(string)
-
-						if errStr != "" {
-							fmt.Printf("[%s] Skill Sync Error: %s - %s\n", timestamp, workspace, errStr)
+						if errStr, _ := p["error"].(string); errStr != "" {
+							emit("error", "Skill Sync", p)
 						} else if skillsList, ok := p["synced_skills"].([]interface{}); ok && len(skillsList) > 0 {
-							fmt.Printf("[%s] Skill Sync: %s synced %d skills to %v\n",
-								timestamp, workspace, len(skillsList), p["dest_paths"])
+							emit("info", "Skill Sync", p)
 						}
 					}
 				case "session":
-					// Session lifecycle event - display details from payload
 					if p, ok := update.Payload.(map[string]interface{}); ok {
 						jobID, _ := p["job_id"].(string)
 						if jobID == "" {
-							// Try session_id for backwards compat
 							jobID, _ = p["session_id"].(string)
 						}
-
-						// Detect event type from payload fields
 						if _, hasNativeID := p["native_id"]; hasNativeID {
-							// Confirmation event
-							pid, _ := p["pid"].(float64)
-							nativeID, _ := p["native_id"].(string)
-							fmt.Printf("[%s] \033[32mSession Confirmed\033[0m: %s (PID: %.0f, native: %s)\n",
-								timestamp, jobID, pid, truncateID(nativeID))
-						} else if status, hasStatus := p["status"].(string); hasStatus {
-							// Status update event
-							fmt.Printf("[%s] \033[33mSession Status\033[0m: %s → %s\n",
-								timestamp, jobID, status)
-						} else if outcome, hasOutcome := p["outcome"].(string); hasOutcome {
-							// End event
-							fmt.Printf("[%s] \033[31mSession Ended\033[0m: %s (%s)\n",
-								timestamp, jobID, outcome)
-						} else if title, hasTitle := p["title"].(string); hasTitle {
-							// Intent event
-							planName, _ := p["plan_name"].(string)
-							fmt.Printf("[%s] \033[36mSession Intent\033[0m: %s [%s] %s\n",
-								timestamp, jobID, planName, title)
-						} else {
-							// Generic session event
-							fmt.Printf("[%s] Session Event: %v\n", timestamp, p)
+							emit("info", "Session Confirmed", p)
+						} else if _, hasStatus := p["status"].(string); hasStatus {
+							emit("info", "Session Status", p)
+						} else if _, hasOutcome := p["outcome"].(string); hasOutcome {
+							emit("warning", "Session Ended", p)
+						} else if _, hasTitle := p["title"].(string); hasTitle {
+							emit("info", "Session Intent", p)
 						}
-					} else {
-						fmt.Printf("[%s] Session: %s\n", timestamp, update.Source)
 					}
-				default:
-					fmt.Printf("[%s] Update: %s\n", timestamp, update.UpdateType)
 				}
 			}
 
 			return nil
 		},
 	}
+
+	cmd.Flags().String("format", "full", "Output format: text, json, full, rich, pretty")
+	cmd.Flags().Bool("compact", true, "Disable spacing between log entries")
+
+	return cmd
+}
+
+// monitorEmitter returns a function that writes structured JSON to the system log
+// and prints formatted output to stdout in the requested format.
+func monitorEmitter(component, format string, compact bool) func(level, msg string, fields map[string]interface{}) {
+	ulog := logging.NewUnifiedLogger(component)
+
+	return func(level, msg string, fields map[string]interface{}) {
+		// Build the structured entry and write to log file only
+		entry := ulog.Info(msg).StructuredOnly()
+		switch level {
+		case "warning":
+			entry = ulog.Warn(msg).StructuredOnly()
+		case "error":
+			entry = ulog.Error(msg).StructuredOnly()
+		case "debug":
+			entry = ulog.Debug(msg).StructuredOnly()
+		}
+		if fields != nil {
+			entry.Fields(fields)
+		}
+		entry.Emit()
+
+		// Build a log map for the format function
+		logMap := map[string]interface{}{
+			"time":      time.Now().Format(time.RFC3339),
+			"level":     level,
+			"msg":       msg,
+			"component": component,
+		}
+		for k, v := range fields {
+			logMap[k] = v
+		}
+
+		fmt.Print(logutil.FormatLogLine(logMap, "system", format, compact))
+	}
 }
 
 // runInlineMonitor subscribes to the store directly and prints updates to stdout.
 // This avoids the need to connect via the HTTP client and captures events from startup.
-func runInlineMonitor(ctx context.Context, st *store.Store) {
+func runInlineMonitor(ctx context.Context, st *store.Store, format string, compact bool) {
+	emit := monitorEmitter("groved.monitor", format, compact)
+
 	sub := st.Subscribe()
 	defer st.Unsubscribe(sub)
 
@@ -549,22 +576,20 @@ func runInlineMonitor(ctx context.Context, st *store.Store) {
 			if !ok {
 				return
 			}
-			ts := time.Now().Format("15:04:05")
 			switch update.Type {
 			case store.UpdateWorkspaces:
 				source := update.Source
 				if source == "" {
 					source = "unknown"
 				}
+				fields := map[string]interface{}{"source": source}
 				if wsMap, ok := update.Payload.(map[string]*models.EnrichedWorkspace); ok {
+					fields["workspaces"] = len(wsMap)
 					if update.Scanned > 0 && update.Scanned != len(wsMap) {
-						fmt.Printf("[%s] %s: scanned %d/%d\n", ts, formatSource(source), update.Scanned, len(wsMap))
-					} else {
-						fmt.Printf("[%s] %s: %d workspaces\n", ts, formatSource(source), len(wsMap))
+						fields["scanned"] = update.Scanned
 					}
-				} else {
-					fmt.Printf("[%s] %s: workspaces updated\n", ts, formatSource(source))
 				}
+				emit("info", formatSource(source), fields)
 			case store.UpdateSessions:
 				if sessions, ok := update.Payload.([]*models.Session); ok {
 					var interactive, flowJobs, openCode, running, pending int
@@ -583,64 +608,77 @@ func runInlineMonitor(ctx context.Context, st *store.Store) {
 							pending++
 						}
 					}
-					fmt.Printf("[%s] Session: %d total (%d running, %d pending) [interactive:%d flow:%d opencode:%d]\n",
-						ts, len(sessions), running, pending, interactive, flowJobs, openCode)
-				} else {
-					fmt.Printf("[%s] Session: sessions updated\n", ts)
+					emit("info", "Session", map[string]interface{}{
+						"total":       len(sessions),
+						"running":     running,
+						"pending":     pending,
+						"interactive": interactive,
+						"flow":        flowJobs,
+						"opencode":    openCode,
+					})
 				}
 			case store.UpdateFocus:
-				fmt.Printf("[%s] Focus: %d workspaces\n", ts, update.Scanned)
+				emit("info", "Focus", map[string]interface{}{
+					"workspaces": update.Scanned,
+				})
 			case store.UpdateConfigReload:
 				file, _ := update.Payload.(string)
-				fmt.Printf("[%s] Config Reload: %s\n", ts, file)
+				emit("info", "Config Reload", map[string]interface{}{
+					"file": file,
+				})
 			case store.UpdateWatcherStatus:
 				if p, ok := update.Payload.(map[string]string); ok {
-					switch p["event"] {
-					case "handler_registered":
-						fmt.Printf("[%s] \033[34mWatcher\033[0m: registered handler %q\n", ts, p["handler"])
-					default:
-						fmt.Printf("[%s] \033[34mWatcher\033[0m: %s\n", ts, p["event"])
+					fields := map[string]interface{}{}
+					for k, v := range p {
+						fields[k] = v
 					}
+					emit("info", "Watcher", fields)
 				} else if p, ok := update.Payload.(map[string]interface{}); ok {
-					event, _ := p["event"].(string)
-					switch event {
-					case "started":
-						handlers, _ := p["handlers"].([]string)
-						pathCount, _ := p["paths"].(int)
-						fmt.Printf("[%s] \033[34mWatcher\033[0m: unified watcher started with %v (%d paths)\n",
-							ts, handlers, pathCount)
-					default:
-						fmt.Printf("[%s] \033[34mWatcher\033[0m: %v\n", ts, p)
-					}
+					emit("info", "Watcher", p)
 				}
 			case store.UpdateSkillSync:
 				if p, ok := update.Payload.(store.SkillSyncPayload); ok {
+					fields := map[string]interface{}{
+						"workspace": p.Workspace,
+					}
 					if p.Error != "" {
-						fmt.Printf("[%s] Skill Sync Error: %s - %s\n", ts, p.Workspace, p.Error)
+						fields["error"] = p.Error
+						emit("error", "Skill Sync", fields)
 					} else if len(p.SyncedSkills) > 0 {
-						fmt.Printf("[%s] Skill Sync: %s synced %d skills to %v\n",
-							ts, p.Workspace, len(p.SyncedSkills), p.DestPaths)
+						fields["synced"] = len(p.SyncedSkills)
+						fields["dest_paths"] = p.DestPaths
+						emit("info", "Skill Sync", fields)
 					}
 				}
 			case store.UpdateSessionIntent:
 				if p, ok := update.Payload.(*store.SessionIntentPayload); ok {
-					fmt.Printf("[%s] \033[36mSession Intent\033[0m: %s [%s] %s\n",
-						ts, p.JobID, p.PlanName, p.Title)
+					emit("info", "Session Intent", map[string]interface{}{
+						"job_id": p.JobID,
+						"plan":   p.PlanName,
+						"title":  p.Title,
+					})
 				}
 			case store.UpdateSessionConfirmation:
 				if p, ok := update.Payload.(*store.SessionConfirmationPayload); ok {
-					fmt.Printf("[%s] \033[32mSession Confirmed\033[0m: %s (PID: %d, native: %s)\n",
-						ts, p.JobID, p.PID, truncateID(p.NativeID))
+					emit("info", "Session Confirmed", map[string]interface{}{
+						"job_id":    p.JobID,
+						"pid":       p.PID,
+						"native_id": truncateID(p.NativeID),
+					})
 				}
 			case store.UpdateSessionStatus:
 				if p, ok := update.Payload.(*store.SessionStatusPayload); ok {
-					fmt.Printf("[%s] \033[33mSession Status\033[0m: %s → %s\n",
-						ts, p.JobID, p.Status)
+					emit("info", "Session Status", map[string]interface{}{
+						"job_id": p.JobID,
+						"status": p.Status,
+					})
 				}
 			case store.UpdateSessionEnd:
 				if p, ok := update.Payload.(*store.SessionEndPayload); ok {
-					fmt.Printf("[%s] \033[31mSession Ended\033[0m: %s (%s)\n",
-						ts, p.JobID, p.Outcome)
+					emit("warning", "Session Ended", map[string]interface{}{
+						"job_id":  p.JobID,
+						"outcome": p.Outcome,
+					})
 				}
 			}
 		}

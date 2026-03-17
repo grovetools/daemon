@@ -297,6 +297,11 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 			Payload: payload,
 		})
 
+		h.log.WithFields(logrus.Fields{
+			"workspace": targetNode.Name,
+			"synced":    len(result.SyncedSkills),
+		}).Debug("Skill sync completed")
+
 		changed := len(result.SyncedSkills) > 0
 		executor.ExecuteOnSkillSync(context.Background(), targetNode.Path, result.SyncedSkills, changed)
 	})

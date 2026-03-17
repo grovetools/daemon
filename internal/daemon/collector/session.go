@@ -138,7 +138,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				c.emitUpdate(updates)
 			}
 			if d := time.Since(start); d > 100*time.Millisecond {
-				c.logger.WithField("duration", d).Warn("Slow PID verification detected")
+				c.logger.WithField("duration", d).Debug("Slow PID verification detected")
 			}
 
 		case <-scanTicker.C:
@@ -150,7 +150,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				c.emitUpdate(updates)
 			}
 			if d := time.Since(start); d > 200*time.Millisecond {
-				c.logger.WithField("duration", d).Warn("Slow job/opencode scan detected")
+				c.logger.WithField("duration", d).Debug("Slow job/opencode scan detected")
 			}
 		}
 	}
@@ -165,7 +165,7 @@ func (c *SessionCollector) runPollingOnly(ctx context.Context, st *store.Store, 
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 200*time.Millisecond {
-				c.logger.WithField("duration", d).Warn("Slow session polling scan detected")
+				c.logger.WithField("duration", d).Debug("Slow session polling scan detected")
 			}
 		}()
 

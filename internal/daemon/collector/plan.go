@@ -45,7 +45,7 @@ func (c *PlanCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 200*time.Millisecond {
-				logger.WithField("duration", d).Warn("Slow plan scan detected")
+				logger.WithField("duration", d).Debug("Slow plan scan detected")
 			}
 		}()
 
