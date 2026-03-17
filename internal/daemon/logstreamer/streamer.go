@@ -317,9 +317,10 @@ func (js *JobStream) getBufferedLines() []models.LogLine {
 	return result
 }
 
-// isTerminalStatus returns true if the job status is a final state.
+// isTerminalStatus returns true if the job status means "done for now" —
+// the job has either finished or is waiting for user input.
 func isTerminalStatus(status string) bool {
-	return status == "completed" || status == "failed" || status == "cancelled"
+	return status == "completed" || status == "failed" || status == "cancelled" || status == "pending_user"
 }
 
 // ErrMaxSubscribers is returned when a job has reached its maximum subscriber limit.

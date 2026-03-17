@@ -35,7 +35,8 @@ const (
 	UpdateJobStarted   UpdateType = "job_started"
 	UpdateJobCompleted UpdateType = "job_completed"
 	UpdateJobFailed    UpdateType = "job_failed"
-	UpdateJobCancelled UpdateType = "job_cancelled"
+	UpdateJobCancelled   UpdateType = "job_cancelled"
+	UpdateJobPendingUser UpdateType = "job_pending_user"
 )
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation

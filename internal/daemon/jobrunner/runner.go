@@ -245,15 +245,26 @@ func (jr *JobRunner) executeJob(ctx context.Context, info *models.JobInfo) {
 			jr.markDone(info, "failed", err.Error())
 		}
 	} else {
-		jr.markDone(info, "completed", "")
+		// Check the job's actual final status — chat jobs set pending_user, not completed.
+		finalStatus := "completed"
+		if job, _ := plan.GetJobByFilename(info.JobFile); job != nil {
+			if job.Status == orchestration.JobStatusPendingUser {
+				finalStatus = string(orchestration.JobStatusPendingUser)
+			}
+		}
+		jr.markDone(info, finalStatus, "")
 	}
 }
 
 func (jr *JobRunner) markDone(info *models.JobInfo, status, errMsg string) {
-	now := time.Now()
 	info.Status = status
 	info.Error = errMsg
-	info.CompletedAt = &now
+
+	// Only set CompletedAt for terminal states
+	if status != "pending_user" {
+		now := time.Now()
+		info.CompletedAt = &now
+	}
 
 	if jr.persister != nil {
 		jr.persister.Save(info)
@@ -265,6 +276,8 @@ func (jr *JobRunner) markDone(info *models.JobInfo, status, errMsg string) {
 		updateType = store.UpdateJobFailed
 	case "cancelled":
 		updateType = store.UpdateJobCancelled
+	case "pending_user":
+		updateType = store.UpdateJobPendingUser
 	}
 	jr.store.ApplyUpdate(store.Update{
 		Type:    updateType,

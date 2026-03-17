@@ -133,7 +133,7 @@ func (s *Store) ApplyUpdate(u Update) {
 		}
 
 	// Job lifecycle updates
-	case UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed, UpdateJobCancelled:
+	case UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed, UpdateJobCancelled, UpdateJobPendingUser:
 		if job, ok := u.Payload.(*models.JobInfo); ok {
 			s.state.Jobs[job.ID] = job
 		}

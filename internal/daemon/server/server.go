@@ -504,7 +504,8 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 
 	// Job lifecycle updates
 	case store.UpdateJobSubmitted, store.UpdateJobStarted,
-		store.UpdateJobCompleted, store.UpdateJobFailed, store.UpdateJobCancelled:
+		store.UpdateJobCompleted, store.UpdateJobFailed, store.UpdateJobCancelled,
+		store.UpdateJobPendingUser:
 		return &apiStateUpdate{
 			UpdateType: string(u.Type),
 			Source:     u.Source,
