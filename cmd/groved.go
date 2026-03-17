@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -13,7 +14,7 @@ import (
 
 	"github.com/grovetools/core/command"
 	"github.com/grovetools/core/config"
-	"github.com/grovetools/core/logging"
+	grovelogging "github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/logging/logutil"
 	"github.com/grovetools/core/pkg/models"
@@ -71,9 +72,9 @@ func newGrovedStartCmd() *cobra.Command {
 		Long:  "Start the grove daemon in foreground mode.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Route all daemon logs to central system log
-			logging.SetGlobalScope(logging.ScopeSystem)
+			grovelogging.SetGlobalScope(grovelogging.ScopeSystem)
 
-			logger := logging.NewLogger("groved")
+			logger := grovelogging.NewLogger("groved")
 			pidPath := paths.PidFilePath()
 			sockPath := paths.SocketPath()
 
@@ -151,6 +152,13 @@ func newGrovedStartCmd() *cobra.Command {
 					}
 				}
 			}
+
+			// Suppress pretty CLI output from in-process job executors.
+			// The daemon's monitor uses fmt.Print directly — it does not go through
+			// the global writer. But executor code (cx context generation, ulog.Emit()
+			// without ctx) falls through to GetGlobalOutput() which defaults to os.Stdout.
+			// Redirecting it to io.Discard prevents that output from leaking to the terminal.
+			grovelogging.SetGlobalOutput(io.Discard)
 
 			// 3. Setup Store and Engine
 			st := store.New()
@@ -455,7 +463,7 @@ func newGrovedMonitorCmd() *cobra.Command {
 		Short: "Monitor daemon activity in real-time",
 		Long:  "Subscribe to the daemon event stream and print activity logs.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			logging.SetGlobalScope(logging.ScopeSystem)
+			grovelogging.SetGlobalScope(grovelogging.ScopeSystem)
 
 			format, _ := cmd.Flags().GetString("format")
 			compact, _ := cmd.Flags().GetBool("compact")
@@ -612,7 +620,7 @@ type monitorState struct {
 // and prints formatted output to stdout in the requested format.
 // Routine polling events are emitted at DEBUG unless values changed.
 func monitorEmitter(component, format string, compact bool) (func(level, msg string, fields map[string]interface{}), *monitorState) {
-	ulog := logging.NewUnifiedLogger(component)
+	ulog := grovelogging.NewUnifiedLogger(component)
 	state := &monitorState{}
 
 	emit := func(level, msg string, fields map[string]interface{}) {

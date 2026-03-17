@@ -5,12 +5,13 @@ package jobrunner
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/grovetools/core/logging"
+	grovelogging "github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/flow/pkg/orchestration"
@@ -40,7 +41,7 @@ func New(st *store.Store, runtime orchestration.Runtime, workers int, persister 
 		running:   make(map[string]context.CancelFunc),
 		runtime:   runtime,
 		store:     st,
-		logger:    logging.NewLogger("jobrunner"),
+		logger:    grovelogging.NewLogger("jobrunner"),
 		persister: persister,
 	}
 }
@@ -227,6 +228,10 @@ func (jr *JobRunner) executeJob(ctx context.Context, info *models.JobInfo) {
 		jr.markDone(info, "failed", fmt.Sprintf("new orchestrator: %v", err))
 		return
 	}
+
+	// Discard stdout — job output is captured in job.log by the runtime.
+	// Without this, non-agent job output leaks to the daemon's terminal.
+	jobCtx = grovelogging.WithWriter(jobCtx, io.Discard)
 
 	// Execute via Orchestrator using the provided job file
 	err = orch.RunJob(jobCtx, info.JobFile)
