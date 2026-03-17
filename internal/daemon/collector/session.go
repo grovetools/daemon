@@ -79,6 +79,13 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				// Only verify sessions we think are active and have a known PID
 				if (session.Status == "running" || session.Status == "idle" || session.Status == "pending_user") && session.PID > 0 {
 
+					// Grace period: skip PID check for sessions confirmed within the last 30s.
+					// During agent startup, the initial PID may be a short-lived intermediate
+					// process (shell, grove meta-tool) that exits before the real agent starts.
+					if time.Since(session.LastActivity) < 30*time.Second && time.Since(session.StartedAt) < 30*time.Second {
+						continue
+					}
+
 					if !process.IsProcessAlive(session.PID) {
 						c.logger.WithFields(logrus.Fields{
 							"job_id": session.ID,

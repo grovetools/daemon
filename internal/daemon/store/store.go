@@ -189,10 +189,21 @@ func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload) {
 }
 
 // applySessionStatus updates the status of an active session.
+// If the session doesn't exist, creates a minimal record so status transitions
+// (e.g., idle→running from hooks PreToolUse) work even without prior registration.
 func (s *Store) applySessionStatus(payload *SessionStatusPayload) {
 	session, exists := s.state.Sessions[payload.JobID]
 	if !exists {
-		return // Session not found
+		// Create a minimal session record — hooks may be calling UpdateSessionStatus
+		// before flow has registered the session via RegisterSessionIntent.
+		session = &models.Session{
+			ID:           payload.JobID,
+			Status:       payload.Status,
+			StartedAt:    time.Now(),
+			LastActivity: time.Now(),
+		}
+		s.state.Sessions[payload.JobID] = session
+		return
 	}
 
 	session.Status = payload.Status
