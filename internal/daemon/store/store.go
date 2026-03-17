@@ -137,6 +137,20 @@ func (s *Store) ApplyUpdate(u Update) {
 		if job, ok := u.Payload.(*models.JobInfo); ok {
 			s.state.Jobs[job.ID] = job
 		}
+
+	// Bulk discovery of idle jobs from filesystem
+	case UpdateJobsDiscovered:
+		if jobs, ok := u.Payload.([]*models.JobInfo); ok {
+			for _, job := range jobs {
+				// Don't overwrite jobs that the JobRunner is actively managing
+				if existing, exists := s.state.Jobs[job.ID]; exists {
+					if existing.Status == "running" || existing.Status == "queued" {
+						continue
+					}
+				}
+				s.state.Jobs[job.ID] = job
+			}
+		}
 	}
 
 	// Broadcast to subscribers

@@ -37,6 +37,9 @@ const (
 	UpdateJobFailed    UpdateType = "job_failed"
 	UpdateJobCancelled   UpdateType = "job_cancelled"
 	UpdateJobPendingUser UpdateType = "job_pending_user"
+
+	// Bulk discovery of idle jobs from filesystem scanning.
+	UpdateJobsDiscovered UpdateType = "jobs_discovered"
 )
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation

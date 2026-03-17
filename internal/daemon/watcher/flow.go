@@ -2,7 +2,9 @@ package watcher
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/util/frontmatter"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/enrichment"
 	"github.com/sirupsen/logrus"
@@ -101,8 +104,82 @@ func (h *FlowHandler) MatchesEvent(event fsnotify.Event) bool {
 }
 
 // HandleEvents triggers a debounced plan stats refresh when plan files change.
+// It also parses modified/created .md files to instantly discover new jobs.
 func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event) error {
 	h.log.WithField("count", len(events)).Debug("Plan file changes detected")
+
+	var discoveredJobs []*models.JobInfo
+
+	for _, event := range events {
+		if !strings.HasSuffix(event.Name, ".md") {
+			continue
+		}
+		if event.Op&fsnotify.Write == 0 && event.Op&fsnotify.Create == 0 {
+			continue
+		}
+
+		base := filepath.Base(event.Name)
+		if base == "spec.md" || base == "README.md" {
+			continue
+		}
+
+		file, err := os.Open(event.Name)
+		if err != nil {
+			continue
+		}
+
+		meta, err := frontmatter.Parse(file)
+		file.Close()
+
+		if err == nil && meta.ID != "" {
+			submittedAt := meta.StartedAt
+			if submittedAt.IsZero() {
+				submittedAt = meta.UpdatedAt
+			}
+			if submittedAt.IsZero() {
+				submittedAt = time.Now()
+			}
+
+			planDir := filepath.Dir(event.Name)
+			job := &models.JobInfo{
+				ID:          meta.ID,
+				Title:       meta.Title,
+				Type:        models.JobType(meta.Type),
+				Status:      meta.Status,
+				PlanDir:     planDir,
+				PlanName:    filepath.Base(planDir),
+				JobFile:     base,
+				SubmittedAt: submittedAt,
+			}
+
+			// Look up workspace from watched paths
+			h.pathsMutex.RLock()
+			for watchedPath, wsNode := range h.watchedPaths {
+				if strings.HasPrefix(event.Name, watchedPath+string(filepath.Separator)) || event.Name == watchedPath {
+					job.WorkDir = wsNode.Path
+					job.Repo = wsNode.Name
+					if meta.Worktree != "" {
+						job.Branch = meta.Worktree
+					} else if wsNode.IsWorktree() {
+						job.Branch = wsNode.Name
+					}
+					break
+				}
+			}
+			h.pathsMutex.RUnlock()
+
+			discoveredJobs = append(discoveredJobs, job)
+		}
+	}
+
+	if len(discoveredJobs) > 0 {
+		h.store.ApplyUpdate(store.Update{
+			Type:    store.UpdateJobsDiscovered,
+			Source:  "flow_watcher",
+			Payload: discoveredJobs,
+		})
+	}
+
 	h.triggerRefresh()
 	return nil
 }

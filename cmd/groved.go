@@ -176,6 +176,7 @@ func newGrovedStartCmd() *cobra.Command {
 			}
 			if isEnabled("plan") {
 				eng.Register(collector.NewPlanCollector(planInterval))
+				eng.Register(collector.NewJobCollector(planInterval))
 			}
 			if isEnabled("note") {
 				eng.Register(collector.NewNoteCollector(noteInterval))
