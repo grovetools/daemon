@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -72,6 +73,10 @@ func (h *NoteHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 		for _, noteType := range noteTypes {
 			notesDir, err := h.locator.GetNotesDir(node, noteType)
 			if err != nil || notesDir == "" {
+				continue
+			}
+			// Only watch directories that actually exist on disk
+			if _, err := os.Stat(notesDir); err != nil {
 				continue
 			}
 			// Watch the note type directory (not recursive — notes are flat files)

@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"os"
 	"sync"
 	"time"
 
@@ -198,6 +199,10 @@ func (w *UnifiedWatcher) refreshWatches() {
 	// Add new watches or update reference counts
 	for p, count := range desiredCounts {
 		if w.watchCounts[p] == 0 {
+			// Skip paths that don't exist on disk
+			if _, err := os.Stat(p); err != nil {
+				continue
+			}
 			if err := w.fsWatcher.Add(p); err != nil {
 				w.logger.WithError(err).WithField("path", p).Debug("Failed to watch path")
 			} else {

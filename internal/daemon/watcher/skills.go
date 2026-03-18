@@ -92,7 +92,9 @@ func (h *SkillHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace)
 
 		// 3. Watch workspace directory for grove.toml changes
 		if node.Path != "" {
-			newWatches[node.Path] = node
+			if _, err := os.Stat(node.Path); err == nil {
+				newWatches[node.Path] = node
+			}
 		}
 	}
 
