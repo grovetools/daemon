@@ -43,6 +43,9 @@ type SkillHandler struct {
 	// Cached skills config per workspace path for change detection
 	cachedConfigs map[string]*skills.SkillsConfig
 	configsMutex  sync.RWMutex
+
+	// Cached global skills config for change detection on config reloads
+	globalSkillsCfg *skills.SkillsConfig
 }
 
 // NewSkillHandler creates a new SkillHandler instance.
@@ -57,15 +60,16 @@ func NewSkillHandler(st *store.Store, cfg *config.Config, debounceMs int) (*Skil
 	}
 
 	return &SkillHandler{
-		store:         st,
-		svc:           svc,
-		cfg:           cfg,
-		hooksExecutor: hooks.NewExecutor(cfg),
-		debounceMs:    debounceMs,
-		log:           logging.NewLogger("groved.skills.watcher"),
-		watchedPaths:  make(map[string]*workspace.WorkspaceNode),
-		timers:        make(map[string]*time.Timer),
-		cachedConfigs: make(map[string]*skills.SkillsConfig),
+		store:           st,
+		svc:             svc,
+		cfg:             cfg,
+		hooksExecutor:   hooks.NewExecutor(cfg),
+		debounceMs:      debounceMs,
+		log:             logging.NewLogger("groved.skills.watcher"),
+		watchedPaths:    make(map[string]*workspace.WorkspaceNode),
+		timers:          make(map[string]*time.Timer),
+		cachedConfigs:   make(map[string]*skills.SkillsConfig),
+		globalSkillsCfg: skills.LoadGlobalSkillsConfig(cfg),
 	}, nil
 }
 
@@ -150,13 +154,26 @@ func (h *SkillHandler) HandleEvents(ctx context.Context, events []fsnotify.Event
 // HandleStoreUpdate responds to store-level updates like config reloads.
 func (h *SkillHandler) HandleStoreUpdate(update store.Update) {
 	if update.Type == store.UpdateConfigReload {
-		h.log.Info("Config reload detected, reloading config and syncing all skills")
-
 		newCfg, err := config.LoadDefault()
 		if err != nil {
 			h.log.WithError(err).Error("Failed to reload config")
 			return
 		}
+
+		// Check if global skills configuration actually changed
+		newGlobalSkillsCfg := skills.LoadGlobalSkillsConfig(newCfg)
+		if reflect.DeepEqual(h.globalSkillsCfg, newGlobalSkillsCfg) {
+			h.log.Debug("Global skills config unchanged, skipping sync")
+			// Still update internal references
+			h.cfg = newCfg
+			h.svc.Config = newCfg
+			h.svc.NotebookLocator = workspace.NewNotebookLocator(newCfg)
+			h.hooksExecutor.UpdateConfig(newCfg)
+			return
+		}
+
+		h.log.Info("Skills config reload detected, syncing all skills")
+		h.globalSkillsCfg = newGlobalSkillsCfg
 		h.cfg = newCfg
 		h.svc.Config = newCfg
 		h.svc.NotebookLocator = workspace.NewNotebookLocator(newCfg)
