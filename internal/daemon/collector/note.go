@@ -12,7 +12,7 @@ import (
 )
 
 // noteBackgroundInterval is how often to update non-focused workspaces.
-const noteBackgroundInterval = 2 * time.Minute
+const noteBackgroundInterval = 10 * time.Minute
 
 // NoteCollector updates note counts for all workspaces.
 type NoteCollector struct {
@@ -20,10 +20,10 @@ type NoteCollector struct {
 }
 
 // NewNoteCollector creates a new NoteCollector with the specified interval.
-// If interval is 0, defaults to 60 seconds.
+// If interval is 0, defaults to 5 minutes.
 func NewNoteCollector(interval time.Duration) *NoteCollector {
 	if interval == 0 {
-		interval = 60 * time.Second
+		interval = 5 * time.Minute
 	}
 	return &NoteCollector{
 		interval: interval,
@@ -44,24 +44,29 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 	scan := func() {
 		start := time.Now()
 		defer func() {
-			if d := time.Since(start); d > 200*time.Millisecond {
+			if d := time.Since(start); d > 1*time.Second {
 				logger.WithField("duration", d).Debug("Slow note scan detected")
 			}
 		}()
-
-		// FetchNoteCountsMap returns counts by workspace name, not path
-		noteCounts, err := enrichment.FetchNoteCountsMap()
-		if err != nil {
-			return
-		}
 
 		state := st.Get()
 		focus := st.GetFocus()
 
 		// Determine if this is a full scan or focused scan
 		doFullScan := len(focus) == 0 || time.Since(lastFullScan) >= noteBackgroundInterval
+
+		if len(focus) == 0 && !doFullScan {
+			return // No focus, not time for background scan — skip entirely
+		}
+
 		if doFullScan {
 			lastFullScan = time.Now()
+		}
+
+		// FetchNoteCountsMap returns counts by workspace name, not path
+		noteCounts, err := enrichment.FetchNoteCountsMap()
+		if err != nil {
+			return
 		}
 
 		// Build case-insensitive focus map

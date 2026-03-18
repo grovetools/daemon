@@ -114,7 +114,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				}
 			}
 
-			if d := time.Since(start); d > 100*time.Millisecond {
+			if d := time.Since(start); d > 1*time.Second {
 				c.logger.WithField("duration", d).Debug("Slow PID verification detected")
 			}
 		}

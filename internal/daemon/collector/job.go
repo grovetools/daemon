@@ -26,7 +26,7 @@ type JobCollector struct {
 // NewJobCollector creates a new JobCollector with the specified interval.
 func NewJobCollector(interval time.Duration) *JobCollector {
 	if interval == 0 {
-		interval = 30 * time.Second
+		interval = 5 * time.Minute
 	}
 	return &JobCollector{interval: interval}
 }

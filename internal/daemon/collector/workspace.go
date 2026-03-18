@@ -59,7 +59,7 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 	scan := func() {
 		start := time.Now()
 		defer func() {
-			if d := time.Since(start); d > 500*time.Millisecond {
+			if d := time.Since(start); d > 1*time.Second {
 				c.logger.WithField("duration", d).Debug("Slow workspace discovery detected")
 			}
 		}()

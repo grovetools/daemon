@@ -12,7 +12,7 @@ import (
 )
 
 // planBackgroundInterval is how often to update non-focused workspaces.
-const planBackgroundInterval = 2 * time.Minute
+const planBackgroundInterval = 10 * time.Minute
 
 // PlanCollector updates plan statistics for all workspaces.
 type PlanCollector struct {
@@ -20,10 +20,10 @@ type PlanCollector struct {
 }
 
 // NewPlanCollector creates a new PlanCollector with the specified interval.
-// If interval is 0, defaults to 30 seconds.
+// If interval is 0, defaults to 5 minutes.
 func NewPlanCollector(interval time.Duration) *PlanCollector {
 	if interval == 0 {
-		interval = 30 * time.Second
+		interval = 5 * time.Minute
 	}
 	return &PlanCollector{
 		interval: interval,
@@ -44,23 +44,28 @@ func (c *PlanCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 	scan := func() {
 		start := time.Now()
 		defer func() {
-			if d := time.Since(start); d > 200*time.Millisecond {
+			if d := time.Since(start); d > 1*time.Second {
 				logger.WithField("duration", d).Debug("Slow plan scan detected")
 			}
 		}()
-
-		planStats, err := enrichment.FetchPlanStatsMap()
-		if err != nil {
-			return
-		}
 
 		state := st.Get()
 		focus := st.GetFocus()
 
 		// Determine if this is a full scan or focused scan
 		doFullScan := len(focus) == 0 || time.Since(lastFullScan) >= planBackgroundInterval
+
+		if len(focus) == 0 && !doFullScan {
+			return // No focus, not time for background scan — skip entirely
+		}
+
 		if doFullScan {
 			lastFullScan = time.Now()
+		}
+
+		planStats, err := enrichment.FetchPlanStatsMap()
+		if err != nil {
+			return
 		}
 
 		// Build case-insensitive focus map

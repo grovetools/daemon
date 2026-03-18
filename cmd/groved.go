@@ -118,13 +118,13 @@ func newGrovedStartCmd() *cobra.Command {
 			}
 
 			// Parse intervals from config with defaults
-			// Defaults: git=10s, session=2s, workspace=5m, plan=30s, note=60s
-			// Workspace uses a long interval because CLI commands trigger /api/refresh on demand.
+			// Defaults: git=10s, session=2s, workspace=5m, plan=5m, note=5m
+			// Long intervals are safe because event-driven watchers handle real-time updates.
 			gitInterval := 10 * time.Second
 			sessionInterval := 2 * time.Second
 			workspaceInterval := 5 * time.Minute
-			planInterval := 30 * time.Second
-			noteInterval := 60 * time.Second
+			planInterval := 5 * time.Minute
+			noteInterval := 5 * time.Minute
 
 			if cfg.Daemon != nil {
 				if cfg.Daemon.GitInterval != "" {

@@ -90,7 +90,7 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 
 		start := time.Now()
 		defer func() {
-			if d := time.Since(start); d > 200*time.Millisecond {
+			if d := time.Since(start); d > 1*time.Second {
 				logger.WithField("duration", d).Debug("Slow git status scan detected")
 			}
 		}()
