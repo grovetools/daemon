@@ -3,6 +3,7 @@ package enrichment
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/grovetools/core/pkg/models"
@@ -84,13 +85,38 @@ func CountNotesInProcess(nodes []*workspace.WorkspaceNode, locator *workspace.No
 func IndexNotesInProcess(nodes []*workspace.WorkspaceNode, locator *workspace.NotebookLocator) map[string]*models.NoteIndexEntry {
 	index := make(map[string]*models.NoteIndexEntry)
 
-	for _, node := range nodes {
+	// Sort nodes so ecosystem roots come first. This ensures that when
+	// multiple nodes share the same content dir (ecosystem worktrees share
+	// the root's notebook), the root's workspace name is used for entries.
+	sorted := make([]*workspace.WorkspaceNode, len(nodes))
+	copy(sorted, nodes)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		iRoot := sorted[i].Kind == workspace.KindEcosystemRoot || sorted[i].Kind == workspace.KindStandaloneProject
+		jRoot := sorted[j].Kind == workspace.KindEcosystemRoot || sorted[j].Kind == workspace.KindStandaloneProject
+		if iRoot != jRoot {
+			return iRoot
+		}
+		iSub := sorted[i].Kind == workspace.KindEcosystemSubProject
+		jSub := sorted[j].Kind == workspace.KindEcosystemSubProject
+		return iSub && !jSub
+	})
+
+	// Track which content dirs we've already indexed to avoid
+	// ecosystem worktrees overwriting the root's entries.
+	indexedDirs := make(map[string]bool)
+
+	for _, node := range sorted {
 		dirs, err := locator.GetAllContentDirs(node)
 		if err != nil {
 			continue
 		}
 
 		for _, dir := range dirs {
+			if indexedDirs[dir.Path] {
+				continue // Already indexed by another node (e.g., ecosystem root)
+			}
+			indexedDirs[dir.Path] = true
+
 			entries, err := os.ReadDir(dir.Path)
 			if err != nil {
 				continue
@@ -238,6 +264,52 @@ func ResolveContentDirForPath(notePath string, node *workspace.WorkspaceNode, lo
 		}
 	}
 	return "", ""
+}
+
+// DeriveCountsFromIndex computes NoteCounts per workspace from an existing note index.
+// This eliminates the need for a separate filesystem walk just to count notes.
+func DeriveCountsFromIndex(index map[string]*models.NoteIndexEntry) map[string]*models.NoteCounts {
+	countsByName := make(map[string]*models.NoteCounts)
+
+	for _, entry := range index {
+		if entry.ContentDir != "notes" {
+			continue
+		}
+
+		counts, ok := countsByName[entry.Workspace]
+		if !ok {
+			counts = &models.NoteCounts{}
+			countsByName[entry.Workspace] = counts
+		}
+
+		// Group is the subdirectory name for notes (inbox, issues, current, etc.)
+		// For nested paths like "inbox/sub", use first segment
+		group := entry.Group
+		if idx := strings.IndexByte(group, '/'); idx >= 0 {
+			group = group[:idx]
+		}
+
+		switch group {
+		case "current":
+			counts.Current++
+		case "issues":
+			counts.Issues++
+		case "inbox":
+			counts.Inbox++
+		case "docs":
+			counts.Docs++
+		case "completed":
+			counts.Completed++
+		case "review":
+			counts.Review++
+		case "in-progress", "in_progress":
+			counts.InProgress++
+		default:
+			counts.Other++
+		}
+	}
+
+	return countsByName
 }
 
 func countMarkdownFiles(dirPath string) int {

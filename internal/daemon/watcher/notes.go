@@ -18,9 +18,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// noteTypes are the note categories to watch for filesystem changes.
-var noteTypes = []string{"current", "issues", "inbox", "docs", "completed", "review", "in-progress"}
-
 // NoteHandler implements DomainHandler for watching note directories.
 // When note files change, it triggers an immediate note counts refresh
 // rather than waiting for the NoteCollector's polling interval.
@@ -60,7 +57,7 @@ func (h *NoteHandler) Name() string {
 	return "notes"
 }
 
-// ComputeWatchPaths returns note directories for all workspaces across all note types.
+// ComputeWatchPaths returns content directories (notes, plans, chats) for all workspaces.
 func (h *NoteHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) []string {
 	newWatches := make(map[string]*workspace.WorkspaceNode)
 
@@ -70,17 +67,16 @@ func (h *NoteHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 			continue
 		}
 
-		for _, noteType := range noteTypes {
-			notesDir, err := h.locator.GetNotesDir(node, noteType)
-			if err != nil || notesDir == "" {
+		// Watch all content directories — notes, plans, and chats
+		dirs, err := h.locator.GetAllContentDirs(node)
+		if err != nil {
+			continue
+		}
+		for _, dir := range dirs {
+			if _, err := os.Stat(dir.Path); err != nil {
 				continue
 			}
-			// Only watch directories that actually exist on disk
-			if _, err := os.Stat(notesDir); err != nil {
-				continue
-			}
-			// Watch the note type directory (not recursive — notes are flat files)
-			newWatches[notesDir] = node
+			newWatches[dir.Path] = node
 		}
 	}
 
@@ -100,8 +96,9 @@ func (h *NoteHandler) MatchesEvent(event fsnotify.Event) bool {
 		return false
 	}
 
-	// Only care about markdown files
-	if !strings.HasSuffix(event.Name, ".md") {
+	// Skip hidden files (but not .archive directories — those contain moved notes)
+	baseName := filepath.Base(event.Name)
+	if strings.HasPrefix(baseName, ".") && baseName != ".archive" {
 		return false
 	}
 
@@ -149,7 +146,7 @@ func (h *NoteHandler) triggerRefresh() {
 	}
 
 	h.refreshTimer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
-		h.log.Debug("Refreshing note counts after file change")
+		h.log.Debug("Refreshing note index after file change")
 
 		state := h.store.Get()
 		var nodes []*workspace.WorkspaceNode
@@ -159,7 +156,9 @@ func (h *NoteHandler) triggerRefresh() {
 			}
 		}
 
-		noteCounts := enrichment.CountNotesInProcess(nodes, h.locator)
+		// Build index and derive counts from it (single walk)
+		noteIndex := enrichment.IndexNotesInProcess(nodes, h.locator)
+		noteCounts := enrichment.DeriveCountsFromIndex(noteIndex)
 
 		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
 		scanned := 0
@@ -182,6 +181,12 @@ func (h *NoteHandler) triggerRefresh() {
 			Source:  "note_watcher",
 			Scanned: scanned,
 			Payload: newWorkspaces,
+		})
+
+		h.store.ApplyUpdate(store.Update{
+			Type:    store.UpdateNoteIndex,
+			Source:  "note_watcher",
+			Payload: noteIndex,
 		})
 	})
 }

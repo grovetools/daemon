@@ -74,10 +74,11 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 
 		cfg, _ := config.LoadDefault()
 		locator := workspace.NewNotebookLocator(cfg)
-		noteCounts := enrichment.CountNotesInProcess(nodes, locator)
 
 		indexStart := time.Now()
 		noteIndex := enrichment.IndexNotesInProcess(nodes, locator)
+		// Derive counts from the index — single walk instead of two
+		noteCounts := enrichment.DeriveCountsFromIndex(noteIndex)
 		logger.WithFields(map[string]interface{}{
 			"entries":  len(noteIndex),
 			"duration": time.Since(indexStart).Round(time.Millisecond),
