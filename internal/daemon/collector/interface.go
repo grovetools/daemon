@@ -17,3 +17,9 @@ type Collector interface {
 	// It can read from the store (thread-safe) to get context (e.g. list of workspaces).
 	Run(ctx context.Context, st *store.Store, updates chan<- store.Update) error
 }
+
+// Refreshable is an optional interface that collectors can implement to support
+// synchronous, on-demand refresh triggers (e.g. from the /api/refresh endpoint).
+type Refreshable interface {
+	Refresh(ctx context.Context) error
+}

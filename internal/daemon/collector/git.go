@@ -18,16 +18,17 @@ import (
 var gitWorkers = max(min(runtime.NumCPU()/2, 8), 2)
 
 // backgroundScanInterval is how often to scan non-focused workspaces.
-const backgroundScanInterval = 60 * time.Second
+// Uses a long interval since CLI commands trigger /api/refresh on demand.
+const backgroundScanInterval = 5 * time.Minute
 
 // dynamicInterval returns a scan interval based on workspace count.
 // Fewer workspaces = faster scanning since it's cheaper.
 func dynamicInterval(count int, baseInterval time.Duration) time.Duration {
 	switch {
 	case count <= 5:
-		return max(baseInterval/4, 250*time.Millisecond) // 4x faster, min 250ms
+		return max(baseInterval/4, 1*time.Second) // 4x faster, min 1s
 	case count <= 15:
-		return max(baseInterval/2, 500*time.Millisecond) // 2x faster, min 500ms
+		return max(baseInterval/2, 2*time.Second) // 2x faster, min 2s
 	case count <= 30:
 		return baseInterval // Normal speed
 	default:
@@ -38,6 +39,7 @@ func dynamicInterval(count int, baseInterval time.Duration) time.Duration {
 // GitStatusCollector updates git status for all workspaces.
 type GitStatusCollector struct {
 	interval time.Duration
+	refresh  chan chan struct{}
 }
 
 // NewGitStatusCollector creates a new GitStatusCollector with the specified interval.
@@ -48,6 +50,23 @@ func NewGitStatusCollector(interval time.Duration) *GitStatusCollector {
 	}
 	return &GitStatusCollector{
 		interval: interval,
+		refresh:  make(chan chan struct{}),
+	}
+}
+
+// Refresh triggers an immediate full git status scan and blocks until it completes.
+func (c *GitStatusCollector) Refresh(ctx context.Context) error {
+	reply := make(chan struct{})
+	select {
+	case c.refresh <- reply:
+		select {
+		case <-reply:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -63,7 +82,12 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
 
-	scan := func() {
+	// scanWorkspaces runs git status on the given workspaces and emits an update.
+	scanWorkspaces := func(toScan []*models.EnrichedWorkspace, allWorkspaces map[string]*models.EnrichedWorkspace) {
+		if len(toScan) == 0 {
+			return
+		}
+
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 200*time.Millisecond {
@@ -71,45 +95,6 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 			}
 		}()
 
-		state := st.Get()
-		focus := st.GetFocus()
-
-		// Clone existing state
-		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
-		for k, v := range state.Workspaces {
-			cpy := *v
-			newWorkspaces[k] = &cpy
-		}
-
-		// Determine which workspaces to scan this tick
-		var toScan []*models.EnrichedWorkspace
-		doFullScan := len(focus) == 0 || time.Since(lastFullScan) >= backgroundScanInterval
-
-		if doFullScan {
-			// Full scan: all workspaces
-			lastFullScan = time.Now()
-			for _, ws := range newWorkspaces {
-				toScan = append(toScan, ws)
-			}
-		} else {
-			// Focused scan: only focused workspaces
-			// Use case-insensitive comparison for macOS compatibility
-			focusLower := make(map[string]struct{}, len(focus))
-			for p := range focus {
-				focusLower[strings.ToLower(p)] = struct{}{}
-			}
-			for _, ws := range newWorkspaces {
-				if _, ok := focusLower[strings.ToLower(ws.Path)]; ok {
-					toScan = append(toScan, ws)
-				}
-			}
-		}
-
-		if len(toScan) == 0 {
-			return
-		}
-
-		// Parallel git status fetching using worker pool
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, gitWorkers)
 		var mu sync.Mutex
@@ -138,9 +123,54 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				Type:    store.UpdateWorkspaces,
 				Source:  "git",
 				Scanned: len(toScan),
-				Payload: newWorkspaces,
+				Payload: allWorkspaces,
 			}
 		}
+	}
+
+	// scan determines which workspaces to scan this tick and scans them.
+	scan := func() {
+		state := st.Get()
+		focus := st.GetFocus()
+
+		// Clone existing state
+		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
+		for k, v := range state.Workspaces {
+			cpy := *v
+			newWorkspaces[k] = &cpy
+		}
+
+		var toScan []*models.EnrichedWorkspace
+
+		if len(focus) == 0 {
+			// No focus set (nav not running): only do periodic background scans
+			if time.Since(lastFullScan) < backgroundScanInterval {
+				return // Skip this tick
+			}
+			lastFullScan = time.Now()
+			for _, ws := range newWorkspaces {
+				toScan = append(toScan, ws)
+			}
+		} else if time.Since(lastFullScan) >= backgroundScanInterval {
+			// Focus is set but it's time for a periodic full scan
+			lastFullScan = time.Now()
+			for _, ws := range newWorkspaces {
+				toScan = append(toScan, ws)
+			}
+		} else {
+			// Focused scan: only focused workspaces
+			focusLower := make(map[string]struct{}, len(focus))
+			for p := range focus {
+				focusLower[strings.ToLower(p)] = struct{}{}
+			}
+			for _, ws := range newWorkspaces {
+				if _, ok := focusLower[strings.ToLower(ws.Path)]; ok {
+					toScan = append(toScan, ws)
+				}
+			}
+		}
+
+		scanWorkspaces(toScan, newWorkspaces)
 
 		// Adjust interval dynamically based on focus count
 		focusCount := len(focus)
@@ -155,9 +185,25 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		}
 	}
 
+	// fullScan forces a scan of all workspaces (used by Refresh).
+	fullScan := func() {
+		state := st.Get()
+		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
+		for k, v := range state.Workspaces {
+			cpy := *v
+			newWorkspaces[k] = &cpy
+		}
+		var toScan []*models.EnrichedWorkspace
+		for _, ws := range newWorkspaces {
+			toScan = append(toScan, ws)
+		}
+		lastFullScan = time.Now()
+		scanWorkspaces(toScan, newWorkspaces)
+	}
+
 	// Wait for workspaces to be populated first
 	time.Sleep(1 * time.Second)
-	scan()
+	fullScan()
 
 	for {
 		select {
@@ -165,6 +211,9 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 			return nil
 		case <-ticker.C:
 			scan()
+		case replyCh := <-c.refresh:
+			fullScan()
+			close(replyCh)
 		}
 	}
 }

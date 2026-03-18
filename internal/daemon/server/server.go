@@ -116,6 +116,7 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/stream", s.handleStreamState)
 	mux.HandleFunc("/api/config", s.handleGetConfig)
 	mux.HandleFunc("/api/focus", s.handleFocus)
+	mux.HandleFunc("/api/refresh", s.handleRefresh)
 	// Job management endpoints
 	mux.HandleFunc("/api/jobs/", s.handleJobByID)
 	mux.HandleFunc("/api/jobs", s.handleJobs)
@@ -560,6 +561,20 @@ func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleRefresh triggers an immediate re-scan of all refreshable collectors.
+// This is synchronous: it blocks until the scan completes, so the caller can
+// immediately fetch fresh data after receiving the 200 OK response.
+func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine != nil {
+		s.engine.Refresh(r.Context())
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleJobs handles POST (submit) and GET (list) for /api/jobs.

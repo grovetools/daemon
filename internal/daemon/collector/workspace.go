@@ -14,19 +14,37 @@ import (
 type WorkspaceCollector struct {
 	interval time.Duration
 	logger   *logrus.Logger
+	refresh  chan chan struct{}
 }
 
 // NewWorkspaceCollector creates a new WorkspaceCollector with the specified interval.
-// If interval is 0, defaults to 30 seconds.
+// If interval is 0, defaults to 5 minutes.
 func NewWorkspaceCollector(interval time.Duration) *WorkspaceCollector {
 	if interval == 0 {
-		interval = 30 * time.Second
+		interval = 5 * time.Minute
 	}
 	logger := logrus.New()
 	logger.SetLevel(logrus.WarnLevel)
 	return &WorkspaceCollector{
 		interval: interval,
 		logger:   logger,
+		refresh:  make(chan chan struct{}),
+	}
+}
+
+// Refresh triggers an immediate workspace scan and blocks until it completes.
+func (c *WorkspaceCollector) Refresh(ctx context.Context) error {
+	reply := make(chan struct{})
+	select {
+	case c.refresh <- reply:
+		select {
+		case <-reply:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -89,6 +107,9 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 			return nil
 		case <-ticker.C:
 			scan()
+		case replyCh := <-c.refresh:
+			scan()
+			close(replyCh)
 		}
 	}
 }

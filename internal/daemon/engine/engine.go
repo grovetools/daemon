@@ -64,6 +64,21 @@ func (e *Engine) Start(ctx context.Context) {
 	wg.Wait()
 }
 
+// Refresh triggers an immediate, out-of-band collection cycle for all refreshable collectors.
+func (e *Engine) Refresh(ctx context.Context) {
+	var wg sync.WaitGroup
+	for _, c := range e.collectors {
+		if r, ok := c.(collector.Refreshable); ok {
+			wg.Add(1)
+			go func(refreshable collector.Refreshable) {
+				defer wg.Done()
+				_ = refreshable.Refresh(ctx)
+			}(r)
+		}
+	}
+	wg.Wait()
+}
+
 // Store returns the engine's state store.
 func (e *Engine) Store() *store.Store {
 	return e.store
