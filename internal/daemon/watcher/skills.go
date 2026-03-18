@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,10 @@ type SkillHandler struct {
 	// Debounce timers per workspace path
 	timers      map[string]*time.Timer
 	timersMutex sync.Mutex
+
+	// Cached skills config per workspace path for change detection
+	cachedConfigs map[string]*skills.SkillsConfig
+	configsMutex  sync.RWMutex
 }
 
 // NewSkillHandler creates a new SkillHandler instance.
@@ -60,6 +65,7 @@ func NewSkillHandler(st *store.Store, cfg *config.Config, debounceMs int) (*Skil
 		log:           logging.NewLogger("groved.skills.watcher"),
 		watchedPaths:  make(map[string]*workspace.WorkspaceNode),
 		timers:        make(map[string]*time.Timer),
+		cachedConfigs: make(map[string]*skills.SkillsConfig),
 	}, nil
 }
 
@@ -167,6 +173,7 @@ func (h *SkillHandler) OnStart(ctx context.Context) {
 }
 
 // handleConfigChange handles grove.toml changes in workspaces.
+// Only triggers a skill sync if the skills-related config actually changed.
 func (h *SkillHandler) handleConfigChange(configPath string) {
 	configDir := filepath.Dir(configPath)
 
@@ -178,10 +185,26 @@ func (h *SkillHandler) handleConfigChange(configPath string) {
 		return
 	}
 
+	// Load the new skills config and compare with cached version
+	newCfg, err := skills.LoadSkillsConfig(h.cfg, node)
+	if err != nil {
+		h.log.WithError(err).WithField("workspace", node.Name).Debug("Failed to load skills config for change detection")
+		// Fall through to sync on error — safer than skipping
+	} else {
+		h.configsMutex.RLock()
+		prev := h.cachedConfigs[node.Path]
+		h.configsMutex.RUnlock()
+
+		if reflect.DeepEqual(prev, newCfg) {
+			h.log.WithField("workspace", node.Name).Debug("Skills config unchanged in grove.toml, skipping sync")
+			return
+		}
+	}
+
 	h.log.WithFields(logrus.Fields{
 		"workspace": node.Name,
 		"config":    configPath,
-	}).Info("Workspace config changed, syncing skills")
+	}).Info("Skills config changed, syncing skills")
 
 	h.syncWorkspace(node)
 }
@@ -287,6 +310,13 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 		}
 
 		h.log.WithField("target", debounceKey).Info("Executing skill sync")
+
+		// Cache the current skills config for change detection on future grove.toml saves
+		if cfg, loadErr := skills.LoadSkillsConfig(h.cfg, targetNode); loadErr == nil {
+			h.configsMutex.Lock()
+			h.cachedConfigs[targetNode.Path] = cfg
+			h.configsMutex.Unlock()
+		}
 
 		opts := skills.SyncOptions{Prune: true, DryRun: false}
 		result, err := skills.SyncWorkspace(h.svc, targetNode, opts, nil)
