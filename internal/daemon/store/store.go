@@ -23,6 +23,7 @@ func New() *Store {
 			Workspaces: make(map[string]*models.EnrichedWorkspace),
 			Sessions:   make(map[string]*models.Session),
 			Jobs:       make(map[string]*models.JobInfo),
+			NoteIndex:  make(map[string]*models.NoteIndexEntry),
 		},
 		subscribers: make(map[chan Update]struct{}),
 		focus:       make(map[string]struct{}),
@@ -94,6 +95,20 @@ func (s *Store) GetJobs() []*models.JobInfo {
 	return result
 }
 
+// GetNoteIndex returns note index entries, optionally filtered by workspace.
+// If workspace is empty, all entries are returned.
+func (s *Store) GetNoteIndex(workspace string) []*models.NoteIndexEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*models.NoteIndexEntry, 0, len(s.state.NoteIndex))
+	for _, entry := range s.state.NoteIndex {
+		if workspace == "" || entry.Workspace == workspace {
+			result = append(result, entry)
+		}
+	}
+	return result
+}
+
 // ApplyUpdate modifies the state and notifies subscribers.
 func (s *Store) ApplyUpdate(u Update) {
 	s.mu.Lock()
@@ -136,6 +151,18 @@ func (s *Store) ApplyUpdate(u Update) {
 	case UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed, UpdateJobCancelled, UpdateJobPendingUser:
 		if job, ok := u.Payload.(*models.JobInfo); ok {
 			s.state.Jobs[job.ID] = job
+		}
+
+	// Note mutation events from nb
+	case UpdateNoteEvent:
+		if event, ok := u.Payload.(*models.NoteEvent); ok {
+			s.applyNoteEvent(event)
+		}
+
+	// Full note index replacement from collector scan
+	case UpdateNoteIndex:
+		if noteIndex, ok := u.Payload.(map[string]*models.NoteIndexEntry); ok {
+			s.state.NoteIndex = noteIndex
 		}
 
 	// Bulk discovery of idle jobs from filesystem
@@ -238,6 +265,100 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload) {
 	if job, exists := s.state.Jobs[payload.JobID]; exists {
 		job.Status = payload.Outcome
 		job.CompletedAt = &now
+	}
+}
+
+// applyNoteEvent incrementally adjusts note counts and the note index based on a mutation event.
+// The event carries workspace name and note type, allowing precise count updates
+// without a full filesystem rescan.
+func (s *Store) applyNoteEvent(event *models.NoteEvent) {
+	// Update note index
+	switch event.Event {
+	case models.NoteEventCreated, models.NoteEventUpdated:
+		if event.IndexEntry != nil {
+			s.state.NoteIndex[event.Path] = event.IndexEntry
+		}
+	case models.NoteEventDeleted, models.NoteEventArchived:
+		delete(s.state.NoteIndex, event.Path)
+	case models.NoteEventMoved:
+		if event.PrevPath != "" {
+			delete(s.state.NoteIndex, event.PrevPath)
+		}
+		if event.IndexEntry != nil {
+			s.state.NoteIndex[event.Path] = event.IndexEntry
+		}
+	case models.NoteEventRenamed:
+		if event.PrevPath != "" {
+			delete(s.state.NoteIndex, event.PrevPath)
+		}
+		if event.IndexEntry != nil {
+			s.state.NoteIndex[event.Path] = event.IndexEntry
+		}
+	}
+
+	// Find workspace by name (state.Workspaces is keyed by path)
+	for _, ws := range s.state.Workspaces {
+		if ws.WorkspaceNode == nil || ws.Name != event.Workspace {
+			continue
+		}
+
+		if ws.NoteCounts == nil {
+			ws.NoteCounts = &models.NoteCounts{}
+		}
+
+		switch event.Event {
+		case models.NoteEventCreated:
+			adjustNoteCount(ws.NoteCounts, event.NoteType, 1)
+		case models.NoteEventDeleted, models.NoteEventArchived:
+			adjustNoteCount(ws.NoteCounts, event.NoteType, -1)
+		case models.NoteEventMoved:
+			adjustNoteCount(ws.NoteCounts, event.NoteType, 1)
+		case models.NoteEventUpdated:
+			// No count change
+		case models.NoteEventRenamed:
+			// No count change — same workspace and type
+		}
+		break
+	}
+
+	// For moved/archived events, also decrement the source workspace
+	if event.Event == models.NoteEventMoved && event.PrevWorkspace != "" {
+		for _, ws := range s.state.Workspaces {
+			if ws.WorkspaceNode == nil || ws.Name != event.PrevWorkspace {
+				continue
+			}
+			if ws.NoteCounts == nil {
+				ws.NoteCounts = &models.NoteCounts{}
+			}
+			prevType := event.PrevNoteType
+			if prevType == "" {
+				prevType = event.NoteType
+			}
+			adjustNoteCount(ws.NoteCounts, prevType, -1)
+			break
+		}
+	}
+}
+
+// adjustNoteCount modifies a specific count field by delta.
+func adjustNoteCount(counts *models.NoteCounts, noteType string, delta int) {
+	switch noteType {
+	case "current":
+		counts.Current = max(0, counts.Current+delta)
+	case "issues":
+		counts.Issues = max(0, counts.Issues+delta)
+	case "inbox":
+		counts.Inbox = max(0, counts.Inbox+delta)
+	case "docs":
+		counts.Docs = max(0, counts.Docs+delta)
+	case "completed":
+		counts.Completed = max(0, counts.Completed+delta)
+	case "review":
+		counts.Review = max(0, counts.Review+delta)
+	case "in-progress", "in_progress":
+		counts.InProgress = max(0, counts.InProgress+delta)
+	default:
+		counts.Other = max(0, counts.Other+delta)
 	}
 }
 

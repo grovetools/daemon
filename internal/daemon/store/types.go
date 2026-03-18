@@ -7,9 +7,10 @@ import (
 
 // State represents the complete world view of the daemon.
 type State struct {
-	Workspaces map[string]*models.EnrichedWorkspace `json:"workspaces"` // Keyed by path
-	Sessions   map[string]*models.Session           `json:"sessions"`   // Keyed by ID
-	Jobs       map[string]*models.JobInfo           `json:"jobs"`       // Keyed by job ID
+	Workspaces map[string]*models.EnrichedWorkspace `json:"workspaces"`           // Keyed by path
+	Sessions   map[string]*models.Session           `json:"sessions"`             // Keyed by ID
+	Jobs       map[string]*models.JobInfo           `json:"jobs"`                 // Keyed by job ID
+	NoteIndex  map[string]*models.NoteIndexEntry    `json:"note_index,omitempty"` // Keyed by file path
 }
 
 // UpdateType defines what kind of data changed.
@@ -40,6 +41,12 @@ const (
 
 	// Bulk discovery of idle jobs from filesystem scanning.
 	UpdateJobsDiscovered UpdateType = "jobs_discovered"
+
+	// Note mutation event from nb for incremental count updates.
+	UpdateNoteEvent UpdateType = "note_event"
+
+	// Full note index replacement from note collector scan.
+	UpdateNoteIndex UpdateType = "note_index"
 )
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation

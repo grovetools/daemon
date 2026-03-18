@@ -139,9 +139,7 @@ func (h *NoteHandler) OnStart(ctx context.Context) {
 	// No initial sync needed — the NoteCollector handles the first scan.
 }
 
-// triggerRefresh debounces the note counts re-scan. Because FetchNoteCountsMap
-// shells out to `nb list`, we use a longer debounce (3s default) to avoid
-// excessive process spawning.
+// triggerRefresh debounces the note counts re-scan.
 func (h *NoteHandler) triggerRefresh() {
 	h.refreshMu.Lock()
 	defer h.refreshMu.Unlock()
@@ -153,13 +151,16 @@ func (h *NoteHandler) triggerRefresh() {
 	h.refreshTimer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
 		h.log.Debug("Refreshing note counts after file change")
 
-		noteCounts, err := enrichment.FetchNoteCountsMap()
-		if err != nil {
-			h.log.WithError(err).Error("Failed to fetch note counts")
-			return
+		state := h.store.Get()
+		var nodes []*workspace.WorkspaceNode
+		for _, ws := range state.Workspaces {
+			if ws.WorkspaceNode != nil {
+				nodes = append(nodes, ws.WorkspaceNode)
+			}
 		}
 
-		state := h.store.Get()
+		noteCounts := enrichment.CountNotesInProcess(nodes, h.locator)
+
 		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
 		scanned := 0
 
@@ -168,8 +169,10 @@ func (h *NoteHandler) triggerRefresh() {
 			if cpy.WorkspaceNode != nil {
 				if counts, ok := noteCounts[cpy.Name]; ok {
 					cpy.NoteCounts = counts
-					scanned++
+				} else {
+					cpy.NoteCounts = &models.NoteCounts{}
 				}
+				scanned++
 			}
 			newWorkspaces[k] = &cpy
 		}

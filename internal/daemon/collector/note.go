@@ -5,8 +5,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/enrichment"
 )
@@ -63,11 +65,24 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 			lastFullScan = time.Now()
 		}
 
-		// FetchNoteCountsMap returns counts by workspace name, not path
-		noteCounts, err := enrichment.FetchNoteCountsMap()
-		if err != nil {
-			return
+		var nodes []*workspace.WorkspaceNode
+		for _, ws := range state.Workspaces {
+			if ws.WorkspaceNode != nil {
+				nodes = append(nodes, ws.WorkspaceNode)
+			}
 		}
+
+		cfg, _ := config.LoadDefault()
+		locator := workspace.NewNotebookLocator(cfg)
+		noteCounts := enrichment.CountNotesInProcess(nodes, locator)
+
+		indexStart := time.Now()
+		noteIndex := enrichment.IndexNotesInProcess(nodes, locator)
+		logger.WithFields(map[string]interface{}{
+			"entries":  len(noteIndex),
+			"duration": time.Since(indexStart).Round(time.Millisecond),
+			"nodes":    len(nodes),
+		}).Info("Note index built")
 
 		// Build case-insensitive focus map
 		focusLower := make(map[string]struct{}, len(focus))
@@ -85,10 +100,12 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 			// Check if this workspace should be updated
 			_, isFocused := focusLower[strings.ToLower(k)]
 			if doFullScan || isFocused {
-				// Note counts are indexed by workspace name, not path
 				if cpy.WorkspaceNode != nil {
 					if counts, ok := noteCounts[cpy.Name]; ok {
 						cpy.NoteCounts = counts
+					} else {
+						// Ensure counts reset to 0 if all notes are deleted
+						cpy.NoteCounts = &models.NoteCounts{}
 					}
 				}
 				scanned++
@@ -102,6 +119,12 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 			Source:  "note",
 			Scanned: scanned,
 			Payload: newWorkspaces,
+		}
+
+		updates <- store.Update{
+			Type:    store.UpdateNoteIndex,
+			Source:  "note",
+			Payload: noteIndex,
 		}
 	}
 

@@ -12,12 +12,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/sessions"
+	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/daemon/internal/enrichment"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -117,6 +120,8 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/config", s.handleGetConfig)
 	mux.HandleFunc("/api/focus", s.handleFocus)
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
+	mux.HandleFunc("/api/notes/index", s.handleNoteIndex)
+	mux.HandleFunc("/api/notes/event", s.handleNoteEvent)
 	// Job management endpoints
 	mux.HandleFunc("/api/jobs/", s.handleJobByID)
 	mux.HandleFunc("/api/jobs", s.handleJobs)
@@ -503,6 +508,21 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			Payload:    u.Payload,
 		}
 
+	// Note mutation events — broadcast as workspace updates so TUI refreshes
+	case store.UpdateNoteEvent:
+		return &apiStateUpdate{
+			UpdateType: "note_event",
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
+
+	// Note index updates — broadcast so TUI can refresh cached metadata
+	case store.UpdateNoteIndex:
+		return &apiStateUpdate{
+			UpdateType: "note_index",
+			Source:     u.Source,
+		}
+
 	// Job lifecycle updates
 	case store.UpdateJobSubmitted, store.UpdateJobStarted,
 		store.UpdateJobCompleted, store.UpdateJobFailed, store.UpdateJobCancelled,
@@ -514,6 +534,91 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 		}
 	}
 	return nil
+}
+
+// handleNoteIndex handles GET /api/notes/index - returns the cached note index.
+// Supports optional ?workspace= query parameter to filter by workspace.
+func (s *Server) handleNoteIndex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	wsFilter := r.URL.Query().Get("workspace")
+	entries := s.engine.Store().GetNoteIndex(wsFilter)
+	s.logger.WithFields(logrus.Fields{
+		"workspace": wsFilter,
+		"entries":   len(entries),
+	}).Debug("Note index request served")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(entries)
+}
+
+// handleNoteEvent handles POST /api/notes/event for incremental note count updates.
+func (s *Server) handleNoteEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var event models.NoteEvent
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Pre-parse index entry for created/updated/moved events so the store
+	// can upsert the note index without needing filesystem access under the lock.
+	if event.IndexEntry == nil && event.Path != "" &&
+		event.Event != models.NoteEventDeleted && event.Event != models.NoteEventArchived {
+		s.tryAttachIndexEntry(&event)
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"event":       event.Event,
+		"workspace":   event.Workspace,
+		"path":        event.Path,
+		"has_index":   event.IndexEntry != nil,
+	}).Debug("Note event received")
+
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:    store.UpdateNoteEvent,
+		Source:  "nb",
+		Payload: &event,
+	})
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// tryAttachIndexEntry attempts to parse frontmatter and attach a NoteIndexEntry to a NoteEvent.
+func (s *Server) tryAttachIndexEntry(event *models.NoteEvent) {
+	state := s.engine.Store().Get()
+	cfg, _ := config.LoadDefault()
+	locator := workspace.NewNotebookLocator(cfg)
+
+	for _, ws := range state.Workspaces {
+		if ws.WorkspaceNode == nil || ws.Name != event.Workspace {
+			continue
+		}
+		contentDirPath, contentDirType := enrichment.ResolveContentDirForPath(event.Path, ws.WorkspaceNode, locator)
+		if contentDirPath == "" {
+			break
+		}
+		entry, err := enrichment.IndexSingleNote(event.Path, ws.Name, contentDirPath, contentDirType)
+		if err == nil {
+			event.IndexEntry = entry
+		}
+		break
+	}
 }
 
 // handleGetConfig returns the running configuration as JSON.

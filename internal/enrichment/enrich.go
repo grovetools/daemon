@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/grovetools/core/git"
+	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
 )
@@ -56,7 +57,9 @@ func EnrichWorkspaces(ctx context.Context, nodes []*workspace.WorkspaceNode, opt
 	// Fetch note counts (indexed by workspace name)
 	var noteCountsByName map[string]*models.NoteCounts
 	if opts.FetchNoteCounts {
-		noteCountsByName, _ = FetchNoteCountsMap()
+		cfg, _ := config.LoadDefault()
+		locator := workspace.NewNotebookLocator(cfg)
+		noteCountsByName = CountNotesInProcess(nodes, locator)
 	}
 
 	// Fetch plan stats (indexed by path)
