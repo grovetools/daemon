@@ -151,40 +151,89 @@ func (h *SkillHandler) HandleEvents(ctx context.Context, events []fsnotify.Event
 	return nil
 }
 
-// HandleStoreUpdate responds to store-level updates like config reloads.
+// HandleStoreUpdate responds to store-level updates like config reloads and workspace discovery.
 func (h *SkillHandler) HandleStoreUpdate(update store.Update) {
-	if update.Type == store.UpdateConfigReload {
-		newCfg, err := config.LoadDefault()
-		if err != nil {
-			h.log.WithError(err).Error("Failed to reload config")
-			return
-		}
+	switch update.Type {
+	case store.UpdateConfigReload:
+		h.handleConfigReload()
+	case store.UpdateWorkspaces:
+		h.handleWorkspacesDiscovered()
+	}
+}
 
-		// Check if global skills configuration actually changed
-		newGlobalSkillsCfg := skills.LoadGlobalSkillsConfig(newCfg)
-		if reflect.DeepEqual(h.globalSkillsCfg, newGlobalSkillsCfg) {
-			h.log.Debug("Global skills config unchanged, skipping sync")
-			// Still update internal references
-			h.cfg = newCfg
-			h.svc.Config = newCfg
-			h.svc.NotebookLocator = workspace.NewNotebookLocator(newCfg)
-			h.hooksExecutor.UpdateConfig(newCfg)
-			return
-		}
+// handleConfigReload reloads the global config and syncs all workspaces if skills config changed.
+func (h *SkillHandler) handleConfigReload() {
+	newCfg, err := config.LoadDefault()
+	if err != nil {
+		h.log.WithError(err).Error("Failed to reload config")
+		return
+	}
 
-		h.log.Info("Skills config reload detected, syncing all skills")
-		h.globalSkillsCfg = newGlobalSkillsCfg
+	// Check if global skills configuration actually changed
+	newGlobalSkillsCfg := skills.LoadGlobalSkillsConfig(newCfg)
+	if reflect.DeepEqual(h.globalSkillsCfg, newGlobalSkillsCfg) {
+		h.log.Debug("Global skills config unchanged, skipping sync")
+		// Still update internal references
 		h.cfg = newCfg
 		h.svc.Config = newCfg
 		h.svc.NotebookLocator = workspace.NewNotebookLocator(newCfg)
 		h.hooksExecutor.UpdateConfig(newCfg)
+		return
+	}
 
+	h.log.Info("Skills config reload detected, syncing all skills")
+	h.globalSkillsCfg = newGlobalSkillsCfg
+	h.cfg = newCfg
+	h.svc.Config = newCfg
+	h.svc.NotebookLocator = workspace.NewNotebookLocator(newCfg)
+	h.hooksExecutor.UpdateConfig(newCfg)
+
+	h.syncAllWorkspaces()
+}
+
+// handleWorkspacesDiscovered syncs skills for newly discovered workspaces.
+// On first discovery (no cached configs yet), syncs all workspaces.
+// On subsequent discoveries, only syncs workspaces not yet seen.
+func (h *SkillHandler) handleWorkspacesDiscovered() {
+	workspaces := h.store.GetWorkspaces()
+
+	h.configsMutex.RLock()
+	cachedCount := len(h.cachedConfigs)
+	h.configsMutex.RUnlock()
+
+	if cachedCount == 0 {
+		h.log.WithField("count", len(workspaces)).Info("Workspaces discovered, performing initial skill sync")
 		h.syncAllWorkspaces()
+		return
+	}
+
+	for _, ew := range workspaces {
+		node := ew.WorkspaceNode
+		if node == nil {
+			continue
+		}
+
+		h.configsMutex.RLock()
+		_, seen := h.cachedConfigs[node.Path]
+		h.configsMutex.RUnlock()
+
+		if !seen {
+			h.log.WithField("workspace", node.Name).Info("New workspace discovered, syncing skills")
+			h.syncWorkspace(node)
+		}
 	}
 }
 
 // OnStart performs the initial skill sync for all workspaces.
+// Note: At startup, the workspace store may not be populated yet.
+// If no workspaces are available, the actual initial sync will happen
+// when the first UpdateWorkspaces event arrives via handleWorkspacesDiscovered.
 func (h *SkillHandler) OnStart(ctx context.Context) {
+	workspaces := h.store.GetWorkspaces()
+	if len(workspaces) == 0 {
+		h.log.Debug("No workspaces available yet at startup, deferring initial sync to workspace discovery")
+		return
+	}
 	h.log.Info("Performing initial skill sync for all workspaces")
 	h.syncAllWorkspaces()
 }
