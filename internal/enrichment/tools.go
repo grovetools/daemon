@@ -2,11 +2,12 @@ package enrichment
 
 import (
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
-	"github.com/grovetools/core/config"
+	coreconfig "github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/util/delegation"
@@ -66,8 +67,8 @@ func FetchToolInfoMap(nodes []*workspace.WorkspaceNode, fetchRelease, fetchBinar
 		if fetchBinary {
 			// Try to read binary name from project's grove config
 			binaryName := tool.Name
-			if configPath, err := config.FindConfigFile(node.Path); err == nil {
-				if cfg, err := config.Load(configPath); err == nil {
+			if configPath, err := coreconfig.FindConfigFile(node.Path); err == nil {
+				if cfg, err := coreconfig.Load(configPath); err == nil {
 					var binaryCfg struct {
 						Name string `yaml:"name"`
 					}
@@ -102,8 +103,14 @@ type cxPerLineStat struct {
 func FetchCxStatsMap(nodes []*workspace.WorkspaceNode) map[string]*models.CxStats {
 	stats := make(map[string]*models.CxStats)
 
-	// Run cx stats --per-line .grove/rules --json
-	cmd := delegation.Command("cx", "stats", "--per-line", ".grove/rules", "--json")
+	// Resolve the rules path using the notebook locator, falling back to legacy .grove/rules
+	rulesPath := resolveRulesPath(nodes)
+	if rulesPath == "" {
+		return stats
+	}
+
+	// Run cx stats --per-line <resolved-rules-path> --json
+	cmd := delegation.Command("cx", "stats", "--per-line", rulesPath, "--json")
 	output, err := cmd.Output()
 	if err != nil || len(output) == 0 {
 		return stats
@@ -178,6 +185,33 @@ func FetchCxStatsMap(nodes []*workspace.WorkspaceNode) map[string]*models.CxStat
 	}
 
 	return stats
+}
+
+// resolveRulesPath finds the rules file path by checking the notebook location first,
+// then falling back to the legacy .grove/rules location.
+func resolveRulesPath(nodes []*workspace.WorkspaceNode) string {
+	coreCfg, err := coreconfig.LoadDefault()
+	if err != nil {
+		coreCfg = &coreconfig.Config{}
+	}
+	locator := workspace.NewNotebookLocator(coreCfg)
+
+	for _, node := range nodes {
+		// Check notebook location first
+		if rulesFile, err := locator.GetContextRulesFile(node); err == nil {
+			if _, statErr := os.Stat(rulesFile); statErr == nil {
+				return rulesFile
+			}
+		}
+
+		// Fall back to legacy .grove/rules
+		legacyPath := filepath.Join(node.Path, ".grove", "rules")
+		if _, err := os.Stat(legacyPath); err == nil {
+			return legacyPath
+		}
+	}
+
+	return ""
 }
 
 // GetRemoteURL fetches the git remote URL for a directory.

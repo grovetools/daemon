@@ -65,7 +65,7 @@ func FetchPlanStatsMap() (map[string]*models.PlanStats, error) {
 			processPlanDir(planPath, stats, node)
 		}
 
-		if activePlan := getActivePlanForPath(node.Path); activePlan != "" {
+		if activePlan := getActivePlanForPath(node, locator); activePlan != "" {
 			stats.ActivePlan = activePlan
 		}
 	}
@@ -164,9 +164,20 @@ func processPlanDir(planPath string, stats *models.PlanStats, node *workspace.Wo
 	}
 }
 
-// getActivePlanForPath reads the active plan from a workspace's state file
-func getActivePlanForPath(workspacePath string) string {
-	stateFilePath := filepath.Join(workspacePath, ".grove", "state.yml")
+// getActivePlanForPath reads the active plan from a workspace's state file.
+// It checks the notebook directory first (sibling of plans dir), then falls back
+// to the legacy .grove/state.yml location.
+func getActivePlanForPath(node *workspace.WorkspaceNode, locator *workspace.NotebookLocator) string {
+	stateFilePath := filepath.Join(node.Path, ".grove", "state.yml")
+
+	// Try notebook location first: state.yml lives alongside plans/ in the notebook dir
+	if plansDir, err := locator.GetPlansDir(node); err == nil {
+		nbStatePath := filepath.Join(filepath.Dir(plansDir), "state.yml")
+		if _, statErr := os.Stat(nbStatePath); statErr == nil {
+			stateFilePath = nbStatePath
+		}
+	}
+
 	data, err := os.ReadFile(stateFilePath)
 	if err != nil {
 		return ""
