@@ -9,6 +9,7 @@ import (
 
 	coreconfig "github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/plan"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/util/frontmatter"
 	"github.com/sirupsen/logrus"
@@ -199,10 +200,10 @@ func getActivePlanForPath(node *workspace.WorkspaceNode, locator *workspace.Note
 	}
 
 	// Try both keys for backward compatibility
-	if val, ok := stateMap["flow.active_plan"].(string); ok {
+	if val, ok := stateMap[plan.StateKey].(string); ok {
 		return val
 	}
-	if val, ok := stateMap["active_plan"].(string); ok {
+	if val, ok := stateMap[plan.LegacyStateKey].(string); ok {
 		return val
 	}
 	return ""
