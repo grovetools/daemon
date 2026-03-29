@@ -219,20 +219,25 @@ func (h *FlowHandler) triggerRefresh() {
 		}
 
 		state := h.store.Get()
-		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
+		var deltas []*models.WorkspaceDelta
 		for k, v := range state.Workspaces {
-			cpy := *v
 			if stats, ok := planStats[k]; ok {
-				cpy.PlanStats = stats
+				if !store.PlanStatsEqual(v.PlanStats, stats) {
+					deltas = append(deltas, &models.WorkspaceDelta{
+						Path:      k,
+						PlanStats: stats,
+					})
+				}
 			}
-			newWorkspaces[k] = &cpy
 		}
 
-		h.store.ApplyUpdate(store.Update{
-			Type:    store.UpdateWorkspaces,
-			Source:  "flow_watcher",
-			Scanned: len(newWorkspaces),
-			Payload: newWorkspaces,
-		})
+		if len(deltas) > 0 {
+			h.store.ApplyUpdate(store.Update{
+				Type:    store.UpdateWorkspacesDelta,
+				Source:  "flow_watcher",
+				Scanned: len(deltas),
+				Payload: deltas,
+			})
+		}
 	})
 }

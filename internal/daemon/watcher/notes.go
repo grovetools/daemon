@@ -160,28 +160,33 @@ func (h *NoteHandler) triggerRefresh() {
 		noteIndex := enrichment.IndexNotesInProcess(nodes, h.locator)
 		noteCounts := enrichment.DeriveCountsFromIndex(noteIndex)
 
-		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
-		scanned := 0
-
+		var deltas []*models.WorkspaceDelta
 		for k, v := range state.Workspaces {
-			cpy := *v
-			if cpy.WorkspaceNode != nil {
-				if counts, ok := noteCounts[cpy.Name]; ok {
-					cpy.NoteCounts = counts
-				} else {
-					cpy.NoteCounts = &models.NoteCounts{}
-				}
-				scanned++
+			if v.WorkspaceNode == nil {
+				continue
 			}
-			newWorkspaces[k] = &cpy
+			var newCounts *models.NoteCounts
+			if counts, ok := noteCounts[v.Name]; ok {
+				newCounts = counts
+			} else {
+				newCounts = &models.NoteCounts{}
+			}
+			if !store.NoteCountsEqual(v.NoteCounts, newCounts) {
+				deltas = append(deltas, &models.WorkspaceDelta{
+					Path:       k,
+					NoteCounts: newCounts,
+				})
+			}
 		}
 
-		h.store.ApplyUpdate(store.Update{
-			Type:    store.UpdateWorkspaces,
-			Source:  "note_watcher",
-			Scanned: scanned,
-			Payload: newWorkspaces,
-		})
+		if len(deltas) > 0 {
+			h.store.ApplyUpdate(store.Update{
+				Type:    store.UpdateWorkspacesDelta,
+				Source:  "note_watcher",
+				Scanned: len(deltas),
+				Payload: deltas,
+			})
+		}
 
 		h.store.ApplyUpdate(store.Update{
 			Type:    store.UpdateNoteIndex,

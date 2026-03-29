@@ -432,13 +432,14 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 
 // apiStateUpdate matches the daemon.StateUpdate type for SSE streaming.
 type apiStateUpdate struct {
-	Workspaces []*models.EnrichedWorkspace `json:"workspaces,omitempty"`
-	Sessions   []*models.Session           `json:"sessions,omitempty"`
-	UpdateType string                      `json:"update_type"`
-	Source     string                      `json:"source,omitempty"`
-	Scanned    int                         `json:"scanned,omitempty"`
-	ConfigFile string                      `json:"config_file,omitempty"`
-	Payload    interface{}                 `json:"payload,omitempty"`
+	Workspaces      []*models.EnrichedWorkspace `json:"workspaces,omitempty"`
+	WorkspaceDeltas []*models.WorkspaceDelta    `json:"workspace_deltas,omitempty"`
+	Sessions        []*models.Session           `json:"sessions,omitempty"`
+	UpdateType      string                      `json:"update_type"`
+	Source          string                      `json:"source,omitempty"`
+	Scanned         int                         `json:"scanned,omitempty"`
+	ConfigFile      string                      `json:"config_file,omitempty"`
+	Payload         interface{}                 `json:"payload,omitempty"`
 }
 
 // convertToAPIUpdate converts internal store.Update to the public API format.
@@ -455,6 +456,15 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 				UpdateType: "workspaces",
 				Source:     u.Source,
 				Scanned:    u.Scanned,
+			}
+		}
+	case store.UpdateWorkspacesDelta:
+		if deltas, ok := u.Payload.([]*models.WorkspaceDelta); ok {
+			return &apiStateUpdate{
+				WorkspaceDeltas: deltas,
+				UpdateType:      "workspaces_delta",
+				Source:          u.Source,
+				Scanned:         len(deltas),
 			}
 		}
 	case store.UpdateSessions:

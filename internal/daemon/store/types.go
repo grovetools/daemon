@@ -47,6 +47,10 @@ const (
 
 	// Full note index replacement from note collector scan.
 	UpdateNoteIndex UpdateType = "note_index"
+
+	// Delta update for workspace enrichment fields (git, plan, note).
+	// Payload is []*models.WorkspaceDelta — only changed fields on changed workspaces.
+	UpdateWorkspacesDelta UpdateType = "workspaces_delta"
 )
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation

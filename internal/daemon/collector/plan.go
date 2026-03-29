@@ -74,30 +74,29 @@ func (c *PlanCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 			focusLower[strings.ToLower(p)] = struct{}{}
 		}
 
-		// Clone existing workspaces and update plan stats
-		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
-		scanned := 0
+		var deltas []*models.WorkspaceDelta
 
 		for k, v := range state.Workspaces {
-			cpy := *v
-
-			// Check if this workspace should be updated
 			_, isFocused := focusLower[strings.ToLower(k)]
 			if doFullScan || isFocused {
 				if stats, ok := planStats[k]; ok {
-					cpy.PlanStats = stats
+					if !store.PlanStatsEqual(v.PlanStats, stats) {
+						deltas = append(deltas, &models.WorkspaceDelta{
+							Path:      k,
+							PlanStats: stats,
+						})
+					}
 				}
-				scanned++
 			}
-
-			newWorkspaces[k] = &cpy
 		}
 
-		updates <- store.Update{
-			Type:    store.UpdateWorkspaces,
-			Source:  "plan",
-			Scanned: scanned,
-			Payload: newWorkspaces,
+		if len(deltas) > 0 {
+			updates <- store.Update{
+				Type:    store.UpdateWorkspacesDelta,
+				Source:  "plan",
+				Scanned: len(deltas),
+				Payload: deltas,
+			}
 		}
 	}
 

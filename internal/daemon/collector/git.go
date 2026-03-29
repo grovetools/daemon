@@ -82,8 +82,8 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
 
-	// scanWorkspaces runs git status on the given workspaces and emits an update.
-	scanWorkspaces := func(toScan []*models.EnrichedWorkspace, allWorkspaces map[string]*models.EnrichedWorkspace) {
+	// scanWorkspaces runs git status on the given workspaces and emits a delta update.
+	scanWorkspaces := func(toScan []*models.EnrichedWorkspace) {
 		if len(toScan) == 0 {
 			return
 		}
@@ -98,7 +98,7 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, gitWorkers)
 		var mu sync.Mutex
-		changed := false
+		var deltas []*models.WorkspaceDelta
 
 		for _, ws := range toScan {
 			wg.Add(1)
@@ -108,24 +108,24 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				defer func() { <-sem }() // Release
 
 				status, err := git.GetExtendedStatus(ws.Path)
-				if err == nil {
+				if err == nil && !store.GitStatusEqual(ws.GitStatus, status) {
 					mu.Lock()
-					if !gitStatusEqual(ws.GitStatus, status) {
-						ws.GitStatus = status
-						changed = true
-					}
+					deltas = append(deltas, &models.WorkspaceDelta{
+						Path:      ws.Path,
+						GitStatus: status,
+					})
 					mu.Unlock()
 				}
 			}(ws)
 		}
 		wg.Wait()
 
-		if changed {
+		if len(deltas) > 0 {
 			updates <- store.Update{
-				Type:    store.UpdateWorkspaces,
+				Type:    store.UpdateWorkspacesDelta,
 				Source:  "git",
 				Scanned: len(toScan),
-				Payload: allWorkspaces,
+				Payload: deltas,
 			}
 		}
 	}
@@ -135,13 +135,6 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		state := st.Get()
 		focus := st.GetFocus()
 
-		// Clone existing state
-		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
-		for k, v := range state.Workspaces {
-			cpy := *v
-			newWorkspaces[k] = &cpy
-		}
-
 		var toScan []*models.EnrichedWorkspace
 
 		if len(focus) == 0 {
@@ -150,13 +143,13 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				return // Skip this tick
 			}
 			lastFullScan = time.Now()
-			for _, ws := range newWorkspaces {
+			for _, ws := range state.Workspaces {
 				toScan = append(toScan, ws)
 			}
 		} else if time.Since(lastFullScan) >= backgroundScanInterval {
 			// Focus is set but it's time for a periodic full scan
 			lastFullScan = time.Now()
-			for _, ws := range newWorkspaces {
+			for _, ws := range state.Workspaces {
 				toScan = append(toScan, ws)
 			}
 		} else {
@@ -165,14 +158,14 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 			for p := range focus {
 				focusLower[strings.ToLower(p)] = struct{}{}
 			}
-			for _, ws := range newWorkspaces {
+			for _, ws := range state.Workspaces {
 				if _, ok := focusLower[strings.ToLower(ws.Path)]; ok {
 					toScan = append(toScan, ws)
 				}
 			}
 		}
 
-		scanWorkspaces(toScan, newWorkspaces)
+		scanWorkspaces(toScan)
 
 		// Adjust interval dynamically based on focus count
 		focusCount := len(focus)
@@ -190,17 +183,12 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 	// fullScan forces a scan of all workspaces (used by Refresh).
 	fullScan := func() {
 		state := st.Get()
-		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
-		for k, v := range state.Workspaces {
-			cpy := *v
-			newWorkspaces[k] = &cpy
-		}
 		var toScan []*models.EnrichedWorkspace
-		for _, ws := range newWorkspaces {
+		for _, ws := range state.Workspaces {
 			toScan = append(toScan, ws)
 		}
 		lastFullScan = time.Now()
-		scanWorkspaces(toScan, newWorkspaces)
+		scanWorkspaces(toScan)
 	}
 
 	// Wait for workspaces to be populated first
@@ -220,30 +208,3 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 	}
 }
 
-// gitStatusEqual returns true if two ExtendedGitStatus values are equivalent.
-// Used to suppress no-op updates that would cause unnecessary TUI re-renders.
-func gitStatusEqual(a, b *git.ExtendedGitStatus) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	if a.LinesAdded != b.LinesAdded || a.LinesDeleted != b.LinesDeleted {
-		return false
-	}
-	if a.StatusInfo == nil && b.StatusInfo == nil {
-		return true
-	}
-	if a.StatusInfo == nil || b.StatusInfo == nil {
-		return false
-	}
-	sa, sb := a.StatusInfo, b.StatusInfo
-	return sa.Branch == sb.Branch &&
-		sa.AheadCount == sb.AheadCount &&
-		sa.BehindCount == sb.BehindCount &&
-		sa.ModifiedCount == sb.ModifiedCount &&
-		sa.UntrackedCount == sb.UntrackedCount &&
-		sa.StagedCount == sb.StagedCount &&
-		sa.IsDirty == sb.IsDirty
-}

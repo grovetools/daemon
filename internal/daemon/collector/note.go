@@ -91,35 +91,33 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 			focusLower[strings.ToLower(p)] = struct{}{}
 		}
 
-		// Clone existing workspaces and update note counts
-		newWorkspaces := make(map[string]*models.EnrichedWorkspace)
-		scanned := 0
+		var deltas []*models.WorkspaceDelta
 
 		for k, v := range state.Workspaces {
-			cpy := *v
-
-			// Check if this workspace should be updated
 			_, isFocused := focusLower[strings.ToLower(k)]
 			if doFullScan || isFocused {
-				if cpy.WorkspaceNode != nil {
-					if counts, ok := noteCounts[cpy.Name]; ok {
-						cpy.NoteCounts = counts
-					} else {
-						// Ensure counts reset to 0 if all notes are deleted
-						cpy.NoteCounts = &models.NoteCounts{}
+				if v.WorkspaceNode != nil {
+					newCounts, ok := noteCounts[v.Name]
+					if !ok {
+						newCounts = &models.NoteCounts{}
+					}
+					if !store.NoteCountsEqual(v.NoteCounts, newCounts) {
+						deltas = append(deltas, &models.WorkspaceDelta{
+							Path:       k,
+							NoteCounts: newCounts,
+						})
 					}
 				}
-				scanned++
 			}
-
-			newWorkspaces[k] = &cpy
 		}
 
-		updates <- store.Update{
-			Type:    store.UpdateWorkspaces,
-			Source:  "note",
-			Scanned: scanned,
-			Payload: newWorkspaces,
+		if len(deltas) > 0 {
+			updates <- store.Update{
+				Type:    store.UpdateWorkspacesDelta,
+				Source:  "note",
+				Scanned: len(deltas),
+				Payload: deltas,
+			}
 		}
 
 		updates <- store.Update{

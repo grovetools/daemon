@@ -121,6 +121,27 @@ func (h *WorkspaceHandler) HandleStoreUpdate(update store.Update) {
 
 func (h *WorkspaceHandler) OnStart(ctx context.Context) {}
 
+// workspaceSetChanged returns true if the discovered workspace list differs
+// structurally from the current store (different paths or different workspace kinds).
+func workspaceSetChanged(current map[string]*models.EnrichedWorkspace, discovered []*workspace.WorkspaceNode) bool {
+	if len(current) != len(discovered) {
+		return true
+	}
+	for _, node := range discovered {
+		existing, ok := current[node.Path]
+		if !ok {
+			return true
+		}
+		// Check if the workspace node metadata changed (kind, name, parent)
+		if existing.WorkspaceNode == nil ||
+			existing.Name != node.Name ||
+			existing.Kind != node.Kind {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *WorkspaceHandler) triggerRefresh() {
 	h.refreshMu.Lock()
 	defer h.refreshMu.Unlock()
@@ -130,7 +151,7 @@ func (h *WorkspaceHandler) triggerRefresh() {
 	}
 
 	h.refreshTimer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
-		h.log.Info("Refreshing workspaces after filesystem change")
+		h.log.Debug("Checking for workspace structural changes")
 
 		nodes, err := workspace.GetProjects(h.log.Logger)
 		if err != nil {
@@ -139,6 +160,16 @@ func (h *WorkspaceHandler) triggerRefresh() {
 		}
 
 		currentState := h.store.Get()
+
+		// Only emit a full update if the set of workspaces actually changed
+		// (new repo, removed repo, worktree added/removed). Enrichment-only
+		// changes are handled by the delta pipeline.
+		if !workspaceSetChanged(currentState.Workspaces, nodes) {
+			h.log.Debug("No structural workspace changes, skipping update")
+			return
+		}
+
+		h.log.Info("Workspace structure changed, refreshing")
 		enrichedMap := make(map[string]*models.EnrichedWorkspace)
 
 		for _, node := range nodes {

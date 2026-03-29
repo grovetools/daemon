@@ -165,6 +165,38 @@ func (s *Store) ApplyUpdate(u Update) {
 			s.state.NoteIndex = noteIndex
 		}
 
+	// Delta updates for workspace enrichment fields
+	case UpdateWorkspacesDelta:
+		if deltas, ok := u.Payload.([]*models.WorkspaceDelta); ok {
+			for _, d := range deltas {
+				ws, exists := s.state.Workspaces[d.Path]
+				if !exists {
+					continue
+				}
+				if d.GitStatus != nil {
+					ws.GitStatus = d.GitStatus
+				}
+				if d.NoteCounts != nil {
+					ws.NoteCounts = d.NoteCounts
+				}
+				if d.PlanStats != nil {
+					ws.PlanStats = d.PlanStats
+				}
+				if d.ReleaseInfo != nil {
+					ws.ReleaseInfo = d.ReleaseInfo
+				}
+				if d.ActiveBinary != nil {
+					ws.ActiveBinary = d.ActiveBinary
+				}
+				if d.CxStats != nil {
+					ws.CxStats = d.CxStats
+				}
+				if d.GitRemoteURL != nil {
+					ws.GitRemoteURL = *d.GitRemoteURL
+				}
+			}
+		}
+
 	// Bulk discovery of idle jobs from filesystem
 	case UpdateJobsDiscovered:
 		if jobs, ok := u.Payload.([]*models.JobInfo); ok {
