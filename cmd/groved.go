@@ -328,6 +328,13 @@ func newGrovedStartCmd() *cobra.Command {
 					}
 				}
 
+				// Register WorkspaceHandler for instant discovery on fs changes
+				if isEnabled("workspace") {
+					workspaceHandler := watcher.NewWorkspaceHandler(st, cfg, 2000)
+					unifiedWatcher.Register(workspaceHandler)
+					logger.Info("Workspace handler registered with unified watcher")
+				}
+
 				// Register FlowHandler for plan directory watching
 				if isEnabled("plan") {
 					flowHandler := watcher.NewFlowHandler(st, cfg, 2000)

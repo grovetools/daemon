@@ -110,8 +110,10 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				status, err := git.GetExtendedStatus(ws.Path)
 				if err == nil {
 					mu.Lock()
-					ws.GitStatus = status
-					changed = true
+					if !gitStatusEqual(ws.GitStatus, status) {
+						ws.GitStatus = status
+						changed = true
+					}
 					mu.Unlock()
 				}
 			}(ws)
@@ -216,4 +218,32 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 			close(replyCh)
 		}
 	}
+}
+
+// gitStatusEqual returns true if two ExtendedGitStatus values are equivalent.
+// Used to suppress no-op updates that would cause unnecessary TUI re-renders.
+func gitStatusEqual(a, b *git.ExtendedGitStatus) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if a.LinesAdded != b.LinesAdded || a.LinesDeleted != b.LinesDeleted {
+		return false
+	}
+	if a.StatusInfo == nil && b.StatusInfo == nil {
+		return true
+	}
+	if a.StatusInfo == nil || b.StatusInfo == nil {
+		return false
+	}
+	sa, sb := a.StatusInfo, b.StatusInfo
+	return sa.Branch == sb.Branch &&
+		sa.AheadCount == sb.AheadCount &&
+		sa.BehindCount == sb.BehindCount &&
+		sa.ModifiedCount == sb.ModifiedCount &&
+		sa.UntrackedCount == sb.UntrackedCount &&
+		sa.StagedCount == sb.StagedCount &&
+		sa.IsDirty == sb.IsDirty
 }

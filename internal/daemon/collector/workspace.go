@@ -101,12 +101,28 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 	// Initial scan
 	scan()
 
+	currentInterval := c.interval
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
 			scan()
+
+			// Dynamically adjust interval based on active client focus.
+			// When the TUI is open (focus set), scan more frequently to catch
+			// worktree additions/removals quickly.
+			focus := st.GetFocus()
+			newInterval := c.interval
+			if len(focus) > 0 {
+				newInterval = 10 * time.Second
+			}
+
+			if newInterval != currentInterval {
+				currentInterval = newInterval
+				ticker.Reset(currentInterval)
+			}
 		case replyCh := <-c.refresh:
 			scan()
 			close(replyCh)
