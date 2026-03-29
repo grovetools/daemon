@@ -185,6 +185,12 @@ func (jr *JobRunner) areDependenciesMet(info *models.JobInfo) bool {
 		return true // Can't find the job definition — let it run
 	}
 
+	// If the CLI already transitioned the job to "running" before submitting
+	// to the daemon, treat it as runnable — the caller explicitly targeted it.
+	if job.Status == orchestration.JobStatusRunning {
+		return true
+	}
+
 	return job.IsRunnable()
 }
 
