@@ -13,10 +13,12 @@ import (
 	"time"
 
 	"github.com/grovetools/core/config"
+	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/engine"
+	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/store"
@@ -45,6 +47,7 @@ type Server struct {
 	runningConfig *RunningConfig
 	jobRunner     *jobrunner.JobRunner
 	logStreamer   *logstreamer.LogStreamer
+	envManager    *daemonenv.Manager
 }
 
 // New creates a new Server instance.
@@ -72,6 +75,11 @@ func (s *Server) SetJobRunner(jr *jobrunner.JobRunner) {
 // SetLogStreamer sets the log streamer for the server.
 func (s *Server) SetLogStreamer(ls *logstreamer.LogStreamer) {
 	s.logStreamer = ls
+}
+
+// SetEnvManager sets the environment manager for the server.
+func (s *Server) SetEnvManager(m *daemonenv.Manager) {
+	s.envManager = m
 }
 
 // ListenAndServe starts the daemon on the given unix socket path.
@@ -917,33 +925,65 @@ func resolveLogFilePath(info *models.JobInfo) string {
 }
 
 // handleEnvUp handles POST /api/env/up requests.
-// Stubbed for now — will route to internal env manager in a follow-up.
 func (s *Server) handleEnvUp(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.envManager == nil {
+		http.Error(w, "env manager not initialized", http.StatusServiceUnavailable)
+		return
+	}
 
-	s.logger.Info("Received env up request (stub)")
+	var req coreenv.EnvRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := s.envManager.Up(r.Context(), req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(coreenv.EnvResponse{
+			Status: "failed",
+			Error:  err.Error(),
+		})
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":    "running",
-		"endpoints": []string{"(daemon env providers not yet implemented)"},
-		"state":     map[string]string{"stub": "true"},
-	})
+	json.NewEncoder(w).Encode(resp)
 }
 
 // handleEnvDown handles POST /api/env/down requests.
-// Stubbed for now — will route to internal env manager in a follow-up.
 func (s *Server) handleEnvDown(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.envManager == nil {
+		http.Error(w, "env manager not initialized", http.StatusServiceUnavailable)
+		return
+	}
 
-	s.logger.Info("Received env down request (stub)")
+	var req coreenv.EnvRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	resp, err := s.envManager.Down(r.Context(), req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(coreenv.EnvResponse{
+			Status: "failed",
+			Error:  err.Error(),
+		})
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
+	json.NewEncoder(w).Encode(resp)
 }

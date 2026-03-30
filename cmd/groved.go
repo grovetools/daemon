@@ -25,6 +25,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
 	"github.com/grovetools/daemon/internal/daemon/server"
+	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
@@ -236,9 +237,18 @@ func newGrovedStartCmd() *cobra.Command {
 			logPollInterval := 500 * time.Millisecond
 			streamer := logstreamer.New(st, logBufSize, logMaxSubs, logPollInterval)
 
-			// 4. Setup Server with engine
+			// 4. Setup Server with engine and env manager
+			envManager := daemonenv.NewManager(logger)
+			// Start proxy server in background on standard grove proxy port
+			go func() {
+				if err := envManager.Proxy.ListenAndServe(":8443"); err != nil {
+					logger.WithError(err).Warn("Proxy server stopped")
+				}
+			}()
+
 			srv := server.New(logger)
 			srv.SetEngine(eng)
+			srv.SetEnvManager(envManager)
 			if jr != nil {
 				srv.SetJobRunner(jr)
 			}
@@ -261,8 +271,9 @@ func newGrovedStartCmd() *cobra.Command {
 			go func() {
 				<-stop
 				logger.Info("Received stop signal")
-				streamer.Stop() // Stop all log tailing goroutines
-				cancel()        // Stop the engine
+				envManager.Shutdown() // Teardown all running environments and proxy routes
+				streamer.Stop()       // Stop all log tailing goroutines
+				cancel()              // Stop the engine
 
 				// Create shutdown context with timeout
 				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
