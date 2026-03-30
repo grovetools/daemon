@@ -122,6 +122,9 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
 	mux.HandleFunc("/api/notes/index", s.handleNoteIndex)
 	mux.HandleFunc("/api/notes/event", s.handleNoteEvent)
+	// Environment management endpoints
+	mux.HandleFunc("/api/env/up", s.handleEnvUp)
+	mux.HandleFunc("/api/env/down", s.handleEnvDown)
 	// Job management endpoints
 	mux.HandleFunc("/api/jobs/", s.handleJobByID)
 	mux.HandleFunc("/api/jobs", s.handleJobs)
@@ -911,4 +914,36 @@ func resolveLogFilePath(info *models.JobInfo) string {
 	// Convention: job logs are stored in .artifacts/<job-name>/job.log within the plan dir
 	jobName := strings.TrimSuffix(info.JobFile, ".md")
 	return filepath.Join(info.PlanDir, ".artifacts", jobName, "job.log")
+}
+
+// handleEnvUp handles POST /api/env/up requests.
+// Stubbed for now — will route to internal env manager in a follow-up.
+func (s *Server) handleEnvUp(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.logger.Info("Received env up request (stub)")
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "running",
+		"endpoints": []string{"(daemon env providers not yet implemented)"},
+		"state":     map[string]string{"stub": "true"},
+	})
+}
+
+// handleEnvDown handles POST /api/env/down requests.
+// Stubbed for now — will route to internal env manager in a follow-up.
+func (s *Server) handleEnvDown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.logger.Info("Received env down request (stub)")
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
 }
