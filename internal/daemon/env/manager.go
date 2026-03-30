@@ -49,6 +49,8 @@ func (m *Manager) Up(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvR
 		return m.nativeUp(ctx, req)
 	case "docker":
 		return m.dockerUp(ctx, req)
+	case "terraform":
+		return m.terraformUp(ctx, req)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", req.Provider)
 	}
@@ -63,6 +65,8 @@ func (m *Manager) Down(ctx context.Context, req coreenv.EnvRequest) (*coreenv.En
 		return m.nativeDown(ctx, req)
 	case "docker":
 		return m.dockerDown(ctx, req)
+	case "terraform":
+		return m.terraformDown(ctx, req)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", req.Provider)
 	}
@@ -82,4 +86,5 @@ func (m *Manager) Shutdown() {
 	m.logger.Info("All environments shut down")
 }
 
-// Note: nativeUp, nativeDown, dockerUp, dockerDown are implemented in their respective files.
+// Note: nativeUp, nativeDown, dockerUp, dockerDown, terraformUp, terraformDown
+// are implemented in their respective files.
