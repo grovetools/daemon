@@ -859,3 +859,7 @@ type noopStatusUpdater struct{}
 func (n *noopStatusUpdater) UpdateJobStatus(job *orchestration.Job, status orchestration.JobStatus) error {
 	return nil
 }
+
+func (n *noopStatusUpdater) UpdateJobMetadata(job *orchestration.Job, meta orchestration.JobMetadata) error {
+	return nil
+}
