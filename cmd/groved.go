@@ -366,7 +366,7 @@ func newGrovedStartCmd() *cobra.Command {
 				// Register MemoryHandler for auto-indexing content
 				dbPath, err := pathutil.Expand("~/.local/share/grove/memory/memory.db")
 				if err == nil {
-					memStore, err := memory.NewSQLiteStore(dbPath)
+					memStore, err := memory.Open(dbPath, 768) // 768 is Gemini's text-embedding-004 dimension
 					if err != nil {
 						logger.WithError(err).Warn("Failed to initialize memory store, indexing disabled")
 					} else {

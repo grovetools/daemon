@@ -31,7 +31,7 @@ type MemoryHandler struct {
 	store    *store.Store
 	cfg      *config.Config
 	locator  *workspace.NotebookLocator
-	memStore memory.Store
+	memStore memory.DocumentStore
 	embedder *memory.Embedder
 	log      *logrus.Entry
 
@@ -46,7 +46,7 @@ type MemoryHandler struct {
 }
 
 // NewMemoryHandler creates a new MemoryHandler for auto-indexing content.
-func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.Store, embedder *memory.Embedder, debounceMs int) *MemoryHandler {
+func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.DocumentStore, embedder *memory.Embedder, debounceMs int) *MemoryHandler {
 	if debounceMs <= 0 {
 		debounceMs = 5000
 	}
@@ -285,6 +285,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	}
 
 	content := string(contentBytes)
+	content = memory.StripFrontmatter(content)
 	if strings.TrimSpace(content) == "" {
 		h.memStore.DeleteDocument(ctx, job.Path)
 		return
@@ -327,6 +328,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 		Path:      job.Path,
 		DocType:   docType,
 		Workspace: job.Workspace,
+		Metadata:  nil,
 		Content:   content,
 		UpdatedAt: time.Now(),
 	}
