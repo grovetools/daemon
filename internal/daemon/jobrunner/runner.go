@@ -36,6 +36,11 @@ type JobRunner struct {
 	// They are promoted to the run queue by evaluateBlockedJobs().
 	blocked   map[string]*models.JobInfo
 	blockedMu sync.Mutex
+
+	// transcriptSem limits concurrent appendTranscriptAsync goroutines.
+	// Each one spawns external grove/aglogs processes; unbounded concurrency
+	// can overwhelm the system.
+	transcriptSem chan struct{}
 }
 
 // New creates a new JobRunner with the given store, runtime, and worker count.
@@ -44,14 +49,15 @@ func New(st *store.Store, runtime orchestration.Runtime, workers int, persister 
 		workers = 4
 	}
 	return &JobRunner{
-		queue:     make(chan *models.JobInfo, 1000),
-		workers:   workers,
-		running:   make(map[string]context.CancelFunc),
-		runtime:   runtime,
-		store:     st,
-		logger:    grovelogging.NewLogger("jobrunner"),
-		persister: persister,
-		blocked:   make(map[string]*models.JobInfo),
+		queue:         make(chan *models.JobInfo, 1000),
+		workers:       workers,
+		running:       make(map[string]context.CancelFunc),
+		runtime:       runtime,
+		store:         st,
+		logger:        grovelogging.NewLogger("jobrunner"),
+		persister:     persister,
+		blocked:       make(map[string]*models.JobInfo),
+		transcriptSem: make(chan struct{}, 4),
 	}
 }
 
@@ -454,21 +460,26 @@ func (jr *JobRunner) watchTransitions(ctx context.Context) {
 		case update := <-sub:
 			switch update.Type {
 			case store.UpdateJobsDiscovered:
+				// Jobs discovered from filesystem scan — these are historical jobs
+				// that already exist on disk. Only evaluate blocked dependencies;
+				// do NOT run appendTranscriptAsync, which spawns expensive external
+				// processes (grove aglogs read). On a large plan history this would
+				// launch thousands of processes and bring the machine to a halt.
 				if jobs, ok := update.Payload.([]*models.JobInfo); ok {
+					needsEval := false
 					for _, job := range jobs {
 						if isJobTerminal(job.Status) {
 							if _, ok := processed[job.ID]; !ok {
 								processed[job.ID] = struct{}{}
-								if job.Type == "interactive_agent" || job.Type == "headless_agent" {
-									jr.appendTranscriptAsync(job)
-								} else {
-									jr.evaluateBlockedJobs()
-								}
+								needsEval = true
 							}
 						} else {
 							// If job reverts to active state, remove from processed map
 							delete(processed, job.ID)
 						}
+					}
+					if needsEval {
+						jr.evaluateBlockedJobs()
 					}
 				}
 			case store.UpdateJobCompleted, store.UpdateJobFailed, store.UpdateJobCancelled:
@@ -505,6 +516,10 @@ func (jr *JobRunner) watchTransitions(ctx context.Context) {
 
 func (jr *JobRunner) appendTranscriptAsync(info *models.JobInfo) {
 	go func() {
+		// Limit concurrent transcript appends — each spawns external processes
+		jr.transcriptSem <- struct{}{}
+		defer func() { <-jr.transcriptSem }()
+
 		// Allow time for final logs to flush to disk before appending
 		time.Sleep(1 * time.Second)
 
