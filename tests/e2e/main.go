@@ -24,6 +24,9 @@ func main() {
 
 		// Daemon Hooks Tests
 		DaemonHooksScenario(),
+
+		// Interactive Agent Transcript Tests
+		DaemonInteractiveTranscriptScenario(),
 	}
 
 	// Execute the custom tend application with our scenarios
