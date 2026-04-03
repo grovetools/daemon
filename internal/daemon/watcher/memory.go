@@ -291,12 +291,16 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 		return
 	}
 
-	// Heuristically determine DocType
+	// Heuristically determine DocType from path
 	docType := "note"
 	if strings.Contains(job.Path, "/skills/") {
 		docType = "skill"
+	} else if strings.Contains(job.Path, "/concepts/") {
+		docType = "concept"
 	} else if strings.Contains(job.Path, "/plans/") {
 		docType = "plan"
+	} else if strings.Contains(job.Path, "/issues/") {
+		docType = "issue"
 	}
 
 	chunks := memory.ChunkDocument(content, memory.DefaultChunkConfig())
