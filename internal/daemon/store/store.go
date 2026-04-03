@@ -201,9 +201,12 @@ func (s *Store) ApplyUpdate(u Update) {
 	case UpdateJobsDiscovered:
 		if jobs, ok := u.Payload.([]*models.JobInfo); ok {
 			for _, job := range jobs {
-				// Don't overwrite jobs that the JobRunner is actively managing
 				if existing, exists := s.state.Jobs[job.ID]; exists {
-					if existing.Status == "running" || existing.Status == "queued" {
+					// Prevent stale filesystem reads from reverting active daemon states.
+					// If daemon says running/queued, but file says pending/queued/pending_user, ignore.
+					// However, if the file says completed/failed/idle, accept the update!
+					if (existing.Status == "running" || existing.Status == "queued") &&
+						(job.Status == "pending" || job.Status == "queued" || job.Status == "pending_user") {
 						continue
 					}
 				}

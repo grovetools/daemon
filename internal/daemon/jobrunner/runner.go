@@ -98,6 +98,8 @@ func (jr *JobRunner) Start(ctx context.Context) {
 	for i := 0; i < jr.workers; i++ {
 		go jr.worker(ctx)
 	}
+
+	go jr.watchTransitions(ctx)
 }
 
 // Submit enqueues a new job for execution. If the job's dependencies are not
@@ -425,4 +427,106 @@ func (jr *JobRunner) cleanupRunning(jobID string) {
 		delete(jr.running, jobID)
 	}
 	jr.mu.Unlock()
+}
+
+func isJobTerminal(status string) bool {
+	switch status {
+	case "completed", "failed", "cancelled", "idle", "interrupted", "abandoned":
+		return true
+	default:
+		return false
+	}
+}
+
+// watchTransitions listens for job state changes in the daemon store.
+// When an interactive_agent or headless_agent reaches a terminal state,
+// it automatically appends the transcript and unblocks downstream dependencies.
+func (jr *JobRunner) watchTransitions(ctx context.Context) {
+	sub := jr.store.Subscribe()
+	defer jr.store.Unsubscribe(sub)
+
+	processed := make(map[string]struct{})
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case update := <-sub:
+			switch update.Type {
+			case store.UpdateJobsDiscovered:
+				if jobs, ok := update.Payload.([]*models.JobInfo); ok {
+					for _, job := range jobs {
+						if isJobTerminal(job.Status) {
+							if _, ok := processed[job.ID]; !ok {
+								processed[job.ID] = struct{}{}
+								if job.Type == "interactive_agent" || job.Type == "headless_agent" {
+									jr.appendTranscriptAsync(job)
+								} else {
+									jr.evaluateBlockedJobs()
+								}
+							}
+						} else {
+							// If job reverts to active state, remove from processed map
+							delete(processed, job.ID)
+						}
+					}
+				}
+			case store.UpdateJobCompleted, store.UpdateJobFailed, store.UpdateJobCancelled:
+				if job, ok := update.Payload.(*models.JobInfo); ok {
+					if isJobTerminal(job.Status) {
+						if _, ok := processed[job.ID]; !ok {
+							processed[job.ID] = struct{}{}
+							if job.Type == "interactive_agent" || job.Type == "headless_agent" {
+								jr.appendTranscriptAsync(job)
+							} else {
+								jr.evaluateBlockedJobs()
+							}
+						}
+					}
+				}
+			case store.UpdateSessionEnd:
+				if payload, ok := update.Payload.(*store.SessionEndPayload); ok {
+					job := jr.store.GetJob(payload.JobID)
+					if job != nil {
+						if _, ok := processed[job.ID]; !ok {
+							processed[job.ID] = struct{}{}
+							if job.Type == "interactive_agent" || job.Type == "headless_agent" {
+								jr.appendTranscriptAsync(job)
+							} else {
+								jr.evaluateBlockedJobs()
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func (jr *JobRunner) appendTranscriptAsync(info *models.JobInfo) {
+	go func() {
+		// Allow time for final logs to flush to disk before appending
+		time.Sleep(1 * time.Second)
+
+		// Ensure we evaluate downstream jobs even if transcript fails or skips
+		defer jr.evaluateBlockedJobs()
+
+		plan, err := orchestration.LoadPlan(info.PlanDir)
+		if err != nil {
+			jr.logger.WithError(err).Warn("Failed to load plan for auto-transcript")
+			return
+		}
+
+		job, found := plan.GetJobByFilename(info.JobFile)
+		if !found {
+			return
+		}
+
+		// AppendAgentTranscript is idempotent and handles locking internally
+		if err := orchestration.AppendAgentTranscript(job, plan); err != nil {
+			jr.logger.WithError(err).Warn("Failed to auto-append agent transcript")
+		} else {
+			jr.logger.WithField("job_id", job.ID).Debug("Auto-appended agent transcript")
+		}
+	}()
 }
