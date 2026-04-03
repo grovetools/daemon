@@ -8,6 +8,8 @@ require (
 	github.com/grovetools/flow v0.6.3
 	github.com/grovetools/skills v0.6.3
 	github.com/grovetools/tend v0.6.0
+	github.com/grovetools/memory v0.6.3
+	github.com/grovetools/grove-gemini v0.6.1
 	github.com/spf13/cobra v1.9.1
 )
 

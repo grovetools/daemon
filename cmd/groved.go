@@ -19,16 +19,19 @@ import (
 	"github.com/grovetools/core/pkg/logging/logutil"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
+	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/engine"
+	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
 	"github.com/grovetools/daemon/internal/daemon/server"
-	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
+	"github.com/grovetools/grove-gemini/pkg/gemini"
+	"github.com/grovetools/memory/pkg/memory"
 	"github.com/spf13/cobra"
 )
 
@@ -358,6 +361,27 @@ func newGrovedStartCmd() *cobra.Command {
 					noteHandler := watcher.NewNoteHandler(st, cfg, 3000)
 					unifiedWatcher.Register(noteHandler)
 					logger.Info("Note handler registered with unified watcher")
+				}
+
+				// Register MemoryHandler for auto-indexing content
+				dbPath, err := pathutil.Expand("~/.local/share/grove/memory/memory.db")
+				if err == nil {
+					memStore, err := memory.NewSQLiteStore(dbPath)
+					if err != nil {
+						logger.WithError(err).Warn("Failed to initialize memory store, indexing disabled")
+					} else {
+						// Use grove-gemini's config resolver (secrets.toml, env var, api_key_command)
+						geminiClient, err := gemini.NewClient(ctx, "")
+						if err != nil {
+							logger.WithError(err).Warn("Failed to initialize Gemini client, memory indexing disabled")
+						} else {
+							embedder := memory.NewEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
+
+							memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
+							unifiedWatcher.Register(memoryHandler)
+							logger.Info("Memory handler registered with unified watcher")
+						}
+					}
 				}
 
 				logger.Info("Unified watcher started")

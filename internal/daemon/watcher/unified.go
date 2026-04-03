@@ -13,7 +13,7 @@ import (
 )
 
 // DomainHandler represents a domain-specific event processor that plugs into the
-// UnifiedWatcher infrastructure. Each handler (skills, flow, notes) implements this
+// UnifiedWatcher infrastructure. Each handler (skills, flow, notes, memory) implements this
 // interface to receive batched filesystem events and store updates.
 type DomainHandler interface {
 	Name() string
