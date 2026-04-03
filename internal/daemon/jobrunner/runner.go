@@ -366,11 +366,13 @@ func (jr *JobRunner) executeJob(ctx context.Context, info *models.JobInfo) {
 			jr.markDone(info, "failed", err.Error())
 		}
 	} else {
-		// Check the job's actual final status — chat jobs set pending_user, not completed.
+		// Check the job's actual final status — some job types manage their own status:
+		// - chat jobs set pending_user (waiting for user input)
+		// - interactive_agent jobs set running (launched in tmux, user interacts)
 		finalStatus := "completed"
 		if job, _ := plan.GetJobByFilename(info.JobFile); job != nil {
-			if job.Status == orchestration.JobStatusPendingUser {
-				finalStatus = string(orchestration.JobStatusPendingUser)
+			if job.Status == orchestration.JobStatusPendingUser || job.Status == orchestration.JobStatusRunning {
+				finalStatus = string(job.Status)
 			}
 		}
 		jr.markDone(info, finalStatus, "")
@@ -382,7 +384,7 @@ func (jr *JobRunner) markDone(info *models.JobInfo, status, errMsg string) {
 	info.Error = errMsg
 
 	// Only set CompletedAt for terminal states
-	if status != "pending_user" {
+	if status != "pending_user" && status != "running" {
 		now := time.Now()
 		info.CompletedAt = &now
 	}
