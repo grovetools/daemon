@@ -125,6 +125,23 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 						Persist: false,
 					})
 				}
+			} else if volumes, ok := svcConfig["volumes"].(map[string]interface{}); ok {
+				// Use first volume's host_path as working directory if no explicit working_dir
+				for _, volCfgRaw := range volumes {
+					if volCfg, ok := volCfgRaw.(map[string]interface{}); ok {
+						if hp, ok := volCfg["host_path"].(string); ok && hp != "" {
+							if filepath.IsAbs(hp) {
+								cmd.Dir = hp
+							} else {
+								cmd.Dir = filepath.Join(req.Workspace.Path, hp)
+							}
+							break
+						}
+					}
+				}
+				if cmd.Dir == "" {
+					cmd.Dir = req.Workspace.Path
+				}
 			} else {
 				cmd.Dir = req.Workspace.Path
 			}
