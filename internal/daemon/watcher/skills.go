@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"sync"
 	"time"
 
@@ -276,6 +275,7 @@ func (h *SkillHandler) handleConfigChange(configPath string) {
 }
 
 // triggerSync finds affected workspaces for a changed skill file and syncs them.
+// Uses the full resolved dependency graph to detect changes in nested/transitive skills.
 func (h *SkillHandler) triggerSync(changedPath string) {
 	h.pathsMutex.RLock()
 	var matchedWatchPath string
@@ -315,21 +315,16 @@ func (h *SkillHandler) triggerSync(changedPath string) {
 			continue
 		}
 
-		usesSkill := false
-		for _, s := range skillsCfg.Use {
-			if s == changedSkillName {
-				usesSkill = true
-				break
-			}
-		}
-		if !usesSkill {
-			if _, exists := skillsCfg.Dependencies[changedSkillName]; exists {
-				usesSkill = true
-			}
+		// Use the resolver to check if the changed skill is anywhere in the transitive graph
+		resolved, err := skills.ResolveConfiguredSkills(h.svc, node, skillsCfg)
+		if err != nil {
+			h.log.WithError(err).Debug("Best effort resolving skills failed")
 		}
 
-		if usesSkill {
-			nodesToSync = append(nodesToSync, node)
+		if resolved != nil {
+			if _, exists := resolved[changedSkillName]; exists {
+				nodesToSync = append(nodesToSync, node)
+			}
 		}
 	}
 
@@ -415,19 +410,21 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 }
 
 // extractSkillName extracts the skill name from a changed file path.
-// Given a path like /path/to/skills/my-skill/SKILL.md and watchPath /path/to/skills
-// it returns "my-skill".
+// The skill name is the leaf directory containing the changed file.
+// For nested paths like /path/to/skills/kitchen/prep/SKILL.md, returns "prep".
+// For flat paths like /path/to/skills/my-skill/SKILL.md, returns "my-skill".
 func extractSkillName(changedPath, watchPath string) string {
 	rel, err := filepath.Rel(watchPath, changedPath)
-	if err != nil {
+	if err != nil || rel == "." {
 		return ""
 	}
 
-	parts := strings.SplitN(rel, string(filepath.Separator), 2)
-	if len(parts) > 0 {
-		return parts[0]
+	// The skill name is the directory containing the changed file
+	dir := filepath.Dir(changedPath)
+	if dir == watchPath {
+		return ""
 	}
-	return ""
+	return filepath.Base(dir)
 }
 
 // addWatchRecursive adds the base directory and immediate subdirectories to the tracker.
