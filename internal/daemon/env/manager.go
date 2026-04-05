@@ -47,19 +47,38 @@ func NewManager(logger *logrus.Entry) *Manager {
 }
 
 // Up starts an environment based on the provider specified in the request.
+// On failure, it rolls back the registered environment entry and releases any allocated ports.
 func (m *Manager) Up(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvResponse, error) {
 	m.logger.WithField("provider", req.Provider).Info("Starting environment")
 
+	var resp *coreenv.EnvResponse
+	var err error
+
 	switch req.Provider {
 	case "native":
-		return m.nativeUp(ctx, req)
+		resp, err = m.nativeUp(ctx, req)
 	case "docker":
-		return m.dockerUp(ctx, req)
+		resp, err = m.dockerUp(ctx, req)
 	case "terraform":
-		return m.terraformUp(ctx, req)
+		resp, err = m.terraformUp(ctx, req)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", req.Provider)
 	}
+
+	if err != nil && req.Workspace != nil {
+		worktree := req.Workspace.Name
+		m.mu.Lock()
+		if _, exists := m.envs[worktree]; exists {
+			delete(m.envs, worktree)
+		}
+		m.mu.Unlock()
+		m.Tunnels.StopAll(worktree)
+		m.Proxy.Unregister(worktree)
+		m.Ports.ReleaseAll(worktree)
+		m.logger.WithField("worktree", worktree).Info("Rolled back failed environment registration")
+	}
+
+	return resp, err
 }
 
 // Down stops an environment based on the provider specified in the request.
