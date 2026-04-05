@@ -118,6 +118,13 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 					cleanupStarted()
 					return nil, fmt.Errorf("failed to create working directory %s for service %s: %w", cmd.Dir, svcName, err)
 				}
+				// If working_dir is set but no volumes block, create an implicit non-persistent volume
+				if _, hasVolumes := svcConfig["volumes"]; !hasVolumes {
+					resp.Volumes = append(resp.Volumes, coreenv.VolumeState{
+						Path:    wd,
+						Persist: false,
+					})
+				}
 			} else {
 				cmd.Dir = req.Workspace.Path
 			}
@@ -222,7 +229,7 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 				}
 			}
 
-			// Collect cleanup paths from service config
+			// Legacy: collect cleanup paths from service config
 			if paths, ok := svcConfig["cleanup_paths"].([]interface{}); ok {
 				for _, p := range paths {
 					if s, ok := p.(string); ok {
