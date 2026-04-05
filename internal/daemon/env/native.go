@@ -105,7 +105,23 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 			runningEnv.Cancels[svcName] = cancel
 
 			cmd := exec.CommandContext(svcCtx, "sh", "-c", cmdStr)
-			cmd.Dir = req.Workspace.Path
+
+			// Resolve and create custom working directory if specified
+			if wd, ok := svcConfig["working_dir"].(string); ok && wd != "" {
+				if filepath.IsAbs(wd) {
+					cmd.Dir = wd
+				} else {
+					cmd.Dir = filepath.Join(req.Workspace.Path, wd)
+				}
+				if err := os.MkdirAll(cmd.Dir, 0755); err != nil {
+					cancel()
+					cleanupStarted()
+					return nil, fmt.Errorf("failed to create working directory %s for service %s: %w", cmd.Dir, svcName, err)
+				}
+			} else {
+				cmd.Dir = req.Workspace.Path
+			}
+
 			cmd.Env = os.Environ()
 
 			// Inject port env var
