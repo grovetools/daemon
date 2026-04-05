@@ -147,6 +147,83 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 				}
 			}
 
+			// Parse volumes config, create directories, and run pre-start restore
+			if volumes, ok := svcConfig["volumes"].(map[string]interface{}); ok {
+				for volName, volCfgRaw := range volumes {
+					volCfg, ok := volCfgRaw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					hostPath, _ := volCfg["host_path"].(string)
+					if hostPath == "" {
+						continue
+					}
+
+					// Resolve relative paths against workspace
+					absPath := hostPath
+					if !filepath.IsAbs(hostPath) {
+						absPath = filepath.Join(req.Workspace.Path, hostPath)
+					}
+					if err := os.MkdirAll(absPath, 0755); err != nil {
+						m.logger.WithError(err).Warnf("Failed to create volume directory %s for service %s", absPath, svcName)
+						continue
+					}
+
+					persist, _ := volCfg["persist"].(bool)
+					containerPath, _ := volCfg["container_path"].(string)
+
+					resp.Volumes = append(resp.Volumes, coreenv.VolumeState{
+						Path:          hostPath,
+						Persist:       persist,
+						ContainerPath: containerPath,
+					})
+
+					// Pre-start restore: run restore.command if volume dir is empty
+					if restoreCfg, ok := volCfg["restore"].(map[string]interface{}); ok {
+						restoreCmd, _ := restoreCfg["command"].(string)
+						if restoreCmd != "" {
+							empty, _ := isDirEmpty(absPath)
+							if empty {
+								m.logger.WithField("service", svcName).
+									WithField("volume", volName).
+									Info("Running volume restore command")
+
+								restoreEnv := append(os.Environ(), fmt.Sprintf("GROVE_VOLUME_HOST_PATH=%s", absPath))
+								// Inject all accumulated env vars
+								for k, v := range resp.EnvVars {
+									restoreEnv = append(restoreEnv, fmt.Sprintf("%s=%s", k, v))
+								}
+
+								rc := exec.Command("sh", "-c", restoreCmd)
+								rc.Dir = req.Workspace.Path
+								rc.Env = restoreEnv
+
+								// Log restore output
+								if logDir != "" {
+									restoreLogPath := filepath.Join(logDir, svcName+"-restore.log")
+									rlf, err := os.OpenFile(restoreLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+									if err == nil {
+										rc.Stdout = rlf
+										rc.Stderr = rlf
+										defer rlf.Close()
+									}
+								}
+
+								if err := rc.Run(); err != nil {
+									cancel()
+									cleanupStarted()
+									return nil, fmt.Errorf("volume restore failed for service %s volume %s: %w", svcName, volName, err)
+								}
+
+								m.logger.WithField("service", svcName).
+									WithField("volume", volName).
+									Info("Volume restore completed")
+							}
+						}
+					}
+				}
+			}
+
 			// Set up logging to file
 			var logFile *os.File
 			if logDir != "" {
@@ -226,6 +303,80 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 					}
 
 					m.logger.WithField("service", svcName).Info("Health check passed")
+				}
+			}
+
+			// Post-start lifecycle hook: run after service is healthy
+			if lifecycle, ok := svcConfig["lifecycle"].(map[string]interface{}); ok {
+				postStart, _ := lifecycle["post_start"].(string)
+				if postStart != "" {
+					mode, _ := lifecycle["post_start_mode"].(string)
+					if mode == "" {
+						mode = "always"
+					}
+
+					shouldRun := true
+					var markerPath string
+
+					// For "once" mode, check for .grove_init marker in first volume's host_path
+					if mode == "once" {
+						// Find the first volume's absolute path for this service
+						if volumes, ok := svcConfig["volumes"].(map[string]interface{}); ok {
+							for _, volCfgRaw := range volumes {
+								if volCfg, ok := volCfgRaw.(map[string]interface{}); ok {
+									if hp, _ := volCfg["host_path"].(string); hp != "" {
+										if filepath.IsAbs(hp) {
+											markerPath = filepath.Join(hp, ".grove_init")
+										} else {
+											markerPath = filepath.Join(req.Workspace.Path, hp, ".grove_init")
+										}
+										break
+									}
+								}
+							}
+						}
+						if markerPath != "" {
+							if _, err := os.Stat(markerPath); err == nil {
+								shouldRun = false
+								m.logger.WithField("service", svcName).Info("Skipping post_start (once mode, already initialized)")
+							}
+						}
+					}
+
+					if shouldRun {
+						m.logger.WithField("service", svcName).
+							WithField("mode", mode).
+							Info("Running post-start lifecycle hook")
+
+						lcCmd := exec.Command("sh", "-c", postStart)
+						lcCmd.Dir = req.Workspace.Path
+						lcCmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
+						for k, v := range resp.EnvVars {
+							lcCmd.Env = append(lcCmd.Env, fmt.Sprintf("%s=%s", k, v))
+						}
+
+						// Log lifecycle output
+						if logDir != "" {
+							lcLogPath := filepath.Join(logDir, svcName+"-lifecycle.log")
+							llf, err := os.OpenFile(lcLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+							if err == nil {
+								lcCmd.Stdout = llf
+								lcCmd.Stderr = llf
+								defer llf.Close()
+							}
+						}
+
+						if err := lcCmd.Run(); err != nil {
+							// Log warning but don't kill the service — migrations may be partial
+							m.logger.WithError(err).Warnf("Post-start lifecycle hook failed for service %s", svcName)
+						} else {
+							m.logger.WithField("service", svcName).Info("Post-start lifecycle hook completed")
+							// Create marker file for "once" mode
+							if mode == "once" && markerPath != "" {
+								os.WriteFile(markerPath, []byte("initialized\n"), 0644)
+							}
+						}
+					}
 				}
 			}
 
@@ -350,4 +501,13 @@ func resolveEnvVars(val string, envVars map[string]string) string {
 		}
 		return os.Getenv(key)
 	})
+}
+
+// isDirEmpty returns true if the directory exists but contains no entries.
+func isDirEmpty(path string) (bool, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) == 0, nil
 }
