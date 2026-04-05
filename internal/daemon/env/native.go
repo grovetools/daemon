@@ -5,13 +5,24 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	coreenv "github.com/grovetools/core/pkg/env"
 )
 
+// serviceEntry holds parsed service config for ordered startup.
+type serviceEntry struct {
+	Name   string
+	Config map[string]interface{}
+	Order  int
+}
+
 // nativeUp starts a native environment by spawning bare processes.
-// On partial failure, all already-started processes are killed before returning.
+// Services are started in order (lowest first), with stdout/stderr logged to
+// .grove/env/logs/<service>.log. On partial failure, all already-started
+// processes are killed before returning.
 func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvResponse, error) {
 	if req.Workspace == nil {
 		return nil, fmt.Errorf("native provider requires a workspace")
@@ -50,13 +61,20 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		EnvVars: make(map[string]string),
 	}
 
-	// 1. Process Services
+	// Create log directory for service output
+	logDir := filepath.Join(req.Workspace.Path, ".grove", "env", "logs")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		m.logger.WithError(err).Warn("Failed to create log directory, process output will be discarded")
+		logDir = ""
+	}
+
+	// 1. Process Services (ordered by "order" field, then alphabetically)
 	if services, ok := req.Config["services"].(map[string]interface{}); ok {
-		for svcName, svcConfigRaw := range services {
-			svcConfig, ok := svcConfigRaw.(map[string]interface{})
-			if !ok {
-				continue
-			}
+		entries := parseServiceEntries(services)
+
+		for _, entry := range entries {
+			svcName := entry.Name
+			svcConfig := entry.Config
 
 			cmdStr, _ := svcConfig["command"].(string)
 			portEnv, _ := svcConfig["port_env"].(string)
@@ -75,24 +93,77 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 			runningEnv.Ports[svcName] = port
 			runningEnv.ServiceCommands[svcName] = cmdStr
 
-			// Spawn process
+			// Record port env var so later services can reference it
+			if portEnv != "" {
+				resp.EnvVars[portEnv] = fmt.Sprintf("%d", port)
+			}
+
+			// Build process environment
 			svcCtx, cancel := context.WithCancel(context.Background())
 			runningEnv.Cancels[svcName] = cancel
 
 			cmd := exec.CommandContext(svcCtx, "sh", "-c", cmdStr)
 			cmd.Dir = req.Workspace.Path
 			cmd.Env = os.Environ()
+
+			// Inject port env var
 			if portEnv != "" {
 				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", portEnv, port))
-				resp.EnvVars[portEnv] = fmt.Sprintf("%d", port)
 			}
+
+			// Inject service-level env vars, resolving $VAR references
+			// against already-allocated port env vars
+			if envMap, ok := svcConfig["env"].(map[string]interface{}); ok {
+				for k, v := range envMap {
+					val, _ := v.(string)
+					resolved := resolveEnvVars(val, resp.EnvVars)
+					cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, resolved))
+					resp.EnvVars[k] = resolved
+				}
+			}
+
+			// Set up logging to file
+			var logFile *os.File
+			if logDir != "" {
+				logPath := filepath.Join(logDir, svcName+".log")
+				lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+				if err != nil {
+					m.logger.WithError(err).Warnf("Failed to create log file for %s", svcName)
+				} else {
+					logFile = lf
+					cmd.Stdout = logFile
+					cmd.Stderr = logFile
+				}
+			}
+
+			m.logger.WithField("service", svcName).
+				WithField("command", cmdStr).
+				WithField("port", port).
+				WithField("order", entry.Order).
+				Info("Starting native service")
 
 			if err := cmd.Start(); err != nil {
 				cancel()
+				if logFile != nil {
+					logFile.Close()
+				}
 				cleanupStarted()
 				return nil, fmt.Errorf("failed to start service %s: %w", svcName, err)
 			}
 			runningEnv.Processes[svcName] = cmd
+
+			// Reap zombie and close log file when process exits
+			go func(name string, c *exec.Cmd, lf *os.File) {
+				err := c.Wait()
+				if lf != nil {
+					lf.Close()
+				}
+				if err != nil {
+					m.logger.WithError(err).Warnf("Service %s exited with error", name)
+				} else {
+					m.logger.WithField("service", name).Info("Service exited")
+				}
+			}(svcName, cmd, logFile)
 
 			// Register Proxy
 			if route != "" {
@@ -159,10 +230,9 @@ func (m *Manager) nativeDown(ctx context.Context, req coreenv.EnvRequest) (*core
 
 	// Kill all native processes
 	for name, cancel := range runningEnv.Cancels {
+		m.logger.WithField("service", name).Info("Stopping native service")
 		cancel()
-		if cmd, ok := runningEnv.Processes[name]; ok {
-			_ = cmd.Wait() // Reclaim zombie
-		}
+		// The background goroutine handles Wait() and log file cleanup
 	}
 
 	m.Tunnels.StopAll(worktree)
@@ -170,4 +240,41 @@ func (m *Manager) nativeDown(ctx context.Context, req coreenv.EnvRequest) (*core
 	m.Ports.ReleaseAll(worktree)
 
 	return &coreenv.EnvResponse{Status: "stopped"}, nil
+}
+
+// parseServiceEntries extracts services from the config map and returns them
+// sorted by the "order" field (ascending), then alphabetically by name.
+func parseServiceEntries(services map[string]interface{}) []serviceEntry {
+	entries := make([]serviceEntry, 0, len(services))
+	for svcName, svcConfigRaw := range services {
+		svcConfig, ok := svcConfigRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		order := 100 // default: high so explicitly-ordered services go first
+		if o, ok := svcConfig["order"].(int64); ok {
+			order = int(o)
+		} else if o, ok := svcConfig["order"].(float64); ok {
+			order = int(o)
+		}
+		entries = append(entries, serviceEntry{Name: svcName, Config: svcConfig, Order: order})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Order != entries[j].Order {
+			return entries[i].Order < entries[j].Order
+		}
+		return entries[i].Name < entries[j].Name
+	})
+	return entries
+}
+
+// resolveEnvVars expands $VAR and ${VAR} references in val using the provided
+// env vars map, falling back to the process environment for unresolved vars.
+func resolveEnvVars(val string, envVars map[string]string) string {
+	return os.Expand(val, func(key string) string {
+		if v, ok := envVars[key]; ok {
+			return v
+		}
+		return os.Getenv(key)
+	})
 }
