@@ -20,6 +20,8 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/util/pathutil"
+	"github.com/grovetools/core/pkg/workspace"
+	"github.com/sirupsen/logrus"
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
@@ -242,6 +244,18 @@ func newGrovedStartCmd() *cobra.Command {
 
 			// 4. Setup Server with engine and env manager
 			envManager := daemonenv.NewManager(logger)
+
+			// Restore environment state from disk to prevent port collisions
+			restoreLogger := logrus.New()
+			restoreLogger.SetLevel(logrus.WarnLevel)
+			discoveryService := workspace.NewDiscoveryService(restoreLogger)
+			if discoveryResult, err := discoveryService.DiscoverAll(); err == nil {
+				wsProvider := workspace.NewProvider(discoveryResult)
+				envManager.Restore(wsProvider)
+			} else {
+				logger.WithError(err).Warn("Failed to discover workspaces for env restore")
+			}
+
 			// Start proxy server in background on standard grove proxy port
 			go func() {
 				if err := envManager.Proxy.ListenAndServe(":8443"); err != nil {

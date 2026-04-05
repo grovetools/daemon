@@ -2,11 +2,15 @@ package env
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 
 	coreenv "github.com/grovetools/core/pkg/env"
+	"github.com/grovetools/core/pkg/workspace"
 	"github.com/sirupsen/logrus"
 )
 
@@ -14,6 +18,8 @@ import (
 type RunningEnv struct {
 	Provider  string
 	Worktree  string
+	ManagedBy string
+	StateDir  string                         // Path to .grove/env/ directory
 	Ports     map[string]int
 	Processes map[string]*exec.Cmd          // Tracked natively spawned processes
 	Cancels   map[string]context.CancelFunc // Used to terminate native processes
@@ -69,6 +75,84 @@ func (m *Manager) Down(ctx context.Context, req coreenv.EnvRequest) (*coreenv.En
 		return m.terraformDown(ctx, req)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", req.Provider)
+	}
+}
+
+// Status returns the current status of an environment for a given worktree.
+func (m *Manager) Status(worktree string) *coreenv.EnvResponse {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	env, exists := m.envs[worktree]
+	if !exists {
+		return &coreenv.EnvResponse{Status: "stopped"}
+	}
+
+	services := make([]coreenv.ServiceState, 0, len(env.Ports))
+	for name, port := range env.Ports {
+		services = append(services, coreenv.ServiceState{
+			Name:   name,
+			Port:   port,
+			Status: "running",
+		})
+	}
+
+	return &coreenv.EnvResponse{
+		Status: "running",
+		State: map[string]string{
+			"provider":   env.Provider,
+			"managed_by": env.ManagedBy,
+		},
+	}
+}
+
+// Restore reloads environment state from disk on daemon boot.
+// It iterates all known workspaces and checks for .grove/env/state.json files,
+// re-registering allocated ports to prevent collisions.
+func (m *Manager) Restore(provider *workspace.Provider) {
+	if provider == nil {
+		return
+	}
+
+	for _, node := range provider.All() {
+		stateDir := filepath.Join(node.Path, ".grove", "env")
+		statePath := filepath.Join(stateDir, "state.json")
+
+		data, err := os.ReadFile(statePath)
+		if err != nil {
+			continue // No state file, skip
+		}
+
+		var stateFile coreenv.EnvStateFile
+		if err := json.Unmarshal(data, &stateFile); err != nil {
+			m.logger.WithError(err).Warnf("Failed to parse env state at %s", statePath)
+			continue
+		}
+
+		m.mu.Lock()
+		runningEnv := &RunningEnv{
+			Provider:  stateFile.Provider,
+			Worktree:  node.Name,
+			ManagedBy: stateFile.ManagedBy,
+			StateDir:  stateDir,
+			Ports:     make(map[string]int),
+		}
+
+		// Re-register allocated ports to prevent collisions
+		for svcName, port := range stateFile.Ports {
+			label := fmt.Sprintf("%s/%s", node.Name, svcName)
+			m.Ports.Reserve(label, port)
+			runningEnv.Ports[svcName] = port
+		}
+
+		m.envs[node.Name] = runningEnv
+		m.mu.Unlock()
+
+		m.logger.WithFields(logrus.Fields{
+			"worktree": node.Name,
+			"provider": stateFile.Provider,
+			"services": len(stateFile.Ports),
+		}).Info("Restored environment from state file")
 	}
 }
 

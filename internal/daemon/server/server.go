@@ -133,6 +133,7 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	// Environment management endpoints
 	mux.HandleFunc("/api/env/up", s.handleEnvUp)
 	mux.HandleFunc("/api/env/down", s.handleEnvDown)
+	mux.HandleFunc("/api/env/status", s.handleEnvStatus)
 	// Job management endpoints
 	mux.HandleFunc("/api/jobs/", s.handleJobByID)
 	mux.HandleFunc("/api/jobs", s.handleJobs)
@@ -952,6 +953,28 @@ func (s *Server) handleEnvUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleEnvStatus handles GET /api/env/status requests.
+func (s *Server) handleEnvStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.envManager == nil {
+		http.Error(w, "env manager not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	worktree := r.URL.Query().Get("worktree")
+	if worktree == "" {
+		http.Error(w, "worktree query parameter required", http.StatusBadRequest)
+		return
+	}
+
+	resp := s.envManager.Status(worktree)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }

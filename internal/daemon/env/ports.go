@@ -48,6 +48,14 @@ func (pa *PortAllocator) Release(port int) {
 	delete(pa.used, port)
 }
 
+// Reserve marks a known port as used without allocating a new one.
+// Used during daemon restore to prevent collisions with previously allocated ports.
+func (pa *PortAllocator) Reserve(label string, port int) {
+	pa.mu.Lock()
+	defer pa.mu.Unlock()
+	pa.used[port] = label
+}
+
 // ReleaseAll frees all ports associated with a given prefix (e.g., a worktree name).
 func (pa *PortAllocator) ReleaseAll(prefix string) {
 	pa.mu.Lock()
