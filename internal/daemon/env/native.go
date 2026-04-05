@@ -3,11 +3,13 @@ package env
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	coreenv "github.com/grovetools/core/pkg/env"
 )
@@ -164,6 +166,54 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 					m.logger.WithField("service", name).Info("Service exited")
 				}
 			}(svcName, cmd, logFile)
+
+			// TCP health check: wait for service port to accept connections
+			if hc, ok := svcConfig["health_check"].(map[string]interface{}); ok {
+				if hcType, _ := hc["type"].(string); hcType == "tcp" {
+					timeoutSec := 30
+					if ts, ok := hc["timeout_seconds"].(int64); ok {
+						timeoutSec = int(ts)
+					} else if ts, ok := hc["timeout_seconds"].(float64); ok {
+						timeoutSec = int(ts)
+					}
+
+					target := fmt.Sprintf("127.0.0.1:%d", port)
+					deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+
+					m.logger.WithField("service", svcName).
+						WithField("target", target).
+						WithField("timeout", timeoutSec).
+						Info("Waiting for TCP health check")
+
+					healthy := false
+					for time.Now().Before(deadline) {
+						conn, err := net.DialTimeout("tcp", target, 500*time.Millisecond)
+						if err == nil {
+							conn.Close()
+							healthy = true
+							break
+						}
+						time.Sleep(500 * time.Millisecond)
+					}
+
+					if !healthy {
+						cancel()
+						cleanupStarted()
+						return nil, fmt.Errorf("health check failed for service %s: port %d not ready after %ds", svcName, port, timeoutSec)
+					}
+
+					m.logger.WithField("service", svcName).Info("Health check passed")
+				}
+			}
+
+			// Collect cleanup paths from service config
+			if paths, ok := svcConfig["cleanup_paths"].([]interface{}); ok {
+				for _, p := range paths {
+					if s, ok := p.(string); ok {
+						resp.CleanupPaths = append(resp.CleanupPaths, s)
+					}
+				}
+			}
 
 			// Register Proxy
 			if route != "" {
