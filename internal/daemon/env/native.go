@@ -11,6 +11,7 @@ import (
 )
 
 // nativeUp starts a native environment by spawning bare processes.
+// On partial failure, all already-started processes are killed before returning.
 func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvResponse, error) {
 	if req.Workspace == nil {
 		return nil, fmt.Errorf("native provider requires a workspace")
@@ -23,14 +24,26 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	}
 
 	runningEnv := &RunningEnv{
-		Provider:  "native",
-		Worktree:  worktree,
-		Ports:     make(map[string]int),
-		Processes: make(map[string]*exec.Cmd),
-		Cancels:   make(map[string]context.CancelFunc),
+		Provider:        "native",
+		Worktree:        worktree,
+		Ports:           make(map[string]int),
+		Processes:       make(map[string]*exec.Cmd),
+		Cancels:         make(map[string]context.CancelFunc),
+		ServiceCommands: make(map[string]string),
 	}
 	m.envs[worktree] = runningEnv
 	m.mu.Unlock()
+
+	// cleanupStarted kills all already-started native processes.
+	// Called on partial failure before returning an error.
+	cleanupStarted := func() {
+		for name, cancel := range runningEnv.Cancels {
+			cancel()
+			if cmd, ok := runningEnv.Processes[name]; ok {
+				_ = cmd.Wait()
+			}
+		}
+	}
 
 	resp := &coreenv.EnvResponse{
 		Status:  "running",
@@ -56,9 +69,11 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 			// Allocate ephemeral port
 			port, err := m.Ports.Allocate(fmt.Sprintf("%s/%s", worktree, svcName))
 			if err != nil {
+				cleanupStarted()
 				return nil, fmt.Errorf("failed to allocate port for %s: %w", svcName, err)
 			}
 			runningEnv.Ports[svcName] = port
+			runningEnv.ServiceCommands[svcName] = cmdStr
 
 			// Spawn process
 			svcCtx, cancel := context.WithCancel(context.Background())
@@ -74,6 +89,7 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 
 			if err := cmd.Start(); err != nil {
 				cancel()
+				cleanupStarted()
 				return nil, fmt.Errorf("failed to start service %s: %w", svcName, err)
 			}
 			runningEnv.Processes[svcName] = cmd
