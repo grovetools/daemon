@@ -189,6 +189,17 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 					persist, _ := volCfg["persist"].(bool)
 					containerPath, _ := volCfg["container_path"].(string)
 
+					// Clean stale lock files from persistent volumes so services can restart
+					if persist {
+						for _, lockFile := range []string{"status", "lock"} {
+							lockPath := filepath.Join(absPath, lockFile)
+							if _, err := os.Stat(lockPath); err == nil {
+								os.Remove(lockPath)
+								m.logger.WithField("service", svcName).Debugf("Removed stale lock file: %s", lockFile)
+							}
+						}
+					}
+
 					resp.Volumes = append(resp.Volumes, coreenv.VolumeState{
 						Path:          hostPath,
 						Persist:       persist,
