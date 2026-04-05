@@ -18,7 +18,8 @@ type ComposeOverride struct {
 
 // ComposeService represents a single service in the compose override.
 type ComposeService struct {
-	Ports []string `yaml:"ports"`
+	Ports   []string `yaml:"ports"`
+	Volumes []string `yaml:"volumes,omitempty"`
 }
 
 // dockerUp orchestrates docker-compose with a generated override file.
@@ -52,45 +53,123 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		baseComposeFile = customFile
 	}
 
-	// Parse services to map ports and proxy routes
-	if services, ok := req.Config["services"].(map[string]interface{}); ok {
-		for svcName, svcConfigRaw := range services {
-			svcConfig, ok := svcConfigRaw.(map[string]interface{})
-			if !ok {
-				continue
-			}
+	// Set up log directory for restore/lifecycle logs
+	logDir := filepath.Join(req.Workspace.Path, ".grove", "env", "logs")
+	_ = os.MkdirAll(logDir, 0755)
 
-			// Read container_port as float64 (JSON/YAML unmarshaling default for numbers)
-			containerPortRaw, ok := svcConfig["container_port"].(float64)
-			if !ok {
-				continue
-			}
-			containerPort := int(containerPortRaw)
+	// Parse services to map ports, proxy routes, and volumes
+	services, _ := req.Config["services"].(map[string]interface{})
+	for svcName, svcConfigRaw := range services {
+		svcConfig, ok := svcConfigRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
 
-			portEnv, _ := svcConfig["port_env"].(string)
-			route, _ := svcConfig["route"].(string)
+		// Read container_port as float64 (JSON/YAML unmarshaling default for numbers)
+		containerPortRaw, ok := svcConfig["container_port"].(float64)
+		if !ok {
+			continue
+		}
+		containerPort := int(containerPortRaw)
 
-			// Allocate ephemeral host port
-			hostPort, err := m.Ports.Allocate(fmt.Sprintf("%s/docker-%s", worktree, svcName))
-			if err != nil {
-				return nil, fmt.Errorf("failed to allocate port for %s: %w", svcName, err)
-			}
-			runningEnv.Ports[svcName] = hostPort
+		portEnv, _ := svcConfig["port_env"].(string)
+		route, _ := svcConfig["route"].(string)
 
-			// Add to override struct
-			override.Services[svcName] = ComposeService{
-				Ports: []string{fmt.Sprintf("127.0.0.1:%d:%d", hostPort, containerPort)},
-			}
+		// Allocate ephemeral host port
+		hostPort, err := m.Ports.Allocate(fmt.Sprintf("%s/docker-%s", worktree, svcName))
+		if err != nil {
+			return nil, fmt.Errorf("failed to allocate port for %s: %w", svcName, err)
+		}
+		runningEnv.Ports[svcName] = hostPort
 
-			if portEnv != "" {
-				resp.EnvVars[portEnv] = fmt.Sprintf("%d", hostPort)
-			}
+		svc := ComposeService{
+			Ports: []string{fmt.Sprintf("127.0.0.1:%d:%d", hostPort, containerPort)},
+		}
 
-			if route != "" {
-				m.Proxy.Register(worktree, route, hostPort)
-				resp.Endpoints = append(resp.Endpoints, fmt.Sprintf("http://%s.%s.grove.local:8443", route, worktree))
+		if portEnv != "" {
+			resp.EnvVars[portEnv] = fmt.Sprintf("%d", hostPort)
+		}
+
+		if route != "" {
+			m.Proxy.Register(worktree, route, hostPort)
+			resp.Endpoints = append(resp.Endpoints, fmt.Sprintf("http://%s.%s.grove.local:8443", route, worktree))
+		}
+
+		// Parse volumes: create host dirs, add bindings, run pre-start restore
+		if volumes, ok := svcConfig["volumes"].(map[string]interface{}); ok {
+			for volName, volCfgRaw := range volumes {
+				volCfg, ok := volCfgRaw.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				hostPath, _ := volCfg["host_path"].(string)
+				if hostPath == "" {
+					continue
+				}
+
+				absPath := hostPath
+				if !filepath.IsAbs(hostPath) {
+					absPath = filepath.Join(req.Workspace.Path, hostPath)
+				}
+				if err := os.MkdirAll(absPath, 0755); err != nil {
+					m.logger.WithError(err).Warnf("Failed to create volume directory %s for service %s", absPath, svcName)
+					continue
+				}
+
+				persist, _ := volCfg["persist"].(bool)
+				containerPath, _ := volCfg["container_path"].(string)
+
+				resp.Volumes = append(resp.Volumes, coreenv.VolumeState{
+					Path:          hostPath,
+					Persist:       persist,
+					ContainerPath: containerPath,
+				})
+
+				// Add volume binding to compose override if container_path is set
+				if containerPath != "" {
+					svc.Volumes = append(svc.Volumes, fmt.Sprintf("%s:%s", absPath, containerPath))
+				}
+
+				// Pre-start restore: run restore.command on host if volume dir is empty
+				if restoreCfg, ok := volCfg["restore"].(map[string]interface{}); ok {
+					restoreCmd, _ := restoreCfg["command"].(string)
+					if restoreCmd != "" {
+						empty, _ := isDirEmpty(absPath)
+						if empty {
+							m.logger.WithField("service", svcName).
+								WithField("volume", volName).
+								Info("Running volume restore command")
+
+							restoreEnv := append(os.Environ(), fmt.Sprintf("GROVE_VOLUME_HOST_PATH=%s", absPath))
+							for k, v := range resp.EnvVars {
+								restoreEnv = append(restoreEnv, fmt.Sprintf("%s=%s", k, v))
+							}
+
+							rc := exec.Command("sh", "-c", restoreCmd)
+							rc.Dir = req.Workspace.Path
+							rc.Env = restoreEnv
+
+							restoreLogPath := filepath.Join(logDir, svcName+"-restore.log")
+							if rlf, err := os.OpenFile(restoreLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+								rc.Stdout = rlf
+								rc.Stderr = rlf
+								defer rlf.Close()
+							}
+
+							if err := rc.Run(); err != nil {
+								return nil, fmt.Errorf("volume restore failed for service %s volume %s: %w", svcName, volName, err)
+							}
+
+							m.logger.WithField("service", svcName).
+								WithField("volume", volName).
+								Info("Volume restore completed")
+						}
+					}
+				}
 			}
 		}
+
+		override.Services[svcName] = svc
 	}
 
 	// Write override YAML to plan directory to avoid dirtying the git working tree
@@ -111,6 +190,83 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	cmd.Dir = req.Workspace.Path
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("docker compose up failed: %w\nOutput: %s", err, string(output))
+	}
+
+	// Post-start lifecycle hooks: run on host after compose up
+	for svcName, svcConfigRaw := range services {
+		svcConfig, ok := svcConfigRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		lifecycle, ok := svcConfig["lifecycle"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		postStart, _ := lifecycle["post_start"].(string)
+		if postStart == "" {
+			continue
+		}
+
+		mode, _ := lifecycle["post_start_mode"].(string)
+		if mode == "" {
+			mode = "always"
+		}
+
+		shouldRun := true
+		var markerPath string
+
+		if mode == "once" {
+			if volumes, ok := svcConfig["volumes"].(map[string]interface{}); ok {
+				for _, volCfgRaw := range volumes {
+					if volCfg, ok := volCfgRaw.(map[string]interface{}); ok {
+						if hp, _ := volCfg["host_path"].(string); hp != "" {
+							if filepath.IsAbs(hp) {
+								markerPath = filepath.Join(hp, ".grove_init")
+							} else {
+								markerPath = filepath.Join(req.Workspace.Path, hp, ".grove_init")
+							}
+							break
+						}
+					}
+				}
+			}
+			if markerPath != "" {
+				if _, err := os.Stat(markerPath); err == nil {
+					shouldRun = false
+					m.logger.WithField("service", svcName).Info("Skipping post_start (once mode, already initialized)")
+				}
+			}
+		}
+
+		if shouldRun {
+			m.logger.WithField("service", svcName).
+				WithField("mode", mode).
+				Info("Running post-start lifecycle hook")
+
+			lcCmd := exec.Command("sh", "-c", postStart)
+			lcCmd.Dir = req.Workspace.Path
+			lcCmd.Env = os.Environ()
+			for k, v := range resp.EnvVars {
+				lcCmd.Env = append(lcCmd.Env, fmt.Sprintf("%s=%s", k, v))
+			}
+
+			lcLogPath := filepath.Join(logDir, svcName+"-lifecycle.log")
+			if llf, err := os.OpenFile(lcLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+				lcCmd.Stdout = llf
+				lcCmd.Stderr = llf
+				defer llf.Close()
+			}
+
+			if err := lcCmd.Run(); err != nil {
+				m.logger.WithError(err).Warnf("Post-start lifecycle hook failed for service %s", svcName)
+			} else {
+				m.logger.WithField("service", svcName).Info("Post-start lifecycle hook completed")
+				if mode == "once" && markerPath != "" {
+					os.WriteFile(markerPath, []byte("initialized\n"), 0644)
+				}
+			}
+		}
 	}
 
 	return resp, nil

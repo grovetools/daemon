@@ -14,11 +14,21 @@ import (
 
 // groveContext is the set of standard variables injected into Terraform as auto.tfvars.json.
 type groveContext struct {
-	GroveEcosystem string `json:"grove_ecosystem"`
-	GroveProject   string `json:"grove_project"`
-	GroveWorktree  string `json:"grove_worktree"`
-	GroveBranch    string `json:"grove_branch,omitempty"`
-	GrovePlanDir   string `json:"grove_plan_dir"`
+	GroveEcosystem string                       `json:"grove_ecosystem"`
+	GroveProject   string                       `json:"grove_project"`
+	GroveWorktree  string                       `json:"grove_worktree"`
+	GroveBranch    string                       `json:"grove_branch,omitempty"`
+	GrovePlanDir   string                       `json:"grove_plan_dir"`
+	GroveVolumes   map[string]groveVolumeConfig `json:"grove_volumes,omitempty"`
+}
+
+// groveVolumeConfig represents a volume's configuration passed to Terraform modules.
+type groveVolumeConfig struct {
+	Service      string `json:"service"`
+	HostPath     string `json:"host_path"`
+	Persist      bool   `json:"persist,omitempty"`
+	SnapshotURL  string `json:"snapshot_url,omitempty"`
+	RestoreCmd   string `json:"restore_command,omitempty"`
 }
 
 // terraformUp provisions infrastructure via Terraform and optionally starts tunnels.
@@ -64,6 +74,45 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	// Extract branch from config if provided
 	if branch, ok := req.Config["branch"].(string); ok {
 		gctx.GroveBranch = branch
+	}
+
+	// Collect volume configs from services and pass through to Terraform
+	if services, ok := req.Config["services"].(map[string]interface{}); ok {
+		for svcName, svcConfigRaw := range services {
+			svcConfig, ok := svcConfigRaw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			volumes, ok := svcConfig["volumes"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			for volName, volCfgRaw := range volumes {
+				volCfg, ok := volCfgRaw.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				hostPath, _ := volCfg["host_path"].(string)
+				persist, _ := volCfg["persist"].(bool)
+
+				vc := groveVolumeConfig{
+					Service:  svcName,
+					HostPath: hostPath,
+					Persist:  persist,
+				}
+
+				// Pass restore config if present
+				if restoreCfg, ok := volCfg["restore"].(map[string]interface{}); ok {
+					vc.RestoreCmd, _ = restoreCfg["command"].(string)
+					vc.SnapshotURL, _ = restoreCfg["snapshot_url"].(string)
+				}
+
+				if gctx.GroveVolumes == nil {
+					gctx.GroveVolumes = make(map[string]groveVolumeConfig)
+				}
+				gctx.GroveVolumes[svcName+"/"+volName] = vc
+			}
+		}
 	}
 
 	varsPath := filepath.Join(req.PlanDir, "grove_context.auto.tfvars.json")
