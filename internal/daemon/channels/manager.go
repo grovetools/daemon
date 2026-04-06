@@ -275,7 +275,8 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 	}
 
 	if m.SendInput != nil {
-		if err := m.SendInput(context.Background(), session.TmuxTarget, text); err != nil {
+		taggedText := fmt.Sprintf("[via Signal from %s] %s", msg.Source, text)
+		if err := m.SendInput(context.Background(), session.TmuxTarget, taggedText); err != nil {
 			m.logger.WithError(err).WithField("job_id", targetJobID).Error("Failed to route message to agent")
 		}
 	}

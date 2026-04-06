@@ -32,7 +32,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
 	"github.com/grovetools/daemon/internal/daemon/server"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	grovetmux "github.com/grovetools/core/pkg/tmux"
+	"github.com/grovetools/agentlogs/pkg/agentstream"
 	notifyconfig "github.com/grovetools/notify/pkg/config"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
@@ -276,17 +276,9 @@ func newGrovedStartCmd() *cobra.Command {
 			srv.SetLogStreamer(streamer)
 
 			// sendInputToTmux sends a message to an agent running in a tmux pane.
-			// Used by both the channel manager and autonomous pinger.
+			// Uses agentstream.SendInput which handles Escape+i for vim-style agents.
 			sendInputToTmux := func(ctx context.Context, tmuxTarget, message string) error {
-				tmuxClient, err := grovetmux.NewClient()
-				if err != nil {
-					return fmt.Errorf("tmux not available: %w", err)
-				}
-				// Send the message followed by Enter
-				if err := tmuxClient.SendKeys(ctx, tmuxTarget, message, "C-m"); err != nil {
-					return fmt.Errorf("failed to send keys to %s: %w", tmuxTarget, err)
-				}
-				return nil
+				return agentstream.SendInput(ctx, tmuxTarget, message)
 			}
 
 			// Initialize channel manager if signal is configured
