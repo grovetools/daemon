@@ -42,6 +42,12 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	m.envs[worktree] = runningEnv
 	m.mu.Unlock()
 
+	// Resolve config.env (static values + cmd-based secrets)
+	baseEnv, err := ResolveConfigEnv(ctx, req.Config, req.Workspace.Path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve environment variables: %w", err)
+	}
+
 	resp := &coreenv.EnvResponse{
 		Status:  "running",
 		EnvVars: make(map[string]string),
@@ -188,6 +194,7 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 
 	cmd := exec.CommandContext(ctx, "docker", "compose", "-p", projectName, "-f", baseComposeAbs, "-f", overridePath, "up", "-d")
 	cmd.Dir = req.Workspace.Path
+	cmd.Env = baseEnv
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("docker compose up failed: %w\nOutput: %s", err, string(output))
 	}

@@ -47,6 +47,12 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	m.envs[worktree] = runningEnv
 	m.mu.Unlock()
 
+	// Resolve config.env (static values + cmd-based secrets)
+	baseEnv, err := ResolveConfigEnv(ctx, req.Config, req.Workspace.Path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve environment variables: %w", err)
+	}
+
 	// cleanupStarted kills all already-started native processes.
 	// Called on partial failure before returning an error.
 	cleanupStarted := func() {
@@ -146,7 +152,7 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 				cmd.Dir = req.Workspace.Path
 			}
 
-			cmd.Env = os.Environ()
+			cmd.Env = append([]string{}, baseEnv...)
 
 			// Inject port env var
 			if portEnv != "" {

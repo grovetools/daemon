@@ -247,7 +247,13 @@ func buildInitArgs(bc backendConfig) []string {
 	return args
 }
 
-// buildImages builds and pushes Docker images, returning a map of image_<key> -> fullURI.
+// buildImages builds container images, returning a map of image_<key> -> fullURI.
+//
+// Two modes:
+//   - cmd: User provides a custom build command. The daemon sets GROVE_IMAGE_TAG and
+//     GROVE_IMAGE_URI in the command's environment. The command is responsible for
+//     building and pushing the image.
+//   - docker (default): Uses local docker build + push with context/dockerfile/registry.
 func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[string]string, error) {
 	images, ok := req.Config["images"].(map[string]interface{})
 	if !ok || len(images) == 0 {
@@ -270,44 +276,63 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 			continue
 		}
 
-		contextPath, _ := imgCfg["context"].(string)
 		registry, _ := imgCfg["registry"].(string)
-		dockerfile, _ := imgCfg["dockerfile"].(string)
-
-		if contextPath == "" || registry == "" {
-			return nil, fmt.Errorf("image %q requires context and registry", key)
-		}
-
-		// Resolve context path relative to workspace
-		if !filepath.IsAbs(contextPath) {
-			contextPath = filepath.Join(req.Workspace.Path, contextPath)
+		if registry == "" {
+			return nil, fmt.Errorf("image %q requires registry", key)
 		}
 
 		// Generate unique tag
 		tag := fmt.Sprintf("grove-%s-%d", worktree, time.Now().Unix())
 		fullURI := registry + ":" + tag
 
-		// Build
-		buildArgs := []string{"build", "-t", fullURI}
-		if dockerfile != "" {
-			buildArgs = append(buildArgs, "-f", dockerfile)
-		}
-		buildArgs = append(buildArgs, contextPath)
-
 		logFile := filepath.Join(logsDir, "build-"+key+".log")
-		buildCmd := exec.CommandContext(ctx, "docker", buildArgs...)
-		buildOutput, err := buildCmd.CombinedOutput()
-		_ = os.WriteFile(logFile, buildOutput, 0644)
-		if err != nil {
-			return nil, fmt.Errorf("docker build failed for %q: %w\nSee log: %s", key, err, logFile)
-		}
 
-		// Push
-		pushCmd := exec.CommandContext(ctx, "docker", "push", fullURI)
-		pushOutput, err := pushCmd.CombinedOutput()
-		_ = os.WriteFile(logFile, append(buildOutput, pushOutput...), 0644)
-		if err != nil {
-			return nil, fmt.Errorf("docker push failed for %q: %w\nSee log: %s", key, err, logFile)
+		if cmdStr, ok := imgCfg["cmd"].(string); ok && cmdStr != "" {
+			// Custom build command — user handles build+push
+			buildCmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
+			buildCmd.Dir = req.Workspace.Path
+			buildCmd.Env = append(os.Environ(),
+				"GROVE_IMAGE_TAG="+tag,
+				"GROVE_IMAGE_URI="+fullURI,
+				"GROVE_IMAGE_REGISTRY="+registry,
+			)
+			output, err := buildCmd.CombinedOutput()
+			_ = os.WriteFile(logFile, output, 0644)
+			if err != nil {
+				return nil, fmt.Errorf("image build command failed for %q: %w\nSee log: %s", key, err, logFile)
+			}
+		} else {
+			// Default: docker build + push
+			contextPath, _ := imgCfg["context"].(string)
+			dockerfile, _ := imgCfg["dockerfile"].(string)
+
+			if contextPath == "" {
+				return nil, fmt.Errorf("image %q requires context or cmd", key)
+			}
+
+			if !filepath.IsAbs(contextPath) {
+				contextPath = filepath.Join(req.Workspace.Path, contextPath)
+			}
+
+			buildArgs := []string{"build", "-t", fullURI}
+			if dockerfile != "" {
+				buildArgs = append(buildArgs, "-f", dockerfile)
+			}
+			buildArgs = append(buildArgs, contextPath)
+
+			buildCmd := exec.CommandContext(ctx, "docker", buildArgs...)
+			buildOutput, err := buildCmd.CombinedOutput()
+			_ = os.WriteFile(logFile, buildOutput, 0644)
+			if err != nil {
+				return nil, fmt.Errorf("docker build failed for %q: %w\nSee log: %s", key, err, logFile)
+			}
+
+			pushCmd := exec.CommandContext(ctx, "docker", "push", fullURI)
+			pushOutput, err := pushCmd.CombinedOutput()
+			_ = os.WriteFile(logFile, append(buildOutput, pushOutput...), 0644)
+			if err != nil {
+				return nil, fmt.Errorf("docker push failed for %q: %w\nSee log: %s", key, err, logFile)
+			}
 		}
 
 		result["image_"+key] = fullURI
@@ -408,6 +433,13 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	m.envs[worktree] = runningEnv
 	m.mu.Unlock()
 
+	// Resolve config.env (static values + cmd-based secrets)
+	resolvedEnv, err := ResolveConfigEnv(ctx, req.Config, req.Workspace.Path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve environment variables: %w", err)
+	}
+	m.logger.WithField("count", len(resolvedEnv)-len(os.Environ())).Info("Resolved config environment variables")
+
 	// Resolve the TF module path (relative to workspace root)
 	modulePath, _ := req.Config["path"].(string)
 	if modulePath == "" {
@@ -415,6 +447,9 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	}
 	moduleAbs := filepath.Join(req.Workspace.Path, modulePath)
 	stateDir := req.EffectiveStateDir()
+
+	// Helper to build env for terraform commands
+	tfEnv := append(resolvedEnv, "TF_DATA_DIR="+filepath.Join(stateDir, ".terraform"))
 
 	// Phase 3: Build images before Terraform
 	imageVars, err := m.buildImages(ctx, req)
@@ -464,7 +499,7 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	initArgs := buildInitArgs(bc)
 	initCmd := exec.CommandContext(ctx, "terraform", initArgs...)
 	initCmd.Dir = moduleAbs
-	initCmd.Env = append(os.Environ(), "TF_DATA_DIR="+filepath.Join(stateDir, ".terraform"))
+	initCmd.Env = tfEnv
 	if output, err := initCmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("terraform init failed: %w\nOutput: %s", err, string(output))
 	}
@@ -477,7 +512,7 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	applyArgs = append(applyArgs, varFileArgs...)
 	applyCmd := exec.CommandContext(ctx, "terraform", applyArgs...)
 	applyCmd.Dir = moduleAbs
-	applyCmd.Env = append(os.Environ(), "TF_DATA_DIR="+filepath.Join(stateDir, ".terraform"))
+	applyCmd.Env = tfEnv
 	if output, err := applyCmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("terraform apply failed: %w\nOutput: %s", err, string(output))
 	}
@@ -494,7 +529,7 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	}
 	outputCmd := exec.CommandContext(ctx, "terraform", outputArgs...)
 	outputCmd.Dir = moduleAbs
-	outputCmd.Env = append(os.Environ(), "TF_DATA_DIR="+filepath.Join(stateDir, ".terraform"))
+	outputCmd.Env = tfEnv
 	outputBytes, err := outputCmd.Output()
 	if err == nil && len(outputBytes) > 0 {
 		var outputs map[string]tfOutput
@@ -556,6 +591,13 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 	m.Tunnels.StopAll(worktree)
 	m.Ports.ReleaseAll(worktree)
 
+	// Resolve config.env for destroy (providers may need credentials)
+	resolvedEnv, err := ResolveConfigEnv(ctx, req.Config, req.Workspace.Path)
+	if err != nil {
+		m.logger.WithError(err).Warn("failed to resolve config env for destroy, proceeding with system env")
+		resolvedEnv = os.Environ()
+	}
+
 	// Resolve module path
 	modulePath, _ := req.Config["path"].(string)
 	if modulePath == "" {
@@ -563,6 +605,9 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 	}
 	moduleAbs := filepath.Join(req.Workspace.Path, modulePath)
 	stateDir := req.EffectiveStateDir()
+
+	// Helper to build env for terraform commands
+	tfEnvDown := append(resolvedEnv, "TF_DATA_DIR="+filepath.Join(stateDir, ".terraform"))
 
 	// Phase 2: Resolve backend
 	bc := resolveBackend(req)
@@ -606,7 +651,7 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 		initArgs := buildInitArgs(bc)
 		initCmd := exec.CommandContext(ctx, "terraform", initArgs...)
 		initCmd.Dir = moduleAbs
-		initCmd.Env = append(os.Environ(), "TF_DATA_DIR="+filepath.Join(stateDir, ".terraform"))
+		initCmd.Env = tfEnvDown
 		if output, err := initCmd.CombinedOutput(); err != nil {
 			m.logger.WithError(err).Warnf("terraform init for destroy failed: %s", string(output))
 		}
@@ -626,7 +671,7 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 
 		cmd := exec.CommandContext(ctx, "terraform", destroyArgs...)
 		cmd.Dir = moduleAbs
-		cmd.Env = append(os.Environ(), "TF_DATA_DIR="+filepath.Join(stateDir, ".terraform"))
+		cmd.Env = tfEnvDown
 		if output, err := cmd.CombinedOutput(); err != nil {
 			m.logger.WithError(err).Warnf("terraform destroy failed: %s", string(output))
 		}
