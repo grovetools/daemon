@@ -51,6 +51,13 @@ const (
 	// Delta update for workspace enrichment fields (git, plan, note).
 	// Payload is []*models.WorkspaceDelta — only changed fields on changed workspaces.
 	UpdateWorkspacesDelta UpdateType = "workspaces_delta"
+
+	// Channel & Autonomous update types.
+	UpdateSessionChannels   UpdateType = "session_channels"   // Update channels for a session
+	UpdateSessionAutonomous UpdateType = "session_autonomous" // Update autonomous config for a session
+	UpdateSessionPing       UpdateType = "session_ping"       // Record idle ping timestamp
+	UpdateSessionTmuxTarget UpdateType = "session_tmux_target" // Update tmux target after detach/attach
+	UpdateSessionLastSender UpdateType = "session_last_sender" // Track last Signal sender for routing
 )
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation
@@ -69,6 +76,40 @@ type SessionIntentPayload struct {
 	PlanName    string `json:"plan_name"`
 	Title       string `json:"title"`
 	WorkDir     string `json:"work_dir"`
+
+	// Channel & Autonomous support
+	Channels   []string                 `json:"channels,omitempty"`
+	Autonomous *models.AutonomousConfig `json:"autonomous,omitempty"`
+	TmuxTarget string                   `json:"tmux_target,omitempty"`
+}
+
+// SessionChannelsPayload contains data for updating session channels.
+type SessionChannelsPayload struct {
+	JobID    string   `json:"job_id"`
+	Channels []string `json:"channels"`
+}
+
+// SessionAutonomousPayload contains data for updating session autonomous config.
+type SessionAutonomousPayload struct {
+	JobID      string                   `json:"job_id"`
+	Autonomous *models.AutonomousConfig `json:"autonomous"`
+}
+
+// SessionPingPayload records an idle ping timestamp.
+type SessionPingPayload struct {
+	JobID string `json:"job_id"`
+}
+
+// SessionTmuxTargetPayload contains data for updating a session's tmux target.
+type SessionTmuxTargetPayload struct {
+	JobID      string `json:"job_id"`
+	TmuxTarget string `json:"tmux_target"`
+}
+
+// SessionLastSenderPayload tracks the last Signal sender for a session.
+type SessionLastSenderPayload struct {
+	JobID      string `json:"job_id"`
+	LastSender string `json:"last_sender"`
 }
 
 // SessionConfirmationPayload contains data for confirming a session after agent startup.

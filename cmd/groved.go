@@ -27,9 +27,13 @@ import (
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
+	"github.com/grovetools/daemon/internal/daemon/autonomous"
+	daemonchannels "github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
 	"github.com/grovetools/daemon/internal/daemon/server"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	grovetmux "github.com/grovetools/core/pkg/tmux"
+	notifyconfig "github.com/grovetools/notify/pkg/config"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/grove-gemini/pkg/gemini"
@@ -270,6 +274,40 @@ func newGrovedStartCmd() *cobra.Command {
 				srv.SetJobRunner(jr)
 			}
 			srv.SetLogStreamer(streamer)
+
+			// sendInputToTmux sends a message to an agent running in a tmux pane.
+			// Used by both the channel manager and autonomous pinger.
+			sendInputToTmux := func(ctx context.Context, tmuxTarget, message string) error {
+				tmuxClient, err := grovetmux.NewClient()
+				if err != nil {
+					return fmt.Errorf("tmux not available: %w", err)
+				}
+				// Send the message followed by Enter
+				if err := tmuxClient.SendKeys(ctx, tmuxTarget, message, "C-m"); err != nil {
+					return fmt.Errorf("failed to send keys to %s: %w", tmuxTarget, err)
+				}
+				return nil
+			}
+
+			// Initialize channel manager if signal is configured
+			notifyCfg := notifyconfig.Load()
+			if notifyCfg.Signal.Enabled {
+				chMgr := daemonchannels.NewManager(st, daemonchannels.SignalConfig{
+					Enabled:   notifyCfg.Signal.Enabled,
+					CLIPath:   notifyCfg.Signal.CLIPath,
+					Account:   notifyCfg.Signal.Account,
+					Allowlist: notifyCfg.Signal.Allowlist,
+				})
+				chMgr.SendInput = sendInputToTmux
+				chMgr.Start(ctx)
+				srv.SetChannelManager(chMgr)
+				logger.Info("Channel manager initialized (signal enabled)")
+			}
+
+			// Register autonomous pinger as a collector
+			pinger := autonomous.NewPinger(st, "")
+			pinger.SendInput = sendInputToTmux
+			eng.Register(pinger)
 
 			// Set running config for introspection
 			srv.SetRunningConfig(&server.RunningConfig{

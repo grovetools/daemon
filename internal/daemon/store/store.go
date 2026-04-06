@@ -213,6 +213,39 @@ func (s *Store) ApplyUpdate(u Update) {
 				s.state.Jobs[job.ID] = job
 			}
 		}
+
+	// Channel & Autonomous updates
+	case UpdateSessionChannels:
+		if payload, ok := u.Payload.(*SessionChannelsPayload); ok {
+			if session, exists := s.state.Sessions[payload.JobID]; exists {
+				session.Channels = payload.Channels
+			}
+		}
+	case UpdateSessionAutonomous:
+		if payload, ok := u.Payload.(*SessionAutonomousPayload); ok {
+			if session, exists := s.state.Sessions[payload.JobID]; exists {
+				session.Autonomous = payload.Autonomous
+			}
+		}
+	case UpdateSessionPing:
+		if payload, ok := u.Payload.(*SessionPingPayload); ok {
+			if session, exists := s.state.Sessions[payload.JobID]; exists {
+				now := time.Now()
+				session.LastIdlePingAt = &now
+			}
+		}
+	case UpdateSessionTmuxTarget:
+		if payload, ok := u.Payload.(*SessionTmuxTargetPayload); ok {
+			if session, exists := s.state.Sessions[payload.JobID]; exists {
+				session.TmuxTarget = payload.TmuxTarget
+			}
+		}
+	case UpdateSessionLastSender:
+		if payload, ok := u.Payload.(*SessionLastSenderPayload); ok {
+			if session, exists := s.state.Sessions[payload.JobID]; exists {
+				session.LastSender = payload.LastSender
+			}
+		}
 	}
 
 	// Broadcast to subscribers
@@ -239,6 +272,9 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload) {
 		PlanName:         payload.PlanName,
 		JobTitle:         payload.Title,
 		JobFilePath:      payload.JobFilePath,
+		Channels:         payload.Channels,
+		Autonomous:       payload.Autonomous,
+		TmuxTarget:       payload.TmuxTarget,
 	}
 	s.state.Sessions[payload.JobID] = session
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
@@ -47,7 +48,8 @@ type Server struct {
 	runningConfig *RunningConfig
 	jobRunner     *jobrunner.JobRunner
 	logStreamer   *logstreamer.LogStreamer
-	envManager    *daemonenv.Manager
+	envManager     *daemonenv.Manager
+	channelManager *channels.Manager
 }
 
 // New creates a new Server instance.
@@ -80,6 +82,11 @@ func (s *Server) SetLogStreamer(ls *logstreamer.LogStreamer) {
 // SetEnvManager sets the environment manager for the server.
 func (s *Server) SetEnvManager(m *daemonenv.Manager) {
 	s.envManager = m
+}
+
+// SetChannelManager sets the channel manager for the server.
+func (s *Server) SetChannelManager(m *channels.Manager) {
+	s.channelManager = m
 }
 
 // ListenAndServe starts the daemon on the given unix socket path.
@@ -137,6 +144,9 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	// Job management endpoints
 	mux.HandleFunc("/api/jobs/", s.handleJobByID)
 	mux.HandleFunc("/api/jobs", s.handleJobs)
+	// Channel management endpoints
+	mux.HandleFunc("/api/channels/send", s.handleChannelSend)
+	mux.HandleFunc("/api/channels/status", s.handleChannelStatus)
 
 	s.server = &http.Server{
 		Handler: h2c.NewHandler(mux, &http2.Server{}),
@@ -220,6 +230,37 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 
 	switch action {
 	case "":
+		if r.Method == http.MethodPatch {
+			// PATCH /api/sessions/{id} — partial update (tmux_target, last_sender)
+			var req models.SessionPatchRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "invalid request body", http.StatusBadRequest)
+				return
+			}
+			if req.TmuxTarget != "" {
+				s.engine.Store().ApplyUpdate(store.Update{
+					Type:   store.UpdateSessionTmuxTarget,
+					Source: "api",
+					Payload: &store.SessionTmuxTargetPayload{
+						JobID:      sessionID,
+						TmuxTarget: req.TmuxTarget,
+					},
+				})
+			}
+			if req.LastSender != "" {
+				s.engine.Store().ApplyUpdate(store.Update{
+					Type:   store.UpdateSessionLastSender,
+					Source: "api",
+					Payload: &store.SessionLastSenderPayload{
+						JobID:      sessionID,
+						LastSender: req.LastSender,
+					},
+				})
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+			return
+		}
 		// GET /api/sessions/{id} - get single session
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -294,6 +335,64 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ended"})
 
+	case "channels":
+		// POST /api/sessions/{id}/channels — enable/disable channels
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req models.SessionChannelsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		s.engine.Store().ApplyUpdate(store.Update{
+			Type:   store.UpdateSessionChannels,
+			Source: "api",
+			Payload: &store.SessionChannelsPayload{
+				JobID:    sessionID,
+				Channels: req.Channels,
+			},
+		})
+		// If channel manager is set, enable/disable channels
+		if s.channelManager != nil {
+			if len(req.Channels) > 0 {
+				if err := s.channelManager.EnableChannel(r.Context(), sessionID); err != nil {
+					s.logger.WithError(err).Error("Failed to enable channel")
+				}
+			} else {
+				s.channelManager.DisableChannel(r.Context(), sessionID)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+
+	case "autonomous":
+		// POST /api/sessions/{id}/autonomous — enable/disable autonomous pinger
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req models.SessionAutonomousRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		s.engine.Store().ApplyUpdate(store.Update{
+			Type:   store.UpdateSessionAutonomous,
+			Source: "api",
+			Payload: &store.SessionAutonomousPayload{
+				JobID: sessionID,
+				Autonomous: &models.AutonomousConfig{
+					Enabled:     req.Enabled,
+					IdleMinutes: req.IdleMinutes,
+					Prompt:      req.Prompt,
+				},
+			},
+		})
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+
 	default:
 		http.Error(w, "unknown action", http.StatusNotFound)
 	}
@@ -322,6 +421,15 @@ func (s *Server) handleSessionIntent(w http.ResponseWriter, r *http.Request) {
 		Source:  "api",
 		Payload: &intent,
 	})
+
+	// If the intent includes channels, enable them in the channel manager
+	if s.channelManager != nil && len(intent.Channels) > 0 {
+		for range intent.Channels {
+			if err := s.channelManager.EnableChannel(r.Context(), intent.JobID); err != nil {
+				s.logger.WithError(err).WithField("job_id", intent.JobID).Warn("Failed to enable channel from intent")
+			}
+		}
+	}
 
 	s.logger.WithField("job_id", intent.JobID).Debug("Session intent registered")
 	w.WriteHeader(http.StatusCreated)
@@ -1009,4 +1117,49 @@ func (s *Server) handleEnvDown(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// --- Channel Management Handlers ---
+
+// handleChannelSend handles POST /api/channels/send — send a message via a channel.
+func (s *Server) handleChannelSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.channelManager == nil {
+		http.Error(w, "channel manager not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req models.ChannelSendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	sendResp, err := s.channelManager.Send(r.Context(), req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(sendResp)
+}
+
+// handleChannelStatus handles GET /api/channels/status — get channel system status.
+func (s *Server) handleChannelStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.channelManager == nil {
+		http.Error(w, "channel manager not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	status := s.channelManager.Status()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
 }
