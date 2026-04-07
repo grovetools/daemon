@@ -18,6 +18,7 @@ import (
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/pkg/paths"
+	"github.com/grovetools/core/pkg/tmux"
 	navbindings "github.com/grovetools/nav/pkg/bindings"
 	"github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/engine"
@@ -399,9 +400,125 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 
+	case "input":
+		// POST /api/sessions/{id}/input — send input text to an interactive agent
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Input string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		session := s.engine.Store().GetSession(sessionID)
+		if session == nil {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		if session.TmuxTarget == "" {
+			http.Error(w, "session has no tmux target", http.StatusBadRequest)
+			return
+		}
+
+		tmuxClient, err := tmux.NewClient()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("tmux not available: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Determine input mode from project config
+		inputMode := s.resolveInputMode(session.WorkingDirectory)
+
+		ctx := r.Context()
+		if inputMode == "vim" {
+			if err := tmuxClient.SendKeys(ctx, session.TmuxTarget, "Escape", "i", req.Input); err != nil {
+				http.Error(w, fmt.Sprintf("failed to send input: %v", err), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			if err := tmuxClient.SendKeys(ctx, session.TmuxTarget, req.Input); err != nil {
+				http.Error(w, fmt.Sprintf("failed to send input: %v", err), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// Send Enter to submit
+		if err := tmuxClient.SendKeys(ctx, session.TmuxTarget, "C-m"); err != nil {
+			http.Error(w, fmt.Sprintf("failed to send submit key: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "sent"})
+
+	case "interrupt":
+		// POST /api/sessions/{id}/interrupt — send Ctrl+C to interrupt an agent
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		session := s.engine.Store().GetSession(sessionID)
+		if session == nil {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		if session.TmuxTarget == "" {
+			http.Error(w, "session has no tmux target", http.StatusBadRequest)
+			return
+		}
+
+		tmuxClient, err := tmux.NewClient()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("tmux not available: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		if err := tmuxClient.SendKeys(r.Context(), session.TmuxTarget, "C-c"); err != nil {
+			http.Error(w, fmt.Sprintf("failed to send interrupt: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "interrupted"})
+
 	default:
 		http.Error(w, "unknown action", http.StatusNotFound)
 	}
+}
+
+// resolveInputMode reads the grove config for a workspace to determine if vim input mode is active.
+func (s *Server) resolveInputMode(workDir string) string {
+	if workDir == "" {
+		return "vim" // default
+	}
+
+	coreCfg, err := config.LoadFrom(workDir)
+	if err != nil {
+		return "vim"
+	}
+
+	var flowCfg struct {
+		InteractiveProvider string `toml:"interactive_provider" yaml:"interactive_provider"`
+		Providers           map[string]struct {
+			InputMode string `toml:"input_mode" yaml:"input_mode"`
+		} `toml:"providers" yaml:"providers"`
+	}
+	coreCfg.UnmarshalExtension("flow", &flowCfg)
+
+	providerName := "claude"
+	if flowCfg.InteractiveProvider != "" {
+		providerName = flowCfg.InteractiveProvider
+	}
+	if providerCfg, ok := flowCfg.Providers[providerName]; ok && providerCfg.InputMode != "" {
+		return providerCfg.InputMode
+	}
+
+	return "vim"
 }
 
 // handleSessionIntent handles POST /api/sessions/intent - pre-register session intent.
