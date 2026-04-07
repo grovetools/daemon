@@ -426,9 +426,12 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	}
 
 	runningEnv := &RunningEnv{
-		Provider: "terraform",
-		Worktree: worktree,
-		Ports:    make(map[string]int),
+		Provider:        "terraform",
+		Worktree:        worktree,
+		Ports:           make(map[string]int),
+		Processes:       make(map[string]*exec.Cmd),
+		Cancels:         make(map[string]context.CancelFunc),
+		ServiceCommands: make(map[string]string),
 	}
 	m.envs[worktree] = runningEnv
 	m.mu.Unlock()
@@ -538,7 +541,17 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 		}
 	}
 
-	// Start tunnels if configured
+	// Tunnel + local-services log directory (shared with native provider).
+	logDir := filepath.Join(req.Workspace.Path, ".grove", "env", "logs")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		m.logger.WithError(err).Warn("Failed to create log directory; tunnel + service output will be discarded")
+		logDir = ""
+	}
+
+	// Start tunnels BEFORE local services so the allocated tunnel ports / URLs
+	// land in resp.EnvVars and downstream local processes (e.g. a local API
+	// pointed at a tunneled cloud DB) can read CLICKHOUSE_URL et al. from their
+	// environment via cmd.Env construction in startLocalServices.
 	if tunnels, ok := req.Config["tunnels"].(map[string]interface{}); ok {
 		for tunnelName, tunnelCfgRaw := range tunnels {
 			tunnelCfg, ok := tunnelCfgRaw.(map[string]interface{})
@@ -556,7 +569,7 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 			}
 			runningEnv.Ports["tunnel-"+tunnelName] = port
 
-			if err := m.Tunnels.Start(context.Background(), worktree, tunnelName, cmdStr, port); err != nil {
+			if err := m.Tunnels.Start(context.Background(), worktree, tunnelName, cmdStr, port, req.Workspace.Path, resp.EnvVars, logDir); err != nil {
 				m.logger.WithError(err).Warnf("Failed to start tunnel %s", tunnelName)
 				continue
 			}
@@ -570,26 +583,68 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 		}
 	}
 
+	// Hybrid mode: spawn local services after the cloud env is up. cmd.Env in
+	// startLocalServices is built from resp.EnvVars (just populated by the
+	// terraform outputs and tunnels above), so a local `cargo run` sees both
+	// the tunneled CLICKHOUSE_URL and any cloud-side TF outputs.
+	if _, hasServices := req.Config["services"].(map[string]interface{}); hasServices {
+		if err := m.startLocalServices(ctx, req, runningEnv, resp, tfEnv, logDir); err != nil {
+			return nil, err
+		}
+	}
+
 	return resp, nil
 }
 
 // terraformDown destroys Terraform-managed infrastructure and cleans up.
+//
+// If req.Config["skip_destroy"] is true, the cloud-side `terraform destroy`
+// step is skipped entirely — only local processes, tunnels, and proxy routes
+// are torn down. This makes hybrid profiles (local API + tunneled cloud DB)
+// safe to bounce without nuking the per-worktree GCE instance. To actually
+// destroy the cloud resources, run `grove env down --clean` or switch to the
+// base terraform profile.
 func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvResponse, error) {
 	if req.Workspace == nil {
 		return nil, fmt.Errorf("terraform provider requires a workspace")
 	}
 	worktree := req.Workspace.Name
 
+	skipDestroy, _ := req.Config["skip_destroy"].(bool)
+	// --clean overrides skip_destroy: the user explicitly asked for a hard wipe.
+	if req.Clean {
+		skipDestroy = false
+	}
+
 	m.mu.Lock()
-	_, exists := m.envs[worktree]
+	runningEnv, exists := m.envs[worktree]
 	if exists {
 		delete(m.envs, worktree)
 	}
 	m.mu.Unlock()
 
-	// Stop tunnels first
+	// Cancel any local services spawned by terraformUp's hybrid path. The
+	// background goroutine in startLocalServices already calls Wait() for
+	// each cmd — calling it a second time here deadlocks. Just cancel and
+	// let the goroutine finish reaping. (See nativeDown for the same pattern.)
+	if exists && runningEnv != nil {
+		for name, cancel := range runningEnv.Cancels {
+			m.logger.WithField("service", name).Info("Stopping local service")
+			cancel()
+		}
+	}
+
+	// Stop tunnels and unregister proxy routes
 	m.Tunnels.StopAll(worktree)
+	m.Proxy.Unregister(worktree)
 	m.Ports.ReleaseAll(worktree)
+
+	if skipDestroy {
+		m.logger.WithField("worktree", worktree).Info(
+			"skip_destroy=true: stopped local processes/tunnels/proxy only; cloud resources left intact. " +
+				"Run `grove env down --clean` or switch to the base terraform profile to actually destroy them.")
+		return &coreenv.EnvResponse{Status: "stopped"}, nil
+	}
 
 	// Resolve config.env for destroy (providers may need credentials)
 	resolvedEnv, err := ResolveConfigEnv(ctx, req.Config, req.Workspace.Path)

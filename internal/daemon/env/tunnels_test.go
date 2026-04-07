@@ -35,7 +35,7 @@ func TestTunnelManager_StartAndStop(t *testing.T) {
 	ctx := context.Background()
 
 	// Start a simple sleep command as a tunnel
-	err := tm.Start(ctx, "demo", "db", "sleep 60", 5432)
+	err := tm.Start(ctx, "demo", "db", "sleep 60", 5432, "", nil, "")
 	if err != nil {
 		t.Fatalf("failed to start tunnel: %v", err)
 	}
@@ -69,8 +69,8 @@ func TestTunnelManager_StopAllSelectiveByWorktree(t *testing.T) {
 
 	ctx := context.Background()
 
-	tm.Start(ctx, "wt-a", "db", "sleep 60", 5432)
-	tm.Start(ctx, "wt-b", "db", "sleep 60", 5433)
+	tm.Start(ctx, "wt-a", "db", "sleep 60", 5432, "", nil, "")
+	tm.Start(ctx, "wt-b", "db", "sleep 60", 5433, "", nil, "")
 
 	tm.StopAll("wt-a")
 
@@ -96,7 +96,7 @@ func TestTunnelManager_InvalidTemplate(t *testing.T) {
 	tm := NewTunnelManager(logger.WithField("test", true))
 
 	ctx := context.Background()
-	err := tm.Start(ctx, "demo", "bad", "{{.Invalid", 5432)
+	err := tm.Start(ctx, "demo", "bad", "{{.Invalid", 5432, "", nil, "")
 	if err == nil {
 		t.Error("expected error for invalid template")
 	}
