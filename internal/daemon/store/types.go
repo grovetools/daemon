@@ -62,7 +62,18 @@ const (
 
 	// Nav bindings update — full replacement of nav binding state.
 	UpdateNavBindings UpdateType = "nav_bindings"
+
+	// Memory index mutation — broadcast after the memory watcher upserts or
+	// deletes a document. Payload is MemoryIndexPayload. The TUI uses this
+	// to render a transient [Index Syncing…] indicator.
+	UpdateMemoryIndex UpdateType = "memory_index"
 )
+
+// MemoryIndexPayload describes a single memory store mutation for SSE subscribers.
+type MemoryIndexPayload struct {
+	Op   string `json:"op"`   // "upsert" | "delete"
+	Path string `json:"path"` // File path that was indexed / removed
+}
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation
 type SkillSyncPayload struct {

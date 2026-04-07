@@ -806,6 +806,14 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
+
+	// Memory index mutation — broadcast so TUIs can show a syncing indicator.
+	case store.UpdateMemoryIndex:
+		return &apiStateUpdate{
+			UpdateType: "memory_index",
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
 	}
 	return nil
 }

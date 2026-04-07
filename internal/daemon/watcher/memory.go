@@ -334,6 +334,8 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 		if os.IsNotExist(err) {
 			if err := h.memStore.DeleteDocument(ctx, job.Path); err != nil {
 				h.log.WithError(err).WithField("path", job.Path).Debug("Failed to delete document from index (might not exist)")
+			} else {
+				h.broadcastMemoryEvent("delete", job.Path)
 			}
 			return
 		}
@@ -466,7 +468,25 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 			WithField("new_embeddings", len(textsToEmbed)).
 			WithField("reused_embeddings", len(chunks)-len(textsToEmbed)).
 			Debug("Successfully indexed document into memory")
+		h.broadcastMemoryEvent("upsert", job.Path)
 	}
+}
+
+// broadcastMemoryEvent publishes a store.UpdateMemoryIndex event so SSE
+// subscribers (the memory TUI) can render a transient syncing indicator.
+// The event is fire-and-forget; failures are logged but never block indexing.
+func (h *MemoryHandler) broadcastMemoryEvent(op, path string) {
+	if h.store == nil {
+		return
+	}
+	h.store.ApplyUpdate(store.Update{
+		Type:   store.UpdateMemoryIndex,
+		Source: "memory",
+		Payload: &store.MemoryIndexPayload{
+			Op:   op,
+			Path: path,
+		},
+	})
 }
 
 // isGeneratedGoFile checks the first few lines for a "Code generated" comment.
