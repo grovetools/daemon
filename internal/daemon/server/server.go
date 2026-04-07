@@ -154,6 +154,7 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/nav/bindings", s.handleNavBindings)
 	mux.HandleFunc("/api/nav/groups/", s.handleNavGroup)
 	mux.HandleFunc("/api/nav/locked-keys", s.handleNavLockedKeys)
+	mux.HandleFunc("/api/nav/last-accessed", s.handleNavLastAccessedGroup)
 
 	s.server = &http.Server{
 		Handler: h2c.NewHandler(mux, &http2.Server{}),
@@ -1422,6 +1423,45 @@ func (s *Server) handleNavLockedKeys(w http.ResponseWriter, r *http.Request) {
 	groupBindings := s.buildGroupBindings(file)
 	if err := navbindings.GenerateTmuxConf(groupBindings, paths.BinDir(), paths.CacheDir()); err != nil {
 		s.logger.WithError(err).Warn("Failed to regenerate tmux bindings")
+	}
+
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:    store.UpdateNavBindings,
+		Source:  "api",
+		Payload: file,
+	})
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+}
+
+// handleNavLastAccessedGroup handles PUT /api/nav/last-accessed — update the last-accessed group.
+func (s *Server) handleNavLastAccessedGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Group string `json:"group"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	sessionsPath := navbindings.DefaultPath()
+	file, err := navbindings.Load(sessionsPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to load bindings: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	file.LastAccessedGroup = req.Group
+
+	if err := navbindings.Save(sessionsPath, file); err != nil {
+		http.Error(w, fmt.Sprintf("failed to save bindings: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	s.engine.Store().ApplyUpdate(store.Update{
