@@ -424,6 +424,11 @@ func newGrovedStartCmd() *cobra.Command {
 							memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
 							unifiedWatcher.Register(memoryHandler)
 							logger.Info("Memory handler registered with unified watcher")
+
+							// Share the same store + embedder with the HTTP server so
+							// /api/memory/* handlers can serve TUI clients without
+							// opening a second SQLite connection.
+							srv.SetMemoryStore(memStore, embedder, dbPath)
 						}
 					}
 				}

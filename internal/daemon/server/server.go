@@ -27,6 +27,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/enrichment"
+	"github.com/grovetools/memory/pkg/memory"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -53,6 +54,12 @@ type Server struct {
 	logStreamer   *logstreamer.LogStreamer
 	envManager     *daemonenv.Manager
 	channelManager *channels.Manager
+
+	// Memory store + embedder are wired via SetMemoryStore so /api/memory/*
+	// handlers can serve the same instance the MemoryHandler watcher uses.
+	memStore    memory.DocumentStore
+	memEmbedder *memory.Embedder
+	memDBPath   string
 }
 
 // New creates a new Server instance.
@@ -150,6 +157,10 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	// Channel management endpoints
 	mux.HandleFunc("/api/channels/send", s.handleChannelSend)
 	mux.HandleFunc("/api/channels/status", s.handleChannelStatus)
+	// Memory search endpoints
+	mux.HandleFunc("/api/memory/search", s.handleMemorySearch)
+	mux.HandleFunc("/api/memory/coverage", s.handleMemoryCoverage)
+	mux.HandleFunc("/api/memory/status", s.handleMemoryStatus)
 	// Nav bindings endpoints
 	mux.HandleFunc("/api/nav/bindings", s.handleNavBindings)
 	mux.HandleFunc("/api/nav/config", s.handleNavConfig)
