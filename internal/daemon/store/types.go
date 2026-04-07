@@ -7,10 +7,11 @@ import (
 
 // State represents the complete world view of the daemon.
 type State struct {
-	Workspaces map[string]*models.EnrichedWorkspace `json:"workspaces"`           // Keyed by path
-	Sessions   map[string]*models.Session           `json:"sessions"`             // Keyed by ID
-	Jobs       map[string]*models.JobInfo           `json:"jobs"`                 // Keyed by job ID
-	NoteIndex  map[string]*models.NoteIndexEntry    `json:"note_index,omitempty"` // Keyed by file path
+	Workspaces  map[string]*models.EnrichedWorkspace `json:"workspaces"`              // Keyed by path
+	Sessions    map[string]*models.Session           `json:"sessions"`                // Keyed by ID
+	Jobs        map[string]*models.JobInfo           `json:"jobs"`                    // Keyed by job ID
+	NoteIndex   map[string]*models.NoteIndexEntry    `json:"note_index,omitempty"`    // Keyed by file path
+	NavBindings *models.NavSessionsFile              `json:"nav_bindings,omitempty"`  // Nav key binding state
 }
 
 // UpdateType defines what kind of data changed.
@@ -58,6 +59,9 @@ const (
 	UpdateSessionPing       UpdateType = "session_ping"       // Record idle ping timestamp
 	UpdateSessionTmuxTarget UpdateType = "session_tmux_target" // Update tmux target after detach/attach
 	UpdateSessionLastSender UpdateType = "session_last_sender" // Track last Signal sender for routing
+
+	// Nav bindings update — full replacement of nav binding state.
+	UpdateNavBindings UpdateType = "nav_bindings"
 )
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation

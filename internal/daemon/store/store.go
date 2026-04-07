@@ -109,6 +109,13 @@ func (s *Store) GetNoteIndex(workspace string) []*models.NoteIndexEntry {
 	return result
 }
 
+// GetNavBindings returns the current nav binding state, or nil if not yet loaded.
+func (s *Store) GetNavBindings() *models.NavSessionsFile {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.NavBindings
+}
+
 // ApplyUpdate modifies the state and notifies subscribers.
 func (s *Store) ApplyUpdate(u Update) {
 	s.mu.Lock()
@@ -245,6 +252,11 @@ func (s *Store) ApplyUpdate(u Update) {
 			if session, exists := s.state.Sessions[payload.JobID]; exists {
 				session.LastSender = payload.LastSender
 			}
+		}
+
+	case UpdateNavBindings:
+		if bindings, ok := u.Payload.(*models.NavSessionsFile); ok {
+			s.state.NavBindings = bindings
 		}
 	}
 

@@ -17,6 +17,8 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/pkg/paths"
+	navbindings "github.com/grovetools/nav/pkg/bindings"
 	"github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
@@ -147,6 +149,10 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	// Channel management endpoints
 	mux.HandleFunc("/api/channels/send", s.handleChannelSend)
 	mux.HandleFunc("/api/channels/status", s.handleChannelStatus)
+	// Nav bindings endpoints
+	mux.HandleFunc("/api/nav/bindings", s.handleNavBindings)
+	mux.HandleFunc("/api/nav/groups/", s.handleNavGroup)
+	mux.HandleFunc("/api/nav/locked-keys", s.handleNavLockedKeys)
 
 	s.server = &http.Server{
 		Handler: h2c.NewHandler(mux, &http2.Server{}),
@@ -662,6 +668,14 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
+
+	// Nav bindings update
+	case store.UpdateNavBindings:
+		return &apiStateUpdate{
+			UpdateType: "nav_bindings",
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
 	}
 	return nil
 }
@@ -1162,4 +1176,207 @@ func (s *Server) handleChannelStatus(w http.ResponseWriter, r *http.Request) {
 	status := s.channelManager.Status()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
+}
+
+// handleNavBindings handles GET /api/nav/bindings — return current nav binding state.
+func (s *Server) handleNavBindings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	bindings := s.engine.Store().GetNavBindings()
+	if bindings == nil {
+		// Load from disk if not yet in store
+		var err error
+		bindings, err = navbindings.Load(navbindings.DefaultPath())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to load nav bindings: %v", err), http.StatusInternalServerError)
+			return
+		}
+		// Cache in store
+		s.engine.Store().ApplyUpdate(store.Update{
+			Type:    store.UpdateNavBindings,
+			Source:  "api",
+			Payload: bindings,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(bindings)
+}
+
+// handleNavGroup handles PUT /api/nav/groups/{group} — update a single group's sessions.
+func (s *Server) handleNavGroup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract group name from path
+	group := strings.TrimPrefix(r.URL.Path, "/api/nav/groups/")
+	if group == "" {
+		http.Error(w, "group name required", http.StatusBadRequest)
+		return
+	}
+
+	var state models.NavGroupState
+	if err := json.NewDecoder(r.Body).Decode(&state); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Load current state
+	sessionsPath := navbindings.DefaultPath()
+	file, err := navbindings.Load(sessionsPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to load bindings: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Apply update
+	if group == "default" || group == "" {
+		file.Sessions = state.Sessions
+	} else {
+		if file.Groups == nil {
+			file.Groups = make(map[string]models.NavGroupState)
+		}
+		file.Groups[group] = state
+	}
+
+	// Validate (load group configs from nav config for prefix conflict detection)
+	groupConfigs := s.loadNavGroupConfigs()
+	if err := navbindings.Validate(file, groupConfigs); err != nil {
+		http.Error(w, fmt.Sprintf("validation failed: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Persist to disk
+	if err := navbindings.Save(sessionsPath, file); err != nil {
+		http.Error(w, fmt.Sprintf("failed to save bindings: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Regenerate tmux config
+	groupBindings := s.buildGroupBindings(file)
+	if err := navbindings.GenerateTmuxConf(groupBindings, paths.BinDir(), paths.CacheDir()); err != nil {
+		s.logger.WithError(err).Warn("Failed to regenerate tmux bindings")
+	}
+
+	// Update store and broadcast SSE
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:    store.UpdateNavBindings,
+		Source:  "api",
+		Payload: file,
+	})
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+}
+
+// handleNavLockedKeys handles PUT /api/nav/locked-keys — update global locked keys.
+func (s *Server) handleNavLockedKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var keys []string
+	if err := json.NewDecoder(r.Body).Decode(&keys); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	sessionsPath := navbindings.DefaultPath()
+	file, err := navbindings.Load(sessionsPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to load bindings: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	file.LockedKeys = keys
+
+	if err := navbindings.Save(sessionsPath, file); err != nil {
+		http.Error(w, fmt.Sprintf("failed to save bindings: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Regenerate tmux config
+	groupBindings := s.buildGroupBindings(file)
+	if err := navbindings.GenerateTmuxConf(groupBindings, paths.BinDir(), paths.CacheDir()); err != nil {
+		s.logger.WithError(err).Warn("Failed to regenerate tmux bindings")
+	}
+
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:    store.UpdateNavBindings,
+		Source:  "api",
+		Payload: file,
+	})
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+}
+
+// loadNavGroupConfigs reads the grove config to get group prefix configurations for validation.
+func (s *Server) loadNavGroupConfigs() map[string]navbindings.GroupConfig {
+	result := make(map[string]navbindings.GroupConfig)
+
+	cfg, err := config.LoadDefault()
+	if err != nil {
+		return result
+	}
+
+	// Extract nav config from the grove config
+	var navCfg struct {
+		Prefix string `toml:"prefix" yaml:"prefix"`
+		Groups map[string]struct {
+			Prefix string `toml:"prefix" yaml:"prefix"`
+		} `toml:"groups" yaml:"groups"`
+	}
+	cfg.UnmarshalExtension("nav", &navCfg)
+
+	if navCfg.Prefix != "" {
+		result["default"] = navbindings.GroupConfig{Prefix: navCfg.Prefix}
+	} else {
+		result["default"] = navbindings.GroupConfig{Prefix: "<prefix>"}
+	}
+
+	for name, g := range navCfg.Groups {
+		result[name] = navbindings.GroupConfig{Prefix: g.Prefix}
+	}
+
+	return result
+}
+
+// buildGroupBindings constructs GroupBinding slice from a NavSessionsFile and the grove config.
+func (s *Server) buildGroupBindings(file *models.NavSessionsFile) []navbindings.GroupBinding {
+	groupConfigs := s.loadNavGroupConfigs()
+
+	var bindings []navbindings.GroupBinding
+
+	// Default group
+	defaultPrefix := "<prefix>"
+	if cfg, ok := groupConfigs["default"]; ok {
+		defaultPrefix = cfg.Prefix
+	}
+	bindings = append(bindings, navbindings.GroupBinding{
+		Name:     "default",
+		Prefix:   defaultPrefix,
+		Sessions: file.Sessions,
+	})
+
+	// Named groups
+	for name, gs := range file.Groups {
+		prefix := ""
+		if cfg, ok := groupConfigs[name]; ok {
+			prefix = cfg.Prefix
+		}
+		bindings = append(bindings, navbindings.GroupBinding{
+			Name:     name,
+			Prefix:   prefix,
+			Sessions: gs.Sessions,
+		})
+	}
+
+	return bindings
 }
