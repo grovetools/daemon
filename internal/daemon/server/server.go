@@ -152,6 +152,7 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/channels/status", s.handleChannelStatus)
 	// Nav bindings endpoints
 	mux.HandleFunc("/api/nav/bindings", s.handleNavBindings)
+	mux.HandleFunc("/api/nav/config", s.handleNavConfig)
 	mux.HandleFunc("/api/nav/groups/", s.handleNavGroup)
 	mux.HandleFunc("/api/nav/locked-keys", s.handleNavLockedKeys)
 	mux.HandleFunc("/api/nav/last-accessed", s.handleNavLastAccessedGroup)
@@ -1322,6 +1323,25 @@ func (s *Server) handleNavBindings(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(bindings)
+}
+
+// handleNavConfig handles GET /api/nav/config — return the static nav configuration
+// (group prefixes) read from the grove config files. This lets non-nav clients
+// resolve group prefix transitions without re-implementing the nav config loader.
+func (s *Server) handleNavConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	groupConfigs := s.loadNavGroupConfigs()
+	cfg := models.NavConfig{Groups: make(map[string]models.NavGroupConfig, len(groupConfigs))}
+	for name, gc := range groupConfigs {
+		cfg.Groups[name] = models.NavGroupConfig{Prefix: gc.Prefix}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(cfg)
 }
 
 // handleNavGroup handles PUT /api/nav/groups/{group} — update a single group's sessions.
