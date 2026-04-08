@@ -99,6 +99,21 @@ func (h *SkillHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace)
 			addWatchRecursive(skillsDir, node, newWatches)
 		}
 
+		// Watch skill directories inside each playbook bundle, so SKILL.md
+		// edits inside playbooks/<name>/skills/ trigger the same sync pipeline
+		// as standalone skills.
+		if playbooksDir, err := h.svc.NotebookLocator.GetPlaybooksDir(node); err == nil && playbooksDir != "" {
+			if entries, err := os.ReadDir(playbooksDir); err == nil {
+				for _, entry := range entries {
+					if !entry.IsDir() {
+						continue
+					}
+					pbSkills := filepath.Join(playbooksDir, entry.Name(), "skills")
+					addWatchRecursive(pbSkills, node, newWatches)
+				}
+			}
+		}
+
 		// 3. Watch workspace directory for grove.toml changes
 		if node.Path != "" {
 			if _, err := os.Stat(node.Path); err == nil {
@@ -410,21 +425,35 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 }
 
 // extractSkillName extracts the skill name from a changed file path.
-// The skill name is the leaf directory containing the changed file.
-// For nested paths like /path/to/skills/kitchen/prep/SKILL.md, returns "prep".
-// For flat paths like /path/to/skills/my-skill/SKILL.md, returns "my-skill".
+// It ascends the directory tree from the changed file until it finds a
+// directory containing SKILL.md, and returns that directory's base name.
+// This correctly handles nested resources like `references/` or `scripts/`
+// inside a skill directory, which the previous implementation mis-attributed
+// to the closest parent instead of the skill root.
+//
+// For /path/to/skills/kitchen/prep/SKILL.md, returns "prep".
+// For /path/to/skills/kitchen/prep/references/example.md, returns "prep".
+// For /path/to/skills/my-skill/SKILL.md, returns "my-skill".
 func extractSkillName(changedPath, watchPath string) string {
 	rel, err := filepath.Rel(watchPath, changedPath)
 	if err != nil || rel == "." {
 		return ""
 	}
 
-	// The skill name is the directory containing the changed file
+	// Ascend from the changed file's parent directory until we find a
+	// directory containing SKILL.md, or we hit the watch root.
 	dir := filepath.Dir(changedPath)
-	if dir == watchPath {
-		return ""
+	for dir != watchPath && dir != "." && dir != "/" {
+		if _, err := os.Stat(filepath.Join(dir, "SKILL.md")); err == nil {
+			return filepath.Base(dir)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
 	}
-	return filepath.Base(dir)
+	return ""
 }
 
 // addWatchRecursive adds the base directory and immediate subdirectories to the tracker.
