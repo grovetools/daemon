@@ -27,6 +27,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/daemon/internal/enrichment"
 	"github.com/grovetools/memory/pkg/memory"
 	"github.com/sirupsen/logrus"
@@ -143,6 +144,7 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/sessions/", s.handleSessionByID)
 	mux.HandleFunc("/api/sessions", s.handleSessions)
 	mux.HandleFunc("/api/stream", s.handleStreamState)
+	mux.HandleFunc("/api/workspace/hud/stream", s.handleStreamWorkspaceHUD)
 	mux.HandleFunc("/api/config", s.handleGetConfig)
 	mux.HandleFunc("/api/focus", s.handleFocus)
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
@@ -746,6 +748,61 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			// SSE format: "data: {json}\n\n"
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
+}
+
+// handleStreamWorkspaceHUD provides Server-Sent Events (SSE) for per-workspace
+// HUD state. The workspace path is read from the "path" query parameter.
+func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request) {
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "missing required 'path' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	hudWatcher := watcher.NewHUDWatcher(s.engine.Store(), path)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	out := hudWatcher.Watch(ctx)
+
+	// Send initial ping to confirm the connection is alive.
+	fmt.Fprintf(w, ": connected\n\n")
+	flusher.Flush()
+
+	s.logger.WithField("path", path).Debug("HUD SSE client connected")
+
+	for {
+		select {
+		case <-r.Context().Done():
+			s.logger.WithField("path", path).Debug("HUD SSE client disconnected")
+			return
+		case hud, ok := <-out:
+			if !ok {
+				return
+			}
+			data, err := json.Marshal(hud)
+			if err != nil {
+				s.logger.WithError(err).Error("Failed to marshal HUD update")
+				continue
+			}
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		}
