@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/grovetools/core/config"
@@ -250,6 +251,20 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 
 	switch action {
 	case "":
+		if r.Method == http.MethodDelete {
+			// DELETE /api/sessions/{id} — kill the session by sending
+			// SIGTERM to its tracked PID and removing the filesystem
+			// registry entry. The daemon's normal session collector
+			// will pick up the dead PID on its next sweep and emit
+			// the appropriate SSE update.
+			if err := s.killSession(sessionID); err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "killed"})
+			return
+		}
 		if r.Method == http.MethodPatch {
 			// PATCH /api/sessions/{id} — partial update (tmux_target, last_sender)
 			var req models.SessionPatchRequest
@@ -502,6 +517,57 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown action", http.StatusNotFound)
 	}
+}
+
+// killSession terminates a tracked session by sending SIGTERM to its
+// recorded PID, removes the filesystem registry entry, and applies a
+// session-end update to the in-memory store so SSE subscribers learn
+// about the termination immediately. The actual session-collector sweep
+// will reconcile the dead PID on its next pass.
+//
+// Returns an error if the session is unknown or has no PID. Killing a
+// process that has already exited is treated as success — the goal is to
+// guarantee the session disappears from active tracking.
+func (s *Server) killSession(sessionID string) error {
+	session := s.engine.Store().GetSession(sessionID)
+	if session == nil {
+		return fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	if session.PID > 0 {
+		// SIGTERM only — let the process clean up. ESRCH (process
+		// already gone) is not an error from our perspective.
+		if err := syscall.Kill(session.PID, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+			return fmt.Errorf("failed to signal pid %d: %w", session.PID, err)
+		}
+	}
+
+	// Remove the crash-recovery directory so a daemon restart won't
+	// re-resurrect this session as alive. The directory is named after
+	// the native session ID (Claude UUID), falling back to the job ID.
+	dirName := sessionID
+	if session.ClaudeSessionID != "" {
+		dirName = session.ClaudeSessionID
+	}
+	if registry, err := sessions.NewFileSystemRegistry(); err == nil {
+		_ = registry.Unregister(dirName)
+	}
+
+	// Mark as interrupted in the in-memory store so SSE subscribers
+	// (the embedded hooks panel, etc.) update immediately. The
+	// session-collector sweep will eventually reconcile the dead PID,
+	// but the eager update keeps the UI snappy.
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:   store.UpdateSessionEnd,
+		Source: "api",
+		Payload: &store.SessionEndPayload{
+			JobID:   sessionID,
+			Outcome: "interrupted",
+		},
+	})
+
+	s.logger.WithField("session_id", sessionID).Info("Session killed via API")
+	return nil
 }
 
 // resolveInputMode reads the grove config for a workspace to determine if vim input mode is active.
