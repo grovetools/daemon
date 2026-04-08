@@ -1506,8 +1506,15 @@ func (s *Server) handleNavGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load current state
+	// Load current state twice: once as the pre-mutation snapshot (prev) so
+	// the validator can tolerate pre-existing rule-3 conflicts, and once as
+	// the working copy we mutate and persist.
 	sessionsPath := navbindings.DefaultPath()
+	prev, err := navbindings.Load(sessionsPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to load bindings: %v", err), http.StatusInternalServerError)
+		return
+	}
 	file, err := navbindings.Load(sessionsPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to load bindings: %v", err), http.StatusInternalServerError)
@@ -1524,9 +1531,12 @@ func (s *Server) handleNavGroup(w http.ResponseWriter, r *http.Request) {
 		file.Groups[group] = state
 	}
 
-	// Validate (load group configs from nav config for prefix conflict detection)
+	// Validate (load group configs from nav config for prefix conflict detection).
+	// Diff-aware against prev so pre-existing rule-3 conflicts don't brick all
+	// writes — the user must still be able to edit a file that was persisted
+	// before the validator was tightened.
 	groupConfigs := s.loadNavGroupConfigs()
-	if err := navbindings.Validate(file, groupConfigs); err != nil {
+	if err := navbindings.ValidateAgainstPrevious(prev, file, groupConfigs); err != nil {
 		http.Error(w, fmt.Sprintf("validation failed: %v", err), http.StatusBadRequest)
 		return
 	}
