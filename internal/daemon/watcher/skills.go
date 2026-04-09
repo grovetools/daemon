@@ -154,15 +154,46 @@ func (h *SkillHandler) MatchesEvent(event fsnotify.Event) bool {
 
 // HandleEvents processes a batch of filesystem events, routing them to the
 // appropriate sync logic (grove.toml changes vs skill file changes).
+//
+// Skill file events are coalesced: rather than running the full workspace
+// graph resolution once per event (which turned a 50-file git checkout into
+// 50 × N_workspaces passes of ResolveConfiguredSkills), we extract the unique
+// changed skill names from the batch and resolve each workspace a single
+// time, checking all changed skills against its transitive graph in one pass.
 func (h *SkillHandler) HandleEvents(ctx context.Context, events []fsnotify.Event) error {
+	changedSkills := make(map[string]struct{})
 	for _, event := range events {
 		if filepath.Base(event.Name) == "grove.toml" {
 			h.handleConfigChange(event.Name)
-		} else {
-			h.triggerSync(event.Name)
+			continue
 		}
+
+		name, ok := h.skillNameForPath(event.Name)
+		if !ok || name == "" {
+			continue
+		}
+		changedSkills[name] = struct{}{}
+	}
+
+	if len(changedSkills) > 0 {
+		h.triggerSync(changedSkills)
 	}
 	return nil
+}
+
+// skillNameForPath maps a changed filesystem path to its owning skill name by
+// locating the matching watch path and extracting the skill directory. Returns
+// false if the path is not under any currently-watched skill directory.
+func (h *SkillHandler) skillNameForPath(changedPath string) (string, bool) {
+	h.pathsMutex.RLock()
+	defer h.pathsMutex.RUnlock()
+
+	for watchedPath := range h.watchedPaths {
+		if changedPath == watchedPath || filepath.HasPrefix(changedPath, watchedPath+string(filepath.Separator)) {
+			return extractSkillName(changedPath, watchedPath), true
+		}
+	}
+	return "", false
 }
 
 // HandleStoreUpdate responds to store-level updates like config reloads and workspace discovery.
@@ -289,32 +320,17 @@ func (h *SkillHandler) handleConfigChange(configPath string) {
 	h.syncWorkspace(node)
 }
 
-// triggerSync finds affected workspaces for a changed skill file and syncs them.
-// Uses the full resolved dependency graph to detect changes in nested/transitive skills.
-func (h *SkillHandler) triggerSync(changedPath string) {
-	h.pathsMutex.RLock()
-	var matchedWatchPath string
-	found := false
-
-	for watchedPath := range h.watchedPaths {
-		if changedPath == watchedPath || filepath.HasPrefix(changedPath, watchedPath+string(filepath.Separator)) {
-			matchedWatchPath = watchedPath
-			found = true
-			break
-		}
-	}
-	h.pathsMutex.RUnlock()
-
-	if !found {
+// triggerSync finds affected workspaces for a batch of changed skill names
+// and syncs them. Uses the full resolved dependency graph to detect changes
+// in nested/transitive skills. The workspace loop runs a single graph
+// resolution per workspace regardless of how many skills changed, so a batch
+// of N events against W workspaces costs O(W) resolves instead of O(N × W).
+func (h *SkillHandler) triggerSync(changedSkills map[string]struct{}) {
+	if len(changedSkills) == 0 {
 		return
 	}
 
-	changedSkillName := extractSkillName(changedPath, matchedWatchPath)
-
-	h.log.WithFields(logrus.Fields{
-		"changedPath": changedPath,
-		"skillName":   changedSkillName,
-	}).Debug("Skill file changed, checking affected workspaces")
+	h.log.WithField("changedSkills", len(changedSkills)).Debug("Skill files changed, checking affected workspaces")
 
 	var nodesToSync []*workspace.WorkspaceNode
 	workspaces := h.store.GetWorkspaces()
@@ -330,15 +346,20 @@ func (h *SkillHandler) triggerSync(changedPath string) {
 			continue
 		}
 
-		// Use the resolver to check if the changed skill is anywhere in the transitive graph
+		// Use the resolver to check if any of the changed skills are anywhere
+		// in the transitive graph. A single resolve covers the whole batch.
 		resolved, err := skills.ResolveConfiguredSkills(h.svc, node, skillsCfg)
 		if err != nil {
 			h.log.WithError(err).Debug("Best effort resolving skills failed")
 		}
 
-		if resolved != nil {
+		if resolved == nil {
+			continue
+		}
+		for changedSkillName := range changedSkills {
 			if _, exists := resolved[changedSkillName]; exists {
 				nodesToSync = append(nodesToSync, node)
+				break
 			}
 		}
 	}
