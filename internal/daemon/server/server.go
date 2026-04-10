@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -65,11 +66,19 @@ type Server struct {
 	memEmbedder *memory.Embedder
 	memDBPath   string
 
+	// activeStreamers tracks the number of active SSE stream connections.
+	// Used by /api/system/terminal-status to report whether a terminal is connected.
+	activeStreamers atomic.Int32
+
 	// captureWaiters holds pending GET /api/agents/{id}/capture requests.
 	// The HTTP handler blocks on the channel until groveterm sends the
 	// capture response via POST /api/agents/{id}/capture_response.
 	captureWaitersMu sync.Mutex
 	captureWaiters   map[string]chan string
+
+	// terminalHub routes WebSocket messages for multi-attach
+	// (Primary/Follower groveterm instances).
+	terminalHub *TerminalHub
 }
 
 // New creates a new Server instance.
@@ -77,6 +86,7 @@ func New(logger *logrus.Entry) *Server {
 	return &Server{
 		logger:         logger,
 		captureWaiters: make(map[string]chan string),
+		terminalHub:    NewTerminalHub(logger),
 	}
 }
 
@@ -173,12 +183,17 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/memory/search", s.handleMemorySearch)
 	mux.HandleFunc("/api/memory/coverage", s.handleMemoryCoverage)
 	mux.HandleFunc("/api/memory/status", s.handleMemoryStatus)
+	// Terminal multi-attach WebSocket endpoint
+	mux.HandleFunc("/api/terminal/ws", s.HandleTerminalWS)
+
 	// Nav bindings endpoints
 	mux.HandleFunc("/api/nav/bindings", s.handleNavBindings)
 	mux.HandleFunc("/api/nav/config", s.handleNavConfig)
 	mux.HandleFunc("/api/nav/groups/", s.handleNavGroup)
 	mux.HandleFunc("/api/nav/locked-keys", s.handleNavLockedKeys)
 	mux.HandleFunc("/api/nav/last-accessed", s.handleNavLastAccessedGroup)
+	// System endpoints
+	mux.HandleFunc("/api/system/terminal-status", s.handleTerminalStatus)
 	// Native agent pane relay endpoints
 	mux.HandleFunc("/api/agents/spawn", s.handleAgentSpawn)
 	mux.HandleFunc("/api/agents/", s.handleAgentByID)
@@ -715,6 +730,10 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	// Track active SSE connections for terminal-status endpoint
+	s.activeStreamers.Add(1)
+	defer s.activeStreamers.Add(-1)
+
 	// Subscribe to store updates
 	ch := s.engine.Store().Subscribe()
 	defer s.engine.Store().Unsubscribe(ch)
@@ -819,6 +838,17 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 			flusher.Flush()
 		}
 	}
+}
+
+// handleTerminalStatus returns whether a terminal (groveterm) is connected via SSE.
+func (s *Server) handleTerminalStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	connected := s.activeStreamers.Load() > 0
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"connected":%t}`, connected)
 }
 
 // handleAgentSpawn handles POST /api/agents/spawn — relay a spawn request to groveterm via SSE.

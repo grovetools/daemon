@@ -157,13 +157,14 @@ type SessionEndPayload struct {
 
 // SpawnAgentPayload requests groveterm to spawn a native agent pane.
 type SpawnAgentPayload struct {
-	JobID     string   `json:"job_id"`
-	PlanName  string   `json:"plan_name"`
-	JobTitle  string   `json:"job_title"`
-	Command   string   `json:"command"`
-	Args      []string `json:"args"`
-	WorkDir   string   `json:"work_dir"`
-	AutoSplit bool     `json:"auto_split"`
+	JobID     string            `json:"job_id"`
+	PlanName  string            `json:"plan_name"`
+	JobTitle  string            `json:"job_title"`
+	Command   string            `json:"command"`
+	Args      []string          `json:"args"`
+	WorkDir   string            `json:"work_dir"`
+	Env       map[string]string `json:"env,omitempty"`
+	AutoSplit bool              `json:"auto_split"`
 }
 
 // AgentInputPayload delivers input text to a native agent pane.
