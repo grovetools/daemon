@@ -130,6 +130,16 @@ func (h *HUDWatcher) snapshot() (models.WorkspaceHUD, bool) {
 		ShortPath:     shortPath(ws.Path),
 	}
 
+	// Populate hierarchy fields from the WorkspaceNode for rich
+	// workspace display (e.g. "grovetools > cx > groveterm-pt3").
+	node := ws.WorkspaceNode
+	if node.RootEcosystemPath != "" {
+		hud.EcosystemName = filepath.Base(node.RootEcosystemPath)
+	}
+	if node.IsWorktree() && node.ParentProjectPath != "" {
+		hud.WorktreeName = filepath.Base(node.Path)
+	}
+
 	if gs := ws.GitStatus; gs != nil && gs.StatusInfo != nil {
 		hud.GitBranch = gs.Branch
 		hud.GitDirty = gs.IsDirty
