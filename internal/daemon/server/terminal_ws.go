@@ -126,6 +126,16 @@ func (h *TerminalHub) register(conn *websocket.Conn) bool {
 		h.followers[conn] = true
 		role = "follower"
 		h.logger.Info("Follower registered")
+
+		// Notify the Primary that a new Follower joined so it can
+		// broadcast its current layout and screen state.
+		if h.primary != nil {
+			notify, _ := json.Marshal(WsMessage{
+				Type:    "follower_joined",
+				Payload: json.RawMessage("{}"),
+			})
+			h.primary.WriteMessage(websocket.TextMessage, notify)
+		}
 	}
 
 	resp, _ := json.Marshal(WsMessage{
