@@ -67,6 +67,14 @@ const (
 	// deletes a document. Payload is MemoryIndexPayload. The TUI uses this
 	// to render a transient [Index Syncing…] indicator.
 	UpdateMemoryIndex UpdateType = "memory_index"
+
+	// Native agent pane lifecycle — these are pass-through events that the
+	// daemon relays from Flow (or the HTTP API) to groveterm via SSE.
+	// The daemon does NOT apply them to its own state; they exist purely
+	// as a control-plane channel between Flow and the terminal.
+	UpdateSpawnAgentPane UpdateType = "spawn_agent_pane" // Payload: *SpawnAgentPayload
+	UpdateAgentInput     UpdateType = "agent_input"      // Payload: *AgentInputPayload
+	UpdateCaptureRequest UpdateType = "capture_request"  // Payload: *CaptureRequestPayload
 )
 
 // MemoryIndexPayload describes a single memory store mutation for SSE subscribers.
@@ -145,6 +153,28 @@ type SessionStatusPayload struct {
 type SessionEndPayload struct {
 	JobID   string `json:"job_id"`
 	Outcome string `json:"outcome"` // "completed", "interrupted", "failed"
+}
+
+// SpawnAgentPayload requests groveterm to spawn a native agent pane.
+type SpawnAgentPayload struct {
+	JobID     string   `json:"job_id"`
+	PlanName  string   `json:"plan_name"`
+	JobTitle  string   `json:"job_title"`
+	Command   string   `json:"command"`
+	Args      []string `json:"args"`
+	WorkDir   string   `json:"work_dir"`
+	AutoSplit bool     `json:"auto_split"`
+}
+
+// AgentInputPayload delivers input text to a native agent pane.
+type AgentInputPayload struct {
+	JobID string `json:"job_id"`
+	Input string `json:"input"`
+}
+
+// CaptureRequestPayload requests a screen capture from a native agent pane.
+type CaptureRequestPayload struct {
+	JobID string `json:"job_id"`
 }
 
 // Update represents a change to the state.

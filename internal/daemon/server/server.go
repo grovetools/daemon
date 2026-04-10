@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -62,12 +64,19 @@ type Server struct {
 	memStore    memory.DocumentStore
 	memEmbedder *memory.Embedder
 	memDBPath   string
+
+	// captureWaiters holds pending GET /api/agents/{id}/capture requests.
+	// The HTTP handler blocks on the channel until groveterm sends the
+	// capture response via POST /api/agents/{id}/capture_response.
+	captureWaitersMu sync.Mutex
+	captureWaiters   map[string]chan string
 }
 
 // New creates a new Server instance.
 func New(logger *logrus.Entry) *Server {
 	return &Server{
-		logger: logger,
+		logger:         logger,
+		captureWaiters: make(map[string]chan string),
 	}
 }
 
@@ -170,6 +179,9 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/nav/groups/", s.handleNavGroup)
 	mux.HandleFunc("/api/nav/locked-keys", s.handleNavLockedKeys)
 	mux.HandleFunc("/api/nav/last-accessed", s.handleNavLastAccessedGroup)
+	// Native agent pane relay endpoints
+	mux.HandleFunc("/api/agents/spawn", s.handleAgentSpawn)
+	mux.HandleFunc("/api/agents/", s.handleAgentByID)
 
 	s.server = &http.Server{
 		Handler: h2c.NewHandler(mux, &http2.Server{}),
@@ -809,6 +821,149 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 	}
 }
 
+// handleAgentSpawn handles POST /api/agents/spawn — relay a spawn request to groveterm via SSE.
+func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var payload store.SpawnAgentPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:    store.UpdateSpawnAgentPane,
+		Source:  "api",
+		Payload: &payload,
+	})
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "spawned"})
+}
+
+// handleAgentByID routes /api/agents/{id}/* actions (input, capture, capture_response).
+func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	path := r.URL.Path[len("/api/agents/"):]
+	parts := splitPath(path)
+	if len(parts) < 2 {
+		http.Error(w, "agent ID and action required", http.StatusBadRequest)
+		return
+	}
+
+	agentID := parts[0]
+	action := parts[1]
+
+	switch action {
+	case "input":
+		// POST /api/agents/{id}/input — relay input to groveterm via SSE
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Input string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		s.engine.Store().ApplyUpdate(store.Update{
+			Type:   store.UpdateAgentInput,
+			Source: "api",
+			Payload: &store.AgentInputPayload{
+				JobID: agentID,
+				Input: req.Input,
+			},
+		})
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "sent"})
+
+	case "capture":
+		// GET /api/agents/{id}/capture — blocking request that waits for groveterm's response
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ch := make(chan string, 1)
+
+		s.captureWaitersMu.Lock()
+		s.captureWaiters[agentID] = ch
+		s.captureWaitersMu.Unlock()
+
+		// Broadcast capture request to groveterm via SSE
+		s.engine.Store().ApplyUpdate(store.Update{
+			Type:   store.UpdateCaptureRequest,
+			Source: "api",
+			Payload: &store.CaptureRequestPayload{
+				JobID: agentID,
+			},
+		})
+
+		// Block until groveterm responds or timeout
+		select {
+		case text := <-ch:
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, text)
+		case <-time.After(5 * time.Second):
+			s.captureWaitersMu.Lock()
+			delete(s.captureWaiters, agentID)
+			s.captureWaitersMu.Unlock()
+			http.Error(w, "capture timeout: groveterm did not respond", http.StatusGatewayTimeout)
+		case <-r.Context().Done():
+			s.captureWaitersMu.Lock()
+			delete(s.captureWaiters, agentID)
+			s.captureWaitersMu.Unlock()
+			return
+		}
+
+	case "capture_response":
+		// POST /api/agents/{id}/capture_response — groveterm sends back screen text
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB limit
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+
+		s.captureWaitersMu.Lock()
+		ch, ok := s.captureWaiters[agentID]
+		if ok {
+			delete(s.captureWaiters, agentID)
+		}
+		s.captureWaitersMu.Unlock()
+
+		if ok {
+			ch <- string(body)
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "received"})
+
+	default:
+		http.Error(w, "unknown action", http.StatusNotFound)
+	}
+}
+
 // apiStateUpdate matches the daemon.StateUpdate type for SSE streaming.
 type apiStateUpdate struct {
 	Workspaces      []*models.EnrichedWorkspace `json:"workspaces,omitempty"`
@@ -934,6 +1089,14 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 	case store.UpdateMemoryIndex:
 		return &apiStateUpdate{
 			UpdateType: "memory_index",
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
+
+	// Native agent pane relay — pass-through to groveterm via SSE.
+	case store.UpdateSpawnAgentPane, store.UpdateAgentInput, store.UpdateCaptureRequest:
+		return &apiStateUpdate{
+			UpdateType: string(u.Type),
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
