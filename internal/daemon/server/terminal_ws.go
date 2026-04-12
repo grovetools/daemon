@@ -34,6 +34,14 @@ func NewTerminalHub(logger *logrus.Entry) *TerminalHub {
 	}
 }
 
+// HasConnections reports whether any groveterm instance (primary or follower)
+// is currently connected via WebSocket.
+func (h *TerminalHub) HasConnections() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.primary != nil || len(h.followers) > 0
+}
+
 // upgrader allows any origin for local unix-socket connections.
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },

@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
+
 	"syscall"
 	"time"
 
@@ -65,10 +65,6 @@ type Server struct {
 	memStore    memory.DocumentStore
 	memEmbedder *memory.Embedder
 	memDBPath   string
-
-	// activeStreamers tracks the number of active SSE stream connections.
-	// Used by /api/system/terminal-status to report whether a terminal is connected.
-	activeStreamers atomic.Int32
 
 	// captureWaiters holds pending GET /api/agents/{id}/capture requests.
 	// The HTTP handler blocks on the channel until groveterm sends the
@@ -730,10 +726,6 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Track active SSE connections for terminal-status endpoint
-	s.activeStreamers.Add(1)
-	defer s.activeStreamers.Add(-1)
-
 	// Subscribe to store updates
 	ch := s.engine.Store().Subscribe()
 	defer s.engine.Store().Unsubscribe(ch)
@@ -840,13 +832,13 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 	}
 }
 
-// handleTerminalStatus returns whether a terminal (groveterm) is connected via SSE.
+// handleTerminalStatus returns whether a groveterm instance is connected via WebSocket.
 func (s *Server) handleTerminalStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	connected := s.activeStreamers.Load() > 0
+	connected := s.terminalHub != nil && s.terminalHub.HasConnections()
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"connected":%t}`, connected)
 }
