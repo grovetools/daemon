@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grove Terminal Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            font-family: monospace;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+        #status {
+            text-align: center;
+        }
+        #status h1 {
+            font-size: 1.5em;
+            margin-bottom: 0.5em;
+        }
+        #status p {
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+    <div id="status">
+        <h1>Grove Terminal Viewer</h1>
+        <p>Connecting to SSE stream...</p>
+        <p id="connection-status"></p>
+        <p id="frame-info" style="color: #888; font-size: 0.9em;"></p>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>
