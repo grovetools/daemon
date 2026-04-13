@@ -13,7 +13,7 @@ import (
 // WsMessage is the JSON envelope for all WebSocket communication
 // between Primary/Follower groveterm instances and the daemon hub.
 type WsMessage struct {
-	Type    string          `json:"type"`    // "register", "role", "layout", "frame", "input", "action", "primary_disconnected"
+	Type    string          `json:"type"`    // "register", "role", "layout", "frame", "input", "action", "request_full_sync", "primary_disconnected"
 	Payload json.RawMessage `json:"payload"` // type-specific JSON payload
 }
 
@@ -225,6 +225,27 @@ func (h *TerminalHub) UnsubscribeSSE(ch chan string) {
 	delete(h.sseSubscribers, ch)
 	close(ch)
 	h.logger.Info("SSE subscriber disconnected")
+}
+
+// RequestFullSync sends a "request_full_sync" message to the Primary terminal,
+// asking it to produce a full-screen payload on its next compositor tick.
+// Used when a new SSE client connects so it gets a complete initial frame.
+func (h *TerminalHub) RequestFullSync() {
+	h.mu.RLock()
+	primary := h.primary
+	h.mu.RUnlock()
+
+	if primary == nil {
+		return
+	}
+
+	msg, _ := json.Marshal(WsMessage{
+		Type:    "request_full_sync",
+		Payload: json.RawMessage("{}"),
+	})
+	if err := primary.WriteMessage(websocket.TextMessage, msg); err != nil {
+		h.logger.WithError(err).Debug("Failed to send request_full_sync to primary")
+	}
 }
 
 // sendToPrimary forwards raw to the Primary connection.

@@ -35,6 +35,11 @@ func (s *Server) handleTerminalStream(w http.ResponseWriter, r *http.Request) {
 
 	hub.logger.Debug("Terminal SSE client connected")
 
+	// Ask the Primary terminal to produce a full-screen payload so this
+	// new client gets a complete initial frame instead of waiting for the
+	// next partial delta.
+	hub.RequestFullSync()
+
 	for {
 		select {
 		case <-r.Context().Done():
