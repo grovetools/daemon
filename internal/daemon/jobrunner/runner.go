@@ -129,6 +129,7 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 		Priority:    req.Priority,
 		TimeoutStr:  timeout.String(),
 		Env:         req.Env,
+		AgentTarget: req.AgentTarget,
 		Status:      "queued",
 		SubmittedAt: time.Now(),
 	}
@@ -347,6 +348,15 @@ func (jr *JobRunner) executeJob(ctx context.Context, info *models.JobInfo) {
 	if err != nil {
 		jr.markDone(info, "failed", fmt.Sprintf("load plan: %v", err))
 		return
+	}
+
+	// Inject agent_target from the submission request into the plan so
+	// executors can route without consulting env vars or daemon state.
+	if info.AgentTarget != "" {
+		if plan.Orchestration == nil {
+			plan.Orchestration = &orchestration.Config{}
+		}
+		plan.Orchestration.AgentTarget = info.AgentTarget
 	}
 
 	// Create an orchestrator to utilize flow's dependency logic

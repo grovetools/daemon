@@ -81,12 +81,6 @@ func newGrovedStartCmd() *cobra.Command {
 		Short: "Start the daemon",
 		Long:  "Start the grove daemon in foreground mode.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Strip TMUX from the daemon's environment. The daemon is a
-			// long-lived service that shouldn't carry env vars from its
-			// parent shell — otherwise job executors inherit TMUX and
-			// route agents to tmux even when groveterm is connected.
-			os.Unsetenv("TMUX")
-
 			// Route all daemon logs to central system log
 			grovelogging.SetGlobalScope(grovelogging.ScopeSystem)
 
