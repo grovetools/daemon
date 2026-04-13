@@ -438,8 +438,9 @@ func newGrovedStartCmd() *cobra.Command {
 			}
 
 			// 8. Start Server (Blocking)
+			httpPort, _ := cmd.Flags().GetInt("http-port")
 			logger.WithField("pid", os.Getpid()).Info("Starting daemon")
-			if err := srv.ListenAndServe(sockPath); err != nil {
+			if err := srv.ListenAndServe(sockPath, httpPort); err != nil {
 				return fmt.Errorf("server error: %w", err)
 			}
 			return nil
@@ -448,6 +449,7 @@ func newGrovedStartCmd() *cobra.Command {
 
 	cmd.Flags().StringSlice("collectors", []string{"all"}, "Comma-separated list of collectors to enable (git, session, workspace, plan, note)")
 	cmd.Flags().Int("pprof-port", 0, "Port to start pprof server on (0 to disable)")
+	cmd.Flags().Int("http-port", 0, "Port to start HTTP server on for browser access (web terminal viewer, 0 to disable)")
 	cmd.Flags().Bool("monitor", false, "Stream daemon activity to stdout")
 	cmd.Flags().String("monitor-format", "full", "Output format for --monitor: text, json, full, rich, pretty")
 	cmd.Flags().Bool("monitor-compact", true, "Disable spacing between monitor log entries")

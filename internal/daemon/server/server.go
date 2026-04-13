@@ -118,8 +118,9 @@ func (s *Server) SetChannelManager(m *channels.Manager) {
 }
 
 // ListenAndServe starts the daemon on the given unix socket path.
-// It blocks until the server stops or fails.
-func (s *Server) ListenAndServe(socketPath string) error {
+// If httpPort > 0, also listens on localhost:httpPort for browser access
+// (web terminal viewer, API debugging). It blocks until the server stops.
+func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	// Cleanup stale socket
 	if _, err := os.Stat(socketPath); err == nil {
 		if err := os.Remove(socketPath); err != nil {
@@ -199,8 +200,26 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/agents/spawn", s.handleAgentSpawn)
 	mux.HandleFunc("/api/agents/", s.handleAgentByID)
 
+	handler := h2c.NewHandler(mux, &http2.Server{})
+
 	s.server = &http.Server{
-		Handler: h2c.NewHandler(mux, &http2.Server{}),
+		Handler: handler,
+	}
+
+	// Optionally start a TCP listener for browser access (web terminal viewer).
+	if len(httpPort) > 0 && httpPort[0] > 0 {
+		port := httpPort[0]
+		go func() {
+			addr := fmt.Sprintf("localhost:%d", port)
+			s.logger.WithField("addr", addr).Info("HTTP server listening (web terminal viewer)")
+			tcpServer := &http.Server{
+				Addr:    addr,
+				Handler: handler,
+			}
+			if err := tcpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				s.logger.WithError(err).Error("HTTP server failed")
+			}
+		}()
 	}
 
 	s.logger.WithField("socket", socketPath).Info("Daemon listening")
