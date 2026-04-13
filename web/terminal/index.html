@@ -5,12 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Grove Terminal Viewer</title>
     <style>
+        @font-face {
+            font-family: 'FiraCode Nerd Font';
+            src: url('fonts/FiraCodeNerdFont-Regular.ttf') format('truetype');
+            font-weight: normal;
+            font-style: normal;
+            font-display: swap;
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
             background: #1a1a2e;
             color: #e0e0e0;
-            font-family: "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code", "Consolas", monospace;
+            font-family: "FiraCode Nerd Font", "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code", "Consolas", monospace;
             display: flex;
             flex-direction: column;
             align-items: center;
