@@ -76,8 +76,8 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 			activeSessions := st.GetSessions()
 
 			for _, session := range activeSessions {
-				// Only verify sessions we think are active and have a known PID
-				if (session.Status == "running" || session.Status == "idle" || session.Status == "pending_user") && session.PID > 0 {
+				// Only verify sessions we think are active
+				if session.Status == "running" || session.Status == "idle" || session.Status == "pending_user" {
 
 					// Grace period: skip PID check for sessions confirmed within the last 30s.
 					// During agent startup, the initial PID may be a short-lived intermediate
@@ -86,7 +86,9 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 						continue
 					}
 
-					if !process.IsProcessAlive(session.PID) {
+					// PID 0 means the real PID was never discovered (e.g., groveterm-native agent crashed
+					// before async PID discovery completed). After the grace period, treat as dead.
+					if session.PID == 0 || !process.IsProcessAlive(session.PID) {
 						c.logger.WithFields(logrus.Fields{
 							"job_id": session.ID,
 							"pid":    session.PID,
