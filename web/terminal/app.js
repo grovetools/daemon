@@ -1,4 +1,4 @@
-// Grove Terminal Viewer — Phase 2: SSE connection + binary decoder
+// Grove Terminal Viewer — Phase 4: DOM rendering
 //
 // Binary protocol (from compositor.zig ext_get_dirty_payload):
 //   Header (12 bytes):
@@ -24,13 +24,37 @@ const HEADER_SIZE = 12;
 const CELL_SIZE = 16;
 const MAGIC = [0x47, 0x52, 0x56, 0x31]; // "GRV1"
 
-// Color type enum values (matches ansi.ColorType in Zig)
 const ColorType = {
     DEFAULT: 0,
     STANDARD: 1,
     PALETTE256: 2,
     RGB: 3,
 };
+
+// Standard ANSI 16-color palette (normal + bright)
+const ANSI_COLORS = [
+    '#282c34', '#e06c75', '#98c379', '#e5c07b', '#61afef', '#c678dd', '#56b6c2', '#abb2bf',
+    '#5c6370', '#e06c75', '#98c379', '#e5c07b', '#61afef', '#c678dd', '#56b6c2', '#ffffff',
+];
+
+// 256-color palette: 0-15 standard, 16-231 color cube, 232-255 grayscale
+const PALETTE_256 = (function () {
+    const p = new Array(256);
+    for (let i = 0; i < 16; i++) p[i] = ANSI_COLORS[i];
+    for (let i = 0; i < 216; i++) {
+        const r = Math.floor(i / 36), g = Math.floor((i % 36) / 6), b = i % 6;
+        const toHex = function (v) { return v === 0 ? 0 : 55 + v * 40; };
+        p[16 + i] = 'rgb(' + toHex(r) + ',' + toHex(g) + ',' + toHex(b) + ')';
+    }
+    for (let i = 0; i < 24; i++) {
+        const v = 8 + i * 10;
+        p[232 + i] = 'rgb(' + v + ',' + v + ',' + v + ')';
+    }
+    return p;
+})();
+
+const DEFAULT_FG = '#abb2bf';
+const DEFAULT_BG = '#0d1117';
 
 // --- Base64 decoding ---
 
@@ -47,7 +71,6 @@ function base64ToArrayBuffer(base64) {
 // --- Binary decoder ---
 
 function decodeHeader(view) {
-    // Validate magic
     if (
         view.getUint8(0) !== MAGIC[0] ||
         view.getUint8(1) !== MAGIC[1] ||
@@ -134,41 +157,129 @@ function decodeFrame(base64Data) {
     return { width: header.width, height: header.height, cells: cells };
 }
 
+// --- Color resolution ---
+
+function resolveColor(color, fallback) {
+    switch (color.type) {
+        case ColorType.RGB:
+            return 'rgb(' + color.r + ',' + color.g + ',' + color.b + ')';
+        case ColorType.PALETTE256:
+            return PALETTE_256[color.r] || fallback;
+        case ColorType.STANDARD:
+            return ANSI_COLORS[color.r] || fallback;
+        default:
+            return fallback;
+    }
+}
+
+// --- DOM Grid ---
+
+var gridWidth = 0;
+var gridHeight = 0;
+var gridCells = []; // flat array of span elements, indexed by y * width + x
+
+function buildGrid(w, h) {
+    var term = document.getElementById('terminal');
+    var splash = document.getElementById('splash');
+
+    splash.style.display = 'none';
+    term.style.display = 'grid';
+    term.style.gridTemplateColumns = 'repeat(' + w + ', 1ch)';
+    term.style.gridTemplateRows = 'repeat(' + h + ', 1.2em)';
+    term.innerHTML = '';
+
+    gridCells = new Array(w * h);
+    for (var i = 0; i < w * h; i++) {
+        var span = document.createElement('span');
+        span.textContent = ' ';
+        span.style.color = DEFAULT_FG;
+        span.style.backgroundColor = DEFAULT_BG;
+        term.appendChild(span);
+        gridCells[i] = span;
+    }
+
+    gridWidth = w;
+    gridHeight = h;
+}
+
+function applyCell(cell) {
+    if (cell.flags.widespacer) return; // skip right half of wide chars
+    if (cell.x >= gridWidth || cell.y >= gridHeight) return;
+
+    var idx = cell.y * gridWidth + cell.x;
+    var span = gridCells[idx];
+    if (!span) return;
+
+    // Character
+    var ch = cell.codepoint === 0 ? ' ' : String.fromCodePoint(cell.codepoint);
+    span.textContent = ch;
+
+    // Colors — handle inverse
+    var fg = resolveColor(cell.fg, DEFAULT_FG);
+    var bg = resolveColor(cell.bg, DEFAULT_BG);
+    if (cell.flags.inverse) {
+        var tmp = fg;
+        fg = bg;
+        bg = tmp;
+    }
+    span.style.color = fg;
+    span.style.backgroundColor = bg;
+
+    // Opacity for faint
+    span.style.opacity = cell.flags.faint ? '0.5' : '';
+
+    // Text decorations
+    var deco = [];
+    if (cell.flags.underline) deco.push('underline');
+    if (cell.flags.strikethrough) deco.push('line-through');
+    span.style.textDecoration = deco.length > 0 ? deco.join(' ') : '';
+
+    // Font style
+    span.style.fontWeight = cell.flags.bold ? 'bold' : '';
+    span.style.fontStyle = cell.flags.italic ? 'italic' : '';
+
+    // Wide characters: span 2 columns
+    if (cell.flags.wide) {
+        span.style.gridColumn = 'span 2';
+        // Hide the spacer cell to the right
+        var spacerIdx = idx + 1;
+        if (spacerIdx < gridCells.length && gridCells[spacerIdx]) {
+            gridCells[spacerIdx].style.display = 'none';
+        }
+    } else {
+        span.style.gridColumn = '';
+        span.style.display = '';
+    }
+}
+
+function renderFrame(frame) {
+    // Rebuild grid if dimensions changed or first frame
+    if (frame.width !== gridWidth || frame.height !== gridHeight) {
+        buildGrid(frame.width, frame.height);
+    }
+
+    for (var i = 0; i < frame.cells.length; i++) {
+        applyCell(frame.cells[i]);
+    }
+}
+
 // --- SSE connection ---
 
 function connect() {
-    const statusEl = document.getElementById('connection-status');
-    const frameInfo = document.getElementById('frame-info');
-    const es = new EventSource('/api/terminal/stream');
+    var statusDot = document.getElementById('status-dot');
+    var statusText = document.getElementById('connection-status');
+    var frameInfo = document.getElementById('frame-info');
+    var es = new EventSource('/api/terminal/stream');
 
     es.addEventListener('frame', function (e) {
-        const frame = decodeFrame(e.data);
+        var frame = decodeFrame(e.data);
         if (!frame) return;
 
-        statusEl.textContent = 'Connected';
-        statusEl.style.color = '#4ecca3';
-        frameInfo.textContent =
-            frame.width + 'x' + frame.height +
-            ' — ' + frame.cells.length + ' cells updated';
+        renderFrame(frame);
 
-        // Log first few cells for verification
-        if (frame.cells.length > 0) {
-            const sample = frame.cells.slice(0, 5);
-            console.log(
-                '[grove] frame: %dx%d, %d cells. Sample:',
-                frame.width, frame.height, frame.cells.length,
-                sample.map(function (c) {
-                    return {
-                        pos: c.x + ',' + c.y,
-                        char: String.fromCodePoint(c.codepoint),
-                        cp: c.codepoint,
-                        fg: c.fg,
-                        bg: c.bg,
-                        flags: c.flags,
-                    };
-                })
-            );
-        }
+        frameInfo.textContent =
+            frame.width + '×' + frame.height +
+            ' · ' + frame.cells.length + ' cells';
     });
 
     es.addEventListener('layout', function (e) {
@@ -176,13 +287,13 @@ function connect() {
     });
 
     es.onopen = function () {
-        statusEl.textContent = 'Connected';
-        statusEl.style.color = '#4ecca3';
+        statusDot.className = 'dot connected';
+        statusText.textContent = 'Connected';
     };
 
     es.onerror = function () {
-        statusEl.textContent = 'Disconnected';
-        statusEl.style.color = '#e74c3c';
+        statusDot.className = 'dot';
+        statusText.textContent = 'Disconnected';
         frameInfo.textContent = '';
     };
 }

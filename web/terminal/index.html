@@ -5,34 +5,101 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Grove Terminal Viewer</title>
     <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
         body {
-            margin: 0;
             background: #1a1a2e;
             color: #e0e0e0;
-            font-family: monospace;
+            font-family: "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code", "Consolas", monospace;
             display: flex;
+            flex-direction: column;
             align-items: center;
             justify-content: center;
             height: 100vh;
+            overflow: hidden;
         }
-        #status {
+
+        #status-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 24px;
+            background: #16213e;
+            border-bottom: 1px solid #0f3460;
+            display: flex;
+            align-items: center;
+            padding: 0 12px;
+            font-size: 11px;
+            color: #888;
+            z-index: 10;
+            gap: 16px;
+        }
+
+        #status-bar .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #e74c3c;
+            display: inline-block;
+            margin-right: 6px;
+            transition: background 0.3s;
+        }
+
+        #status-bar .dot.connected { background: #4ecca3; }
+
+        #terminal-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex: 1;
+            padding-top: 24px;
+        }
+
+        #terminal {
+            display: grid;
+            line-height: 1.2;
+            font-size: 14px;
+            background: #0d1117;
+            padding: 4px;
+            border-radius: 4px;
+            border: 1px solid #21262d;
+            white-space: pre;
+        }
+
+        #terminal span {
+            display: block;
+            text-align: center;
+            overflow: hidden;
+        }
+
+        #splash {
             text-align: center;
         }
-        #status h1 {
-            font-size: 1.5em;
+
+        #splash h1 {
+            font-size: 1.3em;
             margin-bottom: 0.5em;
+            color: #4ecca3;
         }
-        #status p {
-            color: #888;
+
+        #splash p {
+            color: #666;
+            font-size: 0.85em;
         }
     </style>
 </head>
 <body>
-    <div id="status">
-        <h1>Grove Terminal Viewer</h1>
-        <p>Connecting to SSE stream...</p>
-        <p id="connection-status"></p>
-        <p id="frame-info" style="color: #888; font-size: 0.9em;"></p>
+    <div id="status-bar">
+        <span><span class="dot" id="status-dot"></span><span id="connection-status">Connecting…</span></span>
+        <span id="frame-info"></span>
+    </div>
+    <div id="terminal-container">
+        <div id="splash">
+            <h1>Grove Terminal Viewer</h1>
+            <p>Waiting for terminal session…</p>
+        </div>
+        <div id="terminal" style="display:none;"></div>
     </div>
     <script src="app.js"></script>
 </body>
