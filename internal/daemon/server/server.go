@@ -25,6 +25,7 @@ import (
 	"github.com/grovetools/core/pkg/tmux"
 	navbindings "github.com/grovetools/nav/pkg/bindings"
 	"github.com/grovetools/daemon/internal/daemon/channels"
+	daemonweb "github.com/grovetools/daemon/web"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
@@ -181,6 +182,10 @@ func (s *Server) ListenAndServe(socketPath string) error {
 	mux.HandleFunc("/api/memory/status", s.handleMemoryStatus)
 	// Terminal multi-attach WebSocket endpoint
 	mux.HandleFunc("/api/terminal/ws", s.HandleTerminalWS)
+	// Terminal SSE stream for web viewers
+	mux.HandleFunc("/api/terminal/stream", s.handleTerminalStream)
+	// Static web viewer files
+	mux.Handle("/web/terminal/", http.StripPrefix("/web/terminal/", daemonweb.TerminalFileServer()))
 
 	// Nav bindings endpoints
 	mux.HandleFunc("/api/nav/bindings", s.handleNavBindings)

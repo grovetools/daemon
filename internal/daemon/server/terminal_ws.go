@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"sync"
@@ -18,19 +19,22 @@ type WsMessage struct {
 
 // TerminalHub routes WebSocket messages between a single Primary
 // groveterm instance and zero or more Follower instances.
+// It also fans out frame data to SSE subscribers (web viewers).
 // Thread-safe: all access to connections is protected by mu.
 type TerminalHub struct {
-	mu        sync.RWMutex
-	primary   *websocket.Conn
-	followers map[*websocket.Conn]bool
-	logger    *logrus.Entry
+	mu             sync.RWMutex
+	primary        *websocket.Conn
+	followers      map[*websocket.Conn]bool
+	sseSubscribers map[chan string]bool
+	logger         *logrus.Entry
 }
 
 // NewTerminalHub creates a ready-to-use TerminalHub.
 func NewTerminalHub(logger *logrus.Entry) *TerminalHub {
 	return &TerminalHub{
-		followers: make(map[*websocket.Conn]bool),
-		logger:    logger.WithField("component", "terminal-hub"),
+		followers:      make(map[*websocket.Conn]bool),
+		sseSubscribers: make(map[chan string]bool),
+		logger:         logger.WithField("component", "terminal-hub"),
 	}
 }
 
@@ -154,7 +158,8 @@ func (h *TerminalHub) register(conn *websocket.Conn) bool {
 	return role == "primary"
 }
 
-// broadcastToFollowers sends raw to every connected Follower.
+// broadcastToFollowers sends raw to every connected Follower
+// and fans out frame payloads to SSE subscribers.
 // Disconnected followers are cleaned up on their next read error.
 func (h *TerminalHub) broadcastToFollowers(raw []byte) {
 	h.mu.RLock()
@@ -167,6 +172,59 @@ func (h *TerminalHub) broadcastToFollowers(raw []byte) {
 			// broken connection and clean up via removeConn.
 		}
 	}
+
+	// Fan out to SSE subscribers if this is a frame or layout message.
+	if len(h.sseSubscribers) > 0 {
+		var msg WsMessage
+		if err := json.Unmarshal(raw, &msg); err == nil && (msg.Type == "frame" || msg.Type == "layout") {
+			// Extract the base64 data field from the frame payload.
+			var fp struct {
+				Data []byte `json:"data"`
+			}
+			if msg.Type == "frame" {
+				if err := json.Unmarshal(msg.Payload, &fp); err != nil {
+					return
+				}
+			}
+
+			// Build SSE event with type prefix.
+			var sseData string
+			if msg.Type == "layout" {
+				sseData = "event: layout\ndata: " + string(msg.Payload) + "\n\n"
+			} else {
+				sseData = "event: frame\ndata: " + base64.StdEncoding.EncodeToString(fp.Data) + "\n\n"
+			}
+
+			for ch := range h.sseSubscribers {
+				select {
+				case ch <- sseData:
+				default:
+					// Slow SSE client — drop the frame.
+					h.logger.Debug("Dropping frame for slow SSE subscriber")
+				}
+			}
+		}
+	}
+}
+
+// SubscribeSSE registers an SSE channel and returns it.
+// The caller must call UnsubscribeSSE when done.
+func (h *TerminalHub) SubscribeSSE() chan string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ch := make(chan string, 64)
+	h.sseSubscribers[ch] = true
+	h.logger.Info("SSE subscriber connected")
+	return ch
+}
+
+// UnsubscribeSSE removes an SSE channel and closes it.
+func (h *TerminalHub) UnsubscribeSSE(ch chan string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.sseSubscribers, ch)
+	close(ch)
+	h.logger.Info("SSE subscriber disconnected")
 }
 
 // sendToPrimary forwards raw to the Primary connection.
