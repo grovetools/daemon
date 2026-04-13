@@ -29,8 +29,10 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/autonomous"
 	daemonchannels "github.com/grovetools/daemon/internal/daemon/channels"
+	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
 	"github.com/grovetools/daemon/internal/daemon/server"
+	daemonssh "github.com/grovetools/daemon/internal/daemon/ssh"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/agentlogs/pkg/agentstream"
 	notifyconfig "github.com/grovetools/notify/pkg/config"
@@ -275,6 +277,10 @@ func newGrovedStartCmd() *cobra.Command {
 			}
 			srv.SetLogStreamer(streamer)
 
+			// PTY session manager for daemon-owned PTY sessions
+			ptyManager := daemonpty.NewManager(logger)
+			srv.SetPtyManager(ptyManager)
+
 			// sendInputToTmux sends a message to an agent running in a tmux pane.
 			// Uses agentstream.SendInput which handles Escape+i for vim-style agents.
 			sendInputToTmux := func(ctx context.Context, tmuxTarget, message string) error {
@@ -315,12 +321,19 @@ func newGrovedStartCmd() *cobra.Command {
 			stop := make(chan os.Signal, 1)
 			signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
+			// sshServer is set later (step 7.7) and closed by the signal handler.
+			var sshServer *daemonssh.Server
+
 			go func() {
 				<-stop
 				logger.Info("Received stop signal")
+				ptyManager.Shutdown() // Kill all daemon-owned PTY sessions
 				envManager.Shutdown() // Teardown all running environments and proxy routes
 				streamer.Stop()       // Stop all log tailing goroutines
-				cancel()              // Stop the engine
+				if sshServer != nil {
+					_ = sshServer.Stop()
+				}
+				cancel() // Stop the engine
 
 				// Create shutdown context with timeout
 				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -435,6 +448,24 @@ func newGrovedStartCmd() *cobra.Command {
 
 				logger.Info("Unified watcher started")
 				go unifiedWatcher.Start(ctx)
+			}
+
+			// 7.7. Start SSH server if enabled
+			var sshCfg *config.DaemonSSHConfig
+			if cfg.Daemon != nil {
+				sshCfg = cfg.Daemon.SSH
+			}
+			if s, err := daemonssh.New(sshCfg, logger.WithField("component", "ssh")); err != nil {
+				logger.WithError(err).Warn("Failed to start SSH server")
+			} else if s != nil {
+				s.SetStore(st)
+				s.SetPtyManager(ptyManager)
+				sshServer = s
+				go func() {
+					if err := sshServer.Start(); err != nil {
+						logger.WithError(err).Warn("SSH server stopped")
+					}
+				}()
 			}
 
 			// 8. Start Server (Blocking)

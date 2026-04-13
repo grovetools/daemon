@@ -25,6 +25,7 @@ import (
 	"github.com/grovetools/core/pkg/tmux"
 	navbindings "github.com/grovetools/nav/pkg/bindings"
 	"github.com/grovetools/daemon/internal/daemon/channels"
+	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
 	daemonweb "github.com/grovetools/daemon/web"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
@@ -60,6 +61,9 @@ type Server struct {
 	logStreamer   *logstreamer.LogStreamer
 	envManager     *daemonenv.Manager
 	channelManager *channels.Manager
+
+	// PTY session manager for daemon-owned PTY sessions.
+	ptyManager *daemonpty.Manager
 
 	// Memory store + embedder are wired via SetMemoryStore so /api/memory/*
 	// handlers can serve the same instance the MemoryHandler watcher uses.
@@ -115,6 +119,11 @@ func (s *Server) SetEnvManager(m *daemonenv.Manager) {
 // SetChannelManager sets the channel manager for the server.
 func (s *Server) SetChannelManager(m *channels.Manager) {
 	s.channelManager = m
+}
+
+// SetPtyManager sets the PTY session manager for the server.
+func (s *Server) SetPtyManager(m *daemonpty.Manager) {
+	s.ptyManager = m
 }
 
 // ListenAndServe starts the daemon on the given unix socket path.
@@ -187,6 +196,12 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/terminal/stream", s.handleTerminalStream)
 	// Static web viewer files
 	mux.Handle("/web/terminal/", http.StripPrefix("/web/terminal/", daemonweb.TerminalFileServer()))
+
+	// PTY session management endpoints
+	mux.HandleFunc("/api/pty/create", s.handlePtyCreate)
+	mux.HandleFunc("/api/pty/list", s.handlePtyList)
+	mux.HandleFunc("/api/pty/kill/", s.handlePtyKill)
+	mux.HandleFunc("/api/pty/attach/", s.handlePtyAttach)
 
 	// Nav bindings endpoints
 	mux.HandleFunc("/api/nav/bindings", s.handleNavBindings)
