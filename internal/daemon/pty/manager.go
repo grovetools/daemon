@@ -31,19 +31,24 @@ func NewManager(logger *logrus.Entry) *Manager {
 
 // CreateRequest holds the parameters for creating a new PTY session.
 type CreateRequest struct {
-	CWD    string            `json:"cwd"`
-	Env    []string          `json:"env,omitempty"`
-	Name   string            `json:"name,omitempty"`
-	Labels map[string]string `json:"labels,omitempty"`
-	Rows   uint16            `json:"rows,omitempty"`
-	Cols   uint16            `json:"cols,omitempty"`
+	CWD       string            `json:"cwd"`
+	Env       []string          `json:"env,omitempty"`
+	Workspace string            `json:"workspace,omitempty"`
+	Labels    map[string]string `json:"labels,omitempty"`
+	Rows      uint16            `json:"rows,omitempty"`
+	Cols      uint16            `json:"cols,omitempty"`
+	Origin    string            `json:"origin,omitempty"`
+	PanelID   string            `json:"panel_id,omitempty"`
+	Label     string            `json:"label,omitempty"`
+	SessionID string            `json:"session_id,omitempty"`
+	CreatedBy string            `json:"created_by,omitempty"`
 }
 
 // Create spawns a new shell in a PTY, registers it, and starts the read loop.
 func (m *Manager) Create(req CreateRequest) (*Session, error) {
 	id := uuid.New().String()
 
-	name := req.Name
+	name := req.Workspace
 	if name == "" {
 		name = filepath.Base(req.CWD)
 	}
@@ -82,16 +87,21 @@ func (m *Manager) Create(req CreateRequest) (*Session, error) {
 	}
 
 	sess := &Session{
-		ID:      id,
-		Name:    name,
-		CWD:     req.CWD,
-		Labels:  req.Labels,
-		cmd:     cmd,
-		ptmx:    ptmx,
-		clients: make(map[*websocket.Conn]bool),
-		exitCh:  make(chan struct{}),
-		logger:  m.logger.WithField("session", id),
-		onExit:  m.remove,
+		ID:        id,
+		Workspace: name,
+		CWD:       req.CWD,
+		Labels:    req.Labels,
+		Origin:    req.Origin,
+		PanelID:   req.PanelID,
+		Label:     req.Label,
+		SessionID: req.SessionID,
+		CreatedBy: req.CreatedBy,
+		cmd:       cmd,
+		ptmx:      ptmx,
+		clients:   make(map[*websocket.Conn]bool),
+		exitCh:    make(chan struct{}),
+		logger:    m.logger.WithField("session", id),
+		onExit:    m.remove,
 	}
 	sess.StartedAt = time.Now()
 
@@ -113,13 +123,16 @@ func (m *Manager) Get(id string) (*Session, bool) {
 	return s, ok
 }
 
-// List returns metadata for all active sessions.
+// List returns metadata for all active sessions, including live foreground
+// process resolution via TIOCGPGRP.
 func (m *Manager) List() []SessionMetadata {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	result := make([]SessionMetadata, 0, len(m.sessions))
 	for _, s := range m.sessions {
-		result = append(result, s.Metadata())
+		md := s.Metadata()
+		md.ForegroundProcess = s.ForegroundProcess()
+		result = append(result, md)
 	}
 	return result
 }

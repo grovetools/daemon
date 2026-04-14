@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 // historySize is the maximum number of bytes retained in the per-session
@@ -22,10 +25,15 @@ const historySize = 128 * 1024 // 128 KB
 // Session represents a single daemon-owned PTY session.
 type Session struct {
 	ID        string            `json:"id"`
-	Name      string            `json:"name"`
+	Workspace string            `json:"workspace"`
 	CWD       string            `json:"cwd"`
 	Labels    map[string]string `json:"labels,omitempty"`
 	StartedAt time.Time         `json:"started_at"`
+	Origin    string            `json:"origin,omitempty"`
+	PanelID   string            `json:"panel_id,omitempty"`
+	Label     string            `json:"label,omitempty"`
+	SessionID string            `json:"session_id,omitempty"`
+	CreatedBy string            `json:"created_by,omitempty"`
 
 	cmd  *exec.Cmd
 	ptmx *os.File
@@ -47,13 +55,19 @@ type Session struct {
 
 // SessionMetadata is the safe, serializable subset of Session for API responses.
 type SessionMetadata struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	CWD             string            `json:"cwd"`
-	Labels          map[string]string `json:"labels,omitempty"`
-	PID             int               `json:"pid"`
-	StartedAt       time.Time         `json:"started_at"`
-	AttachedClients int               `json:"attached_clients"`
+	ID                string            `json:"id"`
+	Workspace         string            `json:"workspace"`
+	CWD               string            `json:"cwd"`
+	Labels            map[string]string `json:"labels,omitempty"`
+	PID               int               `json:"pid"`
+	StartedAt         time.Time         `json:"started_at"`
+	AttachedClients   int               `json:"attached_clients"`
+	Origin            string            `json:"origin,omitempty"`
+	PanelID           string            `json:"panel_id,omitempty"`
+	Label             string            `json:"label,omitempty"`
+	SessionID         string            `json:"session_id,omitempty"`
+	CreatedBy         string            `json:"created_by,omitempty"`
+	ForegroundProcess string            `json:"foreground_process,omitempty"`
 }
 
 // ControlMessage is the JSON envelope for text-frame control messages.
@@ -76,13 +90,39 @@ func (s *Session) Metadata() SessionMetadata {
 
 	return SessionMetadata{
 		ID:              s.ID,
-		Name:            s.Name,
+		Workspace:       s.Workspace,
 		CWD:             s.CWD,
 		Labels:          s.Labels,
 		PID:             pid,
 		StartedAt:       s.StartedAt,
 		AttachedClients: len(s.clients),
+		Origin:          s.Origin,
+		PanelID:         s.PanelID,
+		Label:           s.Label,
+		SessionID:       s.SessionID,
+		CreatedBy:       s.CreatedBy,
 	}
+}
+
+// ForegroundProcess returns the name of the foreground process running in
+// this PTY session, resolved via TIOCGPGRP + ps. Returns empty string on error.
+func (s *Session) ForegroundProcess() string {
+	if s.ptmx == nil {
+		return ""
+	}
+	pgid, err := unix.IoctlGetInt(int(s.ptmx.Fd()), unix.TIOCGPGRP)
+	if err != nil || pgid <= 0 {
+		return ""
+	}
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pgid), "-o", "comm=").Output()
+	if err != nil {
+		return ""
+	}
+	comm := strings.TrimSpace(string(out))
+	if idx := strings.LastIndex(comm, "/"); idx >= 0 {
+		comm = comm[idx+1:]
+	}
+	return comm
 }
 
 // Write sends raw bytes to the PTY master (client → shell).
