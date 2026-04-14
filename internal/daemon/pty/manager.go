@@ -6,7 +6,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	creackpty "github.com/creack/pty"
@@ -61,8 +60,9 @@ func (m *Manager) Create(req CreateRequest) (*Session, error) {
 		cmd.Env = append(cmd.Env, req.Env...)
 	}
 
-	// Start in its own process group so Kill(-pgid) works.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// NOTE: Do NOT set Setpgid here. creack/pty v1.1.20+ has a regression
+	// where Setpgid combined with pty.Start causes EPERM on macOS.
+	// The shell will still get its own session via the PTY's Setsid.
 
 	rows := req.Rows
 	cols := req.Cols
