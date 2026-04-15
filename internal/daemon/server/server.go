@@ -904,17 +904,29 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 	// and send an attach event instead of a spawn event. This lets the agent
 	// process survive terminal restarts.
 	if s.ptyManager != nil && payload.Command != "" {
-		// Build env slice from the map.
-		var envSlice []string
+		// Wrap the agent command in an interactive shell so the user's RC
+		// files are sourced (PATH includes nvm, homebrew, etc.). Export
+		// env vars inside the script to ensure they survive shell init.
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/sh"
+		}
+
+		var script strings.Builder
 		for k, v := range payload.Env {
-			envSlice = append(envSlice, k+"="+v)
+			escapedVal := strings.ReplaceAll(v, "'", "'\\''")
+			script.WriteString(fmt.Sprintf("export %s='%s'; ", k, escapedVal))
+		}
+		script.WriteString(payload.Command)
+		for _, arg := range payload.Args {
+			escapedArg := strings.ReplaceAll(arg, "'", "'\\''")
+			script.WriteString(fmt.Sprintf(" '%s'", escapedArg))
 		}
 
 		sess, err := s.ptyManager.Create(daemonpty.CreateRequest{
 			CWD:       payload.WorkDir,
-			Env:       envSlice,
-			Command:   payload.Command,
-			Args:      payload.Args,
+			Command:   shell,
+			Args:      []string{"-i", "-c", script.String()},
 			Origin:    "agent:" + payload.JobID,
 			Label:     payload.JobTitle,
 			CreatedBy: "flow",
