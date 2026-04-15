@@ -882,7 +882,8 @@ func (s *Server) handleTerminalStatus(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"connected":%t}`, connected)
 }
 
-// handleAgentSpawn handles POST /api/agents/spawn — relay a spawn request to groveterm via SSE.
+// handleAgentSpawn handles POST /api/agents/spawn — creates a daemon-owned PTY
+// for the agent process and sends an attach event to groveterm via SSE.
 func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -899,6 +900,65 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If the PTY manager is available, create a daemon-owned PTY for the agent
+	// and send an attach event instead of a spawn event. This lets the agent
+	// process survive terminal restarts.
+	if s.ptyManager != nil && payload.Command != "" {
+		// Build env slice from the map.
+		var envSlice []string
+		for k, v := range payload.Env {
+			envSlice = append(envSlice, k+"="+v)
+		}
+
+		sess, err := s.ptyManager.Create(daemonpty.CreateRequest{
+			CWD:       payload.WorkDir,
+			Env:       envSlice,
+			Command:   payload.Command,
+			Args:      payload.Args,
+			Origin:    "agent:" + payload.JobID,
+			Label:     payload.JobTitle,
+			CreatedBy: "flow",
+			Labels: map[string]string{
+				"job_id":    payload.JobID,
+				"plan_name": payload.PlanName,
+				"type":      "agent",
+			},
+		})
+		if err != nil {
+			s.logger.WithError(err).Error("Failed to create agent PTY session")
+			http.Error(w, "failed to create agent PTY: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		ptyID := sess.Metadata().ID
+
+		// Update the session registry with the PTY ID so re-attachment works.
+		if st := s.engine.Store(); st != nil {
+			st.SetSessionPtyID(payload.JobID, ptyID)
+		}
+
+		// Send attach event to groveterm via SSE.
+		attachPayload := &store.AttachAgentPayload{
+			JobID:     payload.JobID,
+			PlanName:  payload.PlanName,
+			JobTitle:  payload.JobTitle,
+			PtyID:     ptyID,
+			WorkDir:   payload.WorkDir,
+			Env:       payload.Env,
+			AutoSplit: payload.AutoSplit,
+		}
+		s.engine.Store().ApplyUpdate(store.Update{
+			Type:    store.UpdateAttachAgentPane,
+			Source:  "api",
+			Payload: attachPayload,
+		})
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "attached", "pty_id": ptyID})
+		return
+	}
+
+	// Fallback: relay spawn request to groveterm (legacy path).
 	s.engine.Store().ApplyUpdate(store.Update{
 		Type:    store.UpdateSpawnAgentPane,
 		Source:  "api",
@@ -1155,7 +1215,7 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 		}
 
 	// Native agent pane relay — pass-through to groveterm via SSE.
-	case store.UpdateSpawnAgentPane, store.UpdateAgentInput, store.UpdateCaptureRequest:
+	case store.UpdateSpawnAgentPane, store.UpdateAttachAgentPane, store.UpdateAgentInput, store.UpdateCaptureRequest:
 		return &apiStateUpdate{
 			UpdateType: string(u.Type),
 			Source:     u.Source,

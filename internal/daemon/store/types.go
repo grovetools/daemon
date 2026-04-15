@@ -72,9 +72,10 @@ const (
 	// daemon relays from Flow (or the HTTP API) to groveterm via SSE.
 	// The daemon does NOT apply them to its own state; they exist purely
 	// as a control-plane channel between Flow and the terminal.
-	UpdateSpawnAgentPane UpdateType = "spawn_agent_pane" // Payload: *SpawnAgentPayload
-	UpdateAgentInput     UpdateType = "agent_input"      // Payload: *AgentInputPayload
-	UpdateCaptureRequest UpdateType = "capture_request"  // Payload: *CaptureRequestPayload
+	UpdateSpawnAgentPane  UpdateType = "spawn_agent_pane"  // Payload: *SpawnAgentPayload
+	UpdateAttachAgentPane UpdateType = "attach_agent_pane" // Payload: *AttachAgentPayload
+	UpdateAgentInput      UpdateType = "agent_input"       // Payload: *AgentInputPayload
+	UpdateCaptureRequest  UpdateType = "capture_request"   // Payload: *CaptureRequestPayload
 )
 
 // MemoryIndexPayload describes a single memory store mutation for SSE subscribers.
@@ -162,6 +163,17 @@ type SpawnAgentPayload struct {
 	JobTitle  string            `json:"job_title"`
 	Command   string            `json:"command"`
 	Args      []string          `json:"args"`
+	WorkDir   string            `json:"work_dir"`
+	Env       map[string]string `json:"env,omitempty"`
+	AutoSplit bool              `json:"auto_split"`
+}
+
+// AttachAgentPayload tells groveterm to attach to a daemon-owned agent PTY.
+type AttachAgentPayload struct {
+	JobID     string            `json:"job_id"`
+	PlanName  string            `json:"plan_name"`
+	JobTitle  string            `json:"job_title"`
+	PtyID     string            `json:"pty_id"`
 	WorkDir   string            `json:"work_dir"`
 	Env       map[string]string `json:"env,omitempty"`
 	AutoSplit bool              `json:"auto_split"`

@@ -351,6 +351,16 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload) {
 	}
 }
 
+// SetSessionPtyID associates a daemon PTY session ID with a session entry.
+// Called by handleAgentSpawn after creating the daemon-owned PTY.
+func (s *Store) SetSessionPtyID(jobID, ptyID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if session, exists := s.state.Sessions[jobID]; exists {
+		session.PtyID = ptyID
+	}
+}
+
 // applyNoteEvent incrementally adjusts note counts and the note index based on a mutation event.
 // The event carries workspace name and note type, allowing precise count updates
 // without a full filesystem rescan.

@@ -42,6 +42,8 @@ type CreateRequest struct {
 	Label     string            `json:"label,omitempty"`
 	SessionID string            `json:"session_id,omitempty"`
 	CreatedBy string            `json:"created_by,omitempty"`
+	Command   string            `json:"command,omitempty"`
+	Args      []string          `json:"args,omitempty"`
 }
 
 // Create spawns a new shell in a PTY, registers it, and starts the read loop.
@@ -53,12 +55,16 @@ func (m *Manager) Create(req CreateRequest) (*Session, error) {
 		name = filepath.Base(req.CWD)
 	}
 
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
+	var cmd *exec.Cmd
+	if req.Command != "" {
+		cmd = exec.Command(req.Command, req.Args...)
+	} else {
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/sh"
+		}
+		cmd = exec.Command(shell)
 	}
-
-	cmd := exec.Command(shell)
 	cmd.Dir = req.CWD
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "GROVE_PTY=1")
 	if len(req.Env) > 0 {
