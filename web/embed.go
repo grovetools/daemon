@@ -7,13 +7,13 @@ import (
 	"net/http"
 )
 
-//go:embed all:terminal
+//go:embed all:treemux
 var staticFiles embed.FS
 
-// TerminalFileServer returns an http.Handler serving the embedded
-// terminal web viewer static files.
-func TerminalFileServer() http.Handler {
-	sub, err := fs.Sub(staticFiles, "terminal")
+// TreemuxFileServer returns an http.Handler serving the embedded
+// treemux web viewer static files.
+func TreemuxFileServer() http.Handler {
+	sub, err := fs.Sub(staticFiles, "treemux")
 	if err != nil {
 		panic("failed to create sub filesystem: " + err.Error())
 	}

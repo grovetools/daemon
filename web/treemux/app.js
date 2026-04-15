@@ -269,7 +269,7 @@ function connect() {
     var statusDot = document.getElementById('status-dot');
     var statusText = document.getElementById('connection-status');
     var frameInfo = document.getElementById('frame-info');
-    var es = new EventSource('/api/terminal/stream');
+    var es = new EventSource('/api/treemux/stream');
 
     es.addEventListener('frame', function (e) {
         var frame = decodeFrame(e.data);

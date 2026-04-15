@@ -190,12 +190,12 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/memory/search", s.handleMemorySearch)
 	mux.HandleFunc("/api/memory/coverage", s.handleMemoryCoverage)
 	mux.HandleFunc("/api/memory/status", s.handleMemoryStatus)
-	// Terminal multi-attach WebSocket endpoint
-	mux.HandleFunc("/api/terminal/ws", s.HandleTerminalWS)
-	// Terminal SSE stream for web viewers
-	mux.HandleFunc("/api/terminal/stream", s.handleTerminalStream)
+	// Treemux multi-attach WebSocket endpoint
+	mux.HandleFunc("/api/treemux/ws", s.HandleTerminalWS)
+	// Treemux SSE stream for web viewers
+	mux.HandleFunc("/api/treemux/stream", s.handleTerminalStream)
 	// Static web viewer files
-	mux.Handle("/web/terminal/", http.StripPrefix("/web/terminal/", daemonweb.TerminalFileServer()))
+	mux.Handle("/web/treemux/", http.StripPrefix("/web/treemux/", daemonweb.TreemuxFileServer()))
 
 	// PTY session management endpoints
 	mux.HandleFunc("/api/pty/create", s.handlePtyCreate)
@@ -210,7 +210,7 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/nav/locked-keys", s.handleNavLockedKeys)
 	mux.HandleFunc("/api/nav/last-accessed", s.handleNavLastAccessedGroup)
 	// System endpoints
-	mux.HandleFunc("/api/system/terminal-status", s.handleTerminalStatus)
+	mux.HandleFunc("/api/system/treemux-status", s.handleTerminalStatus)
 	// Native agent pane relay endpoints
 	mux.HandleFunc("/api/agents/spawn", s.handleAgentSpawn)
 	mux.HandleFunc("/api/agents/", s.handleAgentByID)
