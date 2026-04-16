@@ -66,7 +66,7 @@ func (m *Manager) Create(req CreateRequest) (*Session, error) {
 		cmd = exec.Command(shell)
 	}
 	cmd.Dir = req.CWD
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "GROVE_PTY=1")
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "GROVE_PTY=1", "GROVE_TERMINAL=1")
 	if len(req.Env) > 0 {
 		cmd.Env = append(cmd.Env, req.Env...)
 	}
