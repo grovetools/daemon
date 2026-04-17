@@ -263,7 +263,7 @@ func (h *SkillHandler) handleWorkspacesDiscovered() {
 		h.configsMutex.RUnlock()
 
 		if !seen {
-			h.log.WithField("workspace", node.Name).Info("New workspace discovered, syncing skills")
+			h.log.WithField("workspace", node.Name).Debug("New workspace discovered, syncing skills")
 			h.syncWorkspace(node)
 		}
 	}
@@ -397,12 +397,10 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 	targetNode := node
 	executor := h.hooksExecutor
 	h.timers[debounceKey] = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
-		// Skip workspaces whose paths no longer exist (deleted worktrees, removed repos)
+		// Skip workspaces whose paths no longer exist (deleted worktrees, removed repos).
+		// This is a transient, expected state during worktree teardown when fsnotify
+		// is still flushing events — no need to log.
 		if _, err := os.Stat(targetNode.Path); err != nil {
-			h.log.WithFields(logrus.Fields{
-				"workspace": targetNode.Name,
-				"path":      targetNode.Path,
-			}).Debug("Skipping skill sync for workspace with missing path")
 			return
 		}
 
@@ -425,7 +423,6 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 		}
 
 		if err != nil {
-			h.log.WithError(err).Error("Skill sync failed")
 			payload.Error = err.Error()
 		}
 
@@ -435,10 +432,16 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 			Payload: payload,
 		})
 
-		h.log.WithFields(logrus.Fields{
-			"workspace": targetNode.Name,
-			"synced":    len(result.SyncedSkills),
-		}).Debug("Skill sync completed")
+		switch {
+		case err != nil:
+			h.log.WithError(err).WithField("workspace", targetNode.Name).Error("Skill sync failed")
+		case len(result.SyncedSkills) > 0:
+			h.log.WithFields(logrus.Fields{
+				"workspace":  targetNode.Name,
+				"synced":     len(result.SyncedSkills),
+				"dest_paths": result.DestPaths,
+			}).Info("Skill sync completed")
+		}
 
 		changed := len(result.SyncedSkills) > 0
 		executor.ExecuteOnSkillSync(context.Background(), targetNode.Path, result.SyncedSkills, changed)
