@@ -742,30 +742,14 @@ type monitorState struct {
 	lastFocus      int
 }
 
-// monitorEmitter returns a function that writes structured JSON to the system log
-// and prints formatted output to stdout in the requested format.
-// Routine polling events are emitted at DEBUG unless values changed.
+// monitorEmitter returns a function that prints formatted output to stdout in
+// the requested format. The authoritative audit trail lives on the domain
+// components (watchers, server, collectors); this emitter is a stdout-only
+// presentation layer and must not write to the structured log file.
 func monitorEmitter(component, format string, compact bool) (func(level, msg string, fields map[string]interface{}), *monitorState) {
-	ulog := grovelogging.NewUnifiedLogger(component)
 	state := &monitorState{}
 
 	emit := func(level, msg string, fields map[string]interface{}) {
-		// Build the structured entry and write to log file only
-		entry := ulog.Info(msg).StructuredOnly()
-		switch level {
-		case "warning":
-			entry = ulog.Warn(msg).StructuredOnly()
-		case "error":
-			entry = ulog.Error(msg).StructuredOnly()
-		case "debug":
-			entry = ulog.Debug(msg).StructuredOnly()
-		}
-		if fields != nil {
-			entry.Fields(fields)
-		}
-		entry.Emit()
-
-		// Don't print debug events to terminal (they still go to log file)
 		if level == "debug" {
 			return
 		}
