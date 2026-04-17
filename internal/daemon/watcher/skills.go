@@ -17,7 +17,6 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/skills/pkg/service"
 	"github.com/grovetools/skills/pkg/skills"
-	"github.com/sirupsen/logrus"
 )
 
 // SkillHandler implements DomainHandler for skill file watching and sync.
@@ -29,7 +28,7 @@ type SkillHandler struct {
 	hooksExecutor *hooks.Executor
 	debounceMs    int
 
-	log *logrus.Entry
+	ulog *logging.UnifiedLogger
 
 	// Maps watched path -> associated WorkspaceNode (nil for global paths)
 	watchedPaths map[string]*workspace.WorkspaceNode
@@ -64,7 +63,7 @@ func NewSkillHandler(st *store.Store, cfg *config.Config, debounceMs int) (*Skil
 		cfg:             cfg,
 		hooksExecutor:   hooks.NewExecutor(cfg),
 		debounceMs:      debounceMs,
-		log:             logging.NewLogger("groved.skills.watcher"),
+		ulog:            logging.NewUnifiedLogger("groved.watcher.skills"),
 		watchedPaths:    make(map[string]*workspace.WorkspaceNode),
 		timers:          make(map[string]*time.Timer),
 		cachedConfigs:   make(map[string]*skills.SkillsConfig),
@@ -208,16 +207,17 @@ func (h *SkillHandler) HandleStoreUpdate(update store.Update) {
 
 // handleConfigReload reloads the global config and syncs all workspaces if skills config changed.
 func (h *SkillHandler) handleConfigReload() {
+	ctx := context.Background()
 	newCfg, err := config.LoadDefault()
 	if err != nil {
-		h.log.WithError(err).Error("Failed to reload config")
+		h.ulog.Error("Failed to reload config").Err(err).Log(ctx)
 		return
 	}
 
 	// Check if global skills configuration actually changed
 	newGlobalSkillsCfg := skills.LoadGlobalSkillsConfig(newCfg)
 	if reflect.DeepEqual(h.globalSkillsCfg, newGlobalSkillsCfg) {
-		h.log.Debug("Global skills config unchanged, skipping sync")
+		h.ulog.Debug("Global skills config unchanged, skipping sync").Log(ctx)
 		// Still update internal references
 		h.cfg = newCfg
 		h.svc.Config = newCfg
@@ -226,7 +226,7 @@ func (h *SkillHandler) handleConfigReload() {
 		return
 	}
 
-	h.log.Info("Skills config reload detected, syncing all skills")
+	h.ulog.Info("Skills config reload detected, syncing all skills").Log(ctx)
 	h.globalSkillsCfg = newGlobalSkillsCfg
 	h.cfg = newCfg
 	h.svc.Config = newCfg
@@ -240,6 +240,7 @@ func (h *SkillHandler) handleConfigReload() {
 // On first discovery (no cached configs yet), syncs all workspaces.
 // On subsequent discoveries, only syncs workspaces not yet seen.
 func (h *SkillHandler) handleWorkspacesDiscovered() {
+	ctx := context.Background()
 	workspaces := h.store.GetWorkspaces()
 
 	h.configsMutex.RLock()
@@ -247,7 +248,9 @@ func (h *SkillHandler) handleWorkspacesDiscovered() {
 	h.configsMutex.RUnlock()
 
 	if cachedCount == 0 {
-		h.log.WithField("count", len(workspaces)).Info("Workspaces discovered, performing initial skill sync")
+		h.ulog.Info("Workspaces discovered, performing initial skill sync").
+			Field("count", len(workspaces)).
+			Log(ctx)
 		h.syncAllWorkspaces()
 		return
 	}
@@ -263,7 +266,9 @@ func (h *SkillHandler) handleWorkspacesDiscovered() {
 		h.configsMutex.RUnlock()
 
 		if !seen {
-			h.log.WithField("workspace", node.Name).Debug("New workspace discovered, syncing skills")
+			h.ulog.Debug("New workspace discovered, syncing skills").
+				Field("workspace", node.Name).
+				Log(ctx)
 			h.syncWorkspace(node)
 		}
 	}
@@ -276,16 +281,17 @@ func (h *SkillHandler) handleWorkspacesDiscovered() {
 func (h *SkillHandler) OnStart(ctx context.Context) {
 	workspaces := h.store.GetWorkspaces()
 	if len(workspaces) == 0 {
-		h.log.Debug("No workspaces available yet at startup, deferring initial sync to workspace discovery")
+		h.ulog.Debug("No workspaces available yet at startup, deferring initial sync to workspace discovery").Log(ctx)
 		return
 	}
-	h.log.Info("Performing initial skill sync for all workspaces")
+	h.ulog.Info("Performing initial skill sync for all workspaces").Log(ctx)
 	h.syncAllWorkspaces()
 }
 
 // handleConfigChange handles grove.toml changes in workspaces.
 // Only triggers a skill sync if the skills-related config actually changed.
 func (h *SkillHandler) handleConfigChange(configPath string) {
+	ctx := context.Background()
 	configDir := filepath.Dir(configPath)
 
 	h.pathsMutex.RLock()
@@ -299,7 +305,10 @@ func (h *SkillHandler) handleConfigChange(configPath string) {
 	// Load the new skills config and compare with cached version
 	newCfg, err := skills.LoadSkillsConfig(h.cfg, node)
 	if err != nil {
-		h.log.WithError(err).WithField("workspace", node.Name).Debug("Failed to load skills config for change detection")
+		h.ulog.Debug("Failed to load skills config for change detection").
+			Err(err).
+			Field("workspace", node.Name).
+			Log(ctx)
 		// Fall through to sync on error — safer than skipping
 	} else {
 		h.configsMutex.RLock()
@@ -307,15 +316,17 @@ func (h *SkillHandler) handleConfigChange(configPath string) {
 		h.configsMutex.RUnlock()
 
 		if reflect.DeepEqual(prev, newCfg) {
-			h.log.WithField("workspace", node.Name).Debug("Skills config unchanged in grove.toml, skipping sync")
+			h.ulog.Debug("Skills config unchanged in grove.toml, skipping sync").
+				Field("workspace", node.Name).
+				Log(ctx)
 			return
 		}
 	}
 
-	h.log.WithFields(logrus.Fields{
-		"workspace": node.Name,
-		"config":    configPath,
-	}).Info("Skills config changed, syncing skills")
+	h.ulog.Info("Skills config changed, syncing skills").
+		Field("workspace", node.Name).
+		Field("config", configPath).
+		Log(ctx)
 
 	h.syncWorkspace(node)
 }
@@ -330,7 +341,10 @@ func (h *SkillHandler) triggerSync(changedSkills map[string]struct{}) {
 		return
 	}
 
-	h.log.WithField("changedSkills", len(changedSkills)).Debug("Skill files changed, checking affected workspaces")
+	ctx := context.Background()
+	h.ulog.Debug("Skill files changed, checking affected workspaces").
+		Field("changedSkills", len(changedSkills)).
+		Log(ctx)
 
 	var nodesToSync []*workspace.WorkspaceNode
 	workspaces := h.store.GetWorkspaces()
@@ -350,7 +364,7 @@ func (h *SkillHandler) triggerSync(changedSkills map[string]struct{}) {
 		// in the transitive graph. A single resolve covers the whole batch.
 		resolved, err := skills.ResolveConfiguredSkills(h.svc, node, skillsCfg)
 		if err != nil {
-			h.log.WithError(err).Debug("Best effort resolving skills failed")
+			h.ulog.Debug("Best effort resolving skills failed").Err(err).Log(ctx)
 		}
 
 		if resolved == nil {
@@ -364,7 +378,7 @@ func (h *SkillHandler) triggerSync(changedSkills map[string]struct{}) {
 		}
 	}
 
-	h.log.WithField("count", len(nodesToSync)).Debug("Workspaces to sync")
+	h.ulog.Debug("Workspaces to sync").Field("count", len(nodesToSync)).Log(ctx)
 
 	for _, node := range nodesToSync {
 		h.syncWorkspace(node)
@@ -404,7 +418,8 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 			return
 		}
 
-		h.log.WithField("target", debounceKey).Info("Executing skill sync")
+		ctx := context.Background()
+		h.ulog.Info("Executing skill sync").Field("target", debounceKey).Log(ctx)
 
 		// Cache the current skills config for change detection on future grove.toml saves
 		if cfg, loadErr := skills.LoadSkillsConfig(h.cfg, targetNode); loadErr == nil {
@@ -434,13 +449,16 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 
 		switch {
 		case err != nil:
-			h.log.WithError(err).WithField("workspace", targetNode.Name).Error("Skill sync failed")
+			h.ulog.Error("Skill sync failed").
+				Err(err).
+				Field("workspace", targetNode.Name).
+				Log(ctx)
 		case len(result.SyncedSkills) > 0:
-			h.log.WithFields(logrus.Fields{
-				"workspace":  targetNode.Name,
-				"synced":     len(result.SyncedSkills),
-				"dest_paths": result.DestPaths,
-			}).Info("Skill sync completed")
+			h.ulog.Info("Skill sync completed").
+				Field("workspace", targetNode.Name).
+				Field("synced", len(result.SyncedSkills)).
+				Field("dest_paths", result.DestPaths).
+				Log(ctx)
 		}
 
 		changed := len(result.SyncedSkills) > 0

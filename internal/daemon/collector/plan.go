@@ -35,7 +35,7 @@ func (c *PlanCollector) Name() string { return "plan" }
 
 // Run starts the plan stats collection loop.
 func (c *PlanCollector) Run(ctx context.Context, st *store.Store, updates chan<- store.Update) error {
-	logger := logging.NewLogger("collector.plan")
+	ulog := logging.NewUnifiedLogger("groved.collector.plan")
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
@@ -45,7 +45,7 @@ func (c *PlanCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 1*time.Second {
-				logger.WithField("duration", d).Debug("Slow plan scan detected")
+				ulog.Debug("Slow plan scan detected").Field("duration", d).Log(ctx)
 			}
 		}()
 

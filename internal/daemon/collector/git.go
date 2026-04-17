@@ -75,7 +75,7 @@ func (c *GitStatusCollector) Name() string { return "git" }
 
 // Run starts the git status collection loop.
 func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates chan<- store.Update) error {
-	logger := logging.NewLogger("collector.git")
+	ulog := logging.NewUnifiedLogger("groved.collector.git")
 	var lastFullScan time.Time
 	var lastFocusCount int
 	currentInterval := c.interval
@@ -91,7 +91,7 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 1*time.Second {
-				logger.WithField("duration", d).Debug("Slow git status scan detected")
+				ulog.Debug("Slow git status scan detected").Field("duration", d).Log(ctx)
 			}
 		}()
 

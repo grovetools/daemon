@@ -22,7 +22,8 @@ import (
 type WorkspaceHandler struct {
 	store        *store.Store
 	cfg          *config.Config
-	log          *logrus.Entry
+	ulog         *logging.UnifiedLogger
+	discoveryLog *logrus.Logger // Passed to workspace.GetProjects which requires *logrus.Logger
 	watchedPaths map[string]bool
 	pathsMutex   sync.RWMutex
 	refreshTimer *time.Timer
@@ -34,10 +35,13 @@ func NewWorkspaceHandler(st *store.Store, cfg *config.Config, debounceMs int) *W
 	if debounceMs <= 0 {
 		debounceMs = 2000
 	}
+	discoveryLog := logrus.New()
+	discoveryLog.SetLevel(logrus.WarnLevel)
 	return &WorkspaceHandler{
 		store:        st,
 		cfg:          cfg,
-		log:          logging.NewLogger("groved.workspace.watcher"),
+		ulog:         logging.NewUnifiedLogger("groved.watcher.workspace"),
+		discoveryLog: discoveryLog,
 		watchedPaths: make(map[string]bool),
 		debounceMs:   debounceMs,
 	}
@@ -106,7 +110,7 @@ func (h *WorkspaceHandler) MatchesEvent(event fsnotify.Event) bool {
 }
 
 func (h *WorkspaceHandler) HandleEvents(ctx context.Context, events []fsnotify.Event) error {
-	h.log.WithField("count", len(events)).Debug("Workspace filesystem changes detected")
+	h.ulog.Debug("Workspace filesystem changes detected").Field("count", len(events)).Log(ctx)
 	h.triggerRefresh()
 	return nil
 }
@@ -151,11 +155,12 @@ func (h *WorkspaceHandler) triggerRefresh() {
 	}
 
 	h.refreshTimer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
-		h.log.Debug("Checking for workspace structural changes")
+		ctx := context.Background()
+		h.ulog.Debug("Checking for workspace structural changes").Log(ctx)
 
-		nodes, err := workspace.GetProjects(h.log.Logger)
+		nodes, err := workspace.GetProjects(h.discoveryLog)
 		if err != nil {
-			h.log.WithError(err).Error("Failed to discover workspaces")
+			h.ulog.Error("Failed to discover workspaces").Err(err).Log(ctx)
 			return
 		}
 
@@ -165,11 +170,11 @@ func (h *WorkspaceHandler) triggerRefresh() {
 		// (new repo, removed repo, worktree added/removed). Enrichment-only
 		// changes are handled by the delta pipeline.
 		if !workspaceSetChanged(currentState.Workspaces, nodes) {
-			h.log.Debug("No structural workspace changes, skipping update")
+			h.ulog.Debug("No structural workspace changes, skipping update").Log(ctx)
 			return
 		}
 
-		h.log.Info("Workspace structure changed, refreshing")
+		h.ulog.Info("Workspace structure changed, refreshing").Log(ctx)
 		enrichedMap := make(map[string]*models.EnrichedWorkspace)
 
 		for _, node := range nodes {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/store"
@@ -12,9 +13,10 @@ import (
 
 // WorkspaceCollector discovers workspaces and maintains the base workspace list.
 type WorkspaceCollector struct {
-	interval time.Duration
-	logger   *logrus.Logger
-	refresh  chan chan struct{}
+	interval      time.Duration
+	ulog          *logging.UnifiedLogger
+	discoveryLog  *logrus.Logger // Passed to workspace.GetProjects which requires *logrus.Logger
+	refresh       chan chan struct{}
 }
 
 // NewWorkspaceCollector creates a new WorkspaceCollector with the specified interval.
@@ -23,12 +25,13 @@ func NewWorkspaceCollector(interval time.Duration) *WorkspaceCollector {
 	if interval == 0 {
 		interval = 5 * time.Minute
 	}
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
+	discoveryLog := logrus.New()
+	discoveryLog.SetLevel(logrus.WarnLevel)
 	return &WorkspaceCollector{
-		interval: interval,
-		logger:   logger,
-		refresh:  make(chan chan struct{}),
+		interval:     interval,
+		ulog:         logging.NewUnifiedLogger("groved.collector.workspace"),
+		discoveryLog: discoveryLog,
+		refresh:      make(chan chan struct{}),
 	}
 }
 
@@ -60,12 +63,12 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 1*time.Second {
-				c.logger.WithField("duration", d).Debug("Slow workspace discovery detected")
+				c.ulog.Debug("Slow workspace discovery detected").Field("duration", d).Log(ctx)
 			}
 		}()
 
 		// 1. Discover base nodes
-		nodes, err := workspace.GetProjects(c.logger)
+		nodes, err := workspace.GetProjects(c.discoveryLog)
 		if err != nil {
 			return
 		}

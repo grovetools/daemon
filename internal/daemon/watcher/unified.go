@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/sirupsen/logrus"
@@ -34,12 +35,14 @@ type UnifiedWatcher struct {
 	watchCounts     map[string]int
 	batchInterval   time.Duration
 	refreshInterval time.Duration
-	logger          *logrus.Entry
+	ulog            *logging.UnifiedLogger
 	mu              sync.Mutex
 }
 
 // NewUnifiedWatcher creates a new UnifiedWatcher with a single fsnotify instance.
-func NewUnifiedWatcher(st *store.Store, batchInterval time.Duration, logger *logrus.Entry) (*UnifiedWatcher, error) {
+// The logger parameter is retained for backwards compatibility with cmd/groved.go
+// and will be removed in a later phase.
+func NewUnifiedWatcher(st *store.Store, batchInterval time.Duration, _ *logrus.Entry) (*UnifiedWatcher, error) {
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -52,7 +55,7 @@ func NewUnifiedWatcher(st *store.Store, batchInterval time.Duration, logger *log
 		watchCounts:     make(map[string]int),
 		batchInterval:   batchInterval,
 		refreshInterval: 15 * time.Second,
-		logger:          logger.WithField("component", "unified_watcher"),
+		ulog:            logging.NewUnifiedLogger("groved.watcher.unified"),
 	}, nil
 }
 
@@ -124,7 +127,7 @@ func (w *UnifiedWatcher) Start(ctx context.Context) {
 			if !ok {
 				return
 			}
-			w.logger.WithError(err).Error("fsnotify watcher error")
+			w.ulog.Error("fsnotify watcher error").Err(err).Log(ctx)
 		case <-batchTicker.C:
 			if len(eventBuffer) > 0 {
 				w.dispatch(ctx, eventBuffer)
@@ -163,7 +166,10 @@ func (w *UnifiedWatcher) dispatch(ctx context.Context, events []fsnotify.Event) 
 		if len(matched) > 0 {
 			go func(handler DomainHandler, evts []fsnotify.Event) {
 				if err := handler.HandleEvents(ctx, evts); err != nil {
-					w.logger.WithError(err).WithField("handler", handler.Name()).Error("Handler failed to process events")
+					w.ulog.Error("Handler failed to process events").
+						Err(err).
+						Field("handler", handler.Name()).
+						Log(ctx)
 				}
 			}(h, matched)
 		}
@@ -173,6 +179,7 @@ func (w *UnifiedWatcher) dispatch(ctx context.Context, events []fsnotify.Event) 
 // refreshWatches recomputes watch paths from all handlers and updates the shared
 // fsnotify watcher using reference counting to handle overlapping paths.
 func (w *UnifiedWatcher) refreshWatches() {
+	ctx := context.Background()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -190,7 +197,7 @@ func (w *UnifiedWatcher) refreshWatches() {
 	for p := range w.watchCounts {
 		if desiredCounts[p] == 0 {
 			if err := w.fsWatcher.Remove(p); err != nil {
-				w.logger.WithError(err).WithField("path", p).Debug("Failed to remove watch")
+				w.ulog.Debug("Failed to remove watch").Err(err).Field("path", p).Log(ctx)
 			}
 			delete(w.watchCounts, p)
 		}
@@ -204,7 +211,7 @@ func (w *UnifiedWatcher) refreshWatches() {
 				continue
 			}
 			if err := w.fsWatcher.Add(p); err != nil {
-				w.logger.WithError(err).WithField("path", p).Debug("Failed to watch path")
+				w.ulog.Debug("Failed to watch path").Err(err).Field("path", p).Log(ctx)
 			} else {
 				w.watchCounts[p] = count
 			}

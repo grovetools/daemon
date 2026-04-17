@@ -8,7 +8,6 @@ import (
 	"github.com/grovetools/core/pkg/process"
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	"github.com/sirupsen/logrus"
 )
 
 // SessionCollector monitors active sessions in the store for process liveness.
@@ -21,7 +20,7 @@ import (
 // 3. Cleans up dead sessions (marks as interrupted, removes crash-recovery files)
 type SessionCollector struct {
 	interval time.Duration
-	logger   *logrus.Entry
+	ulog     *logging.UnifiedLogger
 }
 
 // NewSessionCollector creates a new SessionCollector.
@@ -32,7 +31,7 @@ func NewSessionCollector(interval time.Duration) *SessionCollector {
 	}
 	return &SessionCollector{
 		interval: interval,
-		logger:   logging.NewLogger("daemon.collector.session"),
+		ulog:     logging.NewUnifiedLogger("groved.collector.session"),
 	}
 }
 
@@ -45,9 +44,11 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 	// Load sessions that were running before the daemon started/restarted.
 	recoveredSessions, err := sessions.RecoverSessions()
 	if err != nil {
-		c.logger.WithError(err).Warn("Failed to recover sessions from disk")
+		c.ulog.Warn("Failed to recover sessions from disk").Err(err).Log(ctx)
 	} else if len(recoveredSessions) > 0 {
-		c.logger.WithField("count", len(recoveredSessions)).Info("Recovered active sessions from crash registry")
+		c.ulog.Info("Recovered active sessions from crash registry").
+			Field("count", len(recoveredSessions)).
+			Log(ctx)
 		updates <- store.Update{
 			Type:    store.UpdateSessions,
 			Source:  "session_recovery",
@@ -62,7 +63,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 
 	registry, _ := sessions.NewFileSystemRegistry()
 
-	c.logger.Info("Session liveness collector started")
+	c.ulog.Info("Session liveness collector started").Log(ctx)
 
 	for {
 		select {
@@ -89,10 +90,10 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 					// PID 0 means the real PID was never discovered (e.g., groveterm-native agent crashed
 					// before async PID discovery completed). After the grace period, treat as dead.
 					if session.PID == 0 || !process.IsProcessAlive(session.PID) {
-						c.logger.WithFields(logrus.Fields{
-							"job_id": session.ID,
-							"pid":    session.PID,
-						}).Warn("Session process died unexpectedly")
+						c.ulog.Warn("Session process died unexpectedly").
+							Field("job_id", session.ID).
+							Field("pid", session.PID).
+							Log(ctx)
 
 						// Update daemon state
 						updates <- store.Update{
@@ -117,7 +118,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 			}
 
 			if d := time.Since(start); d > 1*time.Second {
-				c.logger.WithField("duration", d).Debug("Slow PID verification detected")
+				c.ulog.Debug("Slow PID verification detected").Field("duration", d).Log(ctx)
 			}
 		}
 	}

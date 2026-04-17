@@ -34,12 +34,12 @@ func NewJobCollector(interval time.Duration) *JobCollector {
 func (c *JobCollector) Name() string { return "job" }
 
 func (c *JobCollector) Run(ctx context.Context, st *store.Store, updates chan<- store.Update) error {
-	logger := logging.NewLogger("collector.job")
+	ulog := logging.NewUnifiedLogger("groved.collector.job")
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
 	scan := func() {
-		jobs := discoverJobsFromFilesystem(logger)
+		jobs := discoverJobsFromFilesystem(ctx, ulog)
 		if len(jobs) > 0 {
 			updates <- store.Update{
 				Type:    store.UpdateJobsDiscovered,
@@ -66,13 +66,13 @@ func (c *JobCollector) Run(ctx context.Context, st *store.Store, updates chan<- 
 
 // discoverJobsFromFilesystem scans all plan directories for job markdown files
 // and returns JobInfo structs for each discovered job.
-func discoverJobsFromFilesystem(logger *logrus.Entry) []*models.JobInfo {
+func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger) []*models.JobInfo {
 	discoveryLogger := logrus.New()
 	discoveryLogger.SetLevel(logrus.WarnLevel)
 	discoveryService := workspace.NewDiscoveryService(discoveryLogger)
 	discoveryResult, err := discoveryService.DiscoverAll()
 	if err != nil {
-		logger.WithError(err).Error("Workspace discovery failed")
+		ulog.Error("Workspace discovery failed").Err(err).Log(ctx)
 		return nil
 	}
 	provider := workspace.NewProvider(discoveryResult)
@@ -85,7 +85,7 @@ func discoverJobsFromFilesystem(logger *logrus.Entry) []*models.JobInfo {
 
 	scannedDirs, err := locator.ScanForAllPlans(provider)
 	if err != nil {
-		logger.WithError(err).Error("Failed to scan for plans")
+		ulog.Error("Failed to scan for plans").Err(err).Log(ctx)
 		return nil
 	}
 
@@ -193,7 +193,7 @@ func discoverJobsFromFilesystem(logger *logrus.Entry) []*models.JobInfo {
 	}
 
 	if len(discoveredJobs) > 0 {
-		logger.WithField("count", len(discoveredJobs)).Debug("Discovered jobs from filesystem")
+		ulog.Debug("Discovered jobs from filesystem").Field("count", len(discoveredJobs)).Log(ctx)
 	}
 
 	return discoveredJobs

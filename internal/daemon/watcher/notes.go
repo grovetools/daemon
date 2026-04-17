@@ -15,7 +15,6 @@ import (
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/enrichment"
-	"github.com/sirupsen/logrus"
 )
 
 // NoteHandler implements DomainHandler for watching note directories.
@@ -25,7 +24,7 @@ type NoteHandler struct {
 	store   *store.Store
 	cfg     *config.Config
 	locator *workspace.NotebookLocator
-	log     *logrus.Entry
+	ulog    *logging.UnifiedLogger
 
 	// Maps watched path -> workspace node
 	watchedPaths map[string]*workspace.WorkspaceNode
@@ -47,7 +46,7 @@ func NewNoteHandler(st *store.Store, cfg *config.Config, debounceMs int) *NoteHa
 		store:        st,
 		cfg:          cfg,
 		locator:      workspace.NewNotebookLocator(cfg),
-		log:          logging.NewLogger("groved.notes.watcher"),
+		ulog:         logging.NewUnifiedLogger("groved.watcher.notes"),
 		watchedPaths: make(map[string]*workspace.WorkspaceNode),
 		debounceMs:   debounceMs,
 	}
@@ -115,7 +114,7 @@ func (h *NoteHandler) MatchesEvent(event fsnotify.Event) bool {
 
 // HandleEvents triggers a debounced note counts refresh when note files change.
 func (h *NoteHandler) HandleEvents(ctx context.Context, events []fsnotify.Event) error {
-	h.log.WithField("count", len(events)).Debug("Note file changes detected")
+	h.ulog.Debug("Note file changes detected").Field("count", len(events)).Log(ctx)
 	h.triggerRefresh()
 	return nil
 }
@@ -124,7 +123,7 @@ func (h *NoteHandler) HandleStoreUpdate(update store.Update) {
 	if update.Type == store.UpdateConfigReload {
 		newCfg, err := config.LoadDefault()
 		if err != nil {
-			h.log.WithError(err).Error("Failed to reload config")
+			h.ulog.Error("Failed to reload config").Err(err).Log(context.Background())
 			return
 		}
 		h.cfg = newCfg
@@ -146,7 +145,7 @@ func (h *NoteHandler) triggerRefresh() {
 	}
 
 	h.refreshTimer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
-		h.log.Debug("Refreshing note index after file change")
+		h.ulog.Debug("Refreshing note index after file change").Log(context.Background())
 
 		state := h.store.Get()
 		var nodes []*workspace.WorkspaceNode

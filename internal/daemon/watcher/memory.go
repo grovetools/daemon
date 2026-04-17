@@ -21,7 +21,6 @@ import (
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/memory/pkg/memory"
-	"github.com/sirupsen/logrus"
 )
 
 // IndexJob represents a file to be indexed into the memory store.
@@ -37,7 +36,7 @@ type MemoryHandler struct {
 	locator  *workspace.NotebookLocator
 	memStore memory.DocumentStore
 	embedder *memory.Embedder
-	log      *logrus.Entry
+	ulog     *logging.UnifiedLogger
 
 	watchedPaths map[string]*workspace.WorkspaceNode
 	codePaths    map[string]bool // paths that contain Go source code (vs notebook content)
@@ -62,7 +61,7 @@ func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.Docum
 		locator:      workspace.NewNotebookLocator(cfg),
 		memStore:     memStore,
 		embedder:     embedder,
-		log:          logging.NewLogger("groved.memory.watcher"),
+		ulog:         logging.NewUnifiedLogger("groved.watcher.memory"),
 		watchedPaths: make(map[string]*workspace.WorkspaceNode),
 		codePaths:    make(map[string]bool),
 		timers:       make(map[string]*time.Timer),
@@ -333,13 +332,19 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			if err := h.memStore.DeleteDocument(ctx, job.Path); err != nil {
-				h.log.WithError(err).WithField("path", job.Path).Debug("Failed to delete document from index (might not exist)")
+				h.ulog.Debug("Failed to delete document from index (might not exist)").
+					Err(err).
+					Field("path", job.Path).
+					Log(ctx)
 			} else {
 				h.broadcastMemoryEvent("delete", job.Path)
 			}
 			return
 		}
-		h.log.WithError(err).WithField("path", job.Path).Warn("Failed to read file for memory indexing")
+		h.ulog.Warn("Failed to read file for memory indexing").
+			Err(err).
+			Field("path", job.Path).
+			Log(ctx)
 		return
 	}
 
@@ -407,7 +412,10 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	// Check which chunks already have embeddings (content-hash dedup)
 	existingEmbeddings, err := h.memStore.GetExistingEmbeddingsByHash(ctx, hashes)
 	if err != nil {
-		h.log.WithError(err).WithField("path", job.Path).Debug("Failed to check existing embeddings, will embed all")
+		h.ulog.Debug("Failed to check existing embeddings, will embed all").
+			Err(err).
+			Field("path", job.Path).
+			Log(ctx)
 		existingEmbeddings = make(map[string][]float32)
 	}
 
@@ -426,7 +434,10 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 
 		newEmbeddings, err = h.embedder.EmbedDocuments(embedCtx, textsToEmbed)
 		if err != nil {
-			h.log.WithError(err).WithField("path", job.Path).Warn("Failed to embed document chunks")
+			h.ulog.Warn("Failed to embed document chunks").
+				Err(err).
+				Field("path", job.Path).
+				Log(ctx)
 			return
 		}
 	}
@@ -462,12 +473,17 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	}
 
 	if err := h.memStore.UpsertDocument(ctx, doc, mappedChunks); err != nil {
-		h.log.WithError(err).WithField("path", job.Path).Warn("Failed to upsert document to memory index")
+		h.ulog.Warn("Failed to upsert document to memory index").
+			Err(err).
+			Field("path", job.Path).
+			Log(ctx)
 	} else {
-		h.log.WithField("path", job.Path).WithField("type", docType).
-			WithField("new_embeddings", len(textsToEmbed)).
-			WithField("reused_embeddings", len(chunks)-len(textsToEmbed)).
-			Debug("Successfully indexed document into memory")
+		h.ulog.Debug("Successfully indexed document into memory").
+			Field("path", job.Path).
+			Field("type", docType).
+			Field("new_embeddings", len(textsToEmbed)).
+			Field("reused_embeddings", len(chunks)-len(textsToEmbed)).
+			Log(ctx)
 		h.broadcastMemoryEvent("upsert", job.Path)
 	}
 }

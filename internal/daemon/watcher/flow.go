@@ -17,7 +17,6 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/enrichment"
 	"github.com/grovetools/flow/pkg/orchestration"
-	"github.com/sirupsen/logrus"
 )
 
 // FlowHandler implements DomainHandler for watching plan directories.
@@ -27,7 +26,7 @@ type FlowHandler struct {
 	store   *store.Store
 	cfg     *config.Config
 	locator *workspace.NotebookLocator
-	log     *logrus.Entry
+	ulog    *logging.UnifiedLogger
 
 	// Maps watched path -> workspace node
 	watchedPaths map[string]*workspace.WorkspaceNode
@@ -49,7 +48,7 @@ func NewFlowHandler(st *store.Store, cfg *config.Config, debounceMs int) *FlowHa
 		store:        st,
 		cfg:          cfg,
 		locator:      workspace.NewNotebookLocator(cfg),
-		log:          logging.NewLogger("groved.flow.watcher"),
+		ulog:         logging.NewUnifiedLogger("groved.watcher.flow"),
 		watchedPaths: make(map[string]*workspace.WorkspaceNode),
 		debounceMs:   debounceMs,
 	}
@@ -107,7 +106,7 @@ func (h *FlowHandler) MatchesEvent(event fsnotify.Event) bool {
 // HandleEvents triggers a debounced plan stats refresh when plan files change.
 // It also parses modified/created .md files to instantly discover new jobs.
 func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event) error {
-	h.log.WithField("count", len(events)).Debug("Plan file changes detected")
+	h.ulog.Debug("Plan file changes detected").Field("count", len(events)).Log(ctx)
 
 	var discoveredJobs []*models.JobInfo
 
@@ -189,7 +188,7 @@ func (h *FlowHandler) HandleStoreUpdate(update store.Update) {
 	if update.Type == store.UpdateConfigReload {
 		newCfg, err := config.LoadDefault()
 		if err != nil {
-			h.log.WithError(err).Error("Failed to reload config")
+			h.ulog.Error("Failed to reload config").Err(err).Log(context.Background())
 			return
 		}
 		h.cfg = newCfg
@@ -214,11 +213,12 @@ func (h *FlowHandler) triggerRefresh() {
 	}
 
 	h.refreshTimer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
-		h.log.Debug("Refreshing plan stats after file change")
+		ctx := context.Background()
+		h.ulog.Debug("Refreshing plan stats after file change").Log(ctx)
 
 		planStats, err := enrichment.FetchPlanStatsMap()
 		if err != nil {
-			h.log.WithError(err).Error("Failed to fetch plan stats")
+			h.ulog.Error("Failed to fetch plan stats").Err(err).Log(ctx)
 			return
 		}
 

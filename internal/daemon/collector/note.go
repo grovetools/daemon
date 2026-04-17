@@ -37,7 +37,7 @@ func (c *NoteCollector) Name() string { return "note" }
 
 // Run starts the note counts collection loop.
 func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<- store.Update) error {
-	logger := logging.NewLogger("collector.note")
+	ulog := logging.NewUnifiedLogger("groved.collector.note")
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
@@ -47,7 +47,7 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 1*time.Second {
-				logger.WithField("duration", d).Debug("Slow note scan detected")
+				ulog.Debug("Slow note scan detected").Field("duration", d).Log(ctx)
 			}
 		}()
 
@@ -79,11 +79,11 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 		noteIndex := enrichment.IndexNotesInProcess(nodes, locator)
 		// Derive counts from the index — single walk instead of two
 		noteCounts := enrichment.DeriveCountsFromIndex(noteIndex)
-		logger.WithFields(map[string]interface{}{
-			"entries":  len(noteIndex),
-			"duration": time.Since(indexStart).Round(time.Millisecond),
-			"nodes":    len(nodes),
-		}).Info("Note index built")
+		ulog.Info("Note index built").
+			Field("entries", len(noteIndex)).
+			Field("duration", time.Since(indexStart).Round(time.Millisecond)).
+			Field("nodes", len(nodes)).
+			Log(ctx)
 
 		// Build case-insensitive focus map
 		focusLower := make(map[string]struct{}, len(focus))
