@@ -3,6 +3,7 @@
 package ssh
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/charmbracelet/wish"
 	"github.com/creack/pty"
 	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/util/pathutil"
 	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
@@ -24,7 +26,7 @@ import (
 // Server wraps a wish SSH server with grove-specific configuration.
 type Server struct {
 	srv        *ssh.Server
-	logger     *logrus.Entry
+	ulog       *logging.UnifiedLogger
 	port       int
 	store      *store.Store
 	ptyManager *daemonpty.Manager
@@ -42,7 +44,9 @@ func (s *Server) SetPtyManager(pm *daemonpty.Manager) {
 
 // New creates a new SSH server from daemon config.
 // Returns nil if SSH is not enabled.
-func New(cfg *config.DaemonSSHConfig, logger *logrus.Entry) (*Server, error) {
+// The logger parameter is retained for backwards compatibility and will be
+// removed in a later phase.
+func New(cfg *config.DaemonSSHConfig, _ *logrus.Entry) (*Server, error) {
 	if cfg == nil || cfg.Enabled == nil || !*cfg.Enabled {
 		return nil, nil
 	}
@@ -74,9 +78,10 @@ func New(cfg *config.DaemonSSHConfig, logger *logrus.Entry) (*Server, error) {
 
 	addr := fmt.Sprintf(":%d", port)
 
+	ulog := logging.NewUnifiedLogger("groved.ssh")
 	s := &Server{
-		logger: logger,
-		port:   port,
+		ulog: ulog,
+		port: port,
 	}
 
 	opts := []ssh.Option{
@@ -89,7 +94,7 @@ func New(cfg *config.DaemonSSHConfig, logger *logrus.Entry) (*Server, error) {
 	if _, err := os.Stat(authorizedKeysPath); err == nil {
 		opts = append(opts, wish.WithAuthorizedKeys(authorizedKeysPath))
 	} else {
-		logger.Warn("~/.ssh/authorized_keys not found, SSH server will accept all connections")
+		ulog.Warn("~/.ssh/authorized_keys not found, SSH server will accept all connections").Log(context.Background())
 	}
 
 	srv, err := wish.NewServer(opts...)
@@ -104,13 +109,13 @@ func New(cfg *config.DaemonSSHConfig, logger *logrus.Entry) (*Server, error) {
 // Start begins listening for SSH connections. This blocks until the server
 // is shut down or encounters an error.
 func (s *Server) Start() error {
-	s.logger.WithField("port", s.port).Info("SSH server listening")
+	s.ulog.Info("SSH server listening").Field("port", s.port).Log(context.Background())
 	return s.srv.ListenAndServe()
 }
 
 // Stop gracefully shuts down the SSH server.
 func (s *Server) Stop() error {
-	s.logger.Info("SSH server stopping")
+	s.ulog.Info("SSH server stopping").Log(context.Background())
 	return s.srv.Close()
 }
 
@@ -133,7 +138,8 @@ func resolveGrovetermPath() (string, error) {
 func groveHandler(s *Server) wish.Middleware {
 	return func(next ssh.Handler) ssh.Handler {
 		return func(sess ssh.Session) {
-			s.logger.WithField("user", sess.User()).Info("SSH session connected")
+			ctx := sess.Context()
+			s.ulog.Info("SSH session connected").Field("user", sess.User()).Log(ctx)
 
 			ptyReq, winCh, isPty := sess.Pty()
 			if !isPty {
@@ -143,7 +149,7 @@ func groveHandler(s *Server) wish.Middleware {
 
 			binPath, err := resolveGrovetermPath()
 			if err != nil {
-				s.logger.WithError(err).Error("failed to resolve groveterm binary")
+				s.ulog.Error("failed to resolve groveterm binary").Err(err).Log(ctx)
 				wish.Println(sess, "Error: "+err.Error())
 				return
 			}
@@ -179,7 +185,7 @@ func groveHandler(s *Server) wish.Middleware {
 			// Allocate a PTY for the child process
 			ptmx, err := pty.Start(cmd)
 			if err != nil {
-				s.logger.WithError(err).Error("failed to start groveterm with PTY")
+				s.ulog.Error("failed to start groveterm with PTY").Err(err).Log(ctx)
 				wish.Println(sess, "Error starting groveterm: "+err.Error())
 				return
 			}
@@ -205,7 +211,7 @@ func groveHandler(s *Server) wish.Middleware {
 			_, _ = io.Copy(sess, ptmx)
 
 			if err := cmd.Wait(); err != nil {
-				s.logger.WithError(err).Debug("groveterm exited")
+				s.ulog.Debug("groveterm exited").Err(err).Log(ctx)
 			}
 		}
 	}

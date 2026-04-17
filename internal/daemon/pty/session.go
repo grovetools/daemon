@@ -2,6 +2,7 @@
 package pty
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -13,7 +14,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
-	"github.com/sirupsen/logrus"
+	"github.com/grovetools/core/logging"
 	"golang.org/x/sys/unix"
 )
 
@@ -49,8 +50,8 @@ type Session struct {
 	historyMu sync.RWMutex
 	history   []byte
 
-	logger   *logrus.Entry
-	onExit   func(id string) // callback to manager for cleanup
+	ulog   *logging.UnifiedLogger
+	onExit func(id string) // callback to manager for cleanup
 }
 
 // SessionMetadata is the safe, serializable subset of Session for API responses.
@@ -150,7 +151,10 @@ func (s *Session) AddClient(conn *websocket.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.clients[conn] = true
-	s.logger.WithField("clients", len(s.clients)).Debug("Client attached")
+	s.ulog.Debug("Client attached").
+		Field("session", s.ID).
+		Field("clients", len(s.clients)).
+		Log(context.Background())
 }
 
 // RemoveClient deregisters a WebSocket connection.
@@ -158,7 +162,10 @@ func (s *Session) RemoveClient(conn *websocket.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.clients, conn)
-	s.logger.WithField("clients", len(s.clients)).Debug("Client detached")
+	s.ulog.Debug("Client detached").
+		Field("session", s.ID).
+		Field("clients", len(s.clients)).
+		Log(context.Background())
 }
 
 // Exited returns true if the child process has exited.
@@ -212,7 +219,10 @@ func (s *Session) readLoop() {
 	}
 	s.mu.RUnlock()
 
-	s.logger.WithField("exit_code", exitCode).Info("PTY session exited")
+	s.ulog.Info("PTY session exited").
+		Field("session", s.ID).
+		Field("exit_code", exitCode).
+		Log(context.Background())
 
 	if s.onExit != nil {
 		s.onExit(s.ID)
@@ -248,7 +258,10 @@ func (s *Session) broadcast(data []byte) {
 	defer s.mu.RUnlock()
 	for conn := range s.clients {
 		if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
-			s.logger.WithError(err).Debug("Failed to write to PTY client")
+			s.ulog.Debug("Failed to write to PTY client").
+				Err(err).
+				Field("session", s.ID).
+				Log(context.Background())
 		}
 	}
 }

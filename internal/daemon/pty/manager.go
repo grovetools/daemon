@@ -1,6 +1,7 @@
 package pty
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	creackpty "github.com/creack/pty"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/grovetools/core/logging"
 	"github.com/sirupsen/logrus"
 )
 
@@ -18,14 +20,16 @@ import (
 type Manager struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
-	logger   *logrus.Entry
+	ulog     *logging.UnifiedLogger
 }
 
 // NewManager creates a new PTY session manager.
-func NewManager(logger *logrus.Entry) *Manager {
+// The logger parameter is retained for backwards compatibility and will be
+// removed in a later phase.
+func NewManager(_ *logrus.Entry) *Manager {
 	return &Manager{
 		sessions: make(map[string]*Session),
-		logger:   logger.WithField("component", "pty-manager"),
+		ulog:     logging.NewUnifiedLogger("groved.pty"),
 	}
 }
 
@@ -106,7 +110,7 @@ func (m *Manager) Create(req CreateRequest) (*Session, error) {
 		ptmx:      ptmx,
 		clients:   make(map[*websocket.Conn]bool),
 		exitCh:    make(chan struct{}),
-		logger:    m.logger.WithField("session", id),
+		ulog:      logging.NewUnifiedLogger("groved.pty.session"),
 		onExit:    m.remove,
 	}
 	sess.StartedAt = time.Now()
@@ -117,7 +121,10 @@ func (m *Manager) Create(req CreateRequest) (*Session, error) {
 
 	go sess.readLoop()
 
-	m.logger.WithField("session", id).WithField("cwd", req.CWD).Info("PTY session created")
+	m.ulog.Info("PTY session created").
+		Field("session", id).
+		Field("cwd", req.CWD).
+		Log(context.Background())
 	return sess, nil
 }
 
@@ -163,9 +170,13 @@ func (m *Manager) Shutdown() {
 	}
 	m.mu.RUnlock()
 
+	ctx := context.Background()
 	for _, id := range ids {
 		if err := m.Kill(id); err != nil {
-			m.logger.WithField("session", id).WithError(err).Warn("Failed to kill PTY session during shutdown")
+			m.ulog.Warn("Failed to kill PTY session during shutdown").
+				Err(err).
+				Field("session", id).
+				Log(ctx)
 		}
 	}
 }
@@ -175,5 +186,5 @@ func (m *Manager) remove(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.sessions, id)
-	m.logger.WithField("session", id).Debug("PTY session removed from registry")
+	m.ulog.Debug("PTY session removed from registry").Field("session", id).Log(context.Background())
 }

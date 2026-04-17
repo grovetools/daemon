@@ -91,7 +91,7 @@ func (s *Server) runPicker(sess chssh.Session, ptyReq chssh.Pty) ([]string, erro
 
 	finalModel, err := p.Run()
 	if err != nil {
-		s.logger.WithError(err).Error("picker program error")
+		s.ulog.Error("picker program error").Err(err).Log(sess.Context())
 		return nil, err
 	}
 
