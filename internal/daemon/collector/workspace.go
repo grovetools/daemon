@@ -8,6 +8,7 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/sirupsen/logrus"
 )
@@ -80,11 +81,25 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 
 		// 1.5 Filter nodes by scope if the daemon is scope-restricted.
 		// Keeps a scoped daemon from watching unrelated ecosystems.
+		//
+		// Paths from workspace.GetProjects preserve the original-case
+		// filesystem spelling (e.g. /Users/solom4/Code/grovetools), while
+		// c.scope is pre-normalized via pathutil.NormalizeForLookup (all
+		// lowercase on case-insensitive filesystems). Compare both sides
+		// normalized so the filter isn't broken by case mismatch.
 		if c.scope != "" {
-			scopePrefix := c.scope + "/"
+			scopeNorm, err := pathutil.NormalizeForLookup(c.scope)
+			if err != nil {
+				scopeNorm = c.scope
+			}
+			scopePrefix := scopeNorm + "/"
 			filtered := nodes[:0]
 			for _, n := range nodes {
-				if n.Path == c.scope || strings.HasPrefix(n.Path, scopePrefix) {
+				pathNorm, err := pathutil.NormalizeForLookup(n.Path)
+				if err != nil {
+					pathNorm = n.Path
+				}
+				if pathNorm == scopeNorm || strings.HasPrefix(pathNorm, scopePrefix) {
 					filtered = append(filtered, n)
 				}
 			}
