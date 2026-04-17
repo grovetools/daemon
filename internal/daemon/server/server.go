@@ -876,12 +876,12 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
-	s.logger.WithField("path", path).Debug("HUD SSE client connected")
+	s.logger.WithField("path", path).Trace("HUD SSE client connected")
 
 	for {
 		select {
 		case <-r.Context().Done():
-			s.logger.WithField("path", path).Debug("HUD SSE client disconnected")
+			s.logger.WithField("path", path).Trace("HUD SSE client disconnected")
 			return
 		case hud, ok := <-out:
 			if !ok {
