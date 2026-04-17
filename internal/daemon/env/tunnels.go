@@ -12,7 +12,6 @@ import (
 	"text/template"
 
 	"github.com/grovetools/core/logging"
-	"github.com/sirupsen/logrus"
 )
 
 type activeTunnel struct {
@@ -29,9 +28,7 @@ type TunnelManager struct {
 }
 
 // NewTunnelManager creates a new tunnel manager.
-// The logger parameter is retained for backwards compatibility and will be
-// removed in a later phase.
-func NewTunnelManager(_ *logrus.Entry) *TunnelManager {
+func NewTunnelManager() *TunnelManager {
 	return &TunnelManager{
 		tunnels: make(map[string]*activeTunnel),
 		ulog:    logging.NewUnifiedLogger("groved.env.tunnels"),

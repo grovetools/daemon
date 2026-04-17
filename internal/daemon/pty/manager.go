@@ -13,7 +13,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/grovetools/core/logging"
-	"github.com/sirupsen/logrus"
 )
 
 // Manager is a thread-safe registry of daemon-owned PTY sessions.
@@ -24,9 +23,7 @@ type Manager struct {
 }
 
 // NewManager creates a new PTY session manager.
-// The logger parameter is retained for backwards compatibility and will be
-// removed in a later phase.
-func NewManager(_ *logrus.Entry) *Manager {
+func NewManager() *Manager {
 	return &Manager{
 		sessions: make(map[string]*Session),
 		ulog:     logging.NewUnifiedLogger("groved.pty"),

@@ -86,17 +86,18 @@ func newGrovedStartCmd() *cobra.Command {
 			// Route all daemon logs to central system log
 			grovelogging.SetGlobalScope(grovelogging.ScopeSystem)
 
-			logger := grovelogging.NewLogger("groved")
+			ulog := grovelogging.NewUnifiedLogger("groved.main")
 			pidPath := paths.PidFilePath()
 			sockPath := paths.SocketPath()
 
 			// Start pprof if requested
 			if port, _ := cmd.Flags().GetInt("pprof-port"); port > 0 {
 				go func() {
+					bgCtx := context.Background()
 					addr := fmt.Sprintf("localhost:%d", port)
-					logger.Infof("Starting pprof server on %s", addr)
+					ulog.Info("Starting pprof server").Field("addr", addr).Log(bgCtx)
 					if err := http.ListenAndServe(addr, nil); err != nil {
-						logger.WithError(err).Error("Failed to start pprof server")
+						ulog.Error("Failed to start pprof server").Err(err).Log(bgCtx)
 					}
 				}()
 			}
@@ -118,14 +119,14 @@ func newGrovedStartCmd() *cobra.Command {
 			}
 			defer func() {
 				if err := pidfile.Release(pidPath); err != nil {
-					logger.Errorf("Failed to release pidfile: %v", err)
+					ulog.Error("Failed to release pidfile").Err(err).Log(context.Background())
 				}
 			}()
 
 			// 2. Load config for daemon settings
 			cfg, err := config.LoadDefault()
 			if err != nil {
-				logger.WithError(err).Warn("Failed to load config, using defaults")
+				ulog.Warn("Failed to load config, using defaults").Err(err).Log(context.Background())
 				cfg = &config.Config{}
 			}
 
@@ -175,7 +176,7 @@ func newGrovedStartCmd() *cobra.Command {
 
 			// 3. Setup Store and Engine
 			st := store.New()
-			eng := engine.New(st, logger)
+			eng := engine.New(st)
 
 			// Register collectors with configured intervals based on flags
 			if isEnabled("workspace") {
@@ -239,7 +240,7 @@ func newGrovedStartCmd() *cobra.Command {
 
 				jr = jobrunner.New(st, localRuntime, workers, persister)
 				go jr.Start(ctx)
-				logger.WithField("workers", workers).Info("JobRunner started")
+				ulog.Info("JobRunner started").Field("workers", workers).Log(ctx)
 			}
 
 			// 3.7 Setup LogStreamer
@@ -249,7 +250,7 @@ func newGrovedStartCmd() *cobra.Command {
 			streamer := logstreamer.New(st, logBufSize, logMaxSubs, logPollInterval)
 
 			// 4. Setup Server with engine and env manager
-			envManager := daemonenv.NewManager(logger)
+			envManager := daemonenv.NewManager()
 
 			// Restore environment state from disk to prevent port collisions
 			restoreLogger := logrus.New()
@@ -259,17 +260,17 @@ func newGrovedStartCmd() *cobra.Command {
 				wsProvider := workspace.NewProvider(discoveryResult)
 				envManager.Restore(wsProvider)
 			} else {
-				logger.WithError(err).Warn("Failed to discover workspaces for env restore")
+				ulog.Warn("Failed to discover workspaces for env restore").Err(err).Log(ctx)
 			}
 
 			// Start proxy server in background on standard grove proxy port
 			go func() {
 				if err := envManager.Proxy.ListenAndServe(":8443"); err != nil {
-					logger.WithError(err).Warn("Proxy server stopped")
+					ulog.Warn("Proxy server stopped").Err(err).Log(context.Background())
 				}
 			}()
 
-			srv := server.New(logger)
+			srv := server.New()
 			srv.SetEngine(eng)
 			srv.SetEnvManager(envManager)
 			if jr != nil {
@@ -278,7 +279,7 @@ func newGrovedStartCmd() *cobra.Command {
 			srv.SetLogStreamer(streamer)
 
 			// PTY session manager for daemon-owned PTY sessions
-			ptyManager := daemonpty.NewManager(logger)
+			ptyManager := daemonpty.NewManager()
 			srv.SetPtyManager(ptyManager)
 
 			// sendInputToTmux sends a message to an agent running in a tmux pane.
@@ -299,7 +300,7 @@ func newGrovedStartCmd() *cobra.Command {
 				chMgr.SendInput = sendInputToTmux
 				chMgr.Start(ctx)
 				srv.SetChannelManager(chMgr)
-				logger.Info("Channel manager initialized (signal enabled)")
+				ulog.Info("Channel manager initialized (signal enabled)").Log(ctx)
 			}
 
 			// Register autonomous pinger as a collector
@@ -325,8 +326,9 @@ func newGrovedStartCmd() *cobra.Command {
 			var sshServer *daemonssh.Server
 
 			go func() {
+				bgCtx := context.Background()
 				<-stop
-				logger.Info("Received stop signal")
+				ulog.Info("Received stop signal").Log(bgCtx)
 				ptyManager.Shutdown() // Kill all daemon-owned PTY sessions
 				envManager.Shutdown() // Teardown all running environments and proxy routes
 				streamer.Stop()       // Stop all log tailing goroutines
@@ -336,11 +338,11 @@ func newGrovedStartCmd() *cobra.Command {
 				cancel() // Stop the engine
 
 				// Create shutdown context with timeout
-				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				shutdownCtx, shutdownCancel := context.WithTimeout(bgCtx, 5*time.Second)
 				defer shutdownCancel()
 
 				if err := srv.Shutdown(shutdownCtx); err != nil {
-					logger.Errorf("Server shutdown error: %v", err)
+					ulog.Error("Server shutdown error").Err(err).Log(bgCtx)
 				}
 
 				// Explicitly release pidfile before exit in signal handler
@@ -366,17 +368,17 @@ func newGrovedStartCmd() *cobra.Command {
 					st.BroadcastConfigReload(file)
 				})
 				if err != nil {
-					logger.WithError(err).Warn("Failed to start config watcher, continuing without it")
+					ulog.Warn("Failed to start config watcher, continuing without it").Err(err).Log(ctx)
 				} else {
-					logger.Info("Config watcher started")
+					ulog.Info("Config watcher started").Log(ctx)
 					go configWatcher.Start(ctx)
 				}
 			}
 
 			// 7.5. Start UnifiedWatcher with registered domain handlers
-			unifiedWatcher, err := watcher.NewUnifiedWatcher(st, 100*time.Millisecond, logger)
+			unifiedWatcher, err := watcher.NewUnifiedWatcher(st, 100*time.Millisecond)
 			if err != nil {
-				logger.WithError(err).Warn("Failed to start unified watcher, continuing without it")
+				ulog.Warn("Failed to start unified watcher, continuing without it").Err(err).Log(ctx)
 			} else {
 				// Register SkillHandler if auto-sync is enabled
 				autoSync := true
@@ -392,10 +394,10 @@ func newGrovedStartCmd() *cobra.Command {
 
 					skillHandler, err := watcher.NewSkillHandler(st, cfg, debounceMs)
 					if err != nil {
-						logger.WithError(err).Warn("Failed to initialize skill handler")
+						ulog.Warn("Failed to initialize skill handler").Err(err).Log(ctx)
 					} else {
 						unifiedWatcher.Register(skillHandler)
-						logger.Info("Skill handler registered with unified watcher")
+						ulog.Info("Skill handler registered with unified watcher").Log(ctx)
 					}
 				}
 
@@ -403,21 +405,21 @@ func newGrovedStartCmd() *cobra.Command {
 				if isEnabled("workspace") {
 					workspaceHandler := watcher.NewWorkspaceHandler(st, cfg, 2000)
 					unifiedWatcher.Register(workspaceHandler)
-					logger.Info("Workspace handler registered with unified watcher")
+					ulog.Info("Workspace handler registered with unified watcher").Log(ctx)
 				}
 
 				// Register FlowHandler for plan directory watching
 				if isEnabled("plan") {
 					flowHandler := watcher.NewFlowHandler(st, cfg, 2000)
 					unifiedWatcher.Register(flowHandler)
-					logger.Info("Flow handler registered with unified watcher")
+					ulog.Info("Flow handler registered with unified watcher").Log(ctx)
 				}
 
 				// Register NoteHandler for note directory watching
 				if isEnabled("note") {
 					noteHandler := watcher.NewNoteHandler(st, cfg, 3000)
 					unifiedWatcher.Register(noteHandler)
-					logger.Info("Note handler registered with unified watcher")
+					ulog.Info("Note handler registered with unified watcher").Log(ctx)
 				}
 
 				// Register MemoryHandler for auto-indexing content
@@ -425,18 +427,18 @@ func newGrovedStartCmd() *cobra.Command {
 				if err == nil {
 					memStore, err := memory.Open(dbPath, 3072) // gemini-embedding-001 outputs 3072 dimensions
 					if err != nil {
-						logger.WithError(err).Warn("Failed to initialize memory store, indexing disabled")
+						ulog.Warn("Failed to initialize memory store, indexing disabled").Err(err).Log(ctx)
 					} else {
 						// Use grove-gemini's config resolver (secrets.toml, env var, api_key_command)
 						geminiClient, err := gemini.NewClient(ctx, "")
 						if err != nil {
-							logger.WithError(err).Warn("Failed to initialize Gemini client, memory indexing disabled")
+							ulog.Warn("Failed to initialize Gemini client, memory indexing disabled").Err(err).Log(ctx)
 						} else {
 							embedder := memory.NewEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
 
 							memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
 							unifiedWatcher.Register(memoryHandler)
-							logger.Info("Memory handler registered with unified watcher")
+							ulog.Info("Memory handler registered with unified watcher").Log(ctx)
 
 							// Share the same store + embedder with the HTTP server so
 							// /api/memory/* handlers can serve TUI clients without
@@ -446,7 +448,7 @@ func newGrovedStartCmd() *cobra.Command {
 					}
 				}
 
-				logger.Info("Unified watcher started")
+				ulog.Info("Unified watcher started").Log(ctx)
 				go unifiedWatcher.Start(ctx)
 			}
 
@@ -455,22 +457,22 @@ func newGrovedStartCmd() *cobra.Command {
 			if cfg.Daemon != nil {
 				sshCfg = cfg.Daemon.SSH
 			}
-			if s, err := daemonssh.New(sshCfg, logger.WithField("component", "ssh")); err != nil {
-				logger.WithError(err).Warn("Failed to start SSH server")
+			if s, err := daemonssh.New(sshCfg); err != nil {
+				ulog.Warn("Failed to start SSH server").Err(err).Log(ctx)
 			} else if s != nil {
 				s.SetStore(st)
 				s.SetPtyManager(ptyManager)
 				sshServer = s
 				go func() {
 					if err := sshServer.Start(); err != nil {
-						logger.WithError(err).Warn("SSH server stopped")
+						ulog.Warn("SSH server stopped").Err(err).Log(context.Background())
 					}
 				}()
 			}
 
 			// 8. Start Server (Blocking)
 			httpPort, _ := cmd.Flags().GetInt("http-port")
-			logger.WithField("pid", os.Getpid()).Info("Starting daemon")
+			ulog.Info("Starting daemon").Field("pid", os.Getpid()).Log(ctx)
 			if err := srv.ListenAndServe(sockPath, httpPort); err != nil {
 				return fmt.Errorf("server error: %w", err)
 			}

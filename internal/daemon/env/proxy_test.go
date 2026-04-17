@@ -2,18 +2,10 @@ package env
 
 import (
 	"testing"
-
-	"github.com/sirupsen/logrus"
 )
 
-func testLogger() *logrus.Entry {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	return logger.WithField("test", true)
-}
-
 func TestProxyManager_RegisterAndLookup(t *testing.T) {
-	pm := NewProxyManager(testLogger())
+	pm := NewProxyManager()
 
 	pm.Register("demo", "web", 34012)
 
@@ -27,7 +19,7 @@ func TestProxyManager_RegisterAndLookup(t *testing.T) {
 }
 
 func TestProxyManager_LookupMiss(t *testing.T) {
-	pm := NewProxyManager(testLogger())
+	pm := NewProxyManager()
 
 	_, ok := pm.Lookup("unknown.demo.grove.local")
 	if ok {
@@ -36,7 +28,7 @@ func TestProxyManager_LookupMiss(t *testing.T) {
 }
 
 func TestProxyManager_Unregister(t *testing.T) {
-	pm := NewProxyManager(testLogger())
+	pm := NewProxyManager()
 
 	pm.Register("demo", "web", 34012)
 	pm.Register("demo", "api", 34013)
@@ -58,7 +50,7 @@ func TestProxyManager_Unregister(t *testing.T) {
 }
 
 func TestProxyManager_MultipleServices(t *testing.T) {
-	pm := NewProxyManager(testLogger())
+	pm := NewProxyManager()
 
 	pm.Register("feature-x", "web", 10001)
 	pm.Register("feature-x", "api", 10002)

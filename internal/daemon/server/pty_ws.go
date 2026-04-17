@@ -32,7 +32,7 @@ func (s *Server) handlePtyCreate(w http.ResponseWriter, r *http.Request) {
 
 	sess, err := s.ptyManager.Create(req)
 	if err != nil {
-		s.logger.WithError(err).Error("Failed to create PTY session")
+		s.ulog.Error("Failed to create PTY session").Err(err).Log(r.Context())
 		http.Error(w, "failed to create session: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -103,9 +103,10 @@ func (s *Server) handlePtyAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx := r.Context()
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		s.logger.WithError(err).Error("PTY WebSocket upgrade failed")
+		s.ulog.Error("PTY WebSocket upgrade failed").Err(err).Log(ctx)
 		return
 	}
 
@@ -126,7 +127,7 @@ func (s *Server) handlePtyAttach(w http.ResponseWriter, r *http.Request) {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				s.logger.WithError(err).Debug("PTY WebSocket read error")
+				s.ulog.Debug("PTY WebSocket read error").Err(err).Log(ctx)
 			}
 			return
 		}
@@ -135,7 +136,7 @@ func (s *Server) handlePtyAttach(w http.ResponseWriter, r *http.Request) {
 		case websocket.BinaryMessage:
 			// Raw keyboard input → PTY
 			if _, err := sess.Write(data); err != nil {
-				s.logger.WithError(err).Debug("Failed to write to PTY")
+				s.ulog.Debug("Failed to write to PTY").Err(err).Log(ctx)
 				return
 			}
 
@@ -143,7 +144,7 @@ func (s *Server) handlePtyAttach(w http.ResponseWriter, r *http.Request) {
 			// JSON control message
 			var ctrl pty.ControlMessage
 			if err := json.Unmarshal(data, &ctrl); err != nil {
-				s.logger.WithError(err).Debug("Invalid PTY control message")
+				s.ulog.Debug("Invalid PTY control message").Err(err).Log(ctx)
 				continue
 			}
 			switch ctrl.Type {

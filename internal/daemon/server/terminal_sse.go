@@ -33,7 +33,8 @@ func (s *Server) handleTerminalStream(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
-	hub.logger.Debug("Terminal SSE client connected")
+	ctx := r.Context()
+	hub.ulog.Debug("Terminal SSE client connected").Log(ctx)
 
 	// Ask the Primary terminal to produce a full-screen payload so this
 	// new client gets a complete initial frame instead of waiting for the
@@ -42,8 +43,8 @@ func (s *Server) handleTerminalStream(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		select {
-		case <-r.Context().Done():
-			hub.logger.Debug("Terminal SSE client disconnected")
+		case <-ctx.Done():
+			hub.ulog.Debug("Terminal SSE client disconnected").Log(ctx)
 			return
 		case data, ok := <-ch:
 			if !ok {

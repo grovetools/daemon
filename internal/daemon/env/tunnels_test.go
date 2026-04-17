@@ -6,8 +6,6 @@ import (
 	"testing"
 	"text/template"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 func TestTunnelContext_Template(t *testing.T) {
@@ -28,9 +26,7 @@ func TestTunnelContext_Template(t *testing.T) {
 }
 
 func TestTunnelManager_StartAndStop(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	tm := NewTunnelManager(logger.WithField("test", true))
+	tm := NewTunnelManager()
 
 	ctx := context.Background()
 
@@ -63,9 +59,7 @@ func TestTunnelManager_StartAndStop(t *testing.T) {
 }
 
 func TestTunnelManager_StopAllSelectiveByWorktree(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	tm := NewTunnelManager(logger.WithField("test", true))
+	tm := NewTunnelManager()
 
 	ctx := context.Background()
 
@@ -91,9 +85,7 @@ func TestTunnelManager_StopAllSelectiveByWorktree(t *testing.T) {
 }
 
 func TestTunnelManager_InvalidTemplate(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	tm := NewTunnelManager(logger.WithField("test", true))
+	tm := NewTunnelManager()
 
 	ctx := context.Background()
 	err := tm.Start(ctx, "demo", "bad", "{{.Invalid", 5432, "", nil, "")

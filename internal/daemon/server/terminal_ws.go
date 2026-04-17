@@ -1,13 +1,14 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"sync"
 
 	"github.com/gorilla/websocket"
-	"github.com/sirupsen/logrus"
+	"github.com/grovetools/core/logging"
 )
 
 // WsMessage is the JSON envelope for all WebSocket communication
@@ -26,15 +27,15 @@ type TerminalHub struct {
 	primary        *websocket.Conn
 	followers      map[*websocket.Conn]bool
 	sseSubscribers map[chan string]bool
-	logger         *logrus.Entry
+	ulog           *logging.UnifiedLogger
 }
 
 // NewTerminalHub creates a ready-to-use TerminalHub.
-func NewTerminalHub(logger *logrus.Entry) *TerminalHub {
+func NewTerminalHub() *TerminalHub {
 	return &TerminalHub{
 		followers:      make(map[*websocket.Conn]bool),
 		sseSubscribers: make(map[chan string]bool),
-		logger:         logger.WithField("component", "terminal-hub"),
+		ulog:           logging.NewUnifiedLogger("groved.server.treemux"),
 	}
 }
 
@@ -60,13 +61,14 @@ func (s *Server) HandleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx := r.Context()
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		hub.logger.WithError(err).Error("WebSocket upgrade failed")
+		hub.ulog.Error("WebSocket upgrade failed").Err(err).Log(ctx)
 		return
 	}
 
-	hub.logger.Debug("New WebSocket connection")
+	hub.ulog.Debug("New WebSocket connection").Log(ctx)
 
 	// Track whether this connection is primary so cleanup knows what to do.
 	var isPrimary bool
@@ -80,14 +82,14 @@ func (s *Server) HandleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				hub.logger.WithError(err).Debug("WebSocket read error")
+				hub.ulog.Debug("WebSocket read error").Err(err).Log(ctx)
 			}
 			return
 		}
 
 		var msg WsMessage
 		if err := json.Unmarshal(raw, &msg); err != nil {
-			hub.logger.WithError(err).Debug("Invalid WsMessage envelope")
+			hub.ulog.Debug("Invalid WsMessage envelope").Err(err).Log(ctx)
 			continue
 		}
 
@@ -101,7 +103,7 @@ func (s *Server) HandleTerminalWS(w http.ResponseWriter, r *http.Request) {
 			sender := conn == hub.primary
 			hub.mu.RUnlock()
 			if !sender {
-				hub.logger.Debug("Non-primary attempted to send layout/frame")
+				hub.ulog.Debug("Non-primary attempted to send layout/frame").Log(ctx)
 				continue
 			}
 			hub.broadcastToFollowers(raw)
@@ -112,13 +114,13 @@ func (s *Server) HandleTerminalWS(w http.ResponseWriter, r *http.Request) {
 			_, isFollower := hub.followers[conn]
 			hub.mu.RUnlock()
 			if !isFollower {
-				hub.logger.Debug("Non-follower attempted to send input/action")
+				hub.ulog.Debug("Non-follower attempted to send input/action").Log(ctx)
 				continue
 			}
 			hub.sendToPrimary(raw)
 
 		default:
-			hub.logger.WithField("type", msg.Type).Debug("Unknown WsMessage type")
+			hub.ulog.Debug("Unknown WsMessage type").Field("type", msg.Type).Log(ctx)
 		}
 	}
 }
@@ -129,15 +131,16 @@ func (h *TerminalHub) register(conn *websocket.Conn) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	bgCtx := context.Background()
 	var role string
 	if h.primary == nil {
 		h.primary = conn
 		role = "primary"
-		h.logger.Info("Primary registered")
+		h.ulog.Info("Primary registered").Log(bgCtx)
 	} else {
 		h.followers[conn] = true
 		role = "follower"
-		h.logger.Info("Follower registered")
+		h.ulog.Info("Follower registered").Log(bgCtx)
 
 		// Notify the Primary that a new Follower joined so it can
 		// broadcast its current layout and screen state.
@@ -165,9 +168,10 @@ func (h *TerminalHub) broadcastToFollowers(raw []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
+	bgCtx := context.Background()
 	for c := range h.followers {
 		if err := c.WriteMessage(websocket.TextMessage, raw); err != nil {
-			h.logger.WithError(err).Debug("Failed to write to follower")
+			h.ulog.Debug("Failed to write to follower").Err(err).Log(bgCtx)
 			// Don't remove here — the follower's read loop will detect the
 			// broken connection and clean up via removeConn.
 		}
@@ -200,7 +204,7 @@ func (h *TerminalHub) broadcastToFollowers(raw []byte) {
 				case ch <- sseData:
 				default:
 					// Slow SSE client — drop the frame.
-					h.logger.Debug("Dropping frame for slow SSE subscriber")
+					h.ulog.Debug("Dropping frame for slow SSE subscriber").Log(bgCtx)
 				}
 			}
 		}
@@ -214,7 +218,7 @@ func (h *TerminalHub) SubscribeSSE() chan string {
 	defer h.mu.Unlock()
 	ch := make(chan string, 64)
 	h.sseSubscribers[ch] = true
-	h.logger.Info("SSE subscriber connected")
+	h.ulog.Info("SSE subscriber connected").Log(context.Background())
 	return ch
 }
 
@@ -224,7 +228,7 @@ func (h *TerminalHub) UnsubscribeSSE(ch chan string) {
 	defer h.mu.Unlock()
 	delete(h.sseSubscribers, ch)
 	close(ch)
-	h.logger.Info("SSE subscriber disconnected")
+	h.ulog.Info("SSE subscriber disconnected").Log(context.Background())
 }
 
 // RequestFullSync sends a "request_full_sync" message to the Primary terminal,
@@ -244,7 +248,7 @@ func (h *TerminalHub) RequestFullSync() {
 		Payload: json.RawMessage("{}"),
 	})
 	if err := primary.WriteMessage(websocket.TextMessage, msg); err != nil {
-		h.logger.WithError(err).Debug("Failed to send request_full_sync to primary")
+		h.ulog.Debug("Failed to send request_full_sync to primary").Err(err).Log(context.Background())
 	}
 }
 
@@ -258,7 +262,7 @@ func (h *TerminalHub) sendToPrimary(raw []byte) {
 		return
 	}
 	if err := primary.WriteMessage(websocket.TextMessage, raw); err != nil {
-		h.logger.WithError(err).Debug("Failed to write to primary")
+		h.ulog.Debug("Failed to write to primary").Err(err).Log(context.Background())
 	}
 }
 
@@ -268,9 +272,10 @@ func (h *TerminalHub) removeConn(conn *websocket.Conn, isPrimary bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	bgCtx := context.Background()
 	if isPrimary && h.primary == conn {
 		h.primary = nil
-		h.logger.Info("Primary disconnected")
+		h.ulog.Info("Primary disconnected").Log(bgCtx)
 
 		// Notify all followers that the primary is gone.
 		msg, _ := json.Marshal(WsMessage{
@@ -282,6 +287,6 @@ func (h *TerminalHub) removeConn(conn *websocket.Conn, isPrimary bool) {
 		}
 	} else {
 		delete(h.followers, conn)
-		h.logger.Debug("Follower disconnected")
+		h.ulog.Debug("Follower disconnected").Log(bgCtx)
 	}
 }

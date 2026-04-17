@@ -12,7 +12,6 @@ import (
 	"github.com/grovetools/core/logging"
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/workspace"
-	"github.com/sirupsen/logrus"
 )
 
 // RunningEnv tracks the state of an active environment.
@@ -39,13 +38,11 @@ type Manager struct {
 }
 
 // NewManager creates a new environment manager.
-// The logger parameter is retained for backwards compatibility with cmd/groved.go
-// and is forwarded to nested managers; it will be removed in a later phase.
-func NewManager(logger *logrus.Entry) *Manager {
+func NewManager() *Manager {
 	return &Manager{
 		Ports:   NewPortAllocator(),
-		Proxy:   NewProxyManager(logger),
-		Tunnels: NewTunnelManager(logger),
+		Proxy:   NewProxyManager(),
+		Tunnels: NewTunnelManager(),
 		envs:    make(map[string]*RunningEnv),
 		ulog:    logging.NewUnifiedLogger("groved.env.manager"),
 	}

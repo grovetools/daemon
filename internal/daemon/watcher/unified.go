@@ -10,7 +10,6 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	"github.com/sirupsen/logrus"
 )
 
 // DomainHandler represents a domain-specific event processor that plugs into the
@@ -40,9 +39,7 @@ type UnifiedWatcher struct {
 }
 
 // NewUnifiedWatcher creates a new UnifiedWatcher with a single fsnotify instance.
-// The logger parameter is retained for backwards compatibility with cmd/groved.go
-// and will be removed in a later phase.
-func NewUnifiedWatcher(st *store.Store, batchInterval time.Duration, _ *logrus.Entry) (*UnifiedWatcher, error) {
+func NewUnifiedWatcher(st *store.Store, batchInterval time.Duration) (*UnifiedWatcher, error) {
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err

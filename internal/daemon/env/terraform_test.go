@@ -9,13 +9,10 @@ import (
 
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/workspace"
-	"github.com/sirupsen/logrus"
 )
 
 func TestMapTerraformOutputs_ExplicitMap(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	m := NewManager(logger.WithField("test", true))
+	m := NewManager()
 
 	outputs := map[string]tfOutput{
 		"db_url":      {Value: "postgres://localhost:5432/mydb"},
@@ -50,9 +47,7 @@ func TestMapTerraformOutputs_ExplicitMap(t *testing.T) {
 }
 
 func TestMapTerraformOutputs_DefaultAutoExport(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	m := NewManager(logger.WithField("test", true))
+	m := NewManager()
 
 	outputs := map[string]tfOutput{
 		"db_url":     {Value: "postgres://localhost:5432/mydb"},
@@ -479,9 +474,7 @@ func TestGroveContext_Write(t *testing.T) {
 }
 
 func TestTerraformUp_RequiresWorkspace(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	m := NewManager(logger.WithField("test", true))
+	m := NewManager()
 
 	req := coreenv.EnvRequest{
 		Provider: "terraform",
@@ -495,9 +488,7 @@ func TestTerraformUp_RequiresWorkspace(t *testing.T) {
 }
 
 func TestTerraformDown_NoState(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	m := NewManager(logger.WithField("test", true))
+	m := NewManager()
 
 	tmpDir := t.TempDir()
 	req := coreenv.EnvRequest{
@@ -518,9 +509,7 @@ func TestTerraformDown_NoState(t *testing.T) {
 }
 
 func TestTerraformDown_CleanFlag(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	m := NewManager(logger.WithField("test", true))
+	m := NewManager()
 
 	tmpDir := t.TempDir()
 
@@ -556,9 +545,7 @@ func TestTerraformDown_CleanFlag(t *testing.T) {
 }
 
 func TestTerraformDown_NoCleanPreservesState(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	m := NewManager(logger.WithField("test", true))
+	m := NewManager()
 
 	tmpDir := t.TempDir()
 

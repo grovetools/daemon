@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/grovetools/core/logging"
-	"github.com/sirupsen/logrus"
 )
 
 // ProxyManager dynamically routes *.grove.local traffic to allocated ephemeral ports.
@@ -20,9 +19,7 @@ type ProxyManager struct {
 }
 
 // NewProxyManager creates a new proxy manager.
-// The logger parameter is retained for backwards compatibility and will be
-// removed in a later phase.
-func NewProxyManager(_ *logrus.Entry) *ProxyManager {
+func NewProxyManager() *ProxyManager {
 	return &ProxyManager{
 		routes: make(map[string]string),
 		ulog:   logging.NewUnifiedLogger("groved.env.proxy"),

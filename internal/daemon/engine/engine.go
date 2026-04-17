@@ -8,7 +8,6 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	"github.com/sirupsen/logrus"
 )
 
 // Engine manages and runs all collectors.
@@ -19,9 +18,7 @@ type Engine struct {
 }
 
 // New creates a new Engine instance.
-// The logger parameter is retained for backwards compatibility with cmd/groved.go
-// and will be removed in a later phase.
-func New(st *store.Store, _ *logrus.Entry) *Engine {
+func New(st *store.Store) *Engine {
 	return &Engine{
 		store: st,
 		ulog:  logging.NewUnifiedLogger("groved.engine"),

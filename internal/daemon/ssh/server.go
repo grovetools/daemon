@@ -20,7 +20,6 @@ import (
 	"github.com/grovetools/core/util/pathutil"
 	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	"github.com/sirupsen/logrus"
 )
 
 // Server wraps a wish SSH server with grove-specific configuration.
@@ -44,9 +43,7 @@ func (s *Server) SetPtyManager(pm *daemonpty.Manager) {
 
 // New creates a new SSH server from daemon config.
 // Returns nil if SSH is not enabled.
-// The logger parameter is retained for backwards compatibility and will be
-// removed in a later phase.
-func New(cfg *config.DaemonSSHConfig, _ *logrus.Entry) (*Server, error) {
+func New(cfg *config.DaemonSSHConfig) (*Server, error) {
 	if cfg == nil || cfg.Enabled == nil || !*cfg.Enabled {
 		return nil, nil
 	}

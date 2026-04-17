@@ -8,14 +8,11 @@ import (
 	"testing"
 
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
-	"github.com/sirupsen/logrus"
 )
 
 func newTestServer() *Server {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	s := New(logger.WithField("test", true))
-	s.SetEnvManager(daemonenv.NewManager(logger.WithField("test", true)))
+	s := New()
+	s.SetEnvManager(daemonenv.NewManager())
 	return s
 }
 
@@ -135,9 +132,7 @@ func TestHandleEnvUp_UnsupportedProvider(t *testing.T) {
 }
 
 func TestHandleEnvUp_NoManager(t *testing.T) {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
-	s := New(logger.WithField("test", true))
+	s := New()
 	// Intentionally do NOT set env manager
 
 	body := strings.NewReader(`{"provider":"native"}`)

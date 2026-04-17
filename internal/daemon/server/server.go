@@ -34,9 +34,9 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/daemon/internal/enrichment"
+	"github.com/grovetools/core/logging"
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/memory/pkg/memory"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )
@@ -54,7 +54,7 @@ type RunningConfig struct {
 
 // Server manages the daemon's HTTP server over a Unix socket.
 type Server struct {
-	logger        *logrus.Entry
+	ulog          *logging.UnifiedLogger
 	server        *http.Server
 	engine        *engine.Engine
 	runningConfig *RunningConfig
@@ -84,11 +84,11 @@ type Server struct {
 }
 
 // New creates a new Server instance.
-func New(logger *logrus.Entry) *Server {
+func New() *Server {
 	return &Server{
-		logger:         logger,
+		ulog:           logging.NewUnifiedLogger("groved.server"),
 		captureWaiters: make(map[string]chan string),
-		terminalHub:    NewTerminalHub(logger),
+		terminalHub:    NewTerminalHub(),
 	}
 }
 
@@ -227,25 +227,28 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	if len(httpPort) > 0 && httpPort[0] > 0 {
 		port := httpPort[0]
 		go func() {
+			bgCtx := context.Background()
 			addr := fmt.Sprintf("localhost:%d", port)
-			s.logger.WithField("addr", addr).Info("HTTP server listening (web terminal viewer)")
+			s.ulog.Info("HTTP server listening (web terminal viewer)").
+				Field("addr", addr).
+				Log(bgCtx)
 			tcpServer := &http.Server{
 				Addr:    addr,
 				Handler: handler,
 			}
 			if err := tcpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				s.logger.WithError(err).Error("HTTP server failed")
+				s.ulog.Error("HTTP server failed").Err(err).Log(bgCtx)
 			}
 		}()
 	}
 
-	s.logger.WithField("socket", socketPath).Info("Daemon listening")
+	s.ulog.Info("Daemon listening").Field("socket", socketPath).Log(context.Background())
 	return s.server.Serve(listener)
 }
 
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.logger.Info("Shutting down server...")
+	s.ulog.Info("Shutting down server...").Log(ctx)
 	if s.server != nil {
 		return s.server.Shutdown(ctx)
 	}
@@ -484,7 +487,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 		if s.channelManager != nil {
 			if len(req.Channels) > 0 {
 				if err := s.channelManager.EnableChannel(r.Context(), sessionID); err != nil {
-					s.logger.WithError(err).Error("Failed to enable channel")
+					s.ulog.Error("Failed to enable channel").Err(err).Log(r.Context())
 				}
 			} else {
 				s.channelManager.DisableChannel(r.Context(), sessionID)
@@ -657,7 +660,7 @@ func (s *Server) killSession(sessionID string) error {
 		},
 	})
 
-	s.logger.WithField("session_id", sessionID).Info("Session killed via API")
+	s.ulog.Info("Session killed via API").Field("session_id", sessionID).Log(context.Background())
 	return nil
 }
 
@@ -719,12 +722,15 @@ func (s *Server) handleSessionIntent(w http.ResponseWriter, r *http.Request) {
 	if s.channelManager != nil && len(intent.Channels) > 0 {
 		for range intent.Channels {
 			if err := s.channelManager.EnableChannel(r.Context(), intent.JobID); err != nil {
-				s.logger.WithError(err).WithField("job_id", intent.JobID).Warn("Failed to enable channel from intent")
+				s.ulog.Warn("Failed to enable channel from intent").
+					Err(err).
+					Field("job_id", intent.JobID).
+					Log(r.Context())
 			}
 		}
 	}
 
-	s.logger.WithField("job_id", intent.JobID).Debug("Session intent registered")
+	s.ulog.Debug("Session intent registered").Field("job_id", intent.JobID).Log(r.Context())
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]string{"status": "registered", "job_id": intent.JobID})
 }
@@ -753,10 +759,10 @@ func (s *Server) handleSessionConfirm(w http.ResponseWriter, r *http.Request) {
 		Payload: &confirmation,
 	})
 
-	s.logger.WithFields(logrus.Fields{
-		"job_id": confirmation.JobID,
-		"pid":    confirmation.PID,
-	}).Debug("Session confirmed")
+	s.ulog.Debug("Session confirmed").
+		Field("job_id", confirmation.JobID).
+		Field("pid", confirmation.PID).
+		Log(r.Context())
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "confirmed"})
 }
@@ -800,7 +806,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
-	s.logger.Debug("SSE client connected")
+	s.ulog.Debug("SSE client connected").StructuredOnly().Log(r.Context())
 
 	// Send current state immediately so client has data right away
 	state := s.engine.Store().Get()
@@ -822,7 +828,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
-			s.logger.Debug("SSE client disconnected")
+			s.ulog.Debug("SSE client disconnected").Log(r.Context())
 			return
 		case update := <-ch:
 			// Convert internal store.Update to public API format
@@ -833,7 +839,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 
 			data, err := json.Marshal(apiUpdate)
 			if err != nil {
-				s.logger.WithError(err).Error("Failed to marshal update")
+				s.ulog.Error("Failed to marshal update").Err(err).Log(r.Context())
 				continue
 			}
 			// SSE format: "data: {json}\n\n"
@@ -876,12 +882,12 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 	fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
-	s.logger.WithField("path", path).Trace("HUD SSE client connected")
+	s.ulog.Debug("HUD SSE client connected").Field("path", path).StructuredOnly().Log(r.Context())
 
 	for {
 		select {
 		case <-r.Context().Done():
-			s.logger.WithField("path", path).Trace("HUD SSE client disconnected")
+			s.ulog.Debug("HUD SSE client disconnected").Field("path", path).StructuredOnly().Log(r.Context())
 			return
 		case hud, ok := <-out:
 			if !ok {
@@ -889,7 +895,7 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 			}
 			data, err := json.Marshal(hud)
 			if err != nil {
-				s.logger.WithError(err).Error("Failed to marshal HUD update")
+				s.ulog.Error("Failed to marshal HUD update").Err(err).Log(r.Context())
 				continue
 			}
 			fmt.Fprintf(w, "data: %s\n\n", data)
@@ -964,7 +970,7 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 		if err != nil {
-			s.logger.WithError(err).Error("Failed to create agent PTY session")
+			s.ulog.Error("Failed to create agent PTY session").Err(err).Log(r.Context())
 			http.Error(w, "failed to create agent PTY: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1278,10 +1284,10 @@ func (s *Server) handleNoteIndex(w http.ResponseWriter, r *http.Request) {
 
 	wsFilter := r.URL.Query().Get("workspace")
 	entries := s.engine.Store().GetNoteIndex(wsFilter)
-	s.logger.WithFields(logrus.Fields{
-		"workspace": wsFilter,
-		"entries":   len(entries),
-	}).Debug("Note index request served")
+	s.ulog.Debug("Note index request served").
+		Field("workspace", wsFilter).
+		Field("entries", len(entries)).
+		Log(r.Context())
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(entries)
 }
@@ -1310,12 +1316,12 @@ func (s *Server) handleNoteEvent(w http.ResponseWriter, r *http.Request) {
 		s.tryAttachIndexEntry(&event)
 	}
 
-	s.logger.WithFields(logrus.Fields{
-		"event":       event.Event,
-		"workspace":   event.Workspace,
-		"path":        event.Path,
-		"has_index":   event.IndexEntry != nil,
-	}).Debug("Note event received")
+	s.ulog.Debug("Note event received").
+		Field("event", event.Event).
+		Field("workspace", event.Workspace).
+		Field("path", event.Path).
+		Field("has_index", event.IndexEntry != nil).
+		Log(r.Context())
 
 	s.engine.Store().ApplyUpdate(store.Update{
 		Type:    store.UpdateNoteEvent,
@@ -1378,7 +1384,7 @@ func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.engine.Store().SetFocus(req.Paths)
-		s.logger.WithField("count", len(req.Paths)).Debug("Focus updated")
+		s.ulog.Debug("Focus updated").Field("count", len(req.Paths)).Log(r.Context())
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]int{"focused": len(req.Paths)})
 
@@ -1873,7 +1879,7 @@ func (s *Server) handleNavGroup(w http.ResponseWriter, r *http.Request) {
 	// Regenerate tmux config
 	groupBindings := s.buildGroupBindings(file)
 	if err := navbindings.GenerateTmuxConf(groupBindings, paths.BinDir(), paths.CacheDir()); err != nil {
-		s.logger.WithError(err).Warn("Failed to regenerate tmux bindings")
+		s.ulog.Warn("Failed to regenerate tmux bindings").Err(err).Log(r.Context())
 	}
 
 	// Update store and broadcast SSE
@@ -1917,7 +1923,7 @@ func (s *Server) handleNavLockedKeys(w http.ResponseWriter, r *http.Request) {
 	// Regenerate tmux config
 	groupBindings := s.buildGroupBindings(file)
 	if err := navbindings.GenerateTmuxConf(groupBindings, paths.BinDir(), paths.CacheDir()); err != nil {
-		s.logger.WithError(err).Warn("Failed to regenerate tmux bindings")
+		s.ulog.Warn("Failed to regenerate tmux bindings").Err(err).Log(r.Context())
 	}
 
 	s.engine.Store().ApplyUpdate(store.Update{
