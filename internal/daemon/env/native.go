@@ -59,7 +59,9 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	// Create log directory for service output
 	logDir := filepath.Join(req.Workspace.Path, ".grove", "env", "logs")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
-		m.logger.WithError(err).Warn("Failed to create log directory, process output will be discarded")
+		m.ulog.Warn("Failed to create log directory, process output will be discarded").
+			Err(err).
+			Log(ctx)
 		logDir = ""
 	}
 
@@ -87,7 +89,10 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 			runningEnv.Ports["tunnel-"+tunnelName] = port
 
 			if err := m.Tunnels.Start(context.Background(), worktree, tunnelName, cmdStr, port, req.Workspace.Path, resp.EnvVars, logDir); err != nil {
-				m.logger.WithError(err).Warnf("Failed to start tunnel %s", tunnelName)
+				m.ulog.Warn("Failed to start tunnel").
+					Err(err).
+					Field("tunnel", tunnelName).
+					Log(ctx)
 				continue
 			}
 
@@ -125,7 +130,7 @@ func (m *Manager) nativeDown(ctx context.Context, req coreenv.EnvRequest) (*core
 
 	// Kill all native processes
 	for name, cancel := range runningEnv.Cancels {
-		m.logger.WithField("service", name).Info("Stopping native service")
+		m.ulog.Info("Stopping native service").Field("service", name).Log(ctx)
 		cancel()
 		// The background goroutine handles Wait() and log file cleanup
 	}

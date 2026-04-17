@@ -118,7 +118,11 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 					absPath = filepath.Join(req.Workspace.Path, hostPath)
 				}
 				if err := os.MkdirAll(absPath, 0755); err != nil {
-					m.logger.WithError(err).Warnf("Failed to create volume directory %s for service %s", absPath, svcName)
+					m.ulog.Warn("Failed to create volume directory").
+						Err(err).
+						Field("path", absPath).
+						Field("service", svcName).
+						Log(ctx)
 					continue
 				}
 
@@ -142,9 +146,10 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 					if restoreCmd != "" {
 						empty, _ := isDirEmpty(absPath)
 						if empty {
-							m.logger.WithField("service", svcName).
-								WithField("volume", volName).
-								Info("Running volume restore command")
+							m.ulog.Info("Running volume restore command").
+								Field("service", svcName).
+								Field("volume", volName).
+								Log(ctx)
 
 							restoreEnv := append(os.Environ(), fmt.Sprintf("GROVE_VOLUME_HOST_PATH=%s", absPath))
 							for k, v := range resp.EnvVars {
@@ -166,9 +171,10 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 								return nil, fmt.Errorf("volume restore failed for service %s volume %s: %w", svcName, volName, err)
 							}
 
-							m.logger.WithField("service", svcName).
-								WithField("volume", volName).
-								Info("Volume restore completed")
+							m.ulog.Info("Volume restore completed").
+								Field("service", svcName).
+								Field("volume", volName).
+								Log(ctx)
 						}
 					}
 				}
@@ -241,15 +247,18 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 			if markerPath != "" {
 				if _, err := os.Stat(markerPath); err == nil {
 					shouldRun = false
-					m.logger.WithField("service", svcName).Info("Skipping post_start (once mode, already initialized)")
+					m.ulog.Info("Skipping post_start (once mode, already initialized)").
+						Field("service", svcName).
+						Log(ctx)
 				}
 			}
 		}
 
 		if shouldRun {
-			m.logger.WithField("service", svcName).
-				WithField("mode", mode).
-				Info("Running post-start lifecycle hook")
+			m.ulog.Info("Running post-start lifecycle hook").
+				Field("service", svcName).
+				Field("mode", mode).
+				Log(ctx)
 
 			lcCmd := exec.Command("sh", "-c", postStart)
 			lcCmd.Dir = req.Workspace.Path
@@ -266,9 +275,14 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 			}
 
 			if err := lcCmd.Run(); err != nil {
-				m.logger.WithError(err).Warnf("Post-start lifecycle hook failed for service %s", svcName)
+				m.ulog.Warn("Post-start lifecycle hook failed").
+					Err(err).
+					Field("service", svcName).
+					Log(ctx)
 			} else {
-				m.logger.WithField("service", svcName).Info("Post-start lifecycle hook completed")
+				m.ulog.Info("Post-start lifecycle hook completed").
+					Field("service", svcName).
+					Log(ctx)
 				if mode == "once" && markerPath != "" {
 					os.WriteFile(markerPath, []byte("initialized\n"), 0644)
 				}
@@ -297,7 +311,10 @@ func (m *Manager) dockerDown(ctx context.Context, req coreenv.EnvRequest) (*core
 	cmd := exec.CommandContext(ctx, "docker", "compose", "-p", projectName, "down", "--volumes", "--remove-orphans")
 	cmd.Dir = req.Workspace.Path
 	if output, err := cmd.CombinedOutput(); err != nil {
-		m.logger.WithError(err).Warnf("docker compose down failed: %s", string(output))
+		m.ulog.Warn("docker compose down failed").
+			Err(err).
+			Field("output", string(output)).
+			Log(ctx)
 	}
 
 	// Cleanup override file

@@ -15,7 +15,6 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/flow/pkg/orchestration"
-	"github.com/sirupsen/logrus"
 )
 
 // JobRunner manages the job queue, worker pool, and execution lifecycle.
@@ -29,7 +28,7 @@ type JobRunner struct {
 	runtime   orchestration.Runtime
 	mu        sync.RWMutex
 	store     *store.Store
-	logger    *logrus.Entry
+	ulog      *grovelogging.UnifiedLogger
 	persister *Persistence
 
 	// blocked holds jobs whose dependencies are not yet satisfied.
@@ -54,7 +53,7 @@ func New(st *store.Store, runtime orchestration.Runtime, workers int, persister 
 		running:       make(map[string]context.CancelFunc),
 		runtime:       runtime,
 		store:         st,
-		logger:        grovelogging.NewLogger("jobrunner"),
+		ulog:          grovelogging.NewUnifiedLogger("groved.jobrunner"),
 		persister:     persister,
 		blocked:       make(map[string]*models.JobInfo),
 		transcriptSem: make(chan struct{}, 4),
@@ -68,7 +67,7 @@ func (jr *JobRunner) Start(ctx context.Context) {
 		restored := jr.persister.Load()
 		for _, job := range restored {
 			if job.Status == "queued" {
-				jr.logger.WithField("job_id", job.ID).Info("Restoring queued job")
+				jr.ulog.Info("Restoring queued job").Field("job_id", job.ID).Log(ctx)
 				jr.store.ApplyUpdate(store.Update{
 					Type:    store.UpdateJobSubmitted,
 					Source:  "jobrunner",
@@ -76,7 +75,7 @@ func (jr *JobRunner) Start(ctx context.Context) {
 				})
 				jr.queue <- job
 			} else if job.Status == "blocked" {
-				jr.logger.WithField("job_id", job.ID).Info("Restoring blocked job")
+				jr.ulog.Info("Restoring blocked job").Field("job_id", job.ID).Log(ctx)
 				jr.blockedMu.Lock()
 				jr.blocked[job.ID] = job
 				jr.blockedMu.Unlock()
@@ -150,11 +149,11 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 		jr.blocked[info.ID] = info
 		jr.blockedMu.Unlock()
 
-		jr.logger.WithFields(logrus.Fields{
-			"job_id":   info.ID,
-			"plan_dir": info.PlanDir,
-			"job_file": info.JobFile,
-		}).Info("Job blocked (dependencies not met)")
+		jr.ulog.Info("Job blocked (dependencies not met)").
+			Field("job_id", info.ID).
+			Field("plan_dir", info.PlanDir).
+			Field("job_file", info.JobFile).
+			Log(ctx)
 
 		return info, nil
 	}
@@ -169,11 +168,11 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 	})
 
 	jr.queue <- info
-	jr.logger.WithFields(logrus.Fields{
-		"job_id":   info.ID,
-		"plan_dir": info.PlanDir,
-		"job_file": info.JobFile,
-	}).Info("Job submitted")
+	jr.ulog.Info("Job submitted").
+		Field("job_id", info.ID).
+		Field("plan_dir", info.PlanDir).
+		Field("job_file", info.JobFile).
+		Log(ctx)
 
 	return info, nil
 }
@@ -185,7 +184,10 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 func (jr *JobRunner) areDependenciesMet(info *models.JobInfo) bool {
 	plan, err := orchestration.LoadPlan(info.PlanDir)
 	if err != nil {
-		jr.logger.WithError(err).WithField("job_id", info.ID).Warn("Could not load plan to check deps; assuming met")
+		jr.ulog.Warn("Could not load plan to check deps; assuming met").
+			Err(err).
+			Field("job_id", info.ID).
+			Log(context.Background())
 		return true
 	}
 
@@ -223,10 +225,10 @@ func (jr *JobRunner) evaluateBlockedJobs() {
 				Payload: info,
 			})
 
-			jr.logger.WithFields(logrus.Fields{
-				"job_id":   info.ID,
-				"job_file": info.JobFile,
-			}).Info("Blocked job promoted to queue")
+			jr.ulog.Info("Blocked job promoted to queue").
+				Field("job_id", info.ID).
+				Field("job_file", info.JobFile).
+				Log(context.Background())
 
 			jr.queue <- info
 		}
@@ -302,7 +304,10 @@ func (jr *JobRunner) executeJob(ctx context.Context, info *models.JobInfo) {
 	// Panic recovery — prevents executor panics from crashing the daemon
 	defer func() {
 		if r := recover(); r != nil {
-			jr.logger.Errorf("Job %s panicked: %v", info.ID, r)
+			jr.ulog.Error("Job panicked").
+				Field("job_id", info.ID).
+				Field("panic", fmt.Sprintf("%v", r)).
+				Log(ctx)
 			jr.markDone(info, "failed", fmt.Sprintf("panic: %v", r))
 			jr.cleanupRunning(info.ID)
 		}
@@ -337,11 +342,11 @@ func (jr *JobRunner) executeJob(ctx context.Context, info *models.JobInfo) {
 		Payload: info,
 	})
 
-	jr.logger.WithFields(logrus.Fields{
-		"job_id":   info.ID,
-		"plan_dir": info.PlanDir,
-		"job_file": info.JobFile,
-	}).Info("Job started")
+	jr.ulog.Info("Job started").
+		Field("job_id", info.ID).
+		Field("plan_dir", info.PlanDir).
+		Field("job_file", info.JobFile).
+		Log(ctx)
 
 	// Load plan and execute
 	plan, err := orchestration.LoadPlan(info.PlanDir)
@@ -426,11 +431,11 @@ func (jr *JobRunner) markDone(info *models.JobInfo, status, errMsg string) {
 		Payload: info,
 	})
 
-	jr.logger.WithFields(logrus.Fields{
-		"job_id": info.ID,
-		"status": status,
-		"error":  errMsg,
-	}).Info("Job finished")
+	jr.ulog.Info("Job finished").
+		Field("job_id", info.ID).
+		Field("status", status).
+		Field("error", errMsg).
+		Log(context.Background())
 
 	// Re-evaluate blocked jobs — this job's completion may unblock dependents.
 	jr.evaluateBlockedJobs()
@@ -536,9 +541,10 @@ func (jr *JobRunner) appendTranscriptAsync(info *models.JobInfo) {
 		// Ensure we evaluate downstream jobs even if transcript fails or skips
 		defer jr.evaluateBlockedJobs()
 
+		ctx := context.Background()
 		plan, err := orchestration.LoadPlan(info.PlanDir)
 		if err != nil {
-			jr.logger.WithError(err).Warn("Failed to load plan for auto-transcript")
+			jr.ulog.Warn("Failed to load plan for auto-transcript").Err(err).Log(ctx)
 			return
 		}
 
@@ -549,9 +555,9 @@ func (jr *JobRunner) appendTranscriptAsync(info *models.JobInfo) {
 
 		// AppendAgentTranscript is idempotent and handles locking internally
 		if err := orchestration.AppendAgentTranscript(job, plan); err != nil {
-			jr.logger.WithError(err).Warn("Failed to auto-append agent transcript")
+			jr.ulog.Warn("Failed to auto-append agent transcript").Err(err).Log(ctx)
 		} else {
-			jr.logger.WithField("job_id", job.ID).Debug("Auto-appended agent transcript")
+			jr.ulog.Debug("Auto-appended agent transcript").Field("job_id", job.ID).Log(ctx)
 		}
 	}()
 }

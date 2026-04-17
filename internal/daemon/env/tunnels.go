@@ -11,6 +11,7 @@ import (
 	"sync"
 	"text/template"
 
+	"github.com/grovetools/core/logging"
 	"github.com/sirupsen/logrus"
 )
 
@@ -24,13 +25,16 @@ type activeTunnel struct {
 type TunnelManager struct {
 	mu      sync.Mutex
 	tunnels map[string]*activeTunnel // Keyed by "worktree/name"
-	logger  *logrus.Entry
+	ulog    *logging.UnifiedLogger
 }
 
-func NewTunnelManager(logger *logrus.Entry) *TunnelManager {
+// NewTunnelManager creates a new tunnel manager.
+// The logger parameter is retained for backwards compatibility and will be
+// removed in a later phase.
+func NewTunnelManager(_ *logrus.Entry) *TunnelManager {
 	return &TunnelManager{
 		tunnels: make(map[string]*activeTunnel),
-		logger:  logger.WithField("component", "tunnels"),
+		ulog:    logging.NewUnifiedLogger("groved.env.tunnels"),
 	}
 }
 
@@ -75,12 +79,18 @@ func (tm *TunnelManager) Start(parentCtx context.Context, worktree, name, cmdTem
 	var logFile *os.File
 	if logDir != "" {
 		if err := os.MkdirAll(logDir, 0755); err != nil {
-			tm.logger.WithError(err).Warnf("Failed to create tunnel log directory %s", logDir)
+			tm.ulog.Warn("Failed to create tunnel log directory").
+				Err(err).
+				Field("log_dir", logDir).
+				Log(parentCtx)
 		} else {
 			logPath := filepath.Join(logDir, "tunnel-"+name+".log")
 			lf, lerr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 			if lerr != nil {
-				tm.logger.WithError(lerr).Warnf("Failed to create tunnel log file %s", logPath)
+				tm.ulog.Warn("Failed to create tunnel log file").
+					Err(lerr).
+					Field("log_path", logPath).
+					Log(parentCtx)
 			} else {
 				logFile = lf
 				cmd.Stdout = lf
@@ -102,11 +112,11 @@ func (tm *TunnelManager) Start(parentCtx context.Context, worktree, name, cmdTem
 	tm.tunnels[key] = &activeTunnel{cmd: cmd, cancel: cancel, log: logFile}
 	tm.mu.Unlock()
 
-	tm.logger.WithFields(logrus.Fields{
-		"worktree": worktree,
-		"tunnel":   name,
-		"port":     port,
-	}).Debug("Tunnel started")
+	tm.ulog.Debug("Tunnel started").
+		Field("worktree", worktree).
+		Field("tunnel", name).
+		Field("port", port).
+		Log(parentCtx)
 	return nil
 }
 

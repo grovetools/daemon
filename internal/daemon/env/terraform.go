@@ -336,7 +336,10 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 		}
 
 		result["image_"+key] = fullURI
-		m.logger.WithField("image", key).Infof("Built and pushed %s", fullURI)
+		m.ulog.Info("Built and pushed image").
+			Field("image", key).
+			Field("uri", fullURI).
+			Log(ctx)
 	}
 
 	return result, nil
@@ -408,7 +411,9 @@ func (m *Manager) fetchSharedOutputs(ctx context.Context, sharedCfg map[string]i
 		}
 	}
 
-	m.logger.WithField("outputs", len(result)).Info("Fetched shared infrastructure outputs")
+	m.ulog.Info("Fetched shared infrastructure outputs").
+		Field("outputs", len(result)).
+		Log(ctx)
 	return result, nil
 }
 
@@ -441,7 +446,9 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve environment variables: %w", err)
 	}
-	m.logger.WithField("count", len(resolvedEnv)-len(os.Environ())).Info("Resolved config environment variables")
+	m.ulog.Info("Resolved config environment variables").
+		Field("count", len(resolvedEnv)-len(os.Environ())).
+		Log(ctx)
 
 	// Resolve the TF module path (relative to workspace root)
 	modulePath, _ := req.Config["path"].(string)
@@ -544,7 +551,9 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	// Tunnel + local-services log directory (shared with native provider).
 	logDir := filepath.Join(req.Workspace.Path, ".grove", "env", "logs")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
-		m.logger.WithError(err).Warn("Failed to create log directory; tunnel + service output will be discarded")
+		m.ulog.Warn("Failed to create log directory; tunnel + service output will be discarded").
+			Err(err).
+			Log(ctx)
 		logDir = ""
 	}
 
@@ -570,7 +579,10 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 			runningEnv.Ports["tunnel-"+tunnelName] = port
 
 			if err := m.Tunnels.Start(context.Background(), worktree, tunnelName, cmdStr, port, req.Workspace.Path, resp.EnvVars, logDir); err != nil {
-				m.logger.WithError(err).Warnf("Failed to start tunnel %s", tunnelName)
+				m.ulog.Warn("Failed to start tunnel").
+					Err(err).
+					Field("tunnel", tunnelName).
+					Log(ctx)
 				continue
 			}
 
@@ -629,7 +641,7 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 	// let the goroutine finish reaping. (See nativeDown for the same pattern.)
 	if exists && runningEnv != nil {
 		for name, cancel := range runningEnv.Cancels {
-			m.logger.WithField("service", name).Info("Stopping local service")
+			m.ulog.Info("Stopping local service").Field("service", name).Log(ctx)
 			cancel()
 		}
 	}
@@ -640,16 +652,18 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 	m.Ports.ReleaseAll(worktree)
 
 	if skipDestroy {
-		m.logger.WithField("worktree", worktree).Info(
-			"skip_destroy=true: stopped local processes/tunnels/proxy only; cloud resources left intact. " +
-				"Run `grove env down --clean` or switch to the base terraform profile to actually destroy them.")
+		m.ulog.Info("skip_destroy=true: stopped local processes/tunnels/proxy only; cloud resources left intact. Run `grove env down --clean` or switch to the base terraform profile to actually destroy them.").
+			Field("worktree", worktree).
+			Log(ctx)
 		return &coreenv.EnvResponse{Status: "stopped"}, nil
 	}
 
 	// Resolve config.env for destroy (providers may need credentials)
 	resolvedEnv, err := ResolveConfigEnv(ctx, req.Config, req.Workspace.Path)
 	if err != nil {
-		m.logger.WithError(err).Warn("failed to resolve config env for destroy, proceeding with system env")
+		m.ulog.Warn("failed to resolve config env for destroy, proceeding with system env").
+			Err(err).
+			Log(ctx)
 		resolvedEnv = os.Environ()
 	}
 
@@ -684,10 +698,10 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 		// Phase 5: Generate tfvars for destroy (TF needs vars for count/for_each evaluation)
 		payload, err := buildTfVarsPayload(req, nil, nil)
 		if err != nil {
-			m.logger.WithError(err).Warn("failed to build tfvars for destroy, proceeding anyway")
+			m.ulog.Warn("failed to build tfvars for destroy, proceeding anyway").Err(err).Log(ctx)
 		} else {
 			if _, err := writeTfVars(stateDir, payload); err != nil {
-				m.logger.WithError(err).Warn("failed to write tfvars for destroy, proceeding anyway")
+				m.ulog.Warn("failed to write tfvars for destroy, proceeding anyway").Err(err).Log(ctx)
 			}
 		}
 
@@ -696,7 +710,7 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 		// Write backend override for GCS
 		overridePath, err := writeBackendOverride(moduleAbs, bc)
 		if err != nil {
-			m.logger.WithError(err).Warn("failed to write backend override for destroy")
+			m.ulog.Warn("failed to write backend override for destroy").Err(err).Log(ctx)
 		}
 		if overridePath != "" {
 			defer os.Remove(overridePath)
@@ -708,7 +722,10 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 		initCmd.Dir = moduleAbs
 		initCmd.Env = tfEnvDown
 		if output, err := initCmd.CombinedOutput(); err != nil {
-			m.logger.WithError(err).Warnf("terraform init for destroy failed: %s", string(output))
+			m.ulog.Warn("terraform init for destroy failed").
+				Err(err).
+				Field("output", string(output)).
+				Log(ctx)
 		}
 
 		// terraform destroy
@@ -728,7 +745,10 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 		cmd.Dir = moduleAbs
 		cmd.Env = tfEnvDown
 		if output, err := cmd.CombinedOutput(); err != nil {
-			m.logger.WithError(err).Warnf("terraform destroy failed: %s", string(output))
+			m.ulog.Warn("terraform destroy failed").
+				Err(err).
+				Field("output", string(output)).
+				Log(ctx)
 		}
 	}
 

@@ -5,20 +5,18 @@ import (
 	"testing"
 	"time"
 
+	grovelogging "github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	"github.com/sirupsen/logrus"
 )
 
 func newTestRunner(st *store.Store) *JobRunner {
-	logger := logrus.New()
-	logger.SetLevel(logrus.WarnLevel)
 	return &JobRunner{
 		store:   st,
 		blocked: make(map[string]*models.JobInfo),
 		queue:   make(chan *models.JobInfo, 100),
 		running: make(map[string]context.CancelFunc),
-		logger:  logger.WithField("test", true),
+		ulog:    grovelogging.NewUnifiedLogger("groved.jobrunner.test"),
 	}
 }
 

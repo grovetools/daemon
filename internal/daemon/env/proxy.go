@@ -1,12 +1,14 @@
 package env
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"strings"
 	"sync"
 
+	"github.com/grovetools/core/logging"
 	"github.com/sirupsen/logrus"
 )
 
@@ -14,13 +16,16 @@ import (
 type ProxyManager struct {
 	mu     sync.RWMutex
 	routes map[string]string // e.g., "api.demo.grove.local" -> "127.0.0.1:34012"
-	logger *logrus.Entry
+	ulog   *logging.UnifiedLogger
 }
 
-func NewProxyManager(logger *logrus.Entry) *ProxyManager {
+// NewProxyManager creates a new proxy manager.
+// The logger parameter is retained for backwards compatibility and will be
+// removed in a later phase.
+func NewProxyManager(_ *logrus.Entry) *ProxyManager {
 	return &ProxyManager{
 		routes: make(map[string]string),
-		logger: logger.WithField("component", "proxy"),
+		ulog:   logging.NewUnifiedLogger("groved.env.proxy"),
 	}
 }
 
@@ -32,7 +37,10 @@ func (pm *ProxyManager) Register(worktree, service string, port int) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.routes[host] = target
-	pm.logger.WithFields(logrus.Fields{"host": host, "target": target}).Debug("Route registered")
+	pm.ulog.Debug("Route registered").
+		Field("host", host).
+		Field("target", target).
+		Log(context.Background())
 }
 
 // Unregister removes all routes matching a specific worktree.
@@ -70,6 +78,6 @@ func (pm *ProxyManager) ListenAndServe(addr string) error {
 	}
 
 	proxy := &httputil.ReverseProxy{Director: director}
-	pm.logger.WithField("addr", addr).Info("Proxy server listening")
+	pm.ulog.Info("Proxy server listening").Field("addr", addr).Log(context.Background())
 	return http.ListenAndServe(addr, proxy)
 }

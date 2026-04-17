@@ -5,6 +5,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/grovetools/core/logging"
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/sirupsen/logrus"
@@ -14,14 +15,16 @@ import (
 type Engine struct {
 	store      *store.Store
 	collectors []collector.Collector
-	logger     *logrus.Entry
+	ulog       *logging.UnifiedLogger
 }
 
 // New creates a new Engine instance.
-func New(st *store.Store, logger *logrus.Entry) *Engine {
+// The logger parameter is retained for backwards compatibility with cmd/groved.go
+// and will be removed in a later phase.
+func New(st *store.Store, _ *logrus.Entry) *Engine {
 	return &Engine{
-		store:  st,
-		logger: logger,
+		store: st,
+		ulog:  logging.NewUnifiedLogger("groved.engine"),
 	}
 }
 
@@ -54,9 +57,12 @@ func (e *Engine) Start(ctx context.Context) {
 		wg.Add(1)
 		go func(col collector.Collector) {
 			defer wg.Done()
-			e.logger.WithField("collector", col.Name()).Info("Starting collector")
+			e.ulog.Info("Starting collector").Field("collector", col.Name()).Log(ctx)
 			if err := col.Run(ctx, e.store, updates); err != nil {
-				e.logger.WithField("collector", col.Name()).WithError(err).Error("Collector failed")
+				e.ulog.Error("Collector failed").
+					Err(err).
+					Field("collector", col.Name()).
+					Log(ctx)
 			}
 		}(c)
 	}
