@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,240 +11,42 @@ import (
 	"time"
 
 	coreenv "github.com/grovetools/core/pkg/env"
-	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/pkg/envtf"
 )
 
-// groveContext is the set of standard variables injected into Terraform as auto.tfvars.json.
-type groveContext struct {
-	GroveEcosystem string                       `json:"grove_ecosystem"`
-	GroveProject   string                       `json:"grove_project"`
-	GroveWorktree  string                       `json:"grove_worktree"`
-	GroveBranch    string                       `json:"grove_branch,omitempty"`
-	GrovePlanDir   string                       `json:"grove_plan_dir"`
-	GroveVolumes   map[string]groveVolumeConfig `json:"grove_volumes,omitempty"`
-	EnvName        string                       `json:"env_name"`
-	GroveEnvId     int                          `json:"grove_env_id"`
-}
+// Local aliases keep the daemon package's call sites terse without dragging
+// the envtf-prefixed names into every terraform.go line. They are purely a
+// naming convenience — the canonical definitions live in core/pkg/envtf.
+type groveContext = envtf.GroveContext
+type groveVolumeConfig = envtf.GroveVolumeConfig
+type backendConfig = envtf.BackendConfig
+type tfOutput = envtf.TfOutput
 
-// groveVolumeConfig represents a volume's configuration passed to Terraform modules.
-type groveVolumeConfig struct {
-	Service     string `json:"service"`
-	HostPath    string `json:"host_path"`
-	Persist     bool   `json:"persist,omitempty"`
-	SnapshotURL string `json:"snapshot_url,omitempty"`
-	RestoreCmd  string `json:"restore_command,omitempty"`
-}
+// generateEnvId is retained as a package-local shim over envtf.GenerateEnvId
+// so existing tests (e.g. TestGenerateEnvId) and daemon call sites don't have
+// to spell out the envtf prefix.
+func generateEnvId(worktreeName string) int { return envtf.GenerateEnvId(worktreeName) }
 
-// backendConfig holds resolved Terraform backend configuration.
-type backendConfig struct {
-	Type   string // "gcs" or "local"
-	Bucket string // GCS bucket name
-	Prefix string // GCS state prefix
-}
+// resolveBackend is a package-local shim that forwards to envtf.ResolveBackend.
+func resolveBackend(req coreenv.EnvRequest) backendConfig { return envtf.ResolveBackend(req) }
 
-// generateEnvId produces a deterministic environment ID (1-255) from a worktree name.
-func generateEnvId(worktreeName string) int {
-	h := fnv.New32a()
-	h.Write([]byte(worktreeName))
-	return int(h.Sum32()%255) + 1
-}
-
-// resolveBackend determines the Terraform backend configuration from the request config.
-// The GCS prefix follows the pattern: <ecosystem>/<project>/<ref> where:
-//   - project = first path component of config["path"] (e.g., "kitchen-infra", "kitchen-app")
-//   - ref = current git branch or worktree name
-func resolveBackend(req coreenv.EnvRequest) backendConfig {
-	stateBackend, _ := req.Config["state_backend"].(string)
-	stateBucket, _ := req.Config["state_bucket"].(string)
-
-	if stateBackend == "gcs" && stateBucket != "" {
-		ecosystem := ""
-		if req.Workspace != nil && req.Workspace.ParentEcosystemPath != "" {
-			ecosystem = filepath.Base(req.Workspace.ParentEcosystemPath)
-		}
-		if ecosystem == "" && req.Workspace != nil && req.Workspace.RootEcosystemPath != "" {
-			ecosystem = filepath.Base(req.Workspace.RootEcosystemPath)
-		}
-
-		// Derive project name from config path (first component)
-		project := "default"
-		if configPath, ok := req.Config["path"].(string); ok && configPath != "" {
-			parts := strings.SplitN(filepath.Clean(configPath), string(filepath.Separator), 2)
-			if len(parts) > 0 && parts[0] != "." {
-				project = parts[0]
-			}
-		}
-
-		// Use git branch (from config) or worktree name as the ref
-		ref := ""
-		if branch, ok := req.Config["branch"].(string); ok && branch != "" {
-			ref = branch
-		} else {
-			ref = currentGitBranch(req.Workspace)
-		}
-
-		prefix := project + "/" + ref
-		if ecosystem != "" {
-			prefix = ecosystem + "/" + project + "/" + ref
-		}
-		return backendConfig{Type: "gcs", Bucket: stateBucket, Prefix: prefix}
-	}
-
-	return backendConfig{Type: "local"}
-}
-
-// currentGitBranch returns the current git branch for the workspace, falling back to the workspace name.
-func currentGitBranch(ws *workspace.WorkspaceNode) string {
-	if ws == nil {
-		return "default"
-	}
-	// Try to get the branch from git
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
-	cmd.Dir = ws.Path
-	out, err := cmd.Output()
-	if err == nil {
-		branch := strings.TrimSpace(string(out))
-		if branch != "" && branch != "HEAD" {
-			return branch
-		}
-	}
-	return ws.Name
-}
-
-// buildTfVarsPayload creates the combined variables map from grove context, user vars,
-// shared outputs, and image URIs.
+// buildTfVarsPayload is a package-local shim that forwards to envtf.BuildTfVarsPayload.
 func buildTfVarsPayload(req coreenv.EnvRequest, imageVars map[string]string, sharedOutputs map[string]interface{}) (map[string]interface{}, error) {
-	worktree := req.Workspace.Name
-	stateDir := req.EffectiveStateDir()
-
-	// Start with grove context fields
-	gctx := groveContext{
-		GroveProject:  req.Workspace.Name,
-		GroveWorktree: worktree,
-		GrovePlanDir:  stateDir,
-		EnvName:       worktree,
-		GroveEnvId:    generateEnvId(worktree),
-	}
-	if req.Workspace.ParentEcosystemPath != "" {
-		gctx.GroveEcosystem = filepath.Base(req.Workspace.ParentEcosystemPath)
-	}
-	if branch, ok := req.Config["branch"].(string); ok {
-		gctx.GroveBranch = branch
-	}
-
-	// Collect volume configs from services
-	if services, ok := req.Config["services"].(map[string]interface{}); ok {
-		for svcName, svcConfigRaw := range services {
-			svcConfig, ok := svcConfigRaw.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			volumes, ok := svcConfig["volumes"].(map[string]interface{})
-			if !ok {
-				continue
-			}
-			for volName, volCfgRaw := range volumes {
-				volCfg, ok := volCfgRaw.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				hostPath, _ := volCfg["host_path"].(string)
-				persist, _ := volCfg["persist"].(bool)
-				vc := groveVolumeConfig{
-					Service:  svcName,
-					HostPath: hostPath,
-					Persist:  persist,
-				}
-				if restoreCfg, ok := volCfg["restore"].(map[string]interface{}); ok {
-					vc.RestoreCmd, _ = restoreCfg["command"].(string)
-					vc.SnapshotURL, _ = restoreCfg["snapshot_url"].(string)
-				}
-				if gctx.GroveVolumes == nil {
-					gctx.GroveVolumes = make(map[string]groveVolumeConfig)
-				}
-				gctx.GroveVolumes[svcName+"/"+volName] = vc
-			}
-		}
-	}
-
-	// Marshal grove context to a generic map
-	gctxBytes, err := json.Marshal(gctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal grove context: %w", err)
-	}
-	payload := make(map[string]interface{})
-	if err := json.Unmarshal(gctxBytes, &payload); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal grove context to map: %w", err)
-	}
-
-	// Merge user vars (overrides grove defaults like env_name)
-	if vars, ok := req.Config["vars"].(map[string]interface{}); ok {
-		for k, v := range vars {
-			payload[k] = v
-		}
-	}
-
-	// Inject image URIs from build step
-	for k, v := range imageVars {
-		payload[k] = v
-	}
-
-	// Inject shared infrastructure outputs
-	if len(sharedOutputs) > 0 {
-		payload["shared"] = sharedOutputs
-	}
-
-	return payload, nil
+	return envtf.BuildTfVarsPayload(req, imageVars, sharedOutputs)
 }
 
-// writeTfVars writes the combined variables payload to grove_context.auto.tfvars.json.
+// writeTfVars is a package-local shim that forwards to envtf.WriteTfVars.
 func writeTfVars(stateDir string, payload map[string]interface{}) (string, error) {
-	varsPath := filepath.Join(stateDir, "grove_context.auto.tfvars.json")
-	varsBytes, err := json.MarshalIndent(payload, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal tfvars: %w", err)
-	}
-	if err := os.WriteFile(varsPath, varsBytes, 0644); err != nil {
-		return "", fmt.Errorf("failed to write tfvars: %w", err)
-	}
-	return varsPath, nil
+	return envtf.WriteTfVars(stateDir, payload)
 }
 
-// writeBackendOverride writes _grove_backend_override.tf.json to the module directory
-// for GCS backend configuration. Returns the file path (for cleanup) or empty string for local backend.
+// writeBackendOverride is a package-local shim that forwards to envtf.WriteBackendOverride.
 func writeBackendOverride(moduleDir string, bc backendConfig) (string, error) {
-	if bc.Type != "gcs" {
-		return "", nil
-	}
-	overridePath := filepath.Join(moduleDir, "_grove_backend_override.tf.json")
-	content := map[string]interface{}{
-		"terraform": map[string]interface{}{
-			"backend": map[string]interface{}{
-				"gcs": map[string]interface{}{},
-			},
-		},
-	}
-	data, err := json.MarshalIndent(content, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal backend override: %w", err)
-	}
-	if err := os.WriteFile(overridePath, data, 0644); err != nil {
-		return "", fmt.Errorf("failed to write backend override: %w", err)
-	}
-	return overridePath, nil
+	return envtf.WriteBackendOverride(moduleDir, bc)
 }
 
-// buildInitArgs returns the terraform init arguments based on backend config.
-func buildInitArgs(bc backendConfig) []string {
-	args := []string{"init", "-input=false", "-reconfigure"}
-	if bc.Type == "gcs" {
-		args = append(args,
-			"-backend-config=bucket="+bc.Bucket,
-			"-backend-config=prefix="+bc.Prefix,
-		)
-	}
-	return args
-}
+// buildInitArgs is a package-local shim that forwards to envtf.BuildInitArgs.
+func buildInitArgs(bc backendConfig) []string { return envtf.BuildInitArgs(bc) }
 
 // buildImages builds container images, returning a map of image_<key> -> fullURI.
 //
@@ -264,7 +65,6 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 	worktree := req.Workspace.Name
 	stateDir := req.EffectiveStateDir()
 
-	// Create logs directory
 	logsDir := filepath.Join(stateDir, "logs")
 	if err := os.MkdirAll(logsDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create logs directory: %w", err)
@@ -281,14 +81,12 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 			return nil, fmt.Errorf("image %q requires registry", key)
 		}
 
-		// Generate unique tag
 		tag := fmt.Sprintf("grove-%s-%d", worktree, time.Now().Unix())
 		fullURI := registry + ":" + tag
 
 		logFile := filepath.Join(logsDir, "build-"+key+".log")
 
 		if cmdStr, ok := imgCfg["cmd"].(string); ok && cmdStr != "" {
-			// Custom build command — user handles build+push
 			buildCmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
 			buildCmd.Dir = req.Workspace.Path
 			buildCmd.Env = append(os.Environ(),
@@ -302,7 +100,6 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 				return nil, fmt.Errorf("image build command failed for %q: %w\nSee log: %s", key, err, logFile)
 			}
 		} else {
-			// Default: docker build + push
 			contextPath, _ := imgCfg["context"].(string)
 			dockerfile, _ := imgCfg["dockerfile"].(string)
 
@@ -345,72 +142,15 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 	return result, nil
 }
 
-// fetchSharedOutputs reads Terraform outputs from a shared infrastructure project's remote state.
-// It creates a temporary directory, configures the backend, runs init + output, and returns the values.
+// fetchSharedOutputs wraps envtf.FetchSharedOutputs with a log line so the
+// daemon surfaces the shared-infra lookup in its structured logs. Kept as a
+// method on Manager so future manager-level instrumentation (metrics, tracing)
+// can hook it without touching the envtf package.
 func (m *Manager) fetchSharedOutputs(ctx context.Context, sharedCfg map[string]interface{}) (map[string]interface{}, error) {
-	bucket, _ := sharedCfg["state_bucket"].(string)
-	prefix, _ := sharedCfg["state_prefix"].(string)
-	backend, _ := sharedCfg["state_backend"].(string)
-
-	if backend != "gcs" || bucket == "" || prefix == "" {
-		return nil, fmt.Errorf("shared backend config requires state_backend=gcs, state_bucket, and state_prefix")
-	}
-
-	tmpDir, err := os.MkdirTemp("", "grove-shared-*")
+	result, err := envtf.FetchSharedOutputs(ctx, sharedCfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp dir for shared outputs: %w", err)
+		return nil, err
 	}
-	defer os.RemoveAll(tmpDir)
-
-	// Write backend override to temp dir
-	overrideContent := map[string]interface{}{
-		"terraform": map[string]interface{}{
-			"backend": map[string]interface{}{
-				"gcs": map[string]interface{}{},
-			},
-		},
-	}
-	overrideBytes, err := json.MarshalIndent(overrideContent, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal shared backend override: %w", err)
-	}
-	overridePath := filepath.Join(tmpDir, "_grove_backend_override.tf.json")
-	if err := os.WriteFile(overridePath, overrideBytes, 0644); err != nil {
-		return nil, fmt.Errorf("failed to write shared backend override: %w", err)
-	}
-
-	// terraform init in temp dir
-	initArgs := []string{"init", "-input=false", "-reconfigure",
-		"-backend-config=bucket=" + bucket,
-		"-backend-config=prefix=" + prefix,
-	}
-	initCmd := exec.CommandContext(ctx, "terraform", initArgs...)
-	initCmd.Dir = tmpDir
-	if output, err := initCmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("terraform init for shared outputs failed: %w\nOutput: %s", err, string(output))
-	}
-
-	// terraform output -json
-	outputCmd := exec.CommandContext(ctx, "terraform", "output", "-json")
-	outputCmd.Dir = tmpDir
-	outputBytes, err := outputCmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("terraform output for shared infra failed: %w", err)
-	}
-
-	var rawOutputs map[string]tfOutput
-	if err := json.Unmarshal(outputBytes, &rawOutputs); err != nil {
-		return nil, fmt.Errorf("failed to parse shared terraform outputs: %w", err)
-	}
-
-	// Extract values (skip sensitive)
-	result := make(map[string]interface{})
-	for name, out := range rawOutputs {
-		if !out.Sensitive {
-			result[name] = out.Value
-		}
-	}
-
 	m.ulog.Info("Fetched shared infrastructure outputs").
 		Field("outputs", len(result)).
 		Log(ctx)
@@ -531,6 +271,15 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	resp := &coreenv.EnvResponse{
 		Status:  "running",
 		EnvVars: make(map[string]string),
+		State:   make(map[string]string),
+	}
+
+	// Persist image URIs into opaque provider state so `grove env drift` can
+	// reuse them on subsequent runs instead of rebuilding (which would produce
+	// a new tag and falsely flag Cloud Run services as drifted). Only the
+	// image_* keys live here; actual env vars still flow through EnvVars.
+	for k, v := range imageVars {
+		resp.State[k] = v
 	}
 
 	outputArgs := []string{"output", "-json"}
@@ -764,13 +513,6 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 	_ = os.Remove(filepath.Join(stateDir, "grove_context.auto.tfvars.json"))
 
 	return &coreenv.EnvResponse{Status: "stopped"}, nil
-}
-
-// tfOutput represents a single Terraform output value.
-type tfOutput struct {
-	Value     interface{} `json:"value"`
-	Type      interface{} `json:"type"`
-	Sensitive bool        `json:"sensitive"`
 }
 
 // mapTerraformOutputs maps Terraform outputs to EnvResponse fields.
