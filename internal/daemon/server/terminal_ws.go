@@ -46,21 +46,23 @@ type TerminalHub struct {
 
 // NewTerminalHub creates a ready-to-use TerminalHub.
 //
-// When autoShutdown is true the hub arms an idle timer immediately so a
-// daemon that is auto-spawned but never gets a client connection exits
-// cleanly after autoShutdownIdleTimeout.
+// When autoShutdown is true the hub will arm a 2-minute idle timer every
+// time the last terminal client disconnects. It intentionally does NOT
+// arm a timer at construction: a freshly auto-spawned daemon must wait
+// indefinitely for its first client (treemux's WS handshake can take
+// several seconds, and racing that against a 2-minute clock caused
+// daemons to exit mid-connect). If no client ever arrives, the daemon
+// stays up until SIGTERM — a leaked idle daemon is a much smaller
+// problem than a daemon that disappears while treemux is still
+// attaching.
 func NewTerminalHub(autoShutdown bool) *TerminalHub {
-	h := &TerminalHub{
+	return &TerminalHub{
 		followers:      make(map[*websocket.Conn]bool),
 		sseSubscribers: make(map[chan string]bool),
 		ulog:           logging.NewUnifiedLogger("groved.server.treemux"),
 		autoShutdown:   autoShutdown,
 		shutdownReq:    make(chan struct{}),
 	}
-	if autoShutdown {
-		h.idleTimer = time.AfterFunc(autoShutdownIdleTimeout, h.fireAutoShutdown)
-	}
-	return h
 }
 
 // ShutdownReq exposes the auto-shutdown request channel. The channel is
