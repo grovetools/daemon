@@ -3,6 +3,7 @@ package store
 
 import (
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/flow/pkg/orchestration"
 )
 
 // State represents the complete world view of the daemon.
@@ -12,6 +13,11 @@ type State struct {
 	Jobs        map[string]*models.JobInfo           `json:"jobs"`                    // Keyed by job ID
 	NoteIndex   map[string]*models.NoteIndexEntry    `json:"note_index,omitempty"`    // Keyed by file path
 	NavBindings *models.NavSessionsFile              `json:"nav_bindings,omitempty"`  // Nav key binding state
+	// Plans caches fully-parsed plan directories keyed by their containing
+	// plansDir. Populated by the flow watcher so TUI clients can fetch
+	// plan lists over the socket instead of hammering the filesystem
+	// every tick.
+	Plans map[string][]*orchestration.Plan `json:"plans,omitempty"`
 }
 
 // UpdateType defines what kind of data changed.
@@ -62,6 +68,10 @@ const (
 
 	// Nav bindings update — full replacement of nav binding state.
 	UpdateNavBindings UpdateType = "nav_bindings"
+
+	// Plans update — full replacement of the cached plan list for one or
+	// more plansDir keys. Payload is map[string][]*orchestration.Plan.
+	UpdatePlans UpdateType = "plans"
 
 	// Memory index mutation — broadcast after the memory watcher upserts or
 	// deletes a document. Payload is MemoryIndexPayload. The TUI uses this

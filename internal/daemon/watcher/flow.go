@@ -16,6 +16,7 @@ import (
 	"github.com/grovetools/core/util/frontmatter"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/enrichment"
+	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/sirupsen/logrus"
 )
 
@@ -197,7 +198,10 @@ func (h *FlowHandler) HandleStoreUpdate(update store.Update) {
 }
 
 func (h *FlowHandler) OnStart(ctx context.Context) {
-	// No initial sync needed — the PlanCollector handles the first scan.
+	// Kick off a first refresh so /api/plans has a snapshot to serve
+	// before any filesystem event arrives. The PlanCollector still
+	// handles aggregated PlanStats; this populates the deep cache.
+	h.triggerRefresh()
 }
 
 // triggerRefresh debounces plan stats re-scan to avoid excessive work.
@@ -237,6 +241,49 @@ func (h *FlowHandler) triggerRefresh() {
 				Source:  "flow_watcher",
 				Scanned: len(deltas),
 				Payload: deltas,
+			})
+		}
+
+		// Refresh the deep plan cache the browser reads from.
+		// Walking every watched plansDir keeps this work out of TUI
+		// clients, and the debounce above limits how often we do it.
+		plansByDir := make(map[string][]*orchestration.Plan)
+		h.pathsMutex.RLock()
+		seen := make(map[string]struct{})
+		for _, wsNode := range h.watchedPaths {
+			plansDir, err := h.locator.GetPlansDir(wsNode)
+			if err != nil || plansDir == "" {
+				continue
+			}
+			if _, dup := seen[plansDir]; dup {
+				continue
+			}
+			seen[plansDir] = struct{}{}
+
+			entries, err := os.ReadDir(plansDir)
+			if err != nil {
+				continue
+			}
+			plans := make([]*orchestration.Plan, 0, len(entries))
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				planPath := filepath.Join(plansDir, entry.Name())
+				if p, err := orchestration.LoadPlan(planPath); err == nil {
+					plans = append(plans, p)
+				}
+			}
+			plansByDir[plansDir] = plans
+		}
+		h.pathsMutex.RUnlock()
+
+		if len(plansByDir) > 0 {
+			h.store.ApplyUpdate(store.Update{
+				Type:    store.UpdatePlans,
+				Source:  "flow_watcher",
+				Scanned: len(plansByDir),
+				Payload: plansByDir,
 			})
 		}
 	})

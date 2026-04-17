@@ -34,6 +34,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/daemon/internal/enrichment"
+	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/memory/pkg/memory"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
@@ -164,6 +165,7 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	// State API endpoints
 	mux.HandleFunc("/api/state", s.handleGetState)
 	mux.HandleFunc("/api/workspaces", s.handleGetWorkspaces)
+	mux.HandleFunc("/api/plans", s.handleGetPlans)
 	// Session endpoints - order matters! Most specific routes first.
 	mux.HandleFunc("/api/sessions/intent", s.handleSessionIntent)
 	mux.HandleFunc("/api/sessions/confirm", s.handleSessionConfirm)
@@ -272,6 +274,31 @@ func (s *Server) handleGetWorkspaces(w http.ResponseWriter, r *http.Request) {
 	workspaces := s.engine.Store().GetWorkspaces()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(workspaces)
+}
+
+// handleGetPlans returns the cached list of fully-parsed plans for a
+// given plansDir as JSON. The browser TUI uses this to avoid scanning
+// every plan's yaml frontmatter on its own refresh tick.
+func (s *Server) handleGetPlans(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	dir := r.URL.Query().Get("dir")
+	if dir == "" {
+		http.Error(w, "dir parameter required", http.StatusBadRequest)
+		return
+	}
+	plans := s.engine.Store().GetPlans(dir)
+	if plans == nil {
+		plans = []*orchestration.Plan{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(plans)
 }
 
 // handleSessions handles GET for all sessions (path: /api/sessions).

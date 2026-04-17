@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/flow/pkg/orchestration"
 )
 
 // Store is the in-memory state store for the daemon.
@@ -24,6 +25,7 @@ func New() *Store {
 			Sessions:   make(map[string]*models.Session),
 			Jobs:       make(map[string]*models.JobInfo),
 			NoteIndex:  make(map[string]*models.NoteIndexEntry),
+			Plans:      make(map[string][]*orchestration.Plan),
 		},
 		subscribers: make(map[chan Update]struct{}),
 		focus:       make(map[string]struct{}),
@@ -114,6 +116,14 @@ func (s *Store) GetNavBindings() *models.NavSessionsFile {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.state.NavBindings
+}
+
+// GetPlans returns the cached parsed plans for a given plansDir, or nil
+// if the watcher has not populated a snapshot for that directory yet.
+func (s *Store) GetPlans(planDir string) []*orchestration.Plan {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.state.Plans[planDir]
 }
 
 // ApplyUpdate modifies the state and notifies subscribers.
@@ -257,6 +267,13 @@ func (s *Store) ApplyUpdate(u Update) {
 	case UpdateNavBindings:
 		if bindings, ok := u.Payload.(*models.NavSessionsFile); ok {
 			s.state.NavBindings = bindings
+		}
+
+	case UpdatePlans:
+		if plansMap, ok := u.Payload.(map[string][]*orchestration.Plan); ok {
+			for dir, plans := range plansMap {
+				s.state.Plans[dir] = plans
+			}
 		}
 	}
 
