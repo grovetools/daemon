@@ -11,7 +11,6 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	"github.com/sirupsen/logrus"
 )
 
 // LogStreamer manages log file tailing, caching via ring buffers, and broadcasting
@@ -23,7 +22,7 @@ type LogStreamer struct {
 	bufferSize        int
 	maxSubscribers    int
 	tailPollInterval  time.Duration
-	logger            *logrus.Entry
+	ulog              *logging.UnifiedLogger
 }
 
 // JobStream holds the state for tailing a single job's log file.
@@ -55,7 +54,7 @@ func New(st *store.Store, bufferSize, maxSubscribers int, tailPollInterval time.
 		bufferSize:       bufferSize,
 		maxSubscribers:   maxSubscribers,
 		tailPollInterval: tailPollInterval,
-		logger:           logging.NewLogger("logstreamer"),
+		ulog:             logging.NewUnifiedLogger("groved.logstreamer"),
 	}
 }
 
@@ -171,8 +170,6 @@ func (ls *LogStreamer) createStream(jobID string, logFilePath string) *JobStream
 // tailJob is the main tailing goroutine for a single job's log file.
 // It reads new lines, normalizes them, appends to the ring buffer, and broadcasts to subscribers.
 func (ls *LogStreamer) tailJob(ctx context.Context, stream *JobStream) {
-	logger := ls.logger.WithField("job_id", stream.jobID)
-
 	// Wait for the log file to exist
 	var file *os.File
 	for {
@@ -197,7 +194,10 @@ func (ls *LogStreamer) tailJob(ctx context.Context, stream *JobStream) {
 	}
 	defer file.Close()
 
-	logger.WithField("path", stream.logFilePath).Debug("Tailing log file")
+	ls.ulog.Debug("Tailing log file").
+		Field("job_id", stream.jobID).
+		Field("path", stream.logFilePath).
+		Log(ctx)
 
 	// Create normalizer based on file path
 	normalizer := NewNormalizerForPath(stream.logFilePath)
@@ -233,7 +233,10 @@ func (ls *LogStreamer) tailJob(ctx context.Context, stream *JobStream) {
 			continue
 		}
 		if err != nil {
-			logger.WithError(err).Error("Error reading log file")
+			ls.ulog.Error("Error reading log file").
+				Err(err).
+				Field("job_id", stream.jobID).
+				Log(ctx)
 			return
 		}
 

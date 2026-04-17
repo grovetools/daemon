@@ -10,20 +10,19 @@ import (
 
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
-	"github.com/sirupsen/logrus"
 )
 
 // Executor handles executing daemon hooks.
 type Executor struct {
-	cfg    *config.Config
-	logger *logrus.Entry
+	cfg  *config.Config
+	ulog *logging.UnifiedLogger
 }
 
 // NewExecutor creates a new hook executor.
 func NewExecutor(cfg *config.Config) *Executor {
 	return &Executor{
-		cfg:    cfg,
-		logger: logging.NewLogger("daemon.hooks"),
+		cfg:  cfg,
+		ulog: logging.NewUnifiedLogger("groved.hooks"),
 	}
 }
 
@@ -78,20 +77,20 @@ func (e *Executor) executeHook(ctx context.Context, hook config.HookCommand, env
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		e.logger.WithFields(logrus.Fields{
-			"hook":   hook.Name,
-			"error":  err,
-			"output": string(output),
-		}).Warn("Hook execution failed")
+		e.ulog.Warn("Hook execution failed").
+			Err(err).
+			Field("hook", hook.Name).
+			Field("output", string(output)).
+			Log(ctx)
 		return
 	}
 
 	if len(output) > 0 {
-		e.logger.WithFields(logrus.Fields{
-			"hook":   hook.Name,
-			"output": string(output),
-		}).Debug("Hook completed")
+		e.ulog.Debug("Hook completed").
+			Field("hook", hook.Name).
+			Field("output", string(output)).
+			Log(ctx)
 	} else {
-		e.logger.WithField("hook", hook.Name).Debug("Hook completed")
+		e.ulog.Debug("Hook completed").Field("hook", hook.Name).Log(ctx)
 	}
 }

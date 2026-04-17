@@ -19,7 +19,6 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/notify/pkg/channels"
 	"github.com/grovetools/notify/pkg/channels/signal"
-	"github.com/sirupsen/logrus"
 )
 
 // SignalConfig holds the configuration needed to create a Signal channel.
@@ -40,7 +39,7 @@ type Manager struct {
 	routeTable     map[int64]string // signal timestamp → jobID
 	ready          chan struct{}     // closed when signal-cli is ready
 	isRunning      bool
-	logger         *logrus.Entry
+	ulog           *logging.UnifiedLogger
 	ctx            context.Context
 	cancel         context.CancelFunc
 
@@ -56,7 +55,7 @@ func NewManager(st *store.Store, cfg SignalConfig) *Manager {
 		signalCfg:      cfg,
 		activeSessions: make(map[string]bool),
 		routeTable:     make(map[int64]string),
-		logger:         logging.NewLogger("daemon.channels"),
+		ulog:           logging.NewUnifiedLogger("groved.channels"),
 	}
 }
 
@@ -73,7 +72,7 @@ func (m *Manager) Start(ctx context.Context) {
 	// Periodic route cleanup (TTL)
 	go m.routeCleanup(m.ctx)
 
-	m.logger.Info("Channel manager started")
+	m.ulog.Info("Channel manager started").Log(m.ctx)
 }
 
 // Stop shuts down the channel manager and signal-cli.
@@ -92,7 +91,7 @@ func (m *Manager) Stop(ctx context.Context) {
 	}
 
 	m.saveRoutes()
-	m.logger.Info("Channel manager stopped")
+	m.ulog.Info("Channel manager stopped").Log(ctx)
 }
 
 // EnableChannel enables a channel for a session. Starts signal-cli if needed.
@@ -112,7 +111,7 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 		go m.startSignalChannel(m.ctx) // Use manager's long-lived context, not request context
 	}
 
-	m.logger.WithField("job_id", jobID).Info("Channel enabled for session")
+	m.ulog.Info("Channel enabled for session").Field("job_id", jobID).Log(m.ctx)
 	return nil
 }
 
@@ -127,7 +126,7 @@ func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
 		m.signalChannel.Stop(ctx)
 		m.signalChannel = nil
 		m.isRunning = false
-		m.logger.Info("Signal channel stopped (no active sessions)")
+		m.ulog.Info("Signal channel stopped (no active sessions)").Log(ctx)
 	}
 }
 
@@ -169,7 +168,7 @@ func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*mod
 					Message:   taggedMsg,
 				})
 				if err != nil {
-					m.logger.WithError(err).WithField("recipient", contact).Error("Failed to send")
+					m.ulog.Error("Failed to send").Err(err).Field("recipient", contact).Log(ctx)
 					continue
 				}
 				if result != nil && result.Timestamp > 0 {
@@ -270,14 +269,14 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 	// Route to agent
 	session := m.store.GetSession(targetJobID)
 	if session == nil || session.TmuxTarget == "" {
-		m.logger.WithField("job_id", targetJobID).Warn("No tmux target for session")
+		m.ulog.Warn("No tmux target for session").Field("job_id", targetJobID).Log(context.Background())
 		return
 	}
 
 	if m.SendInput != nil {
 		taggedText := fmt.Sprintf("[via Signal] %s", text)
 		if err := m.SendInput(context.Background(), session.TmuxTarget, taggedText); err != nil {
-			m.logger.WithError(err).WithField("job_id", targetJobID).Error("Failed to route message to agent")
+			m.ulog.Error("Failed to route message to agent").Err(err).Field("job_id", targetJobID).Log(context.Background())
 		}
 	}
 }
@@ -291,7 +290,7 @@ func (m *Manager) startSignalChannel(ctx context.Context) {
 	})
 
 	if err := ch.Start(ctx, m.handleInbound); err != nil {
-		m.logger.WithError(err).Error("Failed to start Signal channel")
+		m.ulog.Error("Failed to start Signal channel").Err(err).Log(ctx)
 		m.mu.Lock()
 		m.isRunning = false
 		m.mu.Unlock()
@@ -303,7 +302,7 @@ func (m *Manager) startSignalChannel(ctx context.Context) {
 	close(m.ready) // Signal that we're ready
 	m.mu.Unlock()
 
-	m.logger.Info("Signal channel started")
+	m.ulog.Info("Signal channel started").Log(ctx)
 }
 
 // tagMessage prepends a session tag to outbound messages.

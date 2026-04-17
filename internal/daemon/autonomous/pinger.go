@@ -7,7 +7,6 @@ import (
 
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -19,7 +18,7 @@ const (
 type Pinger struct {
 	store         *store.Store
 	defaultPrompt string
-	logger        *logrus.Entry
+	ulog          *logging.UnifiedLogger
 
 	// SendInput is the function used to inject messages into tmux sessions.
 	SendInput func(ctx context.Context, tmuxTarget, message string) error
@@ -33,7 +32,7 @@ func NewPinger(st *store.Store, defaultPrompt string) *Pinger {
 	return &Pinger{
 		store:         st,
 		defaultPrompt: defaultPrompt,
-		logger:        logging.NewLogger("daemon.autonomous"),
+		ulog:          logging.NewUnifiedLogger("groved.autonomous"),
 	}
 }
 
@@ -95,7 +94,7 @@ func (p *Pinger) checkSessions(ctx context.Context, updates chan<- store.Update)
 		// Send ping
 		if p.SendInput != nil {
 			if err := p.SendInput(ctx, session.TmuxTarget, prompt); err != nil {
-				p.logger.WithError(err).WithField("job_id", session.ID).Error("Failed to send idle ping")
+				p.ulog.Error("Failed to send idle ping").Err(err).Field("job_id", session.ID).Log(ctx)
 				continue
 			}
 		}
@@ -109,6 +108,6 @@ func (p *Pinger) checkSessions(ctx context.Context, updates chan<- store.Update)
 			},
 		}
 
-		p.logger.WithField("job_id", session.ID).Info("Sent idle ping")
+		p.ulog.Info("Sent idle ping").Field("job_id", session.ID).Log(ctx)
 	}
 }
