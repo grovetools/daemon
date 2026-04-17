@@ -92,11 +92,27 @@ func (p *Pinger) checkSessions(ctx context.Context, updates chan<- store.Update)
 		}
 
 		// Send ping
-		if p.SendInput != nil {
-			if err := p.SendInput(ctx, session.TmuxTarget, prompt); err != nil {
-				p.ulog.Error("Failed to send idle ping").Err(err).Field("job_id", session.ID).Log(ctx)
-				continue
-			}
+		if p.SendInput == nil {
+			p.ulog.Error("SendInput not wired — idle ping dropped").
+				Field("job_id", session.ID).
+				Log(ctx)
+			continue
+		}
+
+		p.ulog.Info("Injecting idle ping into agent").
+			Field("job_id", session.ID).
+			Field("tmux_target", session.TmuxTarget).
+			Field("pty_id", session.PtyID).
+			Field("idle_since", time.Since(session.LastActivity).String()).
+			Field("prompt_len", len(prompt)).
+			Log(ctx)
+		if err := p.SendInput(ctx, session.TmuxTarget, prompt); err != nil {
+			p.ulog.Error("Failed to send idle ping").
+				Err(err).
+				Field("job_id", session.ID).
+				Field("tmux_target", session.TmuxTarget).
+				Log(ctx)
+			continue
 		}
 
 		// Record ping time (do NOT update LastActivity)
@@ -108,6 +124,6 @@ func (p *Pinger) checkSessions(ctx context.Context, updates chan<- store.Update)
 			},
 		}
 
-		p.ulog.Info("Sent idle ping").Field("job_id", session.ID).Log(ctx)
+		p.ulog.Success("Sent idle ping").Field("job_id", session.ID).Log(ctx)
 	}
 }

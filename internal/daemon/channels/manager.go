@@ -212,18 +212,40 @@ func (m *Manager) Status() *models.ChannelStatusResponse {
 
 // handleInbound routes an inbound message to the correct agent session.
 func (m *Manager) handleInbound(msg channels.InboundMessage) {
+	ctx := context.Background()
 	text := msg.Message
 	var targetJobID string
+	var resolvedVia string
 
 	m.mu.Lock()
+
+	quoteID := int64(0)
+	if msg.Quote != nil {
+		quoteID = msg.Quote.ID
+	}
+	m.ulog.Debug("Inbound signal message").
+		Field("source", msg.Source).
+		Field("text_len", len(text)).
+		Field("quote_id", quoteID).
+		Field("active_sessions", len(m.activeSessions)).
+		Field("route_table_size", len(m.routeTable)).
+		Log(ctx)
 
 	// 1. Check for Quote (Reply)
 	if msg.Quote != nil {
 		if jobID, exists := m.routeTable[msg.Quote.ID]; exists {
 			targetJobID = jobID
+			resolvedVia = "quote"
 		} else {
 			// Stale route — try extracting tag from quoted text
 			targetJobID = m.extractTagFromText(msg.Quote.Text)
+			if targetJobID != "" {
+				resolvedVia = "quote_tag_fallback"
+			}
+			m.ulog.Debug("Quote route miss").
+				Field("quote_id", msg.Quote.ID).
+				Field("recovered_job_id", targetJobID).
+				Log(ctx)
 		}
 	}
 
@@ -233,6 +255,7 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 		targetJobID = m.resolveTag(tag)
 		if targetJobID != "" {
 			text = rest
+			resolvedVia = "tag"
 		}
 	}
 
@@ -243,18 +266,28 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 			for id := range m.activeSessions {
 				targetJobID = id
 			}
+			resolvedVia = "single_active_fallback"
 		} else if count > 1 {
 			m.mu.Unlock()
+			m.ulog.Warn("Inbound message unroutable — multiple active agents").
+				Field("active_sessions", count).
+				Log(ctx)
 			// Reply with active agent list
 			m.replyWithAgentList(msg.Source)
 			return
 		} else {
 			m.mu.Unlock()
-			return // No agents running
+			m.ulog.Warn("Inbound message dropped — no active agents").Log(ctx)
+			return
 		}
 	}
 
 	m.mu.Unlock()
+
+	m.ulog.Info("Inbound message routed").
+		Field("job_id", targetJobID).
+		Field("resolved_via", resolvedVia).
+		Log(ctx)
 
 	// Update LastSender
 	m.store.ApplyUpdate(store.Update{
@@ -268,17 +301,42 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 
 	// Route to agent
 	session := m.store.GetSession(targetJobID)
-	if session == nil || session.TmuxTarget == "" {
-		m.ulog.Warn("No tmux target for session").Field("job_id", targetJobID).Log(context.Background())
+	if session == nil {
+		m.ulog.Warn("Target session not found in store").Field("job_id", targetJobID).Log(ctx)
+		return
+	}
+	if session.TmuxTarget == "" {
+		m.ulog.Warn("Target session has empty TmuxTarget").
+			Field("job_id", targetJobID).
+			Field("session_status", session.Status).
+			Field("pty_id", session.PtyID).
+			Log(ctx)
 		return
 	}
 
-	if m.SendInput != nil {
-		taggedText := fmt.Sprintf("[via Signal] %s", text)
-		if err := m.SendInput(context.Background(), session.TmuxTarget, taggedText); err != nil {
-			m.ulog.Error("Failed to route message to agent").Err(err).Field("job_id", targetJobID).Log(context.Background())
-		}
+	if m.SendInput == nil {
+		m.ulog.Error("SendInput not wired on Manager — message dropped").
+			Field("job_id", targetJobID).
+			Log(ctx)
+		return
 	}
+
+	taggedText := fmt.Sprintf("[via Signal] %s", text)
+	m.ulog.Info("Injecting signal message into agent").
+		Field("job_id", targetJobID).
+		Field("tmux_target", session.TmuxTarget).
+		Field("pty_id", session.PtyID).
+		Field("input_len", len(taggedText)).
+		Log(ctx)
+	if err := m.SendInput(ctx, session.TmuxTarget, taggedText); err != nil {
+		m.ulog.Error("Failed to inject signal message into agent").
+			Err(err).
+			Field("job_id", targetJobID).
+			Field("tmux_target", session.TmuxTarget).
+			Log(ctx)
+		return
+	}
+	m.ulog.Success("Signal message injected").Field("job_id", targetJobID).Log(ctx)
 }
 
 // startSignalChannel starts the signal-cli daemon process.
