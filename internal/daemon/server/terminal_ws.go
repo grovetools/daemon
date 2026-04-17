@@ -6,10 +6,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/grovetools/core/logging"
 )
+
+// autoShutdownIdleTimeout is how long the daemon waits with zero
+// connected terminal clients before triggering auto-shutdown when
+// --auto-shutdown is enabled.
+const autoShutdownIdleTimeout = 2 * time.Minute
 
 // WsMessage is the JSON envelope for all WebSocket communication
 // between Primary/Follower groveterm instances and the daemon hub.
@@ -28,14 +34,56 @@ type TerminalHub struct {
 	followers      map[*websocket.Conn]bool
 	sseSubscribers map[chan string]bool
 	ulog           *logging.UnifiedLogger
+
+	// Auto-shutdown: when the last terminal client disconnects, start an
+	// idle timer; if it fires without a new connection, close shutdownReq
+	// so the daemon's signal handler can route the request through the
+	// same cleanup path as SIGTERM. Disabled if autoShutdown is false.
+	autoShutdown bool
+	idleTimer    *time.Timer
+	shutdownReq  chan struct{}
 }
 
 // NewTerminalHub creates a ready-to-use TerminalHub.
-func NewTerminalHub() *TerminalHub {
-	return &TerminalHub{
+//
+// When autoShutdown is true the hub arms an idle timer immediately so a
+// daemon that is auto-spawned but never gets a client connection exits
+// cleanly after autoShutdownIdleTimeout.
+func NewTerminalHub(autoShutdown bool) *TerminalHub {
+	h := &TerminalHub{
 		followers:      make(map[*websocket.Conn]bool),
 		sseSubscribers: make(map[chan string]bool),
 		ulog:           logging.NewUnifiedLogger("groved.server.treemux"),
+		autoShutdown:   autoShutdown,
+		shutdownReq:    make(chan struct{}),
+	}
+	if autoShutdown {
+		h.idleTimer = time.AfterFunc(autoShutdownIdleTimeout, h.fireAutoShutdown)
+	}
+	return h
+}
+
+// ShutdownReq exposes the auto-shutdown request channel. The channel is
+// closed (not sent to) when the idle timer fires, so multiple receivers
+// can select on it. Returns nil if autoShutdown is disabled.
+func (h *TerminalHub) ShutdownReq() <-chan struct{} {
+	if !h.autoShutdown {
+		return nil
+	}
+	return h.shutdownReq
+}
+
+// fireAutoShutdown closes shutdownReq if it hasn't already been closed.
+// Safe to call from the idle timer's goroutine.
+func (h *TerminalHub) fireAutoShutdown() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	select {
+	case <-h.shutdownReq:
+		// already closed
+	default:
+		close(h.shutdownReq)
+		h.ulog.Info("Auto-shutdown triggered: idle for 2 minutes").Log(context.Background())
 	}
 }
 
@@ -130,6 +178,11 @@ func (s *Server) HandleTerminalWS(w http.ResponseWriter, r *http.Request) {
 func (h *TerminalHub) register(conn *websocket.Conn) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	if h.idleTimer != nil {
+		h.idleTimer.Stop()
+		h.idleTimer = nil
+	}
 
 	bgCtx := context.Background()
 	var role string
@@ -288,5 +341,14 @@ func (h *TerminalHub) removeConn(conn *websocket.Conn, isPrimary bool) {
 	} else {
 		delete(h.followers, conn)
 		h.ulog.Debug("Follower disconnected").Log(bgCtx)
+	}
+
+	// Arm (or re-arm) the idle shutdown timer if all clients are gone.
+	if h.autoShutdown && h.primary == nil && len(h.followers) == 0 {
+		if h.idleTimer != nil {
+			h.idleTimer.Stop()
+		}
+		h.idleTimer = time.AfterFunc(autoShutdownIdleTimeout, h.fireAutoShutdown)
+		h.ulog.Info("All terminal clients disconnected, 2m auto-shutdown timer armed").Log(bgCtx)
 	}
 }

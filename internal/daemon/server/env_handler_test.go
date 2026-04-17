@@ -11,7 +11,7 @@ import (
 )
 
 func newTestServer() *Server {
-	s := New()
+	s := New(false)
 	s.SetEnvManager(daemonenv.NewManager())
 	return s
 }
@@ -132,7 +132,7 @@ func TestHandleEnvUp_UnsupportedProvider(t *testing.T) {
 }
 
 func TestHandleEnvUp_NoManager(t *testing.T) {
-	s := New()
+	s := New(false)
 	// Intentionally do NOT set env manager
 
 	body := strings.NewReader(`{"provider":"native"}`)

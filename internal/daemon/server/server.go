@@ -84,12 +84,28 @@ type Server struct {
 }
 
 // New creates a new Server instance.
-func New() *Server {
+//
+// autoShutdown enables the TerminalHub idle timer: when the last terminal
+// WebSocket client disconnects, a 2-minute timer arms; if no client
+// reconnects, the hub closes its ShutdownReq channel so groved's signal
+// handler can initiate graceful shutdown through the same cleanup path
+// used for SIGTERM.
+func New(autoShutdown bool) *Server {
 	return &Server{
 		ulog:           logging.NewUnifiedLogger("groved.server"),
 		captureWaiters: make(map[string]chan string),
-		terminalHub:    NewTerminalHub(),
+		terminalHub:    NewTerminalHub(autoShutdown),
 	}
+}
+
+// TerminalHubShutdownReq returns the TerminalHub's auto-shutdown channel,
+// or nil if auto-shutdown is disabled. The channel is closed when the
+// idle timer fires.
+func (s *Server) TerminalHubShutdownReq() <-chan struct{} {
+	if s.terminalHub == nil {
+		return nil
+	}
+	return s.terminalHub.ShutdownReq()
 }
 
 // SetEngine sets the collector engine for the server.

@@ -87,8 +87,25 @@ func newGrovedStartCmd() *cobra.Command {
 			grovelogging.SetGlobalScope(grovelogging.ScopeSystem)
 
 			ulog := grovelogging.NewUnifiedLogger("groved.main")
-			pidPath := paths.PidFilePath()
-			sockPath := paths.SocketPath()
+
+			// Resolve scope (--scope flag > current working directory). An empty
+			// scope preserves the legacy global socket/pidfile, so existing dev
+			// and test workflows continue unchanged.
+			scope, _ := cmd.Flags().GetString("scope")
+			if scope != "" {
+				scope = workspace.ResolveScope(scope)
+			}
+
+			pidPath, _ := cmd.Flags().GetString("pidfile")
+			if pidPath == "" {
+				pidPath = paths.PidFilePath(scope)
+			}
+			sockPath, _ := cmd.Flags().GetString("socket")
+			if sockPath == "" {
+				sockPath = paths.SocketPath(scope)
+			}
+
+			autoShutdown, _ := cmd.Flags().GetBool("auto-shutdown")
 
 			// Start pprof if requested
 			if port, _ := cmd.Flags().GetInt("pprof-port"); port > 0 {
@@ -180,7 +197,7 @@ func newGrovedStartCmd() *cobra.Command {
 
 			// Register collectors with configured intervals based on flags
 			if isEnabled("workspace") {
-				eng.Register(collector.NewWorkspaceCollector(workspaceInterval))
+				eng.Register(collector.NewWorkspaceCollector(workspaceInterval, scope))
 			}
 			if isEnabled("git") {
 				eng.Register(collector.NewGitStatusCollector(gitInterval))
@@ -270,7 +287,7 @@ func newGrovedStartCmd() *cobra.Command {
 				}
 			}()
 
-			srv := server.New()
+			srv := server.New(autoShutdown)
 			srv.SetEngine(eng)
 			srv.SetEnvManager(envManager)
 			if jr != nil {
@@ -318,17 +335,25 @@ func newGrovedStartCmd() *cobra.Command {
 				StartedAt:         time.Now(),
 			})
 
-			// 5. Handle Signals
+			// 5. Handle Signals + auto-shutdown
 			stop := make(chan os.Signal, 1)
 			signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+			// shutdownReq fires when the TerminalHub idle timer expires
+			// (auto-shutdown mode). Nil if auto-shutdown is disabled.
+			shutdownReq := srv.TerminalHubShutdownReq()
 
 			// sshServer is set later (step 7.7) and closed by the signal handler.
 			var sshServer *daemonssh.Server
 
 			go func() {
 				bgCtx := context.Background()
-				<-stop
-				ulog.Info("Received stop signal").Log(bgCtx)
+				select {
+				case <-stop:
+					ulog.Info("Received stop signal").Log(bgCtx)
+				case <-shutdownReq:
+					ulog.Info("Auto-shutdown fired (idle TerminalHub)").Log(bgCtx)
+				}
 				ptyManager.Shutdown() // Kill all daemon-owned PTY sessions
 				envManager.Shutdown() // Teardown all running environments and proxy routes
 				streamer.Stop()       // Stop all log tailing goroutines
@@ -486,6 +511,10 @@ func newGrovedStartCmd() *cobra.Command {
 	cmd.Flags().Bool("monitor", false, "Stream daemon activity to stdout")
 	cmd.Flags().String("monitor-format", "full", "Output format for --monitor: text, json, full, rich, pretty")
 	cmd.Flags().Bool("monitor-compact", true, "Disable spacing between monitor log entries")
+	cmd.Flags().String("scope", "", "Ecosystem scope path for this daemon (empty = global/unscoped)")
+	cmd.Flags().String("socket", "", "Override socket path (empty = derive from --scope)")
+	cmd.Flags().String("pidfile", "", "Override pidfile path (empty = derive from --scope)")
+	cmd.Flags().Bool("auto-shutdown", false, "Exit after 2m with no terminal WebSocket clients connected")
 
 	return cmd
 }

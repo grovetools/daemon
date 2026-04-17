@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/grovetools/core/logging"
@@ -13,15 +14,18 @@ import (
 
 // WorkspaceCollector discovers workspaces and maintains the base workspace list.
 type WorkspaceCollector struct {
-	interval      time.Duration
-	ulog          *logging.UnifiedLogger
-	discoveryLog  *logrus.Logger // Passed to workspace.GetProjects which requires *logrus.Logger
-	refresh       chan chan struct{}
+	interval     time.Duration
+	scope        string // if non-empty, only nodes at or under this path are kept
+	ulog         *logging.UnifiedLogger
+	discoveryLog *logrus.Logger // Passed to workspace.GetProjects which requires *logrus.Logger
+	refresh      chan chan struct{}
 }
 
-// NewWorkspaceCollector creates a new WorkspaceCollector with the specified interval.
-// If interval is 0, defaults to 5 minutes.
-func NewWorkspaceCollector(interval time.Duration) *WorkspaceCollector {
+// NewWorkspaceCollector creates a new WorkspaceCollector with the specified interval
+// and scope. If interval is 0, defaults to 5 minutes. If scope is non-empty, discovery
+// results are filtered to nodes at or under that path — used by ecosystem-scoped
+// daemons so each instance only watches its own workspaces.
+func NewWorkspaceCollector(interval time.Duration, scope string) *WorkspaceCollector {
 	if interval == 0 {
 		interval = 5 * time.Minute
 	}
@@ -29,6 +33,7 @@ func NewWorkspaceCollector(interval time.Duration) *WorkspaceCollector {
 	discoveryLog.SetLevel(logrus.WarnLevel)
 	return &WorkspaceCollector{
 		interval:     interval,
+		scope:        scope,
 		ulog:         logging.NewUnifiedLogger("groved.collector.workspace"),
 		discoveryLog: discoveryLog,
 		refresh:      make(chan chan struct{}),
@@ -71,6 +76,19 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 		nodes, err := workspace.GetProjects(c.discoveryLog)
 		if err != nil {
 			return
+		}
+
+		// 1.5 Filter nodes by scope if the daemon is scope-restricted.
+		// Keeps a scoped daemon from watching unrelated ecosystems.
+		if c.scope != "" {
+			scopePrefix := c.scope + "/"
+			filtered := nodes[:0]
+			for _, n := range nodes {
+				if n.Path == c.scope || strings.HasPrefix(n.Path, scopePrefix) {
+					filtered = append(filtered, n)
+				}
+			}
+			nodes = filtered
 		}
 
 		// 2. Convert to EnrichedWorkspace (initially empty enrichment)
