@@ -22,9 +22,14 @@ import (
 // FlowHandler implements DomainHandler for watching plan directories.
 // When plan files change, it triggers an immediate plan stats re-scan
 // rather than waiting for the PlanCollector's polling interval.
+//
+// On a scoped daemon, only plan directories inside the configured scope
+// are watched — out-of-scope plans fall through to the periodic full
+// scan from PlanCollector instead of fsnotify.
 type FlowHandler struct {
 	store   *store.Store
 	cfg     *config.Config
+	scope   string
 	locator *workspace.NotebookLocator
 	ulog    *logging.UnifiedLogger
 
@@ -38,8 +43,9 @@ type FlowHandler struct {
 	debounceMs   int
 }
 
-// NewFlowHandler creates a new FlowHandler instance.
-func NewFlowHandler(st *store.Store, cfg *config.Config, debounceMs int) *FlowHandler {
+// NewFlowHandler creates a new FlowHandler instance. An empty scope watches
+// every workspace's plans directory.
+func NewFlowHandler(st *store.Store, cfg *config.Config, debounceMs int, scope string) *FlowHandler {
 	if debounceMs <= 0 {
 		debounceMs = 2000
 	}
@@ -47,6 +53,7 @@ func NewFlowHandler(st *store.Store, cfg *config.Config, debounceMs int) *FlowHa
 	return &FlowHandler{
 		store:        st,
 		cfg:          cfg,
+		scope:        scope,
 		locator:      workspace.NewNotebookLocator(cfg),
 		ulog:         logging.NewUnifiedLogger("groved.watcher.flow"),
 		watchedPaths: make(map[string]*workspace.WorkspaceNode),
@@ -65,6 +72,9 @@ func (h *FlowHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
 		if node == nil {
+			continue
+		}
+		if !store.IsInScope(node.Path, h.scope) {
 			continue
 		}
 

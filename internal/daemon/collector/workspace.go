@@ -2,31 +2,33 @@ package collector
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
-	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/sirupsen/logrus"
 )
 
 // WorkspaceCollector discovers workspaces and maintains the base workspace list.
+//
+// Discovery is deliberately global — it has no scope filter — so a scoped
+// daemon still populates the store with every workspace on the filesystem.
+// That lets clients like nav present a full worldview even when connected
+// to a worktree-scoped daemon. The per-worktree work budget is enforced by
+// the other collectors and watchers (git, plan, note, memory, skills),
+// which each filter by scope against store.IsInScope.
 type WorkspaceCollector struct {
 	interval     time.Duration
-	scope        string // if non-empty, only nodes at or under this path are kept
 	ulog         *logging.UnifiedLogger
 	discoveryLog *logrus.Logger // Passed to workspace.GetProjects which requires *logrus.Logger
 	refresh      chan chan struct{}
 }
 
-// NewWorkspaceCollector creates a new WorkspaceCollector with the specified interval
-// and scope. If interval is 0, defaults to 5 minutes. If scope is non-empty, discovery
-// results are filtered to nodes at or under that path — used by ecosystem-scoped
-// daemons so each instance only watches its own workspaces.
-func NewWorkspaceCollector(interval time.Duration, scope string) *WorkspaceCollector {
+// NewWorkspaceCollector creates a new WorkspaceCollector with the specified interval.
+// If interval is 0, defaults to 5 minutes.
+func NewWorkspaceCollector(interval time.Duration) *WorkspaceCollector {
 	if interval == 0 {
 		interval = 5 * time.Minute
 	}
@@ -34,7 +36,6 @@ func NewWorkspaceCollector(interval time.Duration, scope string) *WorkspaceColle
 	discoveryLog.SetLevel(logrus.WarnLevel)
 	return &WorkspaceCollector{
 		interval:     interval,
-		scope:        scope,
 		ulog:         logging.NewUnifiedLogger("groved.collector.workspace"),
 		discoveryLog: discoveryLog,
 		refresh:      make(chan chan struct{}),
@@ -73,37 +74,12 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 			}
 		}()
 
-		// 1. Discover base nodes
+		// Discover base nodes globally — a scoped daemon still serves the
+		// full workspace list so nav can show the whole worldview. Heavy
+		// per-workspace enrichment is scope-filtered in the other collectors.
 		nodes, err := workspace.GetProjects(c.discoveryLog)
 		if err != nil {
 			return
-		}
-
-		// 1.5 Filter nodes by scope if the daemon is scope-restricted.
-		// Keeps a scoped daemon from watching unrelated ecosystems.
-		//
-		// Paths from workspace.GetProjects preserve the original-case
-		// filesystem spelling (e.g. /Users/solom4/Code/grovetools), while
-		// c.scope is pre-normalized via pathutil.NormalizeForLookup (all
-		// lowercase on case-insensitive filesystems). Compare both sides
-		// normalized so the filter isn't broken by case mismatch.
-		if c.scope != "" {
-			scopeNorm, err := pathutil.NormalizeForLookup(c.scope)
-			if err != nil {
-				scopeNorm = c.scope
-			}
-			scopePrefix := scopeNorm + "/"
-			filtered := nodes[:0]
-			for _, n := range nodes {
-				pathNorm, err := pathutil.NormalizeForLookup(n.Path)
-				if err != nil {
-					pathNorm = n.Path
-				}
-				if pathNorm == scopeNorm || strings.HasPrefix(pathNorm, scopePrefix) {
-					filtered = append(filtered, n)
-				}
-			}
-			nodes = filtered
 		}
 
 		// 2. Convert to EnrichedWorkspace (initially empty enrichment)
