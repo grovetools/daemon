@@ -18,6 +18,7 @@ import (
 type RunningEnv struct {
 	Provider        string
 	Worktree        string
+	Environment     string // Named environment profile (empty = default)
 	ManagedBy       string
 	StateDir        string                         // Path to .grove/env/ directory
 	Ports           map[string]int
@@ -126,12 +127,16 @@ func (m *Manager) Status(worktree string) *coreenv.EnvResponse {
 		})
 	}
 
+	state := map[string]string{
+		"provider":   env.Provider,
+		"managed_by": env.ManagedBy,
+	}
+	if env.Environment != "" {
+		state["environment"] = env.Environment
+	}
 	return &coreenv.EnvResponse{
 		Status: "running",
-		State: map[string]string{
-			"provider":   env.Provider,
-			"managed_by": env.ManagedBy,
-		},
+		State:  state,
 	}
 }
 
@@ -182,11 +187,12 @@ func (m *Manager) Restore(provider *workspace.Provider) {
 
 		m.mu.Lock()
 		runningEnv := &RunningEnv{
-			Provider:  stateFile.Provider,
-			Worktree:  node.Name,
-			ManagedBy: stateFile.ManagedBy,
-			StateDir:  stateDir,
-			Ports:     make(map[string]int),
+			Provider:    stateFile.Provider,
+			Worktree:    node.Name,
+			Environment: stateFile.Environment,
+			ManagedBy:   stateFile.ManagedBy,
+			StateDir:    stateDir,
+			Ports:       make(map[string]int),
 		}
 
 		// Re-register allocated ports to prevent collisions

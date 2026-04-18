@@ -44,6 +44,88 @@ func TestMapTerraformOutputs_ExplicitMap(t *testing.T) {
 	if _, ok := resp.EnvVars["UNUSED_PORT"]; ok {
 		t.Error("unmapped output should not appear when explicit map is provided")
 	}
+
+	// The http(s) value mapped via output_env_map should populate Endpoints.
+	// The postgres URL should NOT.
+	foundAPI := false
+	for _, ep := range resp.Endpoints {
+		if ep == "https://api.example.com" {
+			foundAPI = true
+		}
+		if ep == "postgres://localhost:5432/mydb" {
+			t.Error("non-http(s) value should not be treated as an endpoint")
+		}
+	}
+	if !foundAPI {
+		t.Errorf("expected https://api.example.com in endpoints (output_env_map path), got %v", resp.Endpoints)
+	}
+}
+
+func TestMapTerraformOutputs_DisplayEndpointsFilter(t *testing.T) {
+	m := NewManager()
+
+	outputs := map[string]tfOutput{
+		"api_url":     {Value: "https://api.example.com"},
+		"admin_url":   {Value: "https://admin.example.com"},
+		"console_url": {Value: "https://console.example.com"},
+	}
+
+	config := map[string]interface{}{
+		"output_env_map": map[string]interface{}{
+			"api_url":     "API_URL",
+			"admin_url":   "ADMIN_URL",
+			"console_url": "CONSOLE_URL",
+		},
+		// Only API_URL should surface as an endpoint — even though all three
+		// are http(s) values.
+		"display_endpoints": []interface{}{"API_URL"},
+	}
+
+	resp := &coreenv.EnvResponse{
+		EnvVars: make(map[string]string),
+	}
+
+	m.mapTerraformOutputs(outputs, config, resp)
+
+	// All three should be in EnvVars
+	if resp.EnvVars["API_URL"] != "https://api.example.com" {
+		t.Errorf("expected API_URL env var, got %v", resp.EnvVars)
+	}
+	if resp.EnvVars["ADMIN_URL"] != "https://admin.example.com" {
+		t.Errorf("expected ADMIN_URL env var, got %v", resp.EnvVars)
+	}
+
+	// Only API_URL's value should be in Endpoints
+	if len(resp.Endpoints) != 1 {
+		t.Fatalf("expected exactly 1 endpoint (filtered via display_endpoints), got %d: %v", len(resp.Endpoints), resp.Endpoints)
+	}
+	if resp.Endpoints[0] != "https://api.example.com" {
+		t.Errorf("expected filtered endpoint https://api.example.com, got %s", resp.Endpoints[0])
+	}
+}
+
+func TestMapTerraformOutputs_DisplayEndpointsFilter_AutoExport(t *testing.T) {
+	// Verify the filter also applies in the default/auto-export path.
+	m := NewManager()
+
+	outputs := map[string]tfOutput{
+		"api_url":   {Value: "https://api.example.com"},
+		"admin_url": {Value: "https://admin.example.com"},
+	}
+
+	config := map[string]interface{}{
+		"display_endpoints": []interface{}{"API_URL"},
+	}
+
+	resp := &coreenv.EnvResponse{
+		EnvVars: make(map[string]string),
+	}
+
+	m.mapTerraformOutputs(outputs, config, resp)
+
+	if len(resp.Endpoints) != 1 || resp.Endpoints[0] != "https://api.example.com" {
+		t.Errorf("expected exactly [https://api.example.com], got %v", resp.Endpoints)
+	}
 }
 
 func TestMapTerraformOutputs_DefaultAutoExport(t *testing.T) {

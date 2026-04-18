@@ -173,6 +173,7 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 	runningEnv := &RunningEnv{
 		Provider:        "terraform",
 		Worktree:        worktree,
+		Environment:     req.Profile,
 		Ports:           make(map[string]int),
 		Processes:       make(map[string]*exec.Cmd),
 		Cancels:         make(map[string]context.CancelFunc),
@@ -518,7 +519,24 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 // mapTerraformOutputs maps Terraform outputs to EnvResponse fields.
 // If config contains "output_env_map", it maps output names to env var names.
 // Otherwise, all non-sensitive string outputs are exported as uppercase env vars.
+//
+// Endpoints are populated in both paths. By default, any value with an http(s)
+// scheme is treated as an endpoint. If config["display_endpoints"] is set,
+// only env vars named in that list qualify as endpoints (the http/https scheme
+// check still applies, so non-URL values are filtered out).
 func (m *Manager) mapTerraformOutputs(outputs map[string]tfOutput, config map[string]interface{}, resp *coreenv.EnvResponse) {
+	allowedEndpoints := parseDisplayEndpoints(config["display_endpoints"])
+
+	isEndpoint := func(val, envName string) bool {
+		if !strings.HasPrefix(val, "http://") && !strings.HasPrefix(val, "https://") {
+			return false
+		}
+		if allowedEndpoints == nil {
+			return true
+		}
+		return allowedEndpoints[envName]
+	}
+
 	// Check for explicit mapping: output_env_map = { "db_url" = "DATABASE_URL", ... }
 	if envMap, ok := config["output_env_map"].(map[string]interface{}); ok {
 		for outputName, envNameRaw := range envMap {
@@ -527,7 +545,11 @@ func (m *Manager) mapTerraformOutputs(outputs map[string]tfOutput, config map[st
 				continue
 			}
 			if out, exists := outputs[outputName]; exists {
-				resp.EnvVars[envName] = fmt.Sprintf("%v", out.Value)
+				val := fmt.Sprintf("%v", out.Value)
+				resp.EnvVars[envName] = val
+				if isEndpoint(val, envName) {
+					resp.Endpoints = append(resp.Endpoints, val)
+				}
 			}
 		}
 		return
@@ -542,9 +564,31 @@ func (m *Manager) mapTerraformOutputs(outputs map[string]tfOutput, config map[st
 		envName := strings.ToUpper(name)
 		resp.EnvVars[envName] = val
 
-		// If the output looks like a URL, also add it as an endpoint
-		if strings.HasPrefix(val, "http://") || strings.HasPrefix(val, "https://") {
+		if isEndpoint(val, envName) {
 			resp.Endpoints = append(resp.Endpoints, val)
 		}
 	}
+}
+
+// parseDisplayEndpoints coerces a config value (as decoded from JSON/TOML) into
+// a set of allowed endpoint env var names. Returns nil if the value is missing
+// or malformed, signaling "no filter — accept any http(s) value as an endpoint".
+func parseDisplayEndpoints(raw interface{}) map[string]bool {
+	if raw == nil {
+		return nil
+	}
+	list, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	allowed := make(map[string]bool, len(list))
+	for _, v := range list {
+		if s, ok := v.(string); ok && s != "" {
+			allowed[s] = true
+		}
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	return allowed
 }

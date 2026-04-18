@@ -35,9 +35,10 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	}
 
 	runningEnv := &RunningEnv{
-		Provider: "docker",
-		Worktree: worktree,
-		Ports:    make(map[string]int),
+		Provider:    "docker",
+		Worktree:    worktree,
+		Environment: req.Profile,
+		Ports:       make(map[string]int),
 	}
 	m.envs[worktree] = runningEnv
 	m.mu.Unlock()

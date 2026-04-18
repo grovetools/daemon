@@ -37,6 +37,7 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	runningEnv := &RunningEnv{
 		Provider:        "native",
 		Worktree:        worktree,
+		Environment:     req.Profile,
 		Ports:           make(map[string]int),
 		Processes:       make(map[string]*exec.Cmd),
 		Cancels:         make(map[string]context.CancelFunc),
