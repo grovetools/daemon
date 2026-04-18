@@ -37,27 +37,19 @@ func dynamicInterval(count int, baseInterval time.Duration) time.Duration {
 }
 
 // GitStatusCollector updates git status for all workspaces.
-//
-// When scope is non-empty, background scans are restricted to workspaces
-// inside that scope. Focused workspaces are always scanned regardless of
-// scope, so a client that focuses an out-of-scope workspace still gets
-// live enrichment.
 type GitStatusCollector struct {
 	interval time.Duration
-	scope    string
 	refresh  chan chan struct{}
 }
 
-// NewGitStatusCollector creates a new GitStatusCollector with the specified
-// interval and scope. If interval is 0, defaults to 10 seconds. An empty
-// scope scans all workspaces.
-func NewGitStatusCollector(interval time.Duration, scope string) *GitStatusCollector {
+// NewGitStatusCollector creates a new GitStatusCollector with the specified interval.
+// If interval is 0, defaults to 10 seconds.
+func NewGitStatusCollector(interval time.Duration) *GitStatusCollector {
 	if interval == 0 {
 		interval = 10 * time.Second
 	}
 	return &GitStatusCollector{
 		interval: interval,
-		scope:    scope,
 		refresh:  make(chan chan struct{}),
 	}
 }
@@ -143,38 +135,29 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		state := st.Get()
 		focus := st.GetFocus()
 
-		focusLower := make(map[string]struct{}, len(focus))
-		for p := range focus {
-			focusLower[strings.ToLower(p)] = struct{}{}
-		}
-
 		var toScan []*models.EnrichedWorkspace
 
 		if len(focus) == 0 {
-			// No focus set (nav not running): only do periodic background scans,
-			// restricted to scope so a scoped daemon doesn't pay for out-of-scope git status.
+			// No focus set (nav not running): only do periodic background scans
 			if time.Since(lastFullScan) < backgroundScanInterval {
 				return // Skip this tick
 			}
 			lastFullScan = time.Now()
 			for _, ws := range state.Workspaces {
-				if store.IsInScope(ws.Path, c.scope) {
-					toScan = append(toScan, ws)
-				}
+				toScan = append(toScan, ws)
 			}
 		} else if time.Since(lastFullScan) >= backgroundScanInterval {
-			// Focus is set but it's time for a periodic full scan.
-			// Always include focused workspaces (even if out of scope) plus
-			// in-scope workspaces for the background coverage.
+			// Focus is set but it's time for a periodic full scan
 			lastFullScan = time.Now()
 			for _, ws := range state.Workspaces {
-				_, isFocused := focusLower[strings.ToLower(ws.Path)]
-				if isFocused || store.IsInScope(ws.Path, c.scope) {
-					toScan = append(toScan, ws)
-				}
+				toScan = append(toScan, ws)
 			}
 		} else {
 			// Focused scan: only focused workspaces
+			focusLower := make(map[string]struct{}, len(focus))
+			for p := range focus {
+				focusLower[strings.ToLower(p)] = struct{}{}
+			}
 			for _, ws := range state.Workspaces {
 				if _, ok := focusLower[strings.ToLower(ws.Path)]; ok {
 					toScan = append(toScan, ws)
@@ -197,23 +180,12 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		}
 	}
 
-	// fullScan forces a scan of workspaces (used by Refresh). On a scoped
-	// daemon this still honors scope — plus any focused workspaces — so
-	// refresh calls don't silently balloon into a global rescan.
+	// fullScan forces a scan of all workspaces (used by Refresh).
 	fullScan := func() {
 		state := st.Get()
-		focus := st.GetFocus()
-		focusLower := make(map[string]struct{}, len(focus))
-		for p := range focus {
-			focusLower[strings.ToLower(p)] = struct{}{}
-		}
-
 		var toScan []*models.EnrichedWorkspace
 		for _, ws := range state.Workspaces {
-			_, isFocused := focusLower[strings.ToLower(ws.Path)]
-			if isFocused || store.IsInScope(ws.Path, c.scope) {
-				toScan = append(toScan, ws)
-			}
+			toScan = append(toScan, ws)
 		}
 		lastFullScan = time.Now()
 		scanWorkspaces(toScan)

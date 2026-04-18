@@ -30,14 +30,9 @@ type IndexJob struct {
 }
 
 // MemoryHandler implements DomainHandler for auto-indexing content into the memory store.
-//
-// On a scoped daemon, only in-scope workspaces contribute content to the
-// index. This keeps the expensive embedding pipeline local to the worktree
-// the daemon was spawned for.
 type MemoryHandler struct {
 	store    *store.Store
 	cfg      *config.Config
-	scope    string
 	locator  *workspace.NotebookLocator
 	memStore memory.DocumentStore
 	embedder *memory.Embedder
@@ -54,9 +49,8 @@ type MemoryHandler struct {
 	jobQueue chan IndexJob
 }
 
-// NewMemoryHandler creates a new MemoryHandler for auto-indexing content. An
-// empty scope indexes every workspace.
-func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.DocumentStore, embedder *memory.Embedder, debounceMs int, scope string) *MemoryHandler {
+// NewMemoryHandler creates a new MemoryHandler for auto-indexing content.
+func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.DocumentStore, embedder *memory.Embedder, debounceMs int) *MemoryHandler {
 	if debounceMs <= 0 {
 		debounceMs = 5000
 	}
@@ -64,7 +58,6 @@ func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.Docum
 	h := &MemoryHandler{
 		store:        st,
 		cfg:          cfg,
-		scope:        scope,
 		locator:      workspace.NewNotebookLocator(cfg),
 		memStore:     memStore,
 		embedder:     embedder,
@@ -112,9 +105,6 @@ func (h *MemoryHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
 		if node == nil {
-			continue
-		}
-		if !store.IsInScope(node.Path, h.scope) {
 			continue
 		}
 

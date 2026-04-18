@@ -15,26 +15,18 @@ import (
 const planBackgroundInterval = 10 * time.Minute
 
 // PlanCollector updates plan statistics for all workspaces.
-//
-// On a scoped daemon, only workspaces inside scope (plus any focused
-// workspaces) receive plan-stat refreshes during the periodic background
-// scan. Focused workspaces are always refreshed regardless of scope so
-// nav stays accurate for whatever the user points it at.
 type PlanCollector struct {
 	interval time.Duration
-	scope    string
 }
 
-// NewPlanCollector creates a new PlanCollector with the specified interval
-// and scope. If interval is 0, defaults to 5 minutes. An empty scope covers
-// every workspace.
-func NewPlanCollector(interval time.Duration, scope string) *PlanCollector {
+// NewPlanCollector creates a new PlanCollector with the specified interval.
+// If interval is 0, defaults to 5 minutes.
+func NewPlanCollector(interval time.Duration) *PlanCollector {
 	if interval == 0 {
 		interval = 5 * time.Minute
 	}
 	return &PlanCollector{
 		interval: interval,
-		scope:    scope,
 	}
 }
 
@@ -86,10 +78,7 @@ func (c *PlanCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 
 		for k, v := range state.Workspaces {
 			_, isFocused := focusLower[strings.ToLower(k)]
-			// Always scan focused workspaces. On full-scan ticks, restrict
-			// the background sweep to scope so a scoped daemon doesn't pay
-			// for plan enrichment on out-of-scope workspaces.
-			if isFocused || (doFullScan && store.IsInScope(k, c.scope)) {
+			if doFullScan || isFocused {
 				if stats, ok := planStats[k]; ok {
 					if !store.PlanStatsEqual(v.PlanStats, stats) {
 						deltas = append(deltas, &models.WorkspaceDelta{

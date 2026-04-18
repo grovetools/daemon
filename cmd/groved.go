@@ -197,25 +197,23 @@ func newGrovedStartCmd() *cobra.Command {
 
 			// Register collectors with configured intervals based on flags.
 			// WorkspaceCollector is intentionally unscoped — it populates the
-			// global workspace list so nav can show everything. The other
-			// collectors honor scope so a worktree-scoped daemon only pays
-			// CPU/disk for its own tree (git status, plan stats, note counts,
-			// job discovery).
+			// global workspace list so nav can show everything even on a
+			// worktree-scoped daemon.
 			if isEnabled("workspace") {
 				eng.Register(collector.NewWorkspaceCollector(workspaceInterval))
 			}
 			if isEnabled("git") {
-				eng.Register(collector.NewGitStatusCollector(gitInterval, scope))
+				eng.Register(collector.NewGitStatusCollector(gitInterval))
 			}
 			if isEnabled("session") {
 				eng.Register(collector.NewSessionCollector(sessionInterval))
 			}
 			if isEnabled("plan") {
-				eng.Register(collector.NewPlanCollector(planInterval, scope))
-				eng.Register(collector.NewJobCollector(planInterval, scope))
+				eng.Register(collector.NewPlanCollector(planInterval))
+				eng.Register(collector.NewJobCollector(planInterval))
 			}
 			if isEnabled("note") {
-				eng.Register(collector.NewNoteCollector(noteInterval, scope))
+				eng.Register(collector.NewNoteCollector(noteInterval))
 			}
 
 			// 3.5 Setup context early (needed by JobRunner and Engine)
@@ -422,7 +420,7 @@ func newGrovedStartCmd() *cobra.Command {
 						debounceMs = cfg.Daemon.SkillSyncDebounceMs
 					}
 
-					skillHandler, err := watcher.NewSkillHandler(st, cfg, debounceMs, scope)
+					skillHandler, err := watcher.NewSkillHandler(st, cfg, debounceMs)
 					if err != nil {
 						ulog.Warn("Failed to initialize skill handler").Err(err).Log(ctx)
 					} else {
@@ -433,21 +431,21 @@ func newGrovedStartCmd() *cobra.Command {
 
 				// Register WorkspaceHandler for instant discovery on fs changes
 				if isEnabled("workspace") {
-					workspaceHandler := watcher.NewWorkspaceHandler(st, cfg, 2000, scope)
+					workspaceHandler := watcher.NewWorkspaceHandler(st, cfg, 2000)
 					unifiedWatcher.Register(workspaceHandler)
 					ulog.Info("Workspace handler registered with unified watcher").Log(ctx)
 				}
 
 				// Register FlowHandler for plan directory watching
 				if isEnabled("plan") {
-					flowHandler := watcher.NewFlowHandler(st, cfg, 2000, scope)
+					flowHandler := watcher.NewFlowHandler(st, cfg, 2000)
 					unifiedWatcher.Register(flowHandler)
 					ulog.Info("Flow handler registered with unified watcher").Log(ctx)
 				}
 
 				// Register NoteHandler for note directory watching
 				if isEnabled("note") {
-					noteHandler := watcher.NewNoteHandler(st, cfg, 3000, scope)
+					noteHandler := watcher.NewNoteHandler(st, cfg, 3000)
 					unifiedWatcher.Register(noteHandler)
 					ulog.Info("Note handler registered with unified watcher").Log(ctx)
 				}
@@ -466,7 +464,7 @@ func newGrovedStartCmd() *cobra.Command {
 						} else {
 							embedder := memory.NewEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
 
-							memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000, scope)
+							memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
 							unifiedWatcher.Register(memoryHandler)
 							ulog.Info("Memory handler registered with unified watcher").Log(ctx)
 

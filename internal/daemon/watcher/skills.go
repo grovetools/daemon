@@ -21,16 +21,10 @@ import (
 
 // SkillHandler implements DomainHandler for skill file watching and sync.
 // It replaces the old standalone SkillWatcher by plugging into the UnifiedWatcher.
-//
-// On a scoped daemon, only in-scope workspaces participate in skill sync —
-// global skills (under ~/.config/grove/skills) are always watched so
-// top-level skill edits still propagate. Out-of-scope workspaces are left
-// untouched so we don't fight another daemon for the same dest dirs.
 type SkillHandler struct {
 	store         *store.Store
 	svc           *service.Service
 	cfg           *config.Config
-	scope         string
 	hooksExecutor *hooks.Executor
 	debounceMs    int
 
@@ -52,9 +46,8 @@ type SkillHandler struct {
 	globalSkillsCfg *skills.SkillsConfig
 }
 
-// NewSkillHandler creates a new SkillHandler instance. An empty scope syncs
-// skills across every workspace.
-func NewSkillHandler(st *store.Store, cfg *config.Config, debounceMs int, scope string) (*SkillHandler, error) {
+// NewSkillHandler creates a new SkillHandler instance.
+func NewSkillHandler(st *store.Store, cfg *config.Config, debounceMs int) (*SkillHandler, error) {
 	if debounceMs <= 0 {
 		debounceMs = 1000
 	}
@@ -68,7 +61,6 @@ func NewSkillHandler(st *store.Store, cfg *config.Config, debounceMs int, scope 
 		store:           st,
 		svc:             svc,
 		cfg:             cfg,
-		scope:           scope,
 		hooksExecutor:   hooks.NewExecutor(cfg),
 		debounceMs:      debounceMs,
 		ulog:            logging.NewUnifiedLogger("groved.watcher.skills"),
@@ -100,9 +92,6 @@ func (h *SkillHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace)
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
 		if node == nil {
-			continue
-		}
-		if !store.IsInScope(node.Path, h.scope) {
 			continue
 		}
 		if skillsDir, err := h.svc.NotebookLocator.GetSkillsDir(node); err == nil && skillsDir != "" {
@@ -271,9 +260,6 @@ func (h *SkillHandler) handleWorkspacesDiscovered() {
 		if node == nil {
 			continue
 		}
-		if !store.IsInScope(node.Path, h.scope) {
-			continue
-		}
 
 		h.configsMutex.RLock()
 		_, seen := h.cachedConfigs[node.Path]
@@ -368,9 +354,6 @@ func (h *SkillHandler) triggerSync(changedSkills map[string]struct{}) {
 		if node == nil {
 			continue
 		}
-		if !store.IsInScope(node.Path, h.scope) {
-			continue
-		}
 
 		skillsCfg, err := skills.LoadSkillsConfig(h.cfg, node)
 		if err != nil || skillsCfg == nil {
@@ -402,17 +385,12 @@ func (h *SkillHandler) triggerSync(changedSkills map[string]struct{}) {
 	}
 }
 
-// syncAllWorkspaces syncs skills for in-scope workspaces. A scoped daemon
-// skips out-of-scope workspaces to avoid fighting another daemon for the
-// same dest dirs.
+// syncAllWorkspaces syncs skills for all workspaces.
 func (h *SkillHandler) syncAllWorkspaces() {
 	workspaces := h.store.GetWorkspaces()
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
 		if node == nil {
-			continue
-		}
-		if !store.IsInScope(node.Path, h.scope) {
 			continue
 		}
 		h.syncWorkspace(node)

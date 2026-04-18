@@ -19,22 +19,16 @@ import (
 // JobCollector scans the filesystem for idle/pending jobs and seeds the daemon store.
 // This ensures jobs created by `flow chat` (which only writes a markdown file)
 // are visible in the daemon's ListJobs API and the hooks TUI.
-//
-// When scope is non-empty, only plans owned by workspaces inside scope are
-// scanned, so a worktree-scoped daemon doesn't repeatedly walk every
-// ecosystem's plan tree.
 type JobCollector struct {
 	interval time.Duration
-	scope    string
 }
 
-// NewJobCollector creates a new JobCollector with the specified interval and scope.
-// An empty scope scans every discovered plan directory.
-func NewJobCollector(interval time.Duration, scope string) *JobCollector {
+// NewJobCollector creates a new JobCollector with the specified interval.
+func NewJobCollector(interval time.Duration) *JobCollector {
 	if interval == 0 {
 		interval = 5 * time.Minute
 	}
-	return &JobCollector{interval: interval, scope: scope}
+	return &JobCollector{interval: interval}
 }
 
 func (c *JobCollector) Name() string { return "job" }
@@ -45,7 +39,7 @@ func (c *JobCollector) Run(ctx context.Context, st *store.Store, updates chan<- 
 	defer ticker.Stop()
 
 	scan := func() {
-		jobs := discoverJobsFromFilesystem(ctx, ulog, c.scope)
+		jobs := discoverJobsFromFilesystem(ctx, ulog)
 		if len(jobs) > 0 {
 			updates <- store.Update{
 				Type:    store.UpdateJobsDiscovered,
@@ -70,10 +64,9 @@ func (c *JobCollector) Run(ctx context.Context, st *store.Store, updates chan<- 
 	}
 }
 
-// discoverJobsFromFilesystem scans plan directories for job markdown files
-// and returns JobInfo structs for each discovered job. If scope is non-empty,
-// plan directories whose owning workspace lives outside scope are skipped.
-func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger, scope string) []*models.JobInfo {
+// discoverJobsFromFilesystem scans all plan directories for job markdown files
+// and returns JobInfo structs for each discovered job.
+func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger) []*models.JobInfo {
 	discoveryLogger := logrus.New()
 	discoveryLogger.SetLevel(logrus.WarnLevel)
 	discoveryService := workspace.NewDiscoveryService(discoveryLogger)
@@ -113,12 +106,6 @@ func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger
 		if scannedDir.Owner != nil {
 			ownerWorkDir = scannedDir.Owner.Path
 			ownerRepo = scannedDir.Owner.Name
-		}
-
-		// Skip plan trees whose owning workspace is out of scope. An empty
-		// scope (unscoped daemon) covers everything via store.IsInScope.
-		if scope != "" && ownerWorkDir != "" && !store.IsInScope(ownerWorkDir, scope) {
-			continue
 		}
 
 		entries, err := os.ReadDir(plansRootDir)

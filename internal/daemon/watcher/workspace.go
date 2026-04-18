@@ -19,16 +19,9 @@ import (
 
 // WorkspaceHandler implements DomainHandler for watching workspace roots and worktree directories.
 // When a directory is created or removed, it triggers an immediate workspace rescan.
-//
-// Grove roots are always watched (they're few and catch new clones anywhere).
-// Per-workspace roots and .grove-worktrees dirs are scope-filtered so a
-// scoped daemon doesn't register fsnotify inodes for unrelated ecosystems.
-// The rescan itself (workspace.GetProjects) remains global to match the
-// WorkspaceCollector, so nav still sees everything even on a scoped daemon.
 type WorkspaceHandler struct {
 	store        *store.Store
 	cfg          *config.Config
-	scope        string
 	ulog         *logging.UnifiedLogger
 	discoveryLog *logrus.Logger // Passed to workspace.GetProjects which requires *logrus.Logger
 	watchedPaths map[string]bool
@@ -38,7 +31,7 @@ type WorkspaceHandler struct {
 	debounceMs   int
 }
 
-func NewWorkspaceHandler(st *store.Store, cfg *config.Config, debounceMs int, scope string) *WorkspaceHandler {
+func NewWorkspaceHandler(st *store.Store, cfg *config.Config, debounceMs int) *WorkspaceHandler {
 	if debounceMs <= 0 {
 		debounceMs = 2000
 	}
@@ -47,7 +40,6 @@ func NewWorkspaceHandler(st *store.Store, cfg *config.Config, debounceMs int, sc
 	return &WorkspaceHandler{
 		store:        st,
 		cfg:          cfg,
-		scope:        scope,
 		ulog:         logging.NewUnifiedLogger("groved.watcher.workspace"),
 		discoveryLog: discoveryLog,
 		watchedPaths: make(map[string]bool),
@@ -78,15 +70,10 @@ func (h *WorkspaceHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorksp
 		}
 	}
 
-	// 2. Watch every project's root and .grove-worktrees directory.
-	// On a scoped daemon, only in-scope projects are watched — grove roots
-	// above still catch new clones anywhere on disk.
+	// 2. Watch every project's root and .grove-worktrees directory
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
 		if node == nil {
-			continue
-		}
-		if !store.IsInScope(node.Path, h.scope) {
 			continue
 		}
 

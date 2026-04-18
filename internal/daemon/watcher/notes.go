@@ -20,13 +20,9 @@ import (
 // NoteHandler implements DomainHandler for watching note directories.
 // When note files change, it triggers an immediate note counts refresh
 // rather than waiting for the NoteCollector's polling interval.
-//
-// On a scoped daemon, only in-scope workspace note directories are
-// watched; out-of-scope changes fall back to the periodic NoteCollector.
 type NoteHandler struct {
 	store   *store.Store
 	cfg     *config.Config
-	scope   string
 	locator *workspace.NotebookLocator
 	ulog    *logging.UnifiedLogger
 
@@ -40,9 +36,8 @@ type NoteHandler struct {
 	debounceMs   int
 }
 
-// NewNoteHandler creates a new NoteHandler instance. An empty scope watches
-// every workspace's note directories.
-func NewNoteHandler(st *store.Store, cfg *config.Config, debounceMs int, scope string) *NoteHandler {
+// NewNoteHandler creates a new NoteHandler instance.
+func NewNoteHandler(st *store.Store, cfg *config.Config, debounceMs int) *NoteHandler {
 	if debounceMs <= 0 {
 		debounceMs = 3000
 	}
@@ -50,7 +45,6 @@ func NewNoteHandler(st *store.Store, cfg *config.Config, debounceMs int, scope s
 	return &NoteHandler{
 		store:        st,
 		cfg:          cfg,
-		scope:        scope,
 		locator:      workspace.NewNotebookLocator(cfg),
 		ulog:         logging.NewUnifiedLogger("groved.watcher.notes"),
 		watchedPaths: make(map[string]*workspace.WorkspaceNode),
@@ -69,9 +63,6 @@ func (h *NoteHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
 		if node == nil {
-			continue
-		}
-		if !store.IsInScope(node.Path, h.scope) {
 			continue
 		}
 

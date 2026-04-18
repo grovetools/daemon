@@ -17,26 +17,18 @@ import (
 const noteBackgroundInterval = 10 * time.Minute
 
 // NoteCollector updates note counts for all workspaces.
-//
-// On a scoped daemon, the background full scan indexes only in-scope
-// workspaces plus anything currently focused. The full-process note
-// index still gets populated from every workspace node on disk — the
-// scope only guards which counts are recomputed and emitted as deltas.
 type NoteCollector struct {
 	interval time.Duration
-	scope    string
 }
 
-// NewNoteCollector creates a new NoteCollector with the specified interval
-// and scope. If interval is 0, defaults to 5 minutes. An empty scope covers
-// every workspace.
-func NewNoteCollector(interval time.Duration, scope string) *NoteCollector {
+// NewNoteCollector creates a new NoteCollector with the specified interval.
+// If interval is 0, defaults to 5 minutes.
+func NewNoteCollector(interval time.Duration) *NoteCollector {
 	if interval == 0 {
 		interval = 5 * time.Minute
 	}
 	return &NoteCollector{
 		interval: interval,
-		scope:    scope,
 	}
 }
 
@@ -73,31 +65,11 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 			lastFullScan = time.Now()
 		}
 
-		// Build case-insensitive focus map up front — we use it both to
-		// decide which nodes to index and which deltas to emit.
-		focusLower := make(map[string]struct{}, len(focus))
-		for p := range focus {
-			focusLower[strings.ToLower(p)] = struct{}{}
-		}
-
-		// inScope reports whether this workspace should participate in this
-		// tick — focused workspaces always qualify, otherwise scope controls.
-		inScope := func(path string) bool {
-			if _, ok := focusLower[strings.ToLower(path)]; ok {
-				return true
-			}
-			return store.IsInScope(path, c.scope)
-		}
-
 		var nodes []*workspace.WorkspaceNode
-		for k, ws := range state.Workspaces {
-			if ws.WorkspaceNode == nil {
-				continue
+		for _, ws := range state.Workspaces {
+			if ws.WorkspaceNode != nil {
+				nodes = append(nodes, ws.WorkspaceNode)
 			}
-			if !inScope(k) {
-				continue
-			}
-			nodes = append(nodes, ws.WorkspaceNode)
 		}
 
 		cfg, _ := config.LoadDefault()
@@ -113,28 +85,29 @@ func (c *NoteCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 			Field("nodes", len(nodes)).
 			Log(ctx)
 
+		// Build case-insensitive focus map
+		focusLower := make(map[string]struct{}, len(focus))
+		for p := range focus {
+			focusLower[strings.ToLower(p)] = struct{}{}
+		}
+
 		var deltas []*models.WorkspaceDelta
 
 		for k, v := range state.Workspaces {
 			_, isFocused := focusLower[strings.ToLower(k)]
-			if !(doFullScan || isFocused) {
-				continue
-			}
-			if !inScope(k) {
-				continue
-			}
-			if v.WorkspaceNode == nil {
-				continue
-			}
-			newCounts, ok := noteCounts[v.Name]
-			if !ok {
-				newCounts = &models.NoteCounts{}
-			}
-			if !store.NoteCountsEqual(v.NoteCounts, newCounts) {
-				deltas = append(deltas, &models.WorkspaceDelta{
-					Path:       k,
-					NoteCounts: newCounts,
-				})
+			if doFullScan || isFocused {
+				if v.WorkspaceNode != nil {
+					newCounts, ok := noteCounts[v.Name]
+					if !ok {
+						newCounts = &models.NoteCounts{}
+					}
+					if !store.NoteCountsEqual(v.NoteCounts, newCounts) {
+						deltas = append(deltas, &models.WorkspaceDelta{
+							Path:       k,
+							NoteCounts: newCounts,
+						})
+					}
+				}
 			}
 		}
 
