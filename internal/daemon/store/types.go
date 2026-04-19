@@ -115,6 +115,9 @@ type SessionIntentPayload struct {
 	Channels   []string                 `json:"channels,omitempty"`
 	Autonomous *models.AutonomousConfig `json:"autonomous,omitempty"`
 	TmuxTarget string                   `json:"tmux_target,omitempty"`
+
+	// Mux identifies the multiplexer backing the session's PTY.
+	Mux string `json:"mux,omitempty"`
 }
 
 // SessionChannelsPayload contains data for updating session channels.

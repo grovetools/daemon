@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/grovetools/agentlogs/pkg/agentstream"
 	"github.com/grovetools/core/config"
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/models"
@@ -552,41 +553,8 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		session := s.engine.Store().GetSession(sessionID)
-		if session == nil {
-			http.Error(w, "session not found", http.StatusNotFound)
-			return
-		}
-		if session.TmuxTarget == "" {
-			http.Error(w, "session has no tmux target", http.StatusBadRequest)
-			return
-		}
-
-		tmuxClient, err := tmux.NewClient()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("tmux not available: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		// Determine input mode from project config
-		inputMode := s.resolveInputMode(session.WorkingDirectory)
-
-		ctx := r.Context()
-		if inputMode == "vim" {
-			if err := tmuxClient.SendKeys(ctx, session.TmuxTarget, "Escape", "i", req.Input); err != nil {
-				http.Error(w, fmt.Sprintf("failed to send input: %v", err), http.StatusInternalServerError)
-				return
-			}
-		} else {
-			if err := tmuxClient.SendKeys(ctx, session.TmuxTarget, req.Input); err != nil {
-				http.Error(w, fmt.Sprintf("failed to send input: %v", err), http.StatusInternalServerError)
-				return
-			}
-		}
-
-		// Send Enter to submit
-		if err := tmuxClient.SendKeys(ctx, session.TmuxTarget, "C-m"); err != nil {
-			http.Error(w, fmt.Sprintf("failed to send submit key: %v", err), http.StatusInternalServerError)
+		if err := s.SendSessionInput(r.Context(), sessionID, req.Input); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -600,24 +568,8 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		session := s.engine.Store().GetSession(sessionID)
-		if session == nil {
-			http.Error(w, "session not found", http.StatusNotFound)
-			return
-		}
-		if session.TmuxTarget == "" {
-			http.Error(w, "session has no tmux target", http.StatusBadRequest)
-			return
-		}
-
-		tmuxClient, err := tmux.NewClient()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("tmux not available: %v", err), http.StatusInternalServerError)
-			return
-		}
-
-		if err := tmuxClient.SendKeys(r.Context(), session.TmuxTarget, "C-c"); err != nil {
-			http.Error(w, fmt.Sprintf("failed to send interrupt: %v", err), http.StatusInternalServerError)
+		if err := s.SendSessionInterrupt(r.Context(), sessionID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
@@ -708,6 +660,189 @@ func (s *Server) resolveInputMode(workDir string) string {
 	}
 
 	return "vim"
+}
+
+// effectiveMux returns the mux to use for routing input/interrupt to a
+// session. An explicit session.Mux wins; otherwise we fall back to the
+// legacy implicit inference (PtyID→treemux, TmuxTarget→tmux) so pre-upgrade
+// sessions still work until they end naturally.
+func effectiveMux(session *models.Session) string {
+	if session.Mux != "" {
+		return session.Mux
+	}
+	if session.PtyID != "" {
+		return models.MuxTreemux
+	}
+	if session.TmuxTarget != "" {
+		return models.MuxTmux
+	}
+	return models.MuxNone
+}
+
+// SendSessionInput routes raw input text to an interactive agent session.
+// The mux (treemux vs tmux) is read from session.Mux, with a fallback to
+// implicit inference for pre-existing sessions. For treemux, it prefers a
+// direct PTY write and falls back to an SSE relay when groveterm is
+// connected. For tmux, it uses agentstream.SendInput which handles the
+// vim-mode wrapping.
+func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) error {
+	if s.engine == nil {
+		return fmt.Errorf("engine not initialized")
+	}
+	session := s.engine.Store().GetSession(jobID)
+	if session == nil {
+		return fmt.Errorf("session not found: %s", jobID)
+	}
+
+	inputMode := s.resolveInputMode(session.WorkingDirectory)
+	payload := rawInput + "\r"
+	if inputMode == "vim" {
+		payload = "\x1bi" + rawInput + "\r"
+	}
+
+	mux := effectiveMux(session)
+
+	switch mux {
+	case models.MuxTreemux:
+		// Tier 1: direct PTY write (zero-hop, works even when no client is attached)
+		if session.PtyID != "" && s.ptyManager != nil {
+			if ptySess, ok := s.ptyManager.Get(session.PtyID); ok {
+				if _, err := ptySess.Write([]byte(payload)); err != nil {
+					s.ulog.Warn("Direct PTY write failed, falling back").
+						Err(err).
+						Field("job_id", jobID).
+						Field("pty_id", session.PtyID).
+						Field("mux", mux).
+						Field("tier", "direct_pty").
+						Log(ctx)
+				} else {
+					s.ulog.Debug("Injected input into agent").
+						Field("job_id", jobID).
+						Field("mux", mux).
+						Field("tier", "direct_pty").
+						Field("input_len", len(payload)).
+						Log(ctx)
+					return nil
+				}
+			}
+		}
+		// Tier 2: SSE relay to groveterm
+		if s.terminalHub != nil && s.terminalHub.HasConnections() {
+			s.engine.Store().ApplyUpdate(store.Update{
+				Type:   store.UpdateAgentInput,
+				Source: "api",
+				Payload: &store.AgentInputPayload{
+					JobID: jobID,
+					Input: payload,
+				},
+			})
+			s.ulog.Debug("Injected input into agent").
+				Field("job_id", jobID).
+				Field("mux", mux).
+				Field("tier", "sse_relay").
+				Field("input_len", len(payload)).
+				Log(ctx)
+			return nil
+		}
+		return fmt.Errorf("treemux route unavailable for session %s (no live PTY, no connected terminal)", jobID)
+
+	case models.MuxTmux:
+		if session.TmuxTarget == "" {
+			return fmt.Errorf("tmux target missing for session %s", jobID)
+		}
+		if err := agentstream.SendInput(ctx, session.TmuxTarget, rawInput); err != nil {
+			return err
+		}
+		s.ulog.Debug("Injected input into agent").
+			Field("job_id", jobID).
+			Field("mux", mux).
+			Field("tier", "tmux").
+			Field("tmux_target", session.TmuxTarget).
+			Field("input_len", len(rawInput)).
+			Log(ctx)
+		return nil
+
+	default:
+		return fmt.Errorf("unknown or missing mux for session %s", jobID)
+	}
+}
+
+// SendSessionInterrupt routes a SIGINT (Ctrl-C) signal to an interactive
+// agent session. Mirrors SendSessionInput's mux-based dispatch: direct PTY
+// write of \x03 for treemux, SSE relay fallback, or tmux send-keys C-c.
+func (s *Server) SendSessionInterrupt(ctx context.Context, jobID string) error {
+	if s.engine == nil {
+		return fmt.Errorf("engine not initialized")
+	}
+	session := s.engine.Store().GetSession(jobID)
+	if session == nil {
+		return fmt.Errorf("session not found: %s", jobID)
+	}
+
+	mux := effectiveMux(session)
+
+	switch mux {
+	case models.MuxTreemux:
+		if session.PtyID != "" && s.ptyManager != nil {
+			if ptySess, ok := s.ptyManager.Get(session.PtyID); ok {
+				if _, err := ptySess.Write([]byte{0x03}); err != nil {
+					s.ulog.Warn("Direct PTY interrupt failed, falling back").
+						Err(err).
+						Field("job_id", jobID).
+						Field("pty_id", session.PtyID).
+						Field("mux", mux).
+						Field("tier", "direct_pty").
+						Log(ctx)
+				} else {
+					s.ulog.Debug("Sent interrupt to agent").
+						Field("job_id", jobID).
+						Field("mux", mux).
+						Field("tier", "direct_pty").
+						Log(ctx)
+					return nil
+				}
+			}
+		}
+		if s.terminalHub != nil && s.terminalHub.HasConnections() {
+			s.engine.Store().ApplyUpdate(store.Update{
+				Type:   store.UpdateAgentInput,
+				Source: "api",
+				Payload: &store.AgentInputPayload{
+					JobID: jobID,
+					Input: "\x03",
+				},
+			})
+			s.ulog.Debug("Sent interrupt to agent").
+				Field("job_id", jobID).
+				Field("mux", mux).
+				Field("tier", "sse_relay").
+				Log(ctx)
+			return nil
+		}
+		return fmt.Errorf("treemux route unavailable for interrupt on session %s", jobID)
+
+	case models.MuxTmux:
+		if session.TmuxTarget == "" {
+			return fmt.Errorf("tmux target missing for session %s", jobID)
+		}
+		tmuxClient, err := tmux.NewClient()
+		if err != nil {
+			return fmt.Errorf("tmux not available: %w", err)
+		}
+		if err := tmuxClient.SendKeys(ctx, session.TmuxTarget, "C-c"); err != nil {
+			return err
+		}
+		s.ulog.Debug("Sent interrupt to agent").
+			Field("job_id", jobID).
+			Field("mux", mux).
+			Field("tier", "tmux").
+			Field("tmux_target", session.TmuxTarget).
+			Log(ctx)
+		return nil
+
+	default:
+		return fmt.Errorf("unknown or missing mux for session %s", jobID)
+	}
 }
 
 // handleSessionIntent handles POST /api/sessions/intent - pre-register session intent.

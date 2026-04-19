@@ -20,8 +20,9 @@ type Pinger struct {
 	defaultPrompt string
 	ulog          *logging.UnifiedLogger
 
-	// SendInput is the function used to inject messages into tmux sessions.
-	SendInput func(ctx context.Context, tmuxTarget, message string) error
+	// SendInput is the function used to inject messages into agent sessions.
+	// Takes a jobID; the server resolves the mux + target internally.
+	SendInput func(ctx context.Context, jobID, message string) error
 }
 
 // NewPinger creates a new idle pinger.
@@ -66,9 +67,6 @@ func (p *Pinger) checkSessions(ctx context.Context, updates chan<- store.Update)
 		if session.Status != "running" && session.Status != "idle" {
 			continue
 		}
-		if session.TmuxTarget == "" {
-			continue
-		}
 
 		idleThreshold := time.Duration(session.Autonomous.IdleMinutes) * time.Minute
 		if idleThreshold == 0 {
@@ -101,16 +99,17 @@ func (p *Pinger) checkSessions(ctx context.Context, updates chan<- store.Update)
 
 		p.ulog.Info("Injecting idle ping into agent").
 			Field("job_id", session.ID).
+			Field("mux", session.Mux).
 			Field("tmux_target", session.TmuxTarget).
 			Field("pty_id", session.PtyID).
 			Field("idle_since", time.Since(session.LastActivity).String()).
 			Field("prompt_len", len(prompt)).
 			Log(ctx)
-		if err := p.SendInput(ctx, session.TmuxTarget, prompt); err != nil {
+		if err := p.SendInput(ctx, session.ID, prompt); err != nil {
 			p.ulog.Error("Failed to send idle ping").
 				Err(err).
 				Field("job_id", session.ID).
-				Field("tmux_target", session.TmuxTarget).
+				Field("mux", session.Mux).
 				Log(ctx)
 			continue
 		}

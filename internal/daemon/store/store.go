@@ -304,6 +304,7 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload) {
 		Channels:         payload.Channels,
 		Autonomous:       payload.Autonomous,
 		TmuxTarget:       payload.TmuxTarget,
+		Mux:              payload.Mux,
 	}
 	s.state.Sessions[payload.JobID] = session
 }

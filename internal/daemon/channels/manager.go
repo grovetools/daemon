@@ -43,9 +43,10 @@ type Manager struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 
-	// SendInput is the function used to inject messages into tmux sessions.
-	// Set by the server at initialization.
-	SendInput func(ctx context.Context, tmuxTarget, message string) error
+	// SendInput is the function used to inject messages into agent sessions.
+	// Set by the server at initialization. It takes a jobID (the server
+	// resolves the mux + PTY/tmux target internally).
+	SendInput func(ctx context.Context, jobID, message string) error
 }
 
 // NewManager creates a new ChannelManager.
@@ -305,14 +306,6 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 		m.ulog.Warn("Target session not found in store").Field("job_id", targetJobID).Log(ctx)
 		return
 	}
-	if session.TmuxTarget == "" {
-		m.ulog.Warn("Target session has empty TmuxTarget").
-			Field("job_id", targetJobID).
-			Field("session_status", session.Status).
-			Field("pty_id", session.PtyID).
-			Log(ctx)
-		return
-	}
 
 	if m.SendInput == nil {
 		m.ulog.Error("SendInput not wired on Manager — message dropped").
@@ -324,15 +317,16 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 	taggedText := fmt.Sprintf("[via Signal] %s", text)
 	m.ulog.Info("Injecting signal message into agent").
 		Field("job_id", targetJobID).
+		Field("mux", session.Mux).
 		Field("tmux_target", session.TmuxTarget).
 		Field("pty_id", session.PtyID).
 		Field("input_len", len(taggedText)).
 		Log(ctx)
-	if err := m.SendInput(ctx, session.TmuxTarget, taggedText); err != nil {
+	if err := m.SendInput(ctx, targetJobID, taggedText); err != nil {
 		m.ulog.Error("Failed to inject signal message into agent").
 			Err(err).
 			Field("job_id", targetJobID).
-			Field("tmux_target", session.TmuxTarget).
+			Field("mux", session.Mux).
 			Log(ctx)
 		return
 	}

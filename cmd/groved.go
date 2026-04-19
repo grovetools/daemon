@@ -34,7 +34,6 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/server"
 	daemonssh "github.com/grovetools/daemon/internal/daemon/ssh"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	"github.com/grovetools/agentlogs/pkg/agentstream"
 	notifyconfig "github.com/grovetools/notify/pkg/config"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
@@ -302,10 +301,12 @@ func newGrovedStartCmd() *cobra.Command {
 			ptyManager := daemonpty.NewManager()
 			srv.SetPtyManager(ptyManager)
 
-			// sendInputToTmux sends a message to an agent running in a tmux pane.
-			// Uses agentstream.SendInput which handles Escape+i for vim-style agents.
-			sendInputToTmux := func(ctx context.Context, tmuxTarget, message string) error {
-				return agentstream.SendInput(ctx, tmuxTarget, message)
+			// sendInputToSession delegates to Server.SendSessionInput so the
+			// channels manager and autonomous pinger both benefit from the
+			// mux-aware dispatch (direct treemux PTY write → SSE relay → tmux
+			// fallback).
+			sendInputToSession := func(ctx context.Context, jobID, message string) error {
+				return srv.SendSessionInput(ctx, jobID, message)
 			}
 
 			// Initialize channel manager if signal is configured
@@ -317,7 +318,7 @@ func newGrovedStartCmd() *cobra.Command {
 					Account:   notifyCfg.Signal.Account,
 					Allowlist: notifyCfg.Signal.Allowlist,
 				})
-				chMgr.SendInput = sendInputToTmux
+				chMgr.SendInput = sendInputToSession
 				chMgr.Start(ctx)
 				srv.SetChannelManager(chMgr)
 				ulog.Info("Channel manager initialized (signal enabled)").Log(ctx)
@@ -325,7 +326,7 @@ func newGrovedStartCmd() *cobra.Command {
 
 			// Register autonomous pinger as a collector
 			pinger := autonomous.NewPinger(st, "")
-			pinger.SendInput = sendInputToTmux
+			pinger.SendInput = sendInputToSession
 			eng.Register(pinger)
 
 			// Set running config for introspection
