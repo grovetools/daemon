@@ -60,8 +60,9 @@ func (m *Manager) startLocalServices(
 		cmdStr, _ := svcConfig["command"].(string)
 		portEnv, _ := svcConfig["port_env"].(string)
 		route, _ := svcConfig["route"].(string)
+		svcType, _ := svcConfig["type"].(string)
 
-		if cmdStr == "" {
+		if svcType != "docker" && cmdStr == "" {
 			continue
 		}
 
@@ -71,16 +72,54 @@ func (m *Manager) startLocalServices(
 			return fmt.Errorf("failed to allocate port for %s: %w", svcName, err)
 		}
 		runningEnv.Ports[svcName] = port
-		runningEnv.ServiceCommands[svcName] = cmdStr
 
 		if portEnv != "" {
 			resp.EnvVars[portEnv] = fmt.Sprintf("%d", port)
 		}
 
 		svcCtx, cancel := context.WithCancel(context.Background())
-		runningEnv.Cancels[svcName] = cancel
 
-		cmd := exec.CommandContext(svcCtx, "sh", "-c", cmdStr)
+		var cmd *exec.Cmd
+		var containerName string
+
+		if svcType == "docker" {
+			dockerArgs, cname, derr := buildDockerServiceArgs(worktree, svcName, svcConfig, port, req.Workspace.Path, resp.EnvVars)
+			if derr != nil {
+				cancel()
+				cleanupStarted()
+				return derr
+			}
+			containerName = cname
+			// Eagerly remove any stale container with this name (e.g. from a
+			// previous crashed daemon that didn't clean up).
+			_ = exec.Command("docker", "rm", "-f", containerName).Run()
+
+			// Surface env vars declared on the service to resp.EnvVars so
+			// subsequent services can reference them (matches native behavior).
+			if envMap, ok := svcConfig["env"].(map[string]interface{}); ok {
+				for k, v := range envMap {
+					val, _ := v.(string)
+					resp.EnvVars[k] = resolveEnvVars(val, resp.EnvVars)
+				}
+			}
+
+			cmd = exec.CommandContext(svcCtx, "docker", dockerArgs...)
+			runningEnv.ServiceCommands[svcName] = "docker " + shellJoin(dockerArgs)
+			runningEnv.ContainerNames[svcName] = containerName
+
+			// Wrap cancel so teardown forcefully removes the container even
+			// if the docker CLI was SIGKILLed before it could clean up.
+			baseCancel := cancel
+			cancel = func() {
+				_ = exec.Command("docker", "rm", "-f", containerName).Run()
+				baseCancel()
+			}
+			runningEnv.Cancels[svcName] = cancel
+		} else {
+			cmd = exec.CommandContext(svcCtx, "sh", "-c", cmdStr)
+			runningEnv.Cancels[svcName] = cancel
+			runningEnv.ServiceCommands[svcName] = cmdStr
+		}
 
 		// Working directory resolution (working_dir or first volume's host_path)
 		if wd, ok := svcConfig["working_dir"].(string); ok && wd != "" {

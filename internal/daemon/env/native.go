@@ -42,6 +42,7 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		Processes:       make(map[string]*exec.Cmd),
 		Cancels:         make(map[string]context.CancelFunc),
 		ServiceCommands: make(map[string]string),
+		ContainerNames:  make(map[string]string),
 	}
 	m.envs[worktree] = runningEnv
 	m.mu.Unlock()

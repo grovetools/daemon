@@ -25,6 +25,7 @@ type RunningEnv struct {
 	Processes       map[string]*exec.Cmd          // Tracked natively spawned processes
 	Cancels         map[string]context.CancelFunc // Used to terminate native processes
 	ServiceCommands map[string]string             // Service name -> command string (for state persistence/restart)
+	ContainerNames  map[string]string             // Service name -> docker container name (for docker-backed native services)
 }
 
 // Manager is the central coordinator for all active environments.
@@ -170,6 +171,15 @@ func (m *Manager) Restore(provider *workspace.Provider) {
 
 		// Native processes died with the old daemon — clean up stale state
 		if stateFile.Provider == "native" {
+			// Any docker-backed services in this native env left containers
+			// running when the old daemon died. Force-remove by the
+			// deterministic pattern grove-<worktree>-<svc>. This is a no-op
+			// for plain native services (docker returns nonzero, we ignore).
+			for svcName := range stateFile.Ports {
+				containerName := fmt.Sprintf("grove-%s-%s", node.Name, svcName)
+				_ = exec.Command("docker", "rm", "-f", containerName).Run()
+			}
+
 			if err := os.Remove(statePath); err != nil {
 				m.ulog.Warn("Failed to remove stale native state").
 					Err(err).
