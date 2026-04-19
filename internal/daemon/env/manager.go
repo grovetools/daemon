@@ -213,6 +213,75 @@ func (m *Manager) Restore(provider *workspace.Provider) {
 	}
 }
 
+// cleanupStaleEnv tears down the side effects of a stale RunningEnv — one whose
+// worktree directory has been deleted without a clean `grove env down`. It is
+// safe to call with any provider kind; unused fields on the RunningEnv (e.g.
+// Cancels for docker/terraform) are simply no-ops. Callers MUST NOT hold
+// Manager.mu when calling this — Tunnels/Proxy/Ports take their own locks.
+func (m *Manager) cleanupStaleEnv(ctx context.Context, worktree string, runningEnv *RunningEnv) {
+	if runningEnv == nil {
+		return
+	}
+	// Kill any native processes that were started before the worktree disappeared.
+	for name, cancel := range runningEnv.Cancels {
+		if cancel != nil {
+			cancel()
+		}
+		if cmd, ok := runningEnv.Processes[name]; ok && cmd != nil {
+			_ = cmd.Wait()
+		}
+	}
+	if m.Tunnels != nil {
+		m.Tunnels.StopAll(worktree)
+	}
+	if m.Proxy != nil {
+		m.Proxy.Unregister(worktree)
+	}
+	if m.Ports != nil {
+		m.Ports.ReleaseAll(worktree)
+	}
+	m.ulog.Info("Reconciled stale environment (worktree directory gone)").
+		Field("worktree", worktree).
+		Field("provider", runningEnv.Provider).
+		Field("state_dir", runningEnv.StateDir).
+		Log(ctx)
+}
+
+// reconcileExistingEnv inspects m.envs[worktree] under m.mu. If the entry is
+// stale (StateDir missing on disk), it releases the lock, cleans up the stale
+// env, re-acquires the lock, deletes the map entry, and returns (true, nil).
+// Callers resume provisioning with m.mu held.
+//
+// If the entry represents a live environment, returns (false, err) with an
+// "environment already running" error and m.mu released.
+//
+// If there is no existing entry, returns (false, nil) with m.mu held.
+//
+// Preconditions:
+//   - m.mu is held on entry.
+//
+// Postconditions (success / new-provision cases):
+//   - m.mu is held on return.
+func (m *Manager) reconcileExistingEnv(ctx context.Context, worktree string) (bool, error) {
+	existing, exists := m.envs[worktree]
+	if !exists {
+		return false, nil
+	}
+	// A stale entry is one whose StateDir no longer exists on disk (e.g. user
+	// `rm -rf .grove-worktrees/<name>` without running `grove env down`).
+	if existing.StateDir != "" {
+		if _, err := os.Stat(existing.StateDir); os.IsNotExist(err) {
+			m.mu.Unlock()
+			m.cleanupStaleEnv(ctx, worktree, existing)
+			m.mu.Lock()
+			delete(m.envs, worktree)
+			return true, nil
+		}
+	}
+	m.mu.Unlock()
+	return false, fmt.Errorf("environment already running for worktree: %s", worktree)
+}
+
 // Shutdown tears down all running environments for graceful daemon shutdown.
 func (m *Manager) Shutdown() {
 	m.mu.Lock()

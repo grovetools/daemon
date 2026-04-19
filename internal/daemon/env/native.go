@@ -29,15 +29,15 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	}
 	worktree := req.Workspace.Name
 	m.mu.Lock()
-	if _, exists := m.envs[worktree]; exists {
-		m.mu.Unlock()
-		return nil, fmt.Errorf("environment already running for worktree: %s", worktree)
+	if _, err := m.reconcileExistingEnv(ctx, worktree); err != nil {
+		return nil, err
 	}
 
 	runningEnv := &RunningEnv{
 		Provider:        "native",
 		Worktree:        worktree,
 		Environment:     req.Profile,
+		StateDir:        req.StateDir,
 		Ports:           make(map[string]int),
 		Processes:       make(map[string]*exec.Cmd),
 		Cancels:         make(map[string]context.CancelFunc),
