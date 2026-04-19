@@ -201,7 +201,10 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 
 	cmd := exec.CommandContext(ctx, "docker", "compose", "-p", projectName, "-f", baseComposeAbs, "-f", overridePath, "up", "-d")
 	cmd.Dir = req.Workspace.Path
-	cmd.Env = baseEnv
+	cmd.Env = append([]string{}, baseEnv...)
+	for k, v := range resp.EnvVars {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+	}
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("docker compose up failed: %w\nOutput: %s", err, string(output))
 	}
