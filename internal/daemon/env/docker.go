@@ -89,12 +89,17 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		}
 		runningEnv.Ports[svcName] = hostPort
 
-		svc := ComposeService{
-			Ports: []string{fmt.Sprintf("127.0.0.1:%d:%d", hostPort, containerPort)},
-		}
-
+		svc := ComposeService{}
 		if portEnv != "" {
+			// Port flows through compose env substitution on the base file
+			// (e.g. "${CLICKHOUSE_PORT:-8123}:8123"). Emitting a second
+			// 127.0.0.1:<port>:<container_port> in the override would make
+			// compose append both to the service's ports list and attempt
+			// two binds on the same host port, which conflicts.
 			resp.EnvVars[portEnv] = fmt.Sprintf("%d", hostPort)
+		} else {
+			// No port_env declared — keep authoritative override binding.
+			svc.Ports = []string{fmt.Sprintf("127.0.0.1:%d:%d", hostPort, containerPort)}
 		}
 
 		if route != "" {
