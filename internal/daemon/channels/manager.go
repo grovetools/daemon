@@ -67,6 +67,12 @@ func (m *Manager) Start(ctx context.Context) {
 
 	m.loadRoutes()
 
+	// Cross-check activeSessions against the store. The route file persists
+	// across daemon restarts but the in-memory session store does not, so we
+	// prune any entry whose session has gone missing to avoid routing inbound
+	// messages to ghost agents.
+	m.pruneStaleSessions(m.ctx)
+
 	// Subscribe to session end events for route cleanup
 	go m.watchSessionEnds(m.ctx)
 
@@ -74,6 +80,53 @@ func (m *Manager) Start(ctx context.Context) {
 	go m.routeCleanup(m.ctx)
 
 	m.ulog.Info("Channel manager started").Log(m.ctx)
+}
+
+// pruneStaleSessions drops any activeSessions entry whose backing store
+// session is missing, along with any routeTable entries pointing at pruned
+// jobIDs. Persists the updated route file if anything changed.
+func (m *Manager) pruneStaleSessions(ctx context.Context) {
+	m.mu.Lock()
+	var stale []string
+	for jobID := range m.activeSessions {
+		if m.store.GetSession(jobID) == nil {
+			stale = append(stale, jobID)
+		}
+	}
+	for _, jobID := range stale {
+		delete(m.activeSessions, jobID)
+		for ts, id := range m.routeTable {
+			if id == jobID {
+				delete(m.routeTable, ts)
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	for _, jobID := range stale {
+		m.ulog.Warn("Pruning stale channel entry — no store session").
+			Field("job_id", jobID).
+			Log(ctx)
+	}
+	if len(stale) > 0 {
+		m.saveRoutes()
+	}
+}
+
+// pruneSession removes a single jobID from activeSessions and purges any
+// routeTable entries pointing at it. Used as inline self-healing when a
+// routed inbound message resolves a jobID that no longer has a store
+// session.
+func (m *Manager) pruneSession(jobID string) {
+	m.mu.Lock()
+	delete(m.activeSessions, jobID)
+	for ts, id := range m.routeTable {
+		if id == jobID {
+			delete(m.routeTable, ts)
+		}
+	}
+	m.mu.Unlock()
+	m.saveRoutes()
 }
 
 // Stop shuts down the channel manager and signal-cli.
@@ -303,7 +356,10 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 	// Route to agent
 	session := m.store.GetSession(targetJobID)
 	if session == nil {
-		m.ulog.Warn("Target session not found in store").Field("job_id", targetJobID).Log(ctx)
+		m.ulog.Warn("Target session not found in store — pruning stale channel entry").
+			Field("job_id", targetJobID).
+			Log(ctx)
+		m.pruneSession(targetJobID)
 		return
 	}
 
