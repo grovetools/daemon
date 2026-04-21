@@ -30,6 +30,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/autonomous"
 	daemonchannels "github.com/grovetools/daemon/internal/daemon/channels"
 	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
+	"github.com/grovetools/daemon/internal/daemon/pairwatch"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
 	"github.com/grovetools/daemon/internal/daemon/server"
 	daemonssh "github.com/grovetools/daemon/internal/daemon/ssh"
@@ -105,6 +106,7 @@ func newGrovedStartCmd() *cobra.Command {
 			}
 
 			autoShutdown, _ := cmd.Flags().GetBool("auto-shutdown")
+			pairPID, _ := cmd.Flags().GetInt("pair-with-pid")
 
 			// Start pprof if requested
 			if port, _ := cmd.Flags().GetInt("pprof-port"); port > 0 {
@@ -343,6 +345,16 @@ func newGrovedStartCmd() *cobra.Command {
 			stop := make(chan os.Signal, 1)
 			signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
+			// 5.1 If paired to a parent PID, watch for its death and trigger
+			// the same graceful shutdown pathway as a SIGTERM. This pipes
+			// kernel-level parent-death events into pidfile cleanup, PTY
+			// teardown, and server stop without bypassing any of them.
+			if pairPID > 0 {
+				pairwatch.Watch(cmd.Context(), pairPID, func() {
+					stop <- syscall.SIGTERM
+				})
+			}
+
 			// shutdownReq fires when the TerminalHub idle timer expires
 			// (auto-shutdown mode). Nil if auto-shutdown is disabled.
 			shutdownReq := srv.TerminalHubShutdownReq()
@@ -519,6 +531,7 @@ func newGrovedStartCmd() *cobra.Command {
 	cmd.Flags().String("socket", "", "Override socket path (empty = derive from --scope)")
 	cmd.Flags().String("pidfile", "", "Override pidfile path (empty = derive from --scope)")
 	cmd.Flags().Bool("auto-shutdown", false, "Exit after 2m with no terminal WebSocket clients connected")
+	cmd.Flags().Int("pair-with-pid", 0, "Shut down when this parent PID exits (0 disables pairing)")
 
 	return cmd
 }
