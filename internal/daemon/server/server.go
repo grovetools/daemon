@@ -82,6 +82,14 @@ type Server struct {
 	// terminalHub routes WebSocket messages for multi-attach
 	// (Primary/Follower groveterm instances).
 	terminalHub *TerminalHub
+
+	// OnReady, if non-nil, is invoked exactly once from inside ListenAndServe
+	// after the unix socket has been bound and chmod'd — i.e. the earliest
+	// moment a client can net.Dial the socket and have the kernel complete
+	// the handshake. Wired up by groved.go to signal a ready-fd pipe back to
+	// the factory, so daemon.NewWithAutoStart can block on pipe EOF instead
+	// of polling with a guessed retry window.
+	OnReady func()
 }
 
 // New creates a new Server instance.
@@ -169,6 +177,14 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	if err := os.Chmod(socketPath, 0600); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("failed to set socket permissions: %w", err)
+	}
+
+	// The socket is bound and chmod'd — clients can connect now even though
+	// Serve hasn't been called yet (kernel holds accept-queue entries until
+	// we start accepting). Signal readiness before the mux/server setup so
+	// the parent stops waiting at the earliest defensible point.
+	if s.OnReady != nil {
+		s.OnReady()
 	}
 
 	mux := http.NewServeMux()

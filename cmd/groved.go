@@ -107,6 +107,7 @@ func newGrovedStartCmd() *cobra.Command {
 
 			autoShutdown, _ := cmd.Flags().GetBool("auto-shutdown")
 			pairPID, _ := cmd.Flags().GetInt("pair-with-pid")
+			readyFd, _ := cmd.Flags().GetInt("ready-fd")
 
 			// Start pprof if requested
 			if port, _ := cmd.Flags().GetInt("pprof-port"); port > 0 {
@@ -514,6 +515,21 @@ func newGrovedStartCmd() *cobra.Command {
 			// 8. Start Server (Blocking)
 			httpPort, _ := cmd.Flags().GetInt("http-port")
 			ulog.Info("Starting daemon").Field("pid", os.Getpid()).Log(ctx)
+
+			// If the parent passed --ready-fd, close that inherited fd as soon
+			// as the socket is bound. The parent reads EOF from its end of the
+			// pipe and stops polling — replaces the old retry-with-backoff
+			// connect loop with a deterministic handshake. No-op when readyFd
+			// is 0 (default, ad-hoc / manual startups).
+			if readyFd > 0 {
+				srv.OnReady = func() {
+					if err := syscall.Close(readyFd); err != nil {
+						ulog.Warn("failed to close ready-fd").
+							Field("fd", readyFd).Err(err).Log(ctx)
+					}
+				}
+			}
+
 			if err := srv.ListenAndServe(sockPath, httpPort); err != nil {
 				return fmt.Errorf("server error: %w", err)
 			}
@@ -532,6 +548,7 @@ func newGrovedStartCmd() *cobra.Command {
 	cmd.Flags().String("pidfile", "", "Override pidfile path (empty = derive from --scope)")
 	cmd.Flags().Bool("auto-shutdown", false, "Exit after 2m with no terminal WebSocket clients connected")
 	cmd.Flags().Int("pair-with-pid", 0, "Shut down when this parent PID exits (0 disables pairing)")
+	cmd.Flags().Int("ready-fd", 0, "Close this inherited file descriptor once the socket is bound (0 disables readiness signaling)")
 
 	return cmd
 }
