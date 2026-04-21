@@ -1777,13 +1777,15 @@ func (s *Server) handleStreamJobLogs(w http.ResponseWriter, r *http.Request, job
 }
 
 // resolveLogFilePath determines the log file path for a job.
-// For now, it constructs the path from the plan directory and job file.
-// TODO: This should be stored in JobInfo when the job starts.
+// Prefers the path the runtime stashed on JobInfo at launch; falls back to
+// a filename-based guess for jobs that pre-date that stashing.
 func resolveLogFilePath(info *models.JobInfo) string {
+	if info.LogFilePath != "" {
+		return info.LogFilePath
+	}
 	if info.PlanDir == "" || info.JobFile == "" {
 		return ""
 	}
-	// Convention: job logs are stored in .artifacts/<job-name>/job.log within the plan dir
 	jobName := strings.TrimSuffix(info.JobFile, ".md")
 	return filepath.Join(info.PlanDir, ".artifacts", jobName, "job.log")
 }

@@ -364,6 +364,22 @@ func (jr *JobRunner) executeJob(ctx context.Context, info *models.JobInfo) {
 		plan.Orchestration.AgentTarget = info.AgentTarget
 	}
 
+	// Stash the job log path on info so the server's log-stream handler
+	// tails the same file the runtime writes to.
+	if job, ok := plan.GetJobByFilename(info.JobFile); ok {
+		if logPath, pathErr := orchestration.GetJobLogPath(plan, job); pathErr == nil {
+			info.LogFilePath = logPath
+			if jr.persister != nil {
+				jr.persister.Save(info)
+			}
+			jr.store.ApplyUpdate(store.Update{
+				Type:    store.UpdateJobStarted,
+				Source:  "jobrunner",
+				Payload: info,
+			})
+		}
+	}
+
 	// Create an orchestrator to utilize flow's dependency logic
 	orch, err := orchestration.NewOrchestrator(plan, &orchestration.OrchestratorConfig{
 		Runtime: jr.runtime,
