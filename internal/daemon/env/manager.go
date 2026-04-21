@@ -169,29 +169,17 @@ func (m *Manager) Restore(provider *workspace.Provider) {
 			continue
 		}
 
-		// Native processes died with the old daemon — clean up stale state
+		// For native envs, clean up any docker-backed containers orphaned
+		// by the previous daemon. Keep state.json + .env.local on disk so
+		// `grove env down` remains the authoritative teardown path — native
+		// processes on macOS are reparented to PID 1 when the daemon exits
+		// and stay alive, so deleting their state file here would orphan
+		// them from the TUI/CLI.
 		if stateFile.Provider == "native" {
-			// Any docker-backed services in this native env left containers
-			// running when the old daemon died. Force-remove by the
-			// deterministic pattern grove-<worktree>-<svc>. This is a no-op
-			// for plain native services (docker returns nonzero, we ignore).
-			for svcName := range stateFile.Ports {
-				containerName := fmt.Sprintf("grove-%s-%s", node.Name, svcName)
+			for _, svc := range stateFile.Services {
+				containerName := fmt.Sprintf("grove-%s-%s", node.Name, svc.Name)
 				_ = exec.Command("docker", "rm", "-f", containerName).Run()
 			}
-
-			if err := os.Remove(statePath); err != nil {
-				m.ulog.Warn("Failed to remove stale native state").
-					Err(err).
-					Field("path", statePath).
-					Log(ctx)
-			}
-			// Also remove .env.local files so grove env status shows "stopped"
-			os.Remove(filepath.Join(stateDir, ".env.local"))
-			os.Remove(filepath.Join(node.Path, ".env.local"))
-			m.ulog.Info("Cleaned up stale native environment state (processes died with previous daemon)").
-				Field("worktree", node.Name).
-				Log(ctx)
 			continue
 		}
 
