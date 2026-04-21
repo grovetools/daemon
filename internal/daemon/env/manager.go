@@ -26,6 +26,7 @@ type RunningEnv struct {
 	Cancels         map[string]context.CancelFunc // Used to terminate native processes
 	ServiceCommands map[string]string             // Service name -> command string (for state persistence/restart)
 	ContainerNames  map[string]string             // Service name -> docker container name (for docker-backed native services)
+	NativePGIDs     map[string]int                // Service/tunnel name -> process group id (for cross-restart teardown; populated in Phase 2)
 }
 
 // Manager is the central coordinator for all active environments.
@@ -52,6 +53,8 @@ func NewManager() *Manager {
 
 // Up starts an environment based on the provider specified in the request.
 // On failure, it rolls back the registered environment entry and releases any allocated ports.
+// On success, it writes .grove/env/state.json from the resulting RunningEnv + EnvResponse
+// so the daemon is the single authoritative writer of that file.
 func (m *Manager) Up(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvResponse, error) {
 	m.ulog.Info("Starting environment").Field("provider", req.Provider).Log(ctx)
 
@@ -88,24 +91,138 @@ func (m *Manager) Up(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvR
 		m.Proxy.Unregister(worktree)
 		m.Ports.ReleaseAll(worktree)
 		m.ulog.Info("Rolled back failed environment registration").Field("worktree", worktree).Log(ctx)
+		return resp, err
+	}
+
+	if err == nil && resp != nil && req.Workspace != nil {
+		if writeErr := m.writeStateFile(ctx, req, resp); writeErr != nil {
+			m.ulog.Warn("Failed to write env state file").
+				Err(writeErr).
+				Field("worktree", req.Workspace.Name).
+				Log(ctx)
+		}
 	}
 
 	return resp, err
 }
 
 // Down stops an environment based on the provider specified in the request.
+// On successful teardown the daemon also deletes .grove/env/state.json so it
+// remains the single authoritative manager of that file.
 func (m *Manager) Down(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvResponse, error) {
 	m.ulog.Info("Stopping environment").Field("provider", req.Provider).Log(ctx)
 
+	var resp *coreenv.EnvResponse
+	var err error
 	switch req.Provider {
 	case "native":
-		return m.nativeDown(ctx, req)
+		resp, err = m.nativeDown(ctx, req)
 	case "docker":
-		return m.dockerDown(ctx, req)
+		resp, err = m.dockerDown(ctx, req)
 	case "terraform":
-		return m.terraformDown(ctx, req)
+		resp, err = m.terraformDown(ctx, req)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", req.Provider)
+	}
+
+	if err == nil {
+		m.removeStateFile(ctx, req)
+	}
+	return resp, err
+}
+
+// writeStateFile renders the current RunningEnv + EnvResponse + EnvRequest into
+// a coreenv.EnvStateFile and persists it to <stateDir>/state.json. Callers must
+// pass a request with a non-nil Workspace.
+func (m *Manager) writeStateFile(ctx context.Context, req coreenv.EnvRequest, resp *coreenv.EnvResponse) error {
+	stateDir := req.EffectiveStateDir()
+	if stateDir == "" {
+		return fmt.Errorf("write state file: empty state dir")
+	}
+
+	worktree := req.Workspace.Name
+	m.mu.Lock()
+	runningEnv := m.envs[worktree]
+	m.mu.Unlock()
+
+	stateFile := coreenv.EnvStateFile{
+		Provider:      req.Provider,
+		Environment:   req.Profile,
+		ManagedBy:     req.ManagedBy,
+		WorkspaceName: req.Workspace.Name,
+		WorkspacePath: req.Workspace.Path,
+		EnvVars:       resp.EnvVars,
+		Endpoints:     resp.Endpoints,
+		CleanupPaths:  resp.CleanupPaths,
+		Volumes:       resp.Volumes,
+		State:         resp.State,
+	}
+
+	if runningEnv != nil {
+		if len(runningEnv.Ports) > 0 {
+			stateFile.Ports = make(map[string]int, len(runningEnv.Ports))
+			stateFile.Services = make([]coreenv.ServiceState, 0, len(runningEnv.Ports))
+			for name, port := range runningEnv.Ports {
+				stateFile.Ports[name] = port
+				stateFile.Services = append(stateFile.Services, coreenv.ServiceState{
+					Name:   name,
+					Port:   port,
+					Status: "running",
+				})
+			}
+		}
+		if len(runningEnv.ServiceCommands) > 0 {
+			stateFile.ServiceCommands = make(map[string]string, len(runningEnv.ServiceCommands))
+			for k, v := range runningEnv.ServiceCommands {
+				stateFile.ServiceCommands[k] = v
+			}
+		}
+		if len(runningEnv.ContainerNames) > 0 {
+			stateFile.DockerContainers = make(map[string]string, len(runningEnv.ContainerNames))
+			for k, v := range runningEnv.ContainerNames {
+				stateFile.DockerContainers[k] = v
+			}
+		}
+		if len(runningEnv.NativePGIDs) > 0 {
+			stateFile.NativePGIDs = make(map[string]int, len(runningEnv.NativePGIDs))
+			for k, v := range runningEnv.NativePGIDs {
+				stateFile.NativePGIDs[k] = v
+			}
+		}
+	}
+
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return fmt.Errorf("create state dir: %w", err)
+	}
+	data, err := json.MarshalIndent(&stateFile, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal state file: %w", err)
+	}
+	statePath := filepath.Join(stateDir, "state.json")
+	if err := os.WriteFile(statePath, data, 0644); err != nil {
+		return fmt.Errorf("write state file: %w", err)
+	}
+	m.ulog.Debug("Wrote env state file").
+		Field("worktree", worktree).
+		Field("path", statePath).
+		Log(ctx)
+	return nil
+}
+
+// removeStateFile deletes <stateDir>/state.json on a successful Down. Errors
+// other than "file already gone" are logged but not returned — the env is down
+// either way, and a stale state.json is the worst outcome.
+func (m *Manager) removeStateFile(ctx context.Context, req coreenv.EnvRequest) {
+	stateDir := req.EffectiveStateDir()
+	if stateDir == "" {
+		return
+	}
+	statePath := filepath.Join(stateDir, "state.json")
+	if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
+		m.ulog.Warn("Failed to remove env state file").
+			Err(err).
+			Field("path", statePath).
+			Log(ctx)
 	}
 }
 

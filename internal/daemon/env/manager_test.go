@@ -96,6 +96,103 @@ func TestRestore_NativeSkipsEnvRegistration(t *testing.T) {
 	}
 }
 
+// TestWriteStateFile_DaemonOwned verifies the daemon-side helper produces a
+// state.json with workspace_name + workspace_path populated and the runtime
+// view of ports/services merged in. This is the Phase 1 contract.
+func TestWriteStateFile_DaemonOwned(t *testing.T) {
+	tmp := t.TempDir()
+	wtPath := filepath.Join(tmp, "tier1-c")
+	stateDir := filepath.Join(wtPath, ".grove", "env")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	m := NewManager()
+	m.envs["tier1-c"] = &RunningEnv{
+		Provider:        "native",
+		Worktree:        "tier1-c",
+		Environment:     "default",
+		ManagedBy:       "user",
+		StateDir:        stateDir,
+		Ports:           map[string]int{"kitchen-api": 49301, "clickhouse": 49302},
+		ServiceCommands: map[string]string{"kitchen-api": "cargo run"},
+		ContainerNames:  map[string]string{"clickhouse": "grove-tier1-c-clickhouse"},
+	}
+
+	req := coreenv.EnvRequest{
+		Provider:  "native",
+		Profile:   "default",
+		StateDir:  stateDir,
+		ManagedBy: "user",
+		Workspace: &workspace.WorkspaceNode{Name: "tier1-c", Path: wtPath},
+	}
+	resp := &coreenv.EnvResponse{
+		Status:    "running",
+		EnvVars:   map[string]string{"KITCHEN_API_PORT": "49301"},
+		Endpoints: []string{"http://localhost:49301"},
+	}
+
+	if err := m.writeStateFile(t.Context(), req, resp); err != nil {
+		t.Fatalf("writeStateFile: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(stateDir, "state.json"))
+	if err != nil {
+		t.Fatalf("read state.json: %v", err)
+	}
+
+	var got coreenv.EnvStateFile
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.WorkspaceName != "tier1-c" {
+		t.Errorf("WorkspaceName = %q, want tier1-c", got.WorkspaceName)
+	}
+	if got.WorkspacePath != wtPath {
+		t.Errorf("WorkspacePath = %q, want %q", got.WorkspacePath, wtPath)
+	}
+	if got.Provider != "native" {
+		t.Errorf("Provider = %q, want native", got.Provider)
+	}
+	if got.Ports["kitchen-api"] != 49301 {
+		t.Errorf("Ports[kitchen-api] = %d, want 49301", got.Ports["kitchen-api"])
+	}
+	if got.DockerContainers["clickhouse"] != "grove-tier1-c-clickhouse" {
+		t.Errorf("DockerContainers[clickhouse] = %q, want grove-tier1-c-clickhouse", got.DockerContainers["clickhouse"])
+	}
+	if len(got.Services) != 2 {
+		t.Errorf("Services count = %d, want 2", len(got.Services))
+	}
+}
+
+// TestRemoveStateFile_NoOpWhenAbsent verifies that removeStateFile is
+// idempotent — calling it twice (or against a path that never existed) is
+// safe.
+func TestRemoveStateFile_NoOpWhenAbsent(t *testing.T) {
+	tmp := t.TempDir()
+	stateDir := filepath.Join(tmp, ".grove", "env")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	m := NewManager()
+	req := coreenv.EnvRequest{
+		StateDir:  stateDir,
+		Workspace: &workspace.WorkspaceNode{Name: "t", Path: tmp},
+	}
+	// First call: no file exists. Should not error/log noisily.
+	m.removeStateFile(t.Context(), req)
+	// Second call after writing then removing.
+	statePath := filepath.Join(stateDir, "state.json")
+	if err := os.WriteFile(statePath, []byte("{}"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	m.removeStateFile(t.Context(), req)
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Errorf("state.json still present after removeStateFile: %v", err)
+	}
+}
+
 // TestRestore_DockerEnvRegistered verifies the non-native branch still
 // re-hydrates m.envs from state.json so ports aren't re-allocated elsewhere.
 func TestRestore_DockerEnvRegistered(t *testing.T) {
