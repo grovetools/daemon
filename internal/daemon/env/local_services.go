@@ -459,7 +459,7 @@ func (m *Manager) startLocalServices(
 				resp.ProxyRoutes = make(map[string]int)
 			}
 			resp.ProxyRoutes[route] = port
-			resp.Endpoints = append(resp.Endpoints, fmt.Sprintf("http://%s.%s.grove.local:8443", route, worktree))
+			resp.Endpoints = append(resp.Endpoints, fmt.Sprintf("http://%s.%s.grove.local", route, worktree))
 		}
 	}
 

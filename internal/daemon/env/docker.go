@@ -106,7 +106,7 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		if route != "" {
 			m.registerProxyRoute(ctx, worktree, route, hostPort)
 			resp.ProxyRoutes[route] = hostPort
-			resp.Endpoints = append(resp.Endpoints, fmt.Sprintf("http://%s.%s.grove.local:8443", route, worktree))
+			resp.Endpoints = append(resp.Endpoints, fmt.Sprintf("http://%s.%s.grove.local", route, worktree))
 		}
 
 		// Parse volumes: create host dirs, add bindings, run pre-start restore
