@@ -120,6 +120,19 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 }
 
 // nativeDown stops a native environment and cleans up.
+//
+// Two paths are intentionally unified here:
+//
+//   - Hot path (m.envs has an entry): cancel each tracked Cmd via its
+//     CancelFunc. The CancelFunc closures wired up in startLocalServices
+//     also force-remove docker-backed service containers, so this branch
+//     handles both bare processes and `type: docker` services.
+//   - Disk-lazy path (m.envs is empty, e.g. after a daemon restart):
+//     read state.json from disk and reap NativePGIDs via the supervisor
+//     plus DockerContainers via `docker rm -f`. This is the path that
+//     fails today — a missing m.envs entry used to silently no-op,
+//     orphaning the reparented native processes that survived the daemon
+//     restart.
 func (m *Manager) nativeDown(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvResponse, error) {
 	if req.Workspace == nil {
 		return nil, fmt.Errorf("native provider requires a workspace")
@@ -133,15 +146,30 @@ func (m *Manager) nativeDown(ctx context.Context, req coreenv.EnvRequest) (*core
 	}
 	m.mu.Unlock()
 
-	if !exists {
-		return &coreenv.EnvResponse{Status: "stopped"}, nil
-	}
-
-	// Kill all native processes
-	for name, cancel := range runningEnv.Cancels {
-		m.ulog.Info("Stopping native service").Field("service", name).Log(ctx)
-		cancel()
-		// The background goroutine handles Wait() and log file cleanup
+	if exists && runningEnv != nil {
+		for name, cancel := range runningEnv.Cancels {
+			m.ulog.Info("Stopping native service").Field("service", name).Log(ctx)
+			cancel()
+			// The background goroutine handles Wait() and log file cleanup.
+		}
+	} else {
+		// Disk-lazy: in-memory record is gone (typical post-restart).
+		// Reap whatever the previous daemon recorded into state.json.
+		stateFile, err := m.readStateFile(req)
+		if err != nil {
+			m.ulog.Warn("Failed to read env state for disk-lazy nativeDown").
+				Err(err).
+				Field("worktree", worktree).
+				Log(ctx)
+		}
+		if stateFile != nil {
+			m.ulog.Info("Disk-lazy native teardown").
+				Field("worktree", worktree).
+				Field("native_pgids", len(stateFile.NativePGIDs)).
+				Field("docker_containers", len(stateFile.DockerContainers)).
+				Log(ctx)
+			m.reapPersistedNatives(ctx, stateFile)
+		}
 	}
 
 	m.Tunnels.StopAll(worktree)

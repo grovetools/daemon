@@ -1,9 +1,12 @@
 package env
 
 import (
+	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	coreenv "github.com/grovetools/core/pkg/env"
@@ -190,6 +193,125 @@ func TestRemoveStateFile_NoOpWhenAbsent(t *testing.T) {
 	m.removeStateFile(t.Context(), req)
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
 		t.Errorf("state.json still present after removeStateFile: %v", err)
+	}
+}
+
+// fakeSupervisor records every Stop call for assertion in disk-lazy tests.
+type fakeSupervisor struct {
+	stops []int
+}
+
+func (f *fakeSupervisor) Spawn(_ context.Context, _ string, cmd *exec.Cmd) (int, error) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+	return cmd.Process.Pid, nil
+}
+
+func (f *fakeSupervisor) Stop(pgid int) error {
+	f.stops = append(f.stops, pgid)
+	return nil
+}
+
+// TestNativeDown_DiskLazyAfterRestart simulates the post-restart scenario:
+// state.json on disk has NativePGIDs but m.envs is empty. nativeDown must
+// signal each persisted PGID via the Supervisor (not silently no-op).
+func TestNativeDown_DiskLazyAfterRestart(t *testing.T) {
+	tmp := t.TempDir()
+	wtPath := filepath.Join(tmp, "tier1-c")
+	stateDir := filepath.Join(wtPath, ".grove", "env")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	stateFile := coreenv.EnvStateFile{
+		Provider:      "native",
+		WorkspaceName: "tier1-c",
+		WorkspacePath: wtPath,
+		NativePGIDs:   map[string]int{"kitchen-api": 99001, "tunnel-clickhouse": 99002},
+	}
+	data, _ := json.MarshalIndent(&stateFile, "", "  ")
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil {
+		t.Fatalf("write state.json: %v", err)
+	}
+
+	m := NewManager()
+	fake := &fakeSupervisor{}
+	m.Supervisor = fake
+
+	req := coreenv.EnvRequest{
+		Provider:  "native",
+		StateDir:  stateDir,
+		Workspace: &workspace.WorkspaceNode{Name: "tier1-c", Path: wtPath},
+	}
+	resp, err := m.Down(t.Context(), req)
+	if err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	if resp == nil || resp.Status != "stopped" {
+		t.Errorf("Down resp = %+v, want status stopped", resp)
+	}
+
+	if len(fake.stops) != 2 {
+		t.Errorf("Supervisor.Stop calls = %d, want 2 (got %v)", len(fake.stops), fake.stops)
+	}
+	gotPgids := map[int]bool{}
+	for _, p := range fake.stops {
+		gotPgids[p] = true
+	}
+	if !gotPgids[99001] || !gotPgids[99002] {
+		t.Errorf("Supervisor.Stop pgids = %v, want both 99001 and 99002", fake.stops)
+	}
+
+	// state.json should be removed after a successful Down.
+	if _, err := os.Stat(filepath.Join(stateDir, "state.json")); !os.IsNotExist(err) {
+		t.Errorf("state.json still present after disk-lazy Down: %v", err)
+	}
+}
+
+// TestDown_PatchesWorkspaceFromStateFile verifies that when state.json has
+// authoritative WorkspaceName/Path that differs from req.Workspace, the
+// daemon trusts the on-disk identity. This protects against the parent-
+// ecosystem-vs-worktree node mix-up flow/cmd/plan_init.go used to hit.
+func TestDown_PatchesWorkspaceFromStateFile(t *testing.T) {
+	tmp := t.TempDir()
+	wtPath := filepath.Join(tmp, "tier1-c")
+	stateDir := filepath.Join(wtPath, ".grove", "env")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	stateFile := coreenv.EnvStateFile{
+		Provider:      "native",
+		WorkspaceName: "tier1-c",
+		WorkspacePath: wtPath,
+		NativePGIDs:   map[string]int{"kitchen-api": 99003},
+	}
+	data, _ := json.MarshalIndent(&stateFile, "", "  ")
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil {
+		t.Fatalf("write state.json: %v", err)
+	}
+
+	m := NewManager()
+	fake := &fakeSupervisor{}
+	m.Supervisor = fake
+
+	// Client passes the parent ecosystem node by mistake — the daemon must
+	// reroute to the worktree from state.json.
+	req := coreenv.EnvRequest{
+		Provider:  "native",
+		StateDir:  stateDir,
+		Workspace: &workspace.WorkspaceNode{Name: "kitchen-env", Path: filepath.Dir(wtPath)},
+	}
+	if _, err := m.Down(t.Context(), req); err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	if len(fake.stops) != 1 || fake.stops[0] != 99003 {
+		t.Errorf("Supervisor.Stop calls = %v, want [99003]", fake.stops)
 	}
 }
 

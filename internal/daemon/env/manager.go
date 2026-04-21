@@ -112,8 +112,36 @@ func (m *Manager) Up(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvR
 // Down stops an environment based on the provider specified in the request.
 // On successful teardown the daemon also deletes .grove/env/state.json so it
 // remains the single authoritative manager of that file.
+//
+// If the daemon has no in-memory record of the env (e.g. the daemon was
+// restarted between Up and Down), Down falls back to reading state.json
+// from req.StateDir and uses the persisted WorkspaceName/Path to ensure
+// the providers' down paths target the correct worktree. The provider-
+// specific down handlers then reap NativePGIDs / DockerContainers from
+// the same state file — this is the disk-lazy teardown path that makes
+// "daemon died, user ran grove env down, env is gone" always true.
 func (m *Manager) Down(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvResponse, error) {
 	m.ulog.Info("Stopping environment").Field("provider", req.Provider).Log(ctx)
+
+	// Disk-lazy fallback: when the in-memory map is empty (post-restart) but
+	// state.json exists, prefer the persisted Workspace identity over whatever
+	// the client computed. This keeps the down handler from operating on the
+	// wrong map key (e.g. parent-ecosystem vs. concrete worktree) and avoids
+	// drifting away from the on-disk truth.
+	if stateFile, err := m.readStateFile(req); err == nil && stateFile != nil {
+		if stateFile.WorkspaceName != "" && stateFile.WorkspacePath != "" {
+			if req.Workspace == nil || req.Workspace.Name != stateFile.WorkspaceName || req.Workspace.Path != stateFile.WorkspacePath {
+				patched := workspace.WorkspaceNode{
+					Name: stateFile.WorkspaceName,
+					Path: stateFile.WorkspacePath,
+				}
+				req.Workspace = &patched
+			}
+		}
+		if req.Provider == "" {
+			req.Provider = stateFile.Provider
+		}
+	}
 
 	var resp *coreenv.EnvResponse
 	var err error
@@ -132,6 +160,60 @@ func (m *Manager) Down(ctx context.Context, req coreenv.EnvRequest) (*coreenv.En
 		m.removeStateFile(ctx, req)
 	}
 	return resp, err
+}
+
+// readStateFile loads .grove/env/state.json from req's effective state dir.
+// Returns (nil, nil) when the file doesn't exist; an error only on read or
+// JSON-parse failure.
+func (m *Manager) readStateFile(req coreenv.EnvRequest) (*coreenv.EnvStateFile, error) {
+	stateDir := req.EffectiveStateDir()
+	if stateDir == "" {
+		return nil, nil
+	}
+	statePath := filepath.Join(stateDir, "state.json")
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var sf coreenv.EnvStateFile
+	if err := json.Unmarshal(data, &sf); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", statePath, err)
+	}
+	return &sf, nil
+}
+
+// reapPersistedNatives stops every entry in stateFile.NativePGIDs via the
+// supervisor and force-removes every container in stateFile.DockerContainers.
+// Both maps may be nil/empty (silent no-op). Errors are logged but not
+// returned — teardown always proceeds best-effort.
+func (m *Manager) reapPersistedNatives(ctx context.Context, stateFile *coreenv.EnvStateFile) {
+	if stateFile == nil {
+		return
+	}
+	for name, pgid := range stateFile.NativePGIDs {
+		if err := m.Supervisor.Stop(pgid); err != nil {
+			m.ulog.Warn("Failed to stop native process group from state file").
+				Err(err).
+				Field("name", name).
+				Field("pgid", pgid).
+				Log(ctx)
+		}
+	}
+	for name, container := range stateFile.DockerContainers {
+		if container == "" {
+			continue
+		}
+		if err := exec.Command("docker", "rm", "-f", container).Run(); err != nil {
+			m.ulog.Debug("docker rm -f returned non-zero (likely already gone)").
+				Err(err).
+				Field("service", name).
+				Field("container", container).
+				Log(ctx)
+		}
+	}
 }
 
 // writeStateFile renders the current RunningEnv + EnvResponse + EnvRequest into

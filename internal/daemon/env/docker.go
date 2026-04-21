@@ -303,6 +303,13 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 }
 
 // dockerDown tears down the docker compose stack and cleans up routes/ports.
+//
+// Disk-lazy behavior: when m.envs[worktree] is empty (post-restart), the
+// `docker compose -p grove-<worktree> down` shell-out is the authoritative
+// teardown — it talks to dockerd, not to in-memory state. We just need an
+// accurate cmd.Dir (the workspace path) so compose finds the base
+// docker-compose.yml. That comes from req.Workspace.Path, which is patched
+// from state.json by Manager.Down before we run.
 func (m *Manager) dockerDown(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvResponse, error) {
 	if req.Workspace == nil {
 		return nil, fmt.Errorf("docker provider requires a workspace")
@@ -326,9 +333,17 @@ func (m *Manager) dockerDown(ctx context.Context, req coreenv.EnvRequest) (*core
 			Log(ctx)
 	}
 
-	// Cleanup override file
-	overridePath := filepath.Join(req.PlanDir, "docker-compose.override.yml")
-	_ = os.Remove(overridePath)
+	// Cleanup override file. Try the request-supplied PlanDir first (the
+	// hot path), then fall back to the StateDir (where compose-managed
+	// envs are written when grove env up runs from inside a worktree —
+	// PlanDir == StateDir in that flow). The remove is best-effort either
+	// way: a stale override doesn't keep dockerd busy.
+	for _, dir := range []string{req.PlanDir, req.EffectiveStateDir()} {
+		if dir == "" {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, "docker-compose.override.yml"))
+	}
 
 	m.Proxy.Unregister(worktree)
 	m.Ports.ReleaseAll(worktree)

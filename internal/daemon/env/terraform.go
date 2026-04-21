@@ -396,10 +396,33 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 	// background goroutine in startLocalServices already calls Wait() for
 	// each cmd — calling it a second time here deadlocks. Just cancel and
 	// let the goroutine finish reaping. (See nativeDown for the same pattern.)
+	//
+	// Disk-lazy fallback: if there's no in-memory record (post-restart),
+	// read state.json and reap NativePGIDs / DockerContainers. This MUST
+	// happen before `terraform destroy` — destroy can take minutes against
+	// a real cloud backend, and leaving the local hybrid processes running
+	// during that window keeps the symptom (orphaned cargo run holding the
+	// kitchen-api port) the redesign is meant to fix.
 	if exists && runningEnv != nil {
 		for name, cancel := range runningEnv.Cancels {
 			m.ulog.Info("Stopping local service").Field("service", name).Log(ctx)
 			cancel()
+		}
+	} else {
+		stateFile, sfErr := m.readStateFile(req)
+		if sfErr != nil {
+			m.ulog.Warn("Failed to read env state for disk-lazy terraformDown").
+				Err(sfErr).
+				Field("worktree", worktree).
+				Log(ctx)
+		}
+		if stateFile != nil {
+			m.ulog.Info("Disk-lazy terraform teardown (reaping local before destroy)").
+				Field("worktree", worktree).
+				Field("native_pgids", len(stateFile.NativePGIDs)).
+				Field("docker_containers", len(stateFile.DockerContainers)).
+				Log(ctx)
+			m.reapPersistedNatives(ctx, stateFile)
 		}
 	}
 
