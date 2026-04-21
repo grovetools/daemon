@@ -21,7 +21,6 @@ import (
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/core/pkg/workspace"
-	"github.com/sirupsen/logrus"
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
@@ -58,6 +57,37 @@ func configDebounceMs(cfg *config.Config) int {
 		return 100
 	}
 	return cfg.Daemon.ConfigDebounceMs
+}
+
+// envBasePathsFromConfig returns the absolute filesystem roots the env
+// manager should walk when restoring state on boot. Pulled from the
+// configured grove sources (cfg.Groves), with `~` / env-var expansion
+// applied so the daemon's WalkDir doesn't try to descend a literal "~"
+// directory. Disabled groves are skipped; duplicates are de-duplicated.
+func envBasePathsFromConfig(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var paths []string
+	for _, src := range cfg.Groves {
+		if src.Enabled != nil && !*src.Enabled {
+			continue
+		}
+		if src.Path == "" {
+			continue
+		}
+		abs, err := pathutil.Expand(src.Path)
+		if err != nil {
+			abs = src.Path
+		}
+		if seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		paths = append(paths, abs)
+	}
+	return paths
 }
 
 // NewGrovedCmd returns the groved daemon command with subcommands.
@@ -274,16 +304,16 @@ func newGrovedStartCmd() *cobra.Command {
 			// 4. Setup Server with engine and env manager
 			envManager := daemonenv.NewManager()
 
-			// Restore environment state from disk to prevent port collisions
-			restoreLogger := logrus.New()
-			restoreLogger.SetLevel(logrus.WarnLevel)
-			discoveryService := workspace.NewDiscoveryService(restoreLogger)
-			if discoveryResult, err := discoveryService.DiscoverAll(); err == nil {
-				wsProvider := workspace.NewProvider(discoveryResult)
-				envManager.Restore(wsProvider)
-			} else {
-				ulog.Warn("Failed to discover workspaces for env restore").Err(err).Log(ctx)
-			}
+			// Restore environment state from disk to prevent port collisions.
+			// Phase 4: walk configured ecosystem base paths directly with
+			// filepath.WalkDir, which bypasses the racy workspace discovery
+			// pass. Newly-created worktrees are guaranteed to be present in
+			// the filesystem before Restore runs (the daemon was just
+			// started after them) but are NOT guaranteed to be present in
+			// workspace.Provider yet (fsnotify + git worktree creation
+			// takes a beat to settle).
+			basePaths := envBasePathsFromConfig(cfg)
+			envManager.Restore(basePaths)
 
 			// Start proxy server in background on standard grove proxy port
 			go func() {

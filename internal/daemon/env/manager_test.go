@@ -49,11 +49,8 @@ func TestRestore_NativeStateSurvives(t *testing.T) {
 		t.Fatalf("write .env.local (root): %v", err)
 	}
 
-	node := &workspace.WorkspaceNode{Name: "tier1-c", Path: wtPath}
-	provider := workspace.NewProviderFromNodes([]*workspace.WorkspaceNode{node})
-
 	m := NewManager()
-	m.Restore(provider)
+	m.Restore([]string{tmp})
 
 	if _, err := os.Stat(statePath); err != nil {
 		t.Errorf("state.json was deleted by Restore: %v", err)
@@ -80,19 +77,18 @@ func TestRestore_NativeSkipsEnvRegistration(t *testing.T) {
 	}
 
 	stateFile := coreenv.EnvStateFile{
-		Provider: "native",
-		Services: []coreenv.ServiceState{{Name: "api", Port: 3000, Status: "running"}},
+		Provider:      "native",
+		WorkspaceName: "tier1-c",
+		WorkspacePath: wtPath,
+		Services:      []coreenv.ServiceState{{Name: "api", Port: 3000, Status: "running"}},
 	}
 	stateBytes, _ := json.MarshalIndent(stateFile, "", "  ")
 	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), stateBytes, 0644); err != nil {
 		t.Fatalf("write state.json: %v", err)
 	}
 
-	node := &workspace.WorkspaceNode{Name: "tier1-c", Path: wtPath}
-	provider := workspace.NewProviderFromNodes([]*workspace.WorkspaceNode{node})
-
 	m := NewManager()
-	m.Restore(provider)
+	m.Restore([]string{tmp})
 
 	if _, ok := m.envs["tier1-c"]; ok {
 		t.Errorf("native env was wrongly registered in m.envs")
@@ -326,19 +322,18 @@ func TestRestore_DockerEnvRegistered(t *testing.T) {
 	}
 
 	stateFile := coreenv.EnvStateFile{
-		Provider: "docker",
-		Ports:    map[string]int{"API_PORT": 52000, "WEB_PORT": 52001},
+		Provider:      "docker",
+		WorkspaceName: "tier1-a",
+		WorkspacePath: wtPath,
+		Ports:         map[string]int{"API_PORT": 52000, "WEB_PORT": 52001},
 	}
 	stateBytes, _ := json.MarshalIndent(stateFile, "", "  ")
 	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), stateBytes, 0644); err != nil {
 		t.Fatalf("write state.json: %v", err)
 	}
 
-	node := &workspace.WorkspaceNode{Name: "tier1-a", Path: wtPath}
-	provider := workspace.NewProviderFromNodes([]*workspace.WorkspaceNode{node})
-
 	m := NewManager()
-	m.Restore(provider)
+	m.Restore([]string{tmp})
 
 	re, ok := m.envs["tier1-a"]
 	if !ok {
@@ -349,5 +344,43 @@ func TestRestore_DockerEnvRegistered(t *testing.T) {
 	}
 	if re.Ports["API_PORT"] != 52000 {
 		t.Errorf("API_PORT port = %d, want 52000", re.Ports["API_PORT"])
+	}
+}
+
+// TestRestore_FindsDeeplyNestedStateFiles verifies the WalkDir-based Restore
+// finds .grove/env/state.json files at arbitrary depths under the supplied
+// ecosystem base paths. This is the workspace-discovery-race fix from Phase
+// 4 — no longer dependent on workspace.Provider's pre-populated map.
+func TestRestore_FindsDeeplyNestedStateFiles(t *testing.T) {
+	tmp := t.TempDir()
+	wtPath := filepath.Join(tmp, "kitchen-env", ".grove-worktrees", "tier1-d")
+	stateDir := filepath.Join(wtPath, ".grove", "env")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	stateFile := coreenv.EnvStateFile{
+		Provider:      "docker",
+		WorkspaceName: "tier1-d",
+		WorkspacePath: wtPath,
+		Ports:         map[string]int{"api": 51234},
+	}
+	data, _ := json.MarshalIndent(&stateFile, "", "  ")
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	m := NewManager()
+	m.Restore([]string{tmp})
+
+	re, ok := m.envs["tier1-d"]
+	if !ok {
+		t.Fatalf("expected tier1-d to be restored from a nested .grove/env/state.json under %s", tmp)
+	}
+	if re.Ports["api"] != 51234 {
+		t.Errorf("Ports[api] = %d, want 51234", re.Ports["api"])
+	}
+	if re.StateDir != stateDir {
+		t.Errorf("StateDir = %q, want %q", re.StateDir, stateDir)
 	}
 }

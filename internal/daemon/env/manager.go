@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/grovetools/core/logging"
@@ -344,22 +346,32 @@ func (m *Manager) Status(worktree string) *coreenv.EnvResponse {
 }
 
 // Restore reloads environment state from disk on daemon boot.
-// It iterates all known workspaces and checks for .grove/env/state.json files.
-// For docker/terraform providers, it re-registers allocated ports.
-// For native providers, it cleans up stale state since processes died with the old daemon.
-func (m *Manager) Restore(provider *workspace.Provider) {
-	if provider == nil {
-		return
-	}
-
+//
+// Phase 4 rewrite: the previous implementation walked workspace.Provider's
+// in-memory project list, which depends on git/fsnotify discovery completing
+// before boot — racy for newly-created worktrees. The new implementation
+// walks the configured ecosystem base paths directly with filepath.WalkDir
+// (Go's stdlib filepath.Glob does not support recursive `**`) and looks for
+// any `.grove/env/state.json`. Worktree identity comes from the file's
+// persisted WorkspaceName, so derivation never has to round-trip through
+// the workspace discovery layer.
+//
+// For docker/terraform providers, the re-discovered state files seed
+// m.envs (so port collisions are prevented). For native providers, any
+// docker-backed services from the previous run are force-removed but
+// state.json + .env.local stay on disk — native processes are reparented
+// to PID 1 on macOS and remain reachable by the disk-lazy nativeDown path
+// added in Phase 3.
+func (m *Manager) Restore(basePaths []string) {
 	ctx := context.Background()
-	for _, node := range provider.All() {
-		stateDir := filepath.Join(node.Path, ".grove", "env")
-		statePath := filepath.Join(stateDir, "state.json")
+
+	statePaths := m.findStateFiles(ctx, basePaths)
+	for _, statePath := range statePaths {
+		stateDir := filepath.Dir(statePath)
 
 		data, err := os.ReadFile(statePath)
 		if err != nil {
-			continue // No state file, skip
+			continue
 		}
 
 		var stateFile coreenv.EnvStateFile
@@ -371,16 +383,25 @@ func (m *Manager) Restore(provider *workspace.Provider) {
 			continue
 		}
 
-		// For native envs, clean up any docker-backed containers orphaned
-		// by the previous daemon. Keep state.json + .env.local on disk so
-		// `grove env down` remains the authoritative teardown path — native
-		// processes on macOS are reparented to PID 1 when the daemon exits
-		// and stay alive, so deleting their state file here would orphan
-		// them from the TUI/CLI.
+		// Worktree name: prefer the persisted value (WorkspaceName), fall
+		// back to filepath inference for legacy state files written by an
+		// older daemon. Inference: <worktree>/.grove/env/state.json — the
+		// worktree dir is two parents up from stateDir.
+		worktree := stateFile.WorkspaceName
+		if worktree == "" {
+			worktree = filepath.Base(filepath.Dir(filepath.Dir(stateDir)))
+		}
+
 		if stateFile.Provider == "native" {
 			for _, svc := range stateFile.Services {
-				containerName := fmt.Sprintf("grove-%s-%s", node.Name, svc.Name)
+				containerName := fmt.Sprintf("grove-%s-%s", worktree, svc.Name)
 				_ = exec.Command("docker", "rm", "-f", containerName).Run()
+			}
+			for _, container := range stateFile.DockerContainers {
+				if container == "" {
+					continue
+				}
+				_ = exec.Command("docker", "rm", "-f", container).Run()
 			}
 			continue
 		}
@@ -388,29 +409,79 @@ func (m *Manager) Restore(provider *workspace.Provider) {
 		m.mu.Lock()
 		runningEnv := &RunningEnv{
 			Provider:    stateFile.Provider,
-			Worktree:    node.Name,
+			Worktree:    worktree,
 			Environment: stateFile.Environment,
 			ManagedBy:   stateFile.ManagedBy,
 			StateDir:    stateDir,
 			Ports:       make(map[string]int),
 		}
 
-		// Re-register allocated ports to prevent collisions
 		for svcName, port := range stateFile.Ports {
-			label := fmt.Sprintf("%s/%s", node.Name, svcName)
+			label := fmt.Sprintf("%s/%s", worktree, svcName)
 			m.Ports.Reserve(label, port)
 			runningEnv.Ports[svcName] = port
 		}
 
-		m.envs[node.Name] = runningEnv
+		m.envs[worktree] = runningEnv
 		m.mu.Unlock()
 
 		m.ulog.Info("Restored environment from state file").
-			Field("worktree", node.Name).
+			Field("worktree", worktree).
 			Field("provider", stateFile.Provider).
 			Field("services", len(stateFile.Ports)).
+			Field("path", statePath).
 			Log(ctx)
 	}
+}
+
+// findStateFiles walks each base path looking for `.grove/env/state.json`.
+// Hidden directories that aren't `.grove` itself, `node_modules`, and
+// `vendor` are skipped to keep the walk cheap on big trees.
+func (m *Manager) findStateFiles(ctx context.Context, basePaths []string) []string {
+	var found []string
+	for _, base := range basePaths {
+		base = strings.TrimSpace(base)
+		if base == "" {
+			continue
+		}
+		if _, err := os.Stat(base); err != nil {
+			continue
+		}
+		err := filepath.WalkDir(base, func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				// Don't abort the whole walk on a single broken symlink or
+				// permission denial; just skip the offending entry.
+				return nil
+			}
+			if d.IsDir() {
+				name := d.Name()
+				if name == "node_modules" || name == "vendor" {
+					return fs.SkipDir
+				}
+				if strings.HasPrefix(name, ".") && name != "." && name != ".grove" && name != ".grove-worktrees" {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if d.Name() != "state.json" {
+				return nil
+			}
+			// Only accept files under `.grove/env/state.json`.
+			parent := filepath.Base(filepath.Dir(p))
+			grandparent := filepath.Base(filepath.Dir(filepath.Dir(p)))
+			if parent == "env" && grandparent == ".grove" {
+				found = append(found, p)
+			}
+			return nil
+		})
+		if err != nil {
+			m.ulog.Warn("Env state walk encountered error").
+				Err(err).
+				Field("base", base).
+				Log(ctx)
+		}
+	}
+	return found
 }
 
 // cleanupStaleEnv tears down the side effects of a stale RunningEnv — one whose
