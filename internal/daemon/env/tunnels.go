@@ -18,20 +18,34 @@ type activeTunnel struct {
 	cmd    *exec.Cmd
 	cancel context.CancelFunc
 	log    *os.File
+	pgid   int
 }
 
 // TunnelManager orchestrates background tunnel processes tied to worktree lifecycles.
 type TunnelManager struct {
-	mu      sync.Mutex
-	tunnels map[string]*activeTunnel // Keyed by "worktree/name"
-	ulog    *logging.UnifiedLogger
+	mu         sync.Mutex
+	tunnels    map[string]*activeTunnel // Keyed by "worktree/name"
+	supervisor NativeSupervisor
+	ulog       *logging.UnifiedLogger
 }
 
-// NewTunnelManager creates a new tunnel manager.
+// NewTunnelManager creates a new tunnel manager backed by the default
+// PGID supervisor. Kept for backward compatibility with callers/tests that
+// don't want to wire a manager-owned supervisor.
 func NewTunnelManager() *TunnelManager {
+	return NewTunnelManagerWithSupervisor(NewPGIDSupervisor())
+}
+
+// NewTunnelManagerWithSupervisor creates a tunnel manager that delegates
+// process spawning + stopping to the supplied NativeSupervisor.
+func NewTunnelManagerWithSupervisor(supervisor NativeSupervisor) *TunnelManager {
+	if supervisor == nil {
+		supervisor = NewPGIDSupervisor()
+	}
 	return &TunnelManager{
-		tunnels: make(map[string]*activeTunnel),
-		ulog:    logging.NewUnifiedLogger("groved.env.tunnels"),
+		tunnels:    make(map[string]*activeTunnel),
+		supervisor: supervisor,
+		ulog:       logging.NewUnifiedLogger("groved.env.tunnels"),
 	}
 }
 
@@ -49,15 +63,19 @@ type TunnelContext struct {
 // via output_env_map). Pass nil if no extra env is needed.
 // If logDir is non-empty, stdout+stderr are captured to <logDir>/tunnel-<name>.log so that
 // errors from the underlying command (e.g. gcloud auth failures) are visible to the user.
-func (tm *TunnelManager) Start(parentCtx context.Context, worktree, name, cmdTemplate string, port int, workspaceDir string, envVars map[string]string, logDir string) error {
+//
+// The returned int is the supervisor-assigned PGID for the spawned tunnel
+// process. Callers persist it into EnvStateFile.NativePGIDs so the daemon
+// can reap the tunnel tree after a restart.
+func (tm *TunnelManager) Start(parentCtx context.Context, worktree, name, cmdTemplate string, port int, workspaceDir string, envVars map[string]string, logDir string) (int, error) {
 	tmpl, err := template.New("tunnel").Parse(cmdTemplate)
 	if err != nil {
-		return fmt.Errorf("invalid tunnel command template: %w", err)
+		return 0, fmt.Errorf("invalid tunnel command template: %w", err)
 	}
 
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, TunnelContext{AllocatedPort: port}); err != nil {
-		return fmt.Errorf("failed to render tunnel command: %w", err)
+		return 0, fmt.Errorf("failed to render tunnel command: %w", err)
 	}
 	renderedCmd := buf.String()
 
@@ -96,25 +114,27 @@ func (tm *TunnelManager) Start(parentCtx context.Context, worktree, name, cmdTem
 		}
 	}
 
-	if err := cmd.Start(); err != nil {
+	pgid, err := tm.supervisor.Spawn(parentCtx, "tunnel-"+name, cmd)
+	if err != nil {
 		cancel()
 		if logFile != nil {
 			logFile.Close()
 		}
-		return fmt.Errorf("failed to start tunnel %s: %w", name, err)
+		return 0, fmt.Errorf("failed to start tunnel %s: %w", name, err)
 	}
 
 	key := worktree + "/" + name
 	tm.mu.Lock()
-	tm.tunnels[key] = &activeTunnel{cmd: cmd, cancel: cancel, log: logFile}
+	tm.tunnels[key] = &activeTunnel{cmd: cmd, cancel: cancel, log: logFile, pgid: pgid}
 	tm.mu.Unlock()
 
 	tm.ulog.Debug("Tunnel started").
 		Field("worktree", worktree).
 		Field("tunnel", name).
 		Field("port", port).
+		Field("pgid", pgid).
 		Log(parentCtx)
-	return nil
+	return pgid, nil
 }
 
 // StopAll kills all running tunnel processes for the given worktree.

@@ -31,9 +31,10 @@ type RunningEnv struct {
 
 // Manager is the central coordinator for all active environments.
 type Manager struct {
-	Ports   *PortAllocator
-	Proxy   *ProxyManager
-	Tunnels *TunnelManager
+	Ports      *PortAllocator
+	Proxy      *ProxyManager
+	Tunnels    *TunnelManager
+	Supervisor NativeSupervisor
 
 	mu   sync.Mutex
 	envs map[string]*RunningEnv // Keyed by worktree name
@@ -42,12 +43,14 @@ type Manager struct {
 
 // NewManager creates a new environment manager.
 func NewManager() *Manager {
+	supervisor := NewPGIDSupervisor()
 	return &Manager{
-		Ports:   NewPortAllocator(),
-		Proxy:   NewProxyManager(),
-		Tunnels: NewTunnelManager(),
-		envs:    make(map[string]*RunningEnv),
-		ulog:    logging.NewUnifiedLogger("groved.env.manager"),
+		Ports:      NewPortAllocator(),
+		Proxy:      NewProxyManager(),
+		Tunnels:    NewTunnelManagerWithSupervisor(supervisor),
+		Supervisor: supervisor,
+		envs:       make(map[string]*RunningEnv),
+		ulog:       logging.NewUnifiedLogger("groved.env.manager"),
 	}
 }
 

@@ -294,7 +294,8 @@ func (m *Manager) startLocalServices(
 			Field("order", entry.Order).
 			Log(ctx)
 
-		if err := cmd.Start(); err != nil {
+		pgid, err := m.Supervisor.Spawn(ctx, svcName, cmd)
+		if err != nil {
 			cancel()
 			if logFile != nil {
 				logFile.Close()
@@ -303,6 +304,12 @@ func (m *Manager) startLocalServices(
 			return fmt.Errorf("failed to start service %s: %w", svcName, err)
 		}
 		runningEnv.Processes[svcName] = cmd
+		if pgid > 0 {
+			if runningEnv.NativePGIDs == nil {
+				runningEnv.NativePGIDs = make(map[string]int)
+			}
+			runningEnv.NativePGIDs[svcName] = pgid
+		}
 		started = append(started, svcName)
 
 		go func(name string, c *exec.Cmd, lf *os.File) {

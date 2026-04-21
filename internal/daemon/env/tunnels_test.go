@@ -31,9 +31,12 @@ func TestTunnelManager_StartAndStop(t *testing.T) {
 	ctx := context.Background()
 
 	// Start a simple sleep command as a tunnel
-	err := tm.Start(ctx, "demo", "db", "sleep 60", 5432, "", nil, "")
+	pgid, err := tm.Start(ctx, "demo", "db", "sleep 60", 5432, "", nil, "")
 	if err != nil {
 		t.Fatalf("failed to start tunnel: %v", err)
+	}
+	if pgid <= 0 {
+		t.Errorf("expected non-zero pgid from supervisor.Spawn, got %d", pgid)
 	}
 
 	// Verify tunnel is tracked
@@ -88,7 +91,7 @@ func TestTunnelManager_InvalidTemplate(t *testing.T) {
 	tm := NewTunnelManager()
 
 	ctx := context.Background()
-	err := tm.Start(ctx, "demo", "bad", "{{.Invalid", 5432, "", nil, "")
+	_, err := tm.Start(ctx, "demo", "bad", "{{.Invalid", 5432, "", nil, "")
 	if err == nil {
 		t.Error("expected error for invalid template")
 	}

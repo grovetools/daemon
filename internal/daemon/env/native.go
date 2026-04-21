@@ -90,12 +90,19 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 			}
 			runningEnv.Ports["tunnel-"+tunnelName] = port
 
-			if err := m.Tunnels.Start(context.Background(), worktree, tunnelName, cmdStr, port, req.Workspace.Path, resp.EnvVars, logDir); err != nil {
+			pgid, err := m.Tunnels.Start(context.Background(), worktree, tunnelName, cmdStr, port, req.Workspace.Path, resp.EnvVars, logDir)
+			if err != nil {
 				m.ulog.Warn("Failed to start tunnel").
 					Err(err).
 					Field("tunnel", tunnelName).
 					Log(ctx)
 				continue
+			}
+			if pgid > 0 {
+				if runningEnv.NativePGIDs == nil {
+					runningEnv.NativePGIDs = make(map[string]int)
+				}
+				runningEnv.NativePGIDs["tunnel-"+tunnelName] = pgid
 			}
 
 			if localPortEnv != "" {
