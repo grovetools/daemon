@@ -173,7 +173,7 @@ func (m *Manager) nativeDown(ctx context.Context, req coreenv.EnvRequest) (*core
 	}
 
 	m.Tunnels.StopAll(worktree)
-	m.Proxy.Unregister(worktree)
+	m.unregisterProxyRoutes(ctx, worktree)
 	m.Ports.ReleaseAll(worktree)
 
 	return &coreenv.EnvResponse{Status: "stopped"}, nil

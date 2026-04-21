@@ -428,7 +428,7 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 
 	// Stop tunnels and unregister proxy routes
 	m.Tunnels.StopAll(worktree)
-	m.Proxy.Unregister(worktree)
+	m.unregisterProxyRoutes(ctx, worktree)
 	m.Ports.ReleaseAll(worktree)
 
 	if skipDestroy {

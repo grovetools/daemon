@@ -50,8 +50,9 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	}
 
 	resp := &coreenv.EnvResponse{
-		Status:  "running",
-		EnvVars: make(map[string]string),
+		Status:      "running",
+		EnvVars:     make(map[string]string),
+		ProxyRoutes: make(map[string]int),
 	}
 
 	override := ComposeOverride{Services: make(map[string]ComposeService)}
@@ -103,7 +104,8 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		}
 
 		if route != "" {
-			m.Proxy.Register(worktree, route, hostPort)
+			m.registerProxyRoute(ctx, worktree, route, hostPort)
+			resp.ProxyRoutes[route] = hostPort
 			resp.Endpoints = append(resp.Endpoints, fmt.Sprintf("http://%s.%s.grove.local:8443", route, worktree))
 		}
 
@@ -345,7 +347,7 @@ func (m *Manager) dockerDown(ctx context.Context, req coreenv.EnvRequest) (*core
 		_ = os.Remove(filepath.Join(dir, "docker-compose.override.yml"))
 	}
 
-	m.Proxy.Unregister(worktree)
+	m.unregisterProxyRoutes(ctx, worktree)
 	m.Ports.ReleaseAll(worktree)
 
 	return &coreenv.EnvResponse{Status: "stopped"}, nil

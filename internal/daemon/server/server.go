@@ -64,6 +64,13 @@ type Server struct {
 	envManager     *daemonenv.Manager
 	channelManager *channels.Manager
 
+	// scope is the daemon's configured ecosystem scope — empty for the
+	// global/unscoped daemon, non-empty for scoped daemons. Proxy
+	// registration handlers gate on this: only the global daemon accepts
+	// RegisterProxyRoute / UnregisterProxyRoutes, so scoped daemons can't
+	// accidentally grow a competing route table.
+	scope string
+
 	// PTY session manager for daemon-owned PTY sessions.
 	ptyManager *daemonpty.Manager
 
@@ -147,6 +154,13 @@ func (s *Server) SetChannelManager(m *channels.Manager) {
 	s.channelManager = m
 }
 
+// SetScope records whether this daemon is global ("") or scoped (non-empty).
+// Proxy handlers consult this to 400 scoped-daemon requests, matching the
+// "only the global daemon owns the route table" architectural invariant.
+func (s *Server) SetScope(scope string) {
+	s.scope = scope
+}
+
 // SetPtyManager sets the PTY session manager for the server.
 func (s *Server) SetPtyManager(m *daemonpty.Manager) {
 	s.ptyManager = m
@@ -215,6 +229,9 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/env/up", s.handleEnvUp)
 	mux.HandleFunc("/api/env/down", s.handleEnvDown)
 	mux.HandleFunc("/api/env/status", s.handleEnvStatus)
+	// Global-proxy route registration (global daemon only)
+	mux.HandleFunc("/api/proxy/register", s.handleProxyRegister)
+	mux.HandleFunc("/api/proxy/unregister", s.handleProxyUnregister)
 	// Job management endpoints
 	mux.HandleFunc("/api/jobs/", s.handleJobByID)
 	mux.HandleFunc("/api/jobs", s.handleJobs)
@@ -1890,6 +1907,65 @@ func (s *Server) handleEnvDown(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// handleProxyRegister handles POST /api/proxy/register. The global
+// (unscoped) daemon owns the *.grove.local route table bound to :8443;
+// scoped daemons delegate every Register to it via this RPC. Scoped
+// daemons return 400 so a misrouted request fails loudly instead of
+// silently painting onto a local map nothing else reads.
+func (s *Server) handleProxyRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		http.Error(w, "proxy registration is only served by the global (unscoped) daemon", http.StatusBadRequest)
+		return
+	}
+	if s.envManager == nil {
+		http.Error(w, "env manager not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	var req coreenv.ProxyRouteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Worktree == "" || req.Route == "" || req.Port <= 0 {
+		http.Error(w, "worktree, route, and positive port are required", http.StatusBadRequest)
+		return
+	}
+	s.envManager.Proxy.Register(req.Worktree, req.Route, req.Port)
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleProxyUnregister handles POST /api/proxy/unregister. Drops every
+// route keyed by the posted worktree; no-op if nothing was registered.
+func (s *Server) handleProxyUnregister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		http.Error(w, "proxy registration is only served by the global (unscoped) daemon", http.StatusBadRequest)
+		return
+	}
+	if s.envManager == nil {
+		http.Error(w, "env manager not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	var req coreenv.ProxyUnregisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Worktree == "" {
+		http.Error(w, "worktree is required", http.StatusBadRequest)
+		return
+	}
+	s.envManager.Proxy.Unregister(req.Worktree)
+	w.WriteHeader(http.StatusOK)
 }
 
 // --- Channel Management Handlers ---

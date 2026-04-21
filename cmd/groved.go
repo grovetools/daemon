@@ -315,14 +315,22 @@ func newGrovedStartCmd() *cobra.Command {
 			basePaths := envBasePathsFromConfig(cfg)
 			envManager.Restore(basePaths)
 
-			// Start proxy server in background on standard grove proxy port
-			go func() {
-				if err := envManager.Proxy.ListenAndServe(":8443"); err != nil {
-					ulog.Warn("Proxy server stopped").Err(err).Log(context.Background())
-				}
-			}()
+			// Only the global (unscoped) daemon binds :8443 — it owns the
+			// shared *.grove.local proxy table. Scoped daemons inject a
+			// client handle so they RPC their routes over to the global
+			// daemon rather than maintaining their own (conflicting) bind.
+			if scope == "" {
+				go func() {
+					if err := envManager.Proxy.ListenAndServe(":8443"); err != nil {
+						ulog.Warn("Proxy server stopped").Err(err).Log(context.Background())
+					}
+				}()
+			} else {
+				envManager.SetGlobalClient(daemon.NewGlobalClient())
+			}
 
 			srv := server.New(autoShutdown)
+			srv.SetScope(scope)
 			srv.SetEngine(eng)
 			srv.SetEnvManager(envManager)
 			if jr != nil {

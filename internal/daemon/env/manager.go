@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/daemon"
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/workspace"
 )
@@ -38,6 +39,12 @@ type Manager struct {
 	Tunnels    *TunnelManager
 	Supervisor NativeSupervisor
 
+	// globalClient, when non-nil, means this manager runs inside a scoped
+	// daemon. Proxy route registration flows via RPC to the global daemon
+	// (which owns the actual :8443 listener) instead of m.Proxy. When nil,
+	// this manager IS the global daemon and uses m.Proxy directly.
+	globalClient daemon.Client
+
 	mu   sync.Mutex
 	envs map[string]*RunningEnv // Keyed by worktree name
 	ulog *logging.UnifiedLogger
@@ -54,6 +61,49 @@ func NewManager() *Manager {
 		envs:       make(map[string]*RunningEnv),
 		ulog:       logging.NewUnifiedLogger("groved.env.manager"),
 	}
+}
+
+// SetGlobalClient wires a daemon client that points at the global (unscoped)
+// daemon. Scoped daemons call this at startup so Up/Down can delegate proxy
+// route registration to the global daemon. Global daemons leave it nil and
+// mutate m.Proxy directly.
+func (m *Manager) SetGlobalClient(c daemon.Client) {
+	m.globalClient = c
+}
+
+// registerProxyRoute applies a route to the authoritative proxy table. On the
+// global daemon this writes m.Proxy; on a scoped daemon it RPCs the global
+// daemon via m.globalClient. RPC failure is logged but not returned — the env
+// itself is usable on the allocated port, only the *.grove.local hostname
+// degrades, which is a better failure mode than killing Up entirely.
+func (m *Manager) registerProxyRoute(ctx context.Context, worktree, route string, port int) {
+	if m.globalClient != nil {
+		if err := m.globalClient.RegisterProxyRoute(ctx, worktree, route, port); err != nil {
+			m.ulog.Warn("Failed to register proxy route with global daemon").
+				Err(err).
+				Field("worktree", worktree).
+				Field("route", route).
+				Field("port", port).
+				Log(ctx)
+		}
+		return
+	}
+	m.Proxy.Register(worktree, route, port)
+}
+
+// unregisterProxyRoutes drops every route keyed by the worktree. Mirrors
+// registerProxyRoute's routing: RPC on scoped daemons, local on global.
+func (m *Manager) unregisterProxyRoutes(ctx context.Context, worktree string) {
+	if m.globalClient != nil {
+		if err := m.globalClient.UnregisterProxyRoutes(ctx, worktree); err != nil {
+			m.ulog.Warn("Failed to unregister proxy routes with global daemon").
+				Err(err).
+				Field("worktree", worktree).
+				Log(ctx)
+		}
+		return
+	}
+	m.Proxy.Unregister(worktree)
 }
 
 // Up starts an environment based on the provider specified in the request.
@@ -93,7 +143,7 @@ func (m *Manager) Up(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvR
 		}
 		m.mu.Unlock()
 		m.Tunnels.StopAll(worktree)
-		m.Proxy.Unregister(worktree)
+		m.unregisterProxyRoutes(ctx, worktree)
 		m.Ports.ReleaseAll(worktree)
 		m.ulog.Info("Rolled back failed environment registration").Field("worktree", worktree).Log(ctx)
 		return resp, err
@@ -242,6 +292,7 @@ func (m *Manager) writeStateFile(ctx context.Context, req coreenv.EnvRequest, re
 		Endpoints:     resp.Endpoints,
 		CleanupPaths:  resp.CleanupPaths,
 		Volumes:       resp.Volumes,
+		ProxyRoutes:   resp.ProxyRoutes,
 		State:         resp.State,
 	}
 
@@ -392,6 +443,17 @@ func (m *Manager) Restore(basePaths []string) {
 			worktree = filepath.Base(filepath.Dir(filepath.Dir(stateDir)))
 		}
 
+		// Re-register every persisted proxy route on the local m.Proxy. On
+		// the global daemon this rebuilds the shared *.grove.local routing
+		// table on boot. On scoped daemons it's a cheap local write that
+		// nothing listens on (they don't bind :8443), so harmless.
+		for route, port := range stateFile.ProxyRoutes {
+			if route == "" || port <= 0 {
+				continue
+			}
+			m.Proxy.Register(worktree, route, port)
+		}
+
 		if stateFile.Provider == "native" {
 			for _, svc := range stateFile.Services {
 				containerName := fmt.Sprintf("grove-%s-%s", worktree, svc.Name)
@@ -429,6 +491,7 @@ func (m *Manager) Restore(basePaths []string) {
 			Field("worktree", worktree).
 			Field("provider", stateFile.Provider).
 			Field("services", len(stateFile.Ports)).
+			Field("proxy_routes", len(stateFile.ProxyRoutes)).
 			Field("path", statePath).
 			Log(ctx)
 	}
@@ -505,9 +568,10 @@ func (m *Manager) cleanupStaleEnv(ctx context.Context, worktree string, runningE
 	if m.Tunnels != nil {
 		m.Tunnels.StopAll(worktree)
 	}
-	if m.Proxy != nil {
-		m.Proxy.Unregister(worktree)
-	}
+	// Unregister routes with whichever proxy owns the worktree's routes:
+	// RPC to the global daemon when we're a scoped daemon, local m.Proxy
+	// when we are the global daemon ourselves.
+	m.unregisterProxyRoutes(ctx, worktree)
 	if m.Ports != nil {
 		m.Ports.ReleaseAll(worktree)
 	}
@@ -555,12 +619,13 @@ func (m *Manager) reconcileExistingEnv(ctx context.Context, worktree string) (bo
 
 // Shutdown tears down all running environments for graceful daemon shutdown.
 func (m *Manager) Shutdown() {
+	ctx := context.Background()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	for worktree := range m.envs {
 		m.Tunnels.StopAll(worktree)
-		m.Proxy.Unregister(worktree)
+		m.unregisterProxyRoutes(ctx, worktree)
 		m.Ports.ReleaseAll(worktree)
 	}
 	m.envs = make(map[string]*RunningEnv)
