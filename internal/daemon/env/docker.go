@@ -202,6 +202,32 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		return nil, fmt.Errorf("failed to write compose override: %w", err)
 	}
 
+	// Pre-start bootstrap hooks run on the host before `docker compose up`
+	// so bind-mounted working dirs (e.g. node_modules) are populated before
+	// containers start. Same schema as the native path; runs with baseEnv +
+	// resp.EnvVars so host-side setup sees allocated ports.
+	for svcName, svcConfigRaw := range services {
+		svcConfig, ok := svcConfigRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		wd := req.Workspace.Path
+		if v, ok := svcConfig["working_dir"].(string); ok && v != "" {
+			if filepath.IsAbs(v) {
+				wd = v
+			} else {
+				wd = filepath.Join(req.Workspace.Path, v)
+			}
+		}
+		bootEnv := append([]string{}, baseEnv...)
+		for k, v := range resp.EnvVars {
+			bootEnv = append(bootEnv, fmt.Sprintf("%s=%s", k, v))
+		}
+		if err := m.runServiceBootstrap(ctx, svcName, svcConfig, wd, bootEnv, logDir); err != nil {
+			return nil, err
+		}
+	}
+
 	// Execute Docker Compose
 	projectName := fmt.Sprintf("grove-%s", worktree)
 	baseComposeAbs := filepath.Join(req.Workspace.Path, baseComposeFile)
