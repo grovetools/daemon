@@ -125,6 +125,9 @@ func newGrovedStartCmd() *cobra.Command {
 			if scope != "" {
 				scope = workspace.ResolveScope(scope)
 			}
+			// Export GROVE_SCOPE so jobrunner and any PTYs spawned by this
+			// daemon inherit the scope naturally via os.Environ().
+			os.Setenv("GROVE_SCOPE", scope)
 
 			pidPath, _ := cmd.Flags().GetString("pidfile")
 			if pidPath == "" {
