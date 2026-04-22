@@ -354,10 +354,12 @@ func newGrovedStartCmd() *cobra.Command {
 				return srv.SendSessionInput(ctx, jobID, message)
 			}
 
-			// Initialize channel manager if signal is configured
+			// Initialize channel manager if signal is configured.
+			// Declared at outer scope so the shutdown goroutine can call Stop().
+			var chMgr *daemonchannels.Manager
 			notifyCfg := notifyconfig.Load()
 			if notifyCfg.Signal.Enabled {
-				chMgr := daemonchannels.NewManager(st, daemonchannels.SignalConfig{
+				chMgr = daemonchannels.NewManager(st, daemonchannels.SignalConfig{
 					Enabled:   notifyCfg.Signal.Enabled,
 					CLIPath:   notifyCfg.Signal.CLIPath,
 					Account:   notifyCfg.Signal.Account,
@@ -425,6 +427,12 @@ func newGrovedStartCmd() *cobra.Command {
 				ptyManager.Shutdown() // Kill all daemon-owned PTY sessions
 				envManager.Shutdown() // Teardown all running environments and proxy routes
 				streamer.Stop()       // Stop all log tailing goroutines
+				if chMgr != nil {
+					// Stop signal-cli daemon subprocess so it doesn't orphan.
+					// A fresh signal-cli is spawned on the next groved boot,
+					// restoring the stdout reader + cross-daemon inbound routing.
+					chMgr.Stop(bgCtx)
+				}
 				if sshServer != nil {
 					_ = sshServer.Stop()
 				}
