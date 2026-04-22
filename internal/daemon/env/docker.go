@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/grovetools/core/pkg/build"
 	coreenv "github.com/grovetools/core/pkg/env"
 	"gopkg.in/yaml.v3"
 )
@@ -18,6 +19,7 @@ type ComposeOverride struct {
 
 // ComposeService represents a single service in the compose override.
 type ComposeService struct {
+	Image   string   `yaml:"image,omitempty"`
 	Ports   []string `yaml:"ports"`
 	Volumes []string `yaml:"volumes,omitempty"`
 }
@@ -53,7 +55,11 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		Status:      "running",
 		EnvVars:     make(map[string]string),
 		ProxyRoutes: make(map[string]int),
+		State:       make(map[string]string),
 	}
+
+	// Read prior state (pre-up) so buildImagesIfStale can compare fingerprints.
+	priorState, _ := m.readStateFile(req)
 
 	override := ComposeOverride{Services: make(map[string]ComposeService)}
 	baseComposeFile := "docker-compose.yml"
@@ -192,6 +198,22 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		override.Services[svcName] = svc
 	}
 
+	// Gate image builds on a content fingerprint of each context. New or
+	// changed contexts (or a --rebuild flag) trigger `docker build`;
+	// unchanged contexts reuse the previously-tagged image.
+	imageTags, err := m.buildImagesIfStale(ctx, req, resp, priorState)
+	if err != nil {
+		return nil, err
+	}
+	// Patch the compose override so compose consumes the pre-built image
+	// instead of re-running its own build: block. Create entries for image
+	// services that aren't already in the override (e.g. no container_port).
+	for svc, tag := range imageTags {
+		cs := override.Services[svc]
+		cs.Image = tag
+		override.Services[svc] = cs
+	}
+
 	// Write override YAML to plan directory to avoid dirtying the git working tree
 	overrideBytes, err := yaml.Marshal(&override)
 	if err != nil {
@@ -328,6 +350,124 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	}
 
 	return resp, nil
+}
+
+// buildImagesIfStale inspects req.Config["images"], computes a deterministic
+// fingerprint of each build context, and runs `docker build` when the
+// fingerprint has changed or a matching --rebuild entry is set. Successful
+// builds write the new fingerprint into resp.State under "fingerprint_<svc>".
+// Skipped builds carry the prior fingerprint forward so subsequent runs
+// don't regress to "no prior fingerprint".
+//
+// Failure behavior:
+//   - Fingerprint compute error → return error (fail-closed).
+//   - Docker build error → return error, fingerprint NOT stored (next run retries).
+//   - Missing prior fingerprint → treated as a mismatch → rebuild (fail-open).
+func (m *Manager) buildImagesIfStale(ctx context.Context, req coreenv.EnvRequest, resp *coreenv.EnvResponse, prior *coreenv.EnvStateFile) (map[string]string, error) {
+	images, ok := req.Config["images"].(map[string]interface{})
+	if !ok || len(images) == 0 {
+		return nil, nil
+	}
+	if resp.State == nil {
+		resp.State = make(map[string]string)
+	}
+
+	worktree := req.Workspace.Name
+	workspaceRoot := req.Workspace.Path
+	logsDir := filepath.Join(req.EffectiveStateDir(), "logs")
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		return nil, fmt.Errorf("create logs dir: %w", err)
+	}
+
+	result := make(map[string]string, len(images))
+
+	for svc, cfgRaw := range images {
+		cfg, ok := cfgRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// `cmd`-based images are terraform-profile territory (Phase B).
+		// Skip them here so docker-local doesn't try to docker-build a
+		// service whose config only defines a gcloud submit command.
+		if c, _ := cfg["cmd"].(string); c != "" {
+			continue
+		}
+
+		ctxPath, _ := cfg["context"].(string)
+		if ctxPath == "" {
+			ctxPath = "."
+		}
+		dockerfile, _ := cfg["dockerfile"].(string)
+
+		absCtx := ctxPath
+		if !filepath.IsAbs(absCtx) {
+			absCtx = filepath.Join(workspaceRoot, absCtx)
+		}
+
+		absDockerfile := dockerfile
+		if absDockerfile == "" {
+			absDockerfile = filepath.Join(absCtx, "Dockerfile")
+		} else if !filepath.IsAbs(absDockerfile) {
+			absDockerfile = filepath.Join(workspaceRoot, absDockerfile)
+		}
+
+		imageTag := fmt.Sprintf("grove-%s-%s:latest", worktree, svc)
+		result[svc] = imageTag
+
+		hash, herr := build.HashContext(absCtx, absDockerfile)
+		if herr != nil {
+			return nil, fmt.Errorf("fingerprint %s: %w", svc, herr)
+		}
+
+		priorHash := ""
+		if prior != nil && prior.State != nil {
+			priorHash = prior.State["fingerprint_"+svc]
+		}
+
+		reason := ""
+		switch {
+		case req.ForceRebuild(svc):
+			reason = "force"
+		case priorHash == "":
+			reason = "no prior fingerprint"
+		case priorHash != hash:
+			reason = "fingerprint mismatch"
+		}
+
+		if reason == "" {
+			m.ulog.Info("Image up-to-date").
+				Field("service", svc).
+				Field("fingerprint", hash).
+				Log(ctx)
+			resp.State["fingerprint_"+svc] = priorHash
+			continue
+		}
+
+		m.ulog.Info("Image build").
+			Field("service", svc).
+			Field("reason", reason).
+			Field("tag", imageTag).
+			Log(ctx)
+
+		args := []string{"build", "-t", imageTag}
+		if absDockerfile != "" {
+			args = append(args, "-f", absDockerfile)
+		}
+		args = append(args, absCtx)
+
+		buildCmd := exec.CommandContext(ctx, "docker", args...)
+		buildCmd.Dir = workspaceRoot
+		logFile := filepath.Join(logsDir, "build-"+svc+".log")
+		out, berr := buildCmd.CombinedOutput()
+		_ = os.WriteFile(logFile, out, 0644)
+		if berr != nil {
+			return nil, fmt.Errorf("docker build failed for %s: %w\nSee log: %s", svc, berr, logFile)
+		}
+		resp.State["fingerprint_"+svc] = hash
+	}
+
+	return result, nil
 }
 
 // dockerDown tears down the docker compose stack and cleans up routes/ports.
