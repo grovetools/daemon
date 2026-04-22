@@ -8,6 +8,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -643,20 +644,49 @@ func newGrovedStopCmd() *cobra.Command {
 func newGrovedStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
-		Short: "Check daemon status",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			pidPath := paths.PidFilePath()
-			running, pid, err := pidfile.IsRunning(pidPath)
+		Short: "List all groved daemons (running and stale)",
+		Long: `Enumerate every groved pidfile under the state dir and report whether
+each daemon is running. Running daemons show PID, scope, age, and socket
+path. Stale pidfiles (PID gone, file left behind) are listed separately.
 
+Exits 0 if at least one running daemon is found; exits 1 if none.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			entries, err := enumerateDaemons()
 			if err != nil {
-				return fmt.Errorf("error: %w", err)
+				return fmt.Errorf("enumerate: %w", err)
 			}
 
-			if running {
-				fmt.Printf("Running (PID: %d)\nSocket: %s\n", pid, paths.SocketPath())
-			} else {
-				fmt.Println("Stopped")
-				os.Exit(1) // Return non-zero for stopped state (useful for scripts)
+			var running, stale []daemonEntry
+			for _, e := range entries {
+				if e.Running {
+					running = append(running, e)
+				} else {
+					stale = append(stale, e)
+				}
+			}
+
+			if len(running) == 0 {
+				fmt.Println("No daemons running")
+				if len(stale) > 0 {
+					fmt.Printf("\nStale pidfiles (%d):\n", len(stale))
+					for _, e := range stale {
+						fmt.Printf("  %s (last PID %d)\n", filepath.Base(e.PidPath), e.PID)
+					}
+				}
+				os.Exit(1)
+			}
+
+			fmt.Printf("%-8s  %-32s  %-10s  %s\n", "PID", "SCOPE", "AGE", "SOCKET")
+			for _, e := range running {
+				fmt.Printf("%-8d  %-32s  %-10s  %s\n",
+					e.PID, displayScope(e.Scope), e.Age, filepath.Base(e.SockPath))
+			}
+
+			if len(stale) > 0 {
+				fmt.Printf("\nStale pidfiles (%d):\n", len(stale))
+				for _, e := range stale {
+					fmt.Printf("  %s (last PID %d — not running)\n", filepath.Base(e.PidPath), e.PID)
+				}
 			}
 			return nil
 		},

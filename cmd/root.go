@@ -24,6 +24,7 @@ func init() {
 	rootCmd.AddCommand(newGrovedStartCmd())
 	rootCmd.AddCommand(newGrovedStopCmd())
 	rootCmd.AddCommand(newGrovedStatusCmd())
+	rootCmd.AddCommand(newGrovedKillCmd())
 	rootCmd.AddCommand(newGrovedConfigCmd())
 	rootCmd.AddCommand(newGrovedMonitorCmd())
 }
