@@ -11,9 +11,17 @@ import (
 	"os"
 
 	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/models"
 	memory "github.com/grovetools/memory/pkg/memory"
 )
+
+// forwardToGlobal returns a daemon client pointed at the global daemon so
+// scoped daemons can proxy /api/memory/* without opening their own SQLite
+// connection. The global daemon is auto-started if not running.
+func (s *Server) forwardToGlobal() daemon.Client {
+	return daemon.NewGlobalClient()
+}
 
 // SetMemoryStore wires the memory store + embedder into the server so HTTP
 // handlers can serve /api/memory/* requests. Called from cmd/groved.go after
@@ -30,14 +38,27 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.memStore == nil {
-		http.Error(w, "memory store not initialized", http.StatusServiceUnavailable)
-		return
-	}
 
 	var req models.MemorySearchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Scoped daemons proxy to the global daemon, which owns the SQLite DB.
+	if s.scope != "" {
+		results, err := s.forwardToGlobal().SearchMemory(r.Context(), req)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("forward search failed: %v", err), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(results)
+		return
+	}
+
+	if s.memStore == nil {
+		http.Error(w, "memory store not initialized", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -106,14 +127,26 @@ func (s *Server) handleMemoryCoverage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.memStore == nil {
-		http.Error(w, "memory store not initialized", http.StatusServiceUnavailable)
-		return
-	}
 
 	var req models.MemoryCoverageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if s.scope != "" {
+		report, err := s.forwardToGlobal().GetMemoryCoverage(r.Context(), req)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("forward coverage failed: %v", err), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(report)
+		return
+	}
+
+	if s.memStore == nil {
+		http.Error(w, "memory store not initialized", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -155,6 +188,18 @@ func (s *Server) handleMemoryStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	if s.scope != "" {
+		status, err := s.forwardToGlobal().GetMemoryStatus(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("forward status failed: %v", err), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(status)
+		return
+	}
+
 	if s.memStore == nil {
 		http.Error(w, "memory store not initialized", http.StatusServiceUnavailable)
 		return

@@ -505,7 +505,10 @@ func newGrovedStartCmd() *cobra.Command {
 					ulog.Info("Note handler registered with unified watcher").Log(ctx)
 				}
 
-				// Register MemoryHandler for auto-indexing content
+				// Register MemoryHandler for auto-indexing content.
+				// Only the global daemon owns the SQLite DB and embedder; scoped
+				// daemons proxy /api/memory/* to global via server-side forwarding.
+				if scope == "" {
 				dbPath, err := pathutil.Expand("~/.local/share/grove/memory/memory.db")
 				if err == nil {
 					memStore, err := memory.Open(dbPath, 3072) // gemini-embedding-001 outputs 3072 dimensions
@@ -529,6 +532,7 @@ func newGrovedStartCmd() *cobra.Command {
 							srv.SetMemoryStore(memStore, embedder, dbPath)
 						}
 					}
+				}
 				}
 
 				ulog.Info("Unified watcher started").Log(ctx)
