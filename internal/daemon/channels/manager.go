@@ -96,11 +96,33 @@ func (m *Manager) Start(ctx context.Context) {
 
 	m.loadRoutes()
 
-	// Cross-check activeSessions against the store. The route file persists
-	// across daemon restarts but the in-memory session store does not, so we
-	// prune any entry whose session has gone missing to avoid routing inbound
-	// messages to ghost agents.
-	m.pruneStaleSessions(m.ctx)
+	if m.scope == "" && m.globalClient == nil {
+		// Global daemon: the local session store is ephemeral (empty
+		// immediately after restart; sessions live in scoped daemons OR
+		// get re-registered lazily by hooks on the next agent activity).
+		// Rebuild activeSessions from persisted state so cross-daemon
+		// claw survives a global-daemon restart.
+		//
+		// Two sources:
+		//   1. routing.json — jobIDs owned by scoped daemons (cross-daemon).
+		//   2. routeTable — jobIDs that had recent outbound traffic (local
+		//      sessions whose store entry will re-register via hooks).
+		m.mu.Lock()
+		if routes, err := readInboundRoutes(); err == nil {
+			for jobID := range routes {
+				m.activeSessions[jobID] = true
+			}
+		}
+		for _, jobID := range m.routeTable {
+			m.activeSessions[jobID] = true
+		}
+		m.mu.Unlock()
+	} else {
+		// Scoped / proxy daemon: activeSessions tracks local sessions.
+		// The store is authoritative — prune any activeSessions entry
+		// whose session has gone missing.
+		m.pruneStaleSessions(m.ctx)
+	}
 
 	// Subscribe to session end events for route cleanup
 	go m.watchSessionEnds(m.ctx)
@@ -108,7 +130,11 @@ func (m *Manager) Start(ctx context.Context) {
 	// Periodic route cleanup (TTL)
 	go m.routeCleanup(m.ctx)
 
-	m.ulog.Info("Channel manager started").Log(m.ctx)
+	m.ulog.Info("Channel manager started").
+		Field("scope", m.scope).
+		Field("active_sessions", len(m.activeSessions)).
+		Field("route_table_size", len(m.routeTable)).
+		Log(m.ctx)
 }
 
 // pruneStaleSessions drops any activeSessions entry whose backing store
@@ -426,16 +452,16 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 		return
 	}
 
-	// Route to agent
-	session := m.store.GetSession(targetJobID)
-	if session == nil {
-		m.ulog.Warn("Target session not found in store — pruning stale channel entry").
-			Field("job_id", targetJobID).
-			Log(ctx)
-		m.pruneSession(targetJobID)
-		return
-	}
-
+	// Route to agent.
+	//
+	// Note: we intentionally do NOT prune on a local store miss anymore.
+	// Under the cross-daemon model the global daemon's store is
+	// ephemeral — sessions live in scoped daemons, or in the global
+	// daemon but get repopulated lazily by hooks. A transient store miss
+	// immediately after daemon restart is normal and doesn't mean the
+	// session is dead. SendInput handles its own "session not found"
+	// error; we log and move on without mutating activeSessions. The
+	// periodic routeCleanup handles genuinely stale entries via TTL.
 	if m.SendInput == nil {
 		m.ulog.Error("SendInput not wired on Manager — message dropped").
 			Field("job_id", targetJobID).
@@ -443,19 +469,25 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 		return
 	}
 
+	session := m.store.GetSession(targetJobID)
 	taggedText := fmt.Sprintf("[via Signal] %s", text)
-	m.ulog.Info("Injecting signal message into agent").
+	injectLog := m.ulog.Info("Injecting signal message into agent").
 		Field("job_id", targetJobID).
-		Field("mux", session.Mux).
-		Field("tmux_target", session.TmuxTarget).
-		Field("pty_id", session.PtyID).
-		Field("input_len", len(taggedText)).
-		Log(ctx)
+		Field("input_len", len(taggedText))
+	if session != nil {
+		injectLog = injectLog.
+			Field("mux", session.Mux).
+			Field("tmux_target", session.TmuxTarget).
+			Field("pty_id", session.PtyID)
+	} else {
+		injectLog = injectLog.Field("store_entry", "missing")
+	}
+	injectLog.Log(ctx)
+
 	if err := m.SendInput(ctx, targetJobID, taggedText); err != nil {
 		m.ulog.Error("Failed to inject signal message into agent").
 			Err(err).
 			Field("job_id", targetJobID).
-			Field("mux", session.Mux).
 			Log(ctx)
 		return
 	}
