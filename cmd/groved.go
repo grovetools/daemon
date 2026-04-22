@@ -642,12 +642,15 @@ func newGrovedStopCmd() *cobra.Command {
 }
 
 func newGrovedStatusCmd() *cobra.Command {
-	return &cobra.Command{
+	var prune bool
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "List all groved daemons (running and stale)",
 		Long: `Enumerate every groved pidfile under the state dir and report whether
 each daemon is running. Running daemons show PID, scope, age, and socket
 path. Stale pidfiles (PID gone, file left behind) are listed separately.
+
+Pass --prune to remove stale pidfiles. Stale sockets are also unlinked.
 
 Exits 0 if at least one running daemon is found; exits 1 if none.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -665,32 +668,46 @@ Exits 0 if at least one running daemon is found; exits 1 if none.`,
 				}
 			}
 
-			if len(running) == 0 {
-				fmt.Println("No daemons running")
-				if len(stale) > 0 {
-					fmt.Printf("\nStale pidfiles (%d):\n", len(stale))
-					for _, e := range stale {
-						fmt.Printf("  %s (last PID %d)\n", filepath.Base(e.PidPath), e.PID)
-					}
+			if len(running) > 0 {
+				fmt.Printf("%-8s  %-32s  %-10s  %s\n", "PID", "SCOPE", "AGE", "SOCKET")
+				for _, e := range running {
+					fmt.Printf("%-8d  %-32s  %-10s  %s\n",
+						e.PID, displayScope(e.Scope), e.Age, filepath.Base(e.SockPath))
 				}
-				os.Exit(1)
-			}
-
-			fmt.Printf("%-8s  %-32s  %-10s  %s\n", "PID", "SCOPE", "AGE", "SOCKET")
-			for _, e := range running {
-				fmt.Printf("%-8d  %-32s  %-10s  %s\n",
-					e.PID, displayScope(e.Scope), e.Age, filepath.Base(e.SockPath))
+			} else {
+				fmt.Println("No daemons running")
 			}
 
 			if len(stale) > 0 {
-				fmt.Printf("\nStale pidfiles (%d):\n", len(stale))
-				for _, e := range stale {
-					fmt.Printf("  %s (last PID %d — not running)\n", filepath.Base(e.PidPath), e.PID)
+				if prune {
+					fmt.Printf("\nPruning %d stale pidfile(s):\n", len(stale))
+					for _, e := range stale {
+						if err := os.Remove(e.PidPath); err == nil {
+							fmt.Printf("  removed %s\n", filepath.Base(e.PidPath))
+						} else {
+							fmt.Printf("  failed %s: %v\n", filepath.Base(e.PidPath), err)
+						}
+						// Also unlink the orphaned socket if it still exists.
+						if _, err := os.Stat(e.SockPath); err == nil {
+							_ = os.Remove(e.SockPath)
+						}
+					}
+				} else {
+					fmt.Printf("\nStale pidfiles (%d) — pass --prune to remove:\n", len(stale))
+					for _, e := range stale {
+						fmt.Printf("  %s (last PID %d — not running)\n", filepath.Base(e.PidPath), e.PID)
+					}
 				}
+			}
+
+			if len(running) == 0 {
+				os.Exit(1)
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&prune, "prune", false, "Remove stale pidfiles (and their orphaned sockets)")
+	return cmd
 }
 
 func newGrovedConfigCmd() *cobra.Command {
