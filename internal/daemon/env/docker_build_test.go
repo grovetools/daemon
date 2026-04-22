@@ -54,7 +54,7 @@ func TestBuildImagesIfStale_SkipOnFingerprintMatch(t *testing.T) {
 		},
 	}
 	resp := &coreenv.EnvResponse{State: map[string]string{}}
-	prior := &coreenv.EnvStateFile{State: map[string]string{"fingerprint_api": hash}}
+	prior := map[string]string{"fingerprint_api": hash}
 
 	tags, err := m.buildImagesIfStale(context.Background(), req, resp, prior)
 	if err != nil {

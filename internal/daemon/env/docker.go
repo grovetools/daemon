@@ -2,6 +2,7 @@ package env
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -58,8 +59,8 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		State:       make(map[string]string),
 	}
 
-	// Read prior state (pre-up) so buildImagesIfStale can compare fingerprints.
-	priorState, _ := m.readStateFile(req)
+	// Read prior build fingerprints (survive across env down; state.json is deleted on down).
+	priorFingerprints := readBuildFingerprints(req.EffectiveStateDir())
 
 	override := ComposeOverride{Services: make(map[string]ComposeService)}
 	baseComposeFile := "docker-compose.yml"
@@ -201,7 +202,7 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	// Gate image builds on a content fingerprint of each context. New or
 	// changed contexts (or a --rebuild flag) trigger `docker build`;
 	// unchanged contexts reuse the previously-tagged image.
-	imageTags, err := m.buildImagesIfStale(ctx, req, resp, priorState)
+	imageTags, err := m.buildImagesIfStale(ctx, req, resp, priorFingerprints)
 	if err != nil {
 		return nil, err
 	}
@@ -212,6 +213,17 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		cs := override.Services[svc]
 		cs.Image = tag
 		override.Services[svc] = cs
+	}
+	// Persist the updated fingerprint cache so it survives `grove env down`,
+	// which deletes state.json.
+	if len(resp.State) > 0 {
+		fps := make(map[string]string, len(resp.State))
+		for k, v := range resp.State {
+			fps[k] = v
+		}
+		if werr := writeBuildFingerprints(req.EffectiveStateDir(), fps); werr != nil {
+			m.ulog.Warn("Failed to write build-fingerprints sidecar").Err(werr).Log(ctx)
+		}
 	}
 
 	// Write override YAML to plan directory to avoid dirtying the git working tree
@@ -363,7 +375,44 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 //   - Fingerprint compute error → return error (fail-closed).
 //   - Docker build error → return error, fingerprint NOT stored (next run retries).
 //   - Missing prior fingerprint → treated as a mismatch → rebuild (fail-open).
-func (m *Manager) buildImagesIfStale(ctx context.Context, req coreenv.EnvRequest, resp *coreenv.EnvResponse, prior *coreenv.EnvStateFile) (map[string]string, error) {
+// buildFingerprintsFile is a sidecar that survives across env down so the
+// fingerprint cache isn't wiped when state.json is deleted.
+const buildFingerprintsFile = "build-fingerprints.json"
+
+// readBuildFingerprints loads the sidecar map; returns an empty map when the
+// file is absent or unparseable (fail-open for a missing cache).
+func readBuildFingerprints(stateDir string) map[string]string {
+	if stateDir == "" {
+		return map[string]string{}
+	}
+	data, err := os.ReadFile(filepath.Join(stateDir, buildFingerprintsFile))
+	if err != nil {
+		return map[string]string{}
+	}
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil {
+		return map[string]string{}
+	}
+	return m
+}
+
+// writeBuildFingerprints persists the sidecar. Best-effort; failures don't
+// abort env up.
+func writeBuildFingerprints(stateDir string, m map[string]string) error {
+	if stateDir == "" || len(m) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(stateDir, buildFingerprintsFile), data, 0644)
+}
+
+func (m *Manager) buildImagesIfStale(ctx context.Context, req coreenv.EnvRequest, resp *coreenv.EnvResponse, prior map[string]string) (map[string]string, error) {
 	images, ok := req.Config["images"].(map[string]interface{})
 	if !ok || len(images) == 0 {
 		return nil, nil
@@ -421,8 +470,8 @@ func (m *Manager) buildImagesIfStale(ctx context.Context, req coreenv.EnvRequest
 		}
 
 		priorHash := ""
-		if prior != nil && prior.State != nil {
-			priorHash = prior.State["fingerprint_"+svc]
+		if prior != nil {
+			priorHash = prior["fingerprint_"+svc]
 		}
 
 		reason := ""
