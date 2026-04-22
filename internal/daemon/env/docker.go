@@ -73,12 +73,12 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 			continue
 		}
 
-		// Read container_port as float64 (JSON/YAML unmarshaling default for numbers)
-		containerPortRaw, ok := svcConfig["container_port"].(float64)
-		if !ok {
+		// Coerce container_port defensively — json decodes numbers to float64,
+		// but non-JSON transports (toml, msgpack, UseNumber) can surface int/int64.
+		containerPort := toInt(svcConfig["container_port"])
+		if containerPort == 0 {
 			continue
 		}
-		containerPort := int(containerPortRaw)
 
 		portEnv, _ := svcConfig["port_env"].(string)
 		route, _ := svcConfig["route"].(string)

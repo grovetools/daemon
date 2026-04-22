@@ -3,6 +3,7 @@ package env
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"strings"
@@ -60,21 +61,31 @@ func (pm *ProxyManager) Lookup(host string) (string, bool) {
 	return target, ok
 }
 
-// ListenAndServe starts the proxy server in a blocking manner.
-func (pm *ProxyManager) ListenAndServe(addr string) error {
-	director := func(req *http.Request) {
-		pm.mu.RLock()
-		target, ok := pm.routes[req.Host]
-		pm.mu.RUnlock()
-
-		if ok {
-			req.URL.Scheme = "http"
-			req.URL.Host = target
-			req.Host = target
-		}
+// directRequest rewrites an incoming request's URL/Host to the registered
+// target for its Host header. It is exported via director closure below and
+// exercised directly by tests. Callers coming in on :8443 produce Host
+// headers like "api.worktree.grove.local:8443"; the OS-redirect path yields
+// a bare "api.worktree.grove.local". Strip any port before the map lookup.
+func (pm *ProxyManager) directRequest(req *http.Request) {
+	host := req.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
 
-	proxy := &httputil.ReverseProxy{Director: director}
+	pm.mu.RLock()
+	target, ok := pm.routes[host]
+	pm.mu.RUnlock()
+
+	if ok {
+		req.URL.Scheme = "http"
+		req.URL.Host = target
+		req.Host = target
+	}
+}
+
+// ListenAndServe starts the proxy server in a blocking manner.
+func (pm *ProxyManager) ListenAndServe(addr string) error {
+	proxy := &httputil.ReverseProxy{Director: pm.directRequest}
 	pm.ulog.Info("Proxy server listening").Field("addr", addr).Log(context.Background())
 	return http.ListenAndServe(addr, proxy)
 }

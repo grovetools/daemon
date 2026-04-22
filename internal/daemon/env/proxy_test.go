@@ -1,8 +1,56 @@
 package env
 
 import (
+	"net/http/httptest"
+	"net/url"
 	"testing"
 )
+
+func TestProxyManager_DirectorStripsHostPort(t *testing.T) {
+	pm := NewProxyManager()
+	pm.Register("tier1-c", "api", 61320)
+
+	tests := []struct {
+		name     string
+		reqHost  string
+		wantHost string
+	}{
+		{"with :8443 suffix", "api.tier1-c.grove.local:8443", "127.0.0.1:61320"},
+		{"no port (OS-redirect path)", "api.tier1-c.grove.local", "127.0.0.1:61320"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.invalid/", nil)
+			req.Host = tt.reqHost
+			req.URL = &url.URL{Scheme: "http", Host: tt.reqHost, Path: "/"}
+
+			pm.directRequest(req)
+
+			if req.URL.Host != tt.wantHost {
+				t.Errorf("expected URL.Host %q, got %q", tt.wantHost, req.URL.Host)
+			}
+			if req.URL.Scheme != "http" {
+				t.Errorf("expected scheme http, got %q", req.URL.Scheme)
+			}
+		})
+	}
+}
+
+func TestProxyManager_DirectorLookupMiss(t *testing.T) {
+	pm := NewProxyManager()
+
+	req := httptest.NewRequest("GET", "http://unknown.foo.grove.local/", nil)
+	req.Host = "unknown.foo.grove.local:8443"
+	origURL := *req.URL
+
+	pm.directRequest(req)
+
+	if req.URL.Host != origURL.Host {
+		t.Errorf("expected URL.Host unchanged on miss, got %q", req.URL.Host)
+	}
+}
+
 
 func TestProxyManager_RegisterAndLookup(t *testing.T) {
 	pm := NewProxyManager()

@@ -132,6 +132,34 @@ func TestBuildDockerServiceArgs_Int64ContainerPort(t *testing.T) {
 	}
 }
 
+// TestToInt_DockerUpCoercion mirrors the dockerUp loop's container_port
+// coercion: if toInt returns 0 the service is silently skipped (no port
+// allocation, no proxy route). A non-JSON transport (TOML, msgpack,
+// UseNumber) can surface int64; ensure toInt coerces rather than treating
+// it as the "missing" sentinel.
+func TestToInt_DockerUpCoercion(t *testing.T) {
+	cases := []struct {
+		name string
+		in   interface{}
+		want int
+	}{
+		{"int64", int64(80), 80},
+		{"int", int(80), 80},
+		{"int32", int32(80), 80},
+		{"float64", float64(80), 80},
+		{"missing", nil, 0},
+		{"string (unsupported)", "80", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := toInt(c.in)
+			if got != c.want {
+				t.Errorf("toInt(%v) = %d, want %d", c.in, got, c.want)
+			}
+		})
+	}
+}
+
 func TestShellJoin(t *testing.T) {
 	cases := []struct {
 		in   []string
