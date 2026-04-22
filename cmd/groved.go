@@ -361,11 +361,20 @@ func newGrovedStartCmd() *cobra.Command {
 					CLIPath:   notifyCfg.Signal.CLIPath,
 					Account:   notifyCfg.Signal.Account,
 					Allowlist: notifyCfg.Signal.Allowlist,
-				})
+				}, scope, sockPath)
 				chMgr.SendInput = sendInputToSession
+				// Scoped daemons proxy outbound sends to the global daemon
+				// (which owns signal-cli) and register their sessions in
+				// routing.json so global can forward inbound replies back.
+				if scope != "" {
+					chMgr.SetGlobalClient(daemon.NewGlobalClient())
+				}
 				chMgr.Start(ctx)
 				srv.SetChannelManager(chMgr)
-				ulog.Info("Channel manager initialized (signal enabled)").Log(ctx)
+				ulog.Info("Channel manager initialized (signal enabled)").
+					Field("scope", scope).
+					Field("proxy_mode", scope != "").
+					Log(ctx)
 			}
 
 			// Register autonomous pinger as a collector

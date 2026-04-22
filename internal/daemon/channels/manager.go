@@ -4,9 +4,12 @@
 package channels
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/daemon/internal/daemon/store"
@@ -43,21 +47,46 @@ type Manager struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 
+	// scope is this daemon's scope (empty for the global daemon). Scoped
+	// daemons forward outbound sends to the global daemon and register their
+	// socket in routing.json so global can forward inbound replies back.
+	scope string
+	// socketPath is this daemon's own socket, written into routing.json so
+	// the global daemon can dial it for inbound session input.
+	socketPath string
+	// globalClient is non-nil on scoped daemons. When set, Send() proxies
+	// to the global daemon and signal-cli is never spawned locally.
+	globalClient daemon.Client
+
 	// SendInput is the function used to inject messages into agent sessions.
 	// Set by the server at initialization. It takes a jobID (the server
 	// resolves the mux + PTY/tmux target internally).
 	SendInput func(ctx context.Context, jobID, message string) error
 }
 
-// NewManager creates a new ChannelManager.
-func NewManager(st *store.Store, cfg SignalConfig) *Manager {
+// NewManager creates a new ChannelManager. scope is the daemon's scope
+// ("" for the global daemon); socketPath is this daemon's own socket path
+// (used by scoped daemons to register inbound routes in routing.json).
+func NewManager(st *store.Store, cfg SignalConfig, scope, socketPath string) *Manager {
 	return &Manager{
 		store:          st,
 		signalCfg:      cfg,
+		scope:          scope,
+		socketPath:     socketPath,
 		activeSessions: make(map[string]bool),
 		routeTable:     make(map[int64]string),
 		ulog:           logging.NewUnifiedLogger("groved.channels"),
 	}
+}
+
+// SetGlobalClient puts the Manager into "proxy mode". Scoped daemons call
+// this at boot; thereafter Send() forwards to the global daemon and
+// EnableChannel writes this daemon's socket into routing.json instead of
+// spawning signal-cli.
+func (m *Manager) SetGlobalClient(c daemon.Client) {
+	m.mu.Lock()
+	m.globalClient = c
+	m.mu.Unlock()
 }
 
 // Start initializes the channel manager. It loads persisted routes and checks
@@ -149,20 +178,30 @@ func (m *Manager) Stop(ctx context.Context) {
 }
 
 // EnableChannel enables a channel for a session. Starts signal-cli if needed.
+// On a scoped daemon (globalClient != nil) it registers this daemon's socket
+// in routing.json instead of spawning signal-cli locally.
 func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if !m.signalCfg.Enabled {
+		m.mu.Unlock()
 		return fmt.Errorf("signal is not enabled in configuration")
 	}
 
 	m.activeSessions[jobID] = true
+	isProxy := m.globalClient != nil
 
-	if !m.isRunning {
+	if !isProxy && !m.isRunning {
 		m.isRunning = true
 		m.ready = make(chan struct{})
 		go m.startSignalChannel(m.ctx) // Use manager's long-lived context, not request context
+	}
+	m.mu.Unlock()
+
+	if isProxy {
+		if err := m.addInboundRoute(jobID); err != nil {
+			m.ulog.Warn("Failed to write inbound route").Err(err).Field("job_id", jobID).Log(m.ctx)
+		}
 	}
 
 	m.ulog.Info("Channel enabled for session").Field("job_id", jobID).Log(m.ctx)
@@ -172,24 +211,37 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 // DisableChannel disables a channel for a session. Stops signal-cli if no sessions remain.
 func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	delete(m.activeSessions, jobID)
+	isProxy := m.globalClient != nil
 
-	if len(m.activeSessions) == 0 && m.signalChannel != nil {
+	if !isProxy && len(m.activeSessions) == 0 && m.signalChannel != nil {
 		m.signalChannel.Stop(ctx)
 		m.signalChannel = nil
 		m.isRunning = false
 		m.ulog.Info("Signal channel stopped (no active sessions)").Log(ctx)
 	}
+	m.mu.Unlock()
+
+	if isProxy {
+		if err := m.removeInboundRoute(jobID); err != nil {
+			m.ulog.Warn("Failed to remove inbound route").Err(err).Field("job_id", jobID).Log(ctx)
+		}
+	}
 }
 
 // Send sends a message via the signal channel and records the route.
+// On scoped daemons (globalClient != nil), this is forwarded to the global
+// daemon which owns signal-cli.
 func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*models.ChannelSendResponse, error) {
 	m.mu.Lock()
+	gc := m.globalClient
 	ch := m.signalChannel
 	ready := m.ready
 	m.mu.Unlock()
+
+	if gc != nil {
+		return gc.SendChannelMessage(ctx, req)
+	}
 
 	if ch == nil {
 		return nil, fmt.Errorf("signal channel is not running")
@@ -353,6 +405,27 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 		},
 	})
 
+	// Cross-daemon routing: if routing.json maps this jobID to another
+	// daemon's socket, forward the input there instead of looking it up
+	// in our local store.
+	if sockPath, ok := m.lookupInboundRoute(targetJobID); ok && sockPath != "" && sockPath != m.socketPath {
+		taggedText := fmt.Sprintf("[via Signal] %s", text)
+		if err := m.forwardSessionInput(ctx, sockPath, targetJobID, taggedText); err != nil {
+			m.ulog.Warn("Cross-daemon inbound forward failed — purging route").
+				Err(err).
+				Field("job_id", targetJobID).
+				Field("socket", sockPath).
+				Log(ctx)
+			_ = m.removeInboundRoute(targetJobID)
+			return
+		}
+		m.ulog.Success("Signal message forwarded to scoped daemon").
+			Field("job_id", targetJobID).
+			Field("socket", sockPath).
+			Log(ctx)
+		return
+	}
+
 	// Route to agent
 	session := m.store.GetSession(targetJobID)
 	if session == nil {
@@ -512,14 +585,17 @@ func (m *Manager) watchSessionEnds(ctx context.Context) {
 // cleanupRoutesForJob removes all route entries for a specific job.
 func (m *Manager) cleanupRoutesForJob(jobID string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	for ts, id := range m.routeTable {
 		if id == jobID {
 			delete(m.routeTable, ts)
 		}
 	}
+	isProxy := m.globalClient != nil
+	m.mu.Unlock()
 	go m.saveRoutes()
+	if isProxy {
+		_ = m.removeInboundRoute(jobID)
+	}
 }
 
 // routeCleanup periodically purges stale routes older than 7 days.
@@ -575,4 +651,139 @@ func (m *Manager) saveRoutes() {
 	dir := filepath.Dir(m.routeFilePath())
 	os.MkdirAll(dir, 0755)
 	os.WriteFile(m.routeFilePath(), data, 0644)
+}
+
+// --- Cross-daemon inbound routing (routing.json) ---
+//
+// routing.json maps jobID → absolute socketPath of the scoped daemon that
+// owns that session. Scoped daemons write entries when a user enables the
+// Signal channel on a session; the global daemon reads entries when an
+// inbound Signal message resolves to that jobID and forwards SendInput
+// across daemons via HTTP over the scoped socket.
+//
+// Writes use a tmp-file + atomic rename to avoid torn reads from the
+// global daemon's inbound goroutine.
+
+func inboundRouteFile() string {
+	return filepath.Join(paths.StateDir(), "channels", "routing.json")
+}
+
+func readInboundRoutes() (map[string]string, error) {
+	data, err := os.ReadFile(inboundRouteFile())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]string{}, nil
+		}
+		return nil, err
+	}
+	out := map[string]string{}
+	if len(data) == 0 {
+		return out, nil
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// writeInboundRoutesAtomic writes the routing.json atomically via a
+// tmp-file + rename so readers never observe a torn file.
+func writeInboundRoutesAtomic(routes map[string]string) error {
+	path := inboundRouteFile()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(routes)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".routing-*.tmp")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// inboundRouteMu serializes read-modify-write cycles across goroutines in
+// the same daemon. Cross-daemon concurrency is covered by atomic rename.
+var inboundRouteMu sync.Mutex
+
+func (m *Manager) addInboundRoute(jobID string) error {
+	if m.socketPath == "" {
+		return fmt.Errorf("manager has no socketPath; cannot register inbound route")
+	}
+	inboundRouteMu.Lock()
+	defer inboundRouteMu.Unlock()
+	routes, err := readInboundRoutes()
+	if err != nil {
+		return err
+	}
+	routes[jobID] = m.socketPath
+	return writeInboundRoutesAtomic(routes)
+}
+
+func (m *Manager) removeInboundRoute(jobID string) error {
+	inboundRouteMu.Lock()
+	defer inboundRouteMu.Unlock()
+	routes, err := readInboundRoutes()
+	if err != nil {
+		return err
+	}
+	if _, ok := routes[jobID]; !ok {
+		return nil
+	}
+	delete(routes, jobID)
+	return writeInboundRoutesAtomic(routes)
+}
+
+func (m *Manager) lookupInboundRoute(jobID string) (string, bool) {
+	routes, err := readInboundRoutes()
+	if err != nil {
+		return "", false
+	}
+	sock, ok := routes[jobID]
+	return sock, ok
+}
+
+// forwardSessionInput POSTs /api/sessions/{jobID}/input to the given scoped
+// daemon socket. Used by the global daemon to hand inbound Signal messages
+// to the scoped daemon that actually owns the session's PTY.
+func (m *Manager) forwardSessionInput(ctx context.Context, socketPath, jobID, input string) error {
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", socketPath)
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+	body, err := json.Marshal(map[string]string{"input": input})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://unix/api/sessions/"+jobID+"/input", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("scoped daemon returned %s", resp.Status)
+	}
+	return nil
 }
