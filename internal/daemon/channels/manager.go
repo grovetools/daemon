@@ -124,6 +124,23 @@ func (m *Manager) Start(ctx context.Context) {
 		m.pruneStaleSessions(m.ctx)
 	}
 
+	// Global daemon: signal-cli is infrastructure, not per-session. Spawn
+	// it unconditionally at startup so outbound sends from scoped daemons
+	// and inbound Signal replies are always routable. Refcount-based
+	// lifecycle was wrong under the cross-daemon model because scoped
+	// daemons' claws live in routing.json, not in this daemon's
+	// activeSessions — the global daemon can't ref-count something it
+	// doesn't own.
+	if m.scope == "" && m.globalClient == nil && m.signalCfg.Enabled {
+		m.mu.Lock()
+		if !m.isRunning {
+			m.isRunning = true
+			m.ready = make(chan struct{})
+			go m.startSignalChannel(m.ctx)
+		}
+		m.mu.Unlock()
+	}
+
 	// Subscribe to session end events for route cleanup
 	go m.watchSessionEnds(m.ctx)
 
@@ -234,18 +251,16 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 	return nil
 }
 
-// DisableChannel disables a channel for a session. Stops signal-cli if no sessions remain.
+// DisableChannel disables a channel for a session. On scoped daemons
+// this removes the routing.json entry. signal-cli lifecycle is no longer
+// ref-counted — on the global daemon it runs for the daemon's lifetime
+// (started in Start, stopped in Stop). Ref-counting was wrong under
+// cross-daemon because scoped claws live in routing.json, not in the
+// global daemon's activeSessions.
 func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
 	m.mu.Lock()
 	delete(m.activeSessions, jobID)
 	isProxy := m.globalClient != nil
-
-	if !isProxy && len(m.activeSessions) == 0 && m.signalChannel != nil {
-		m.signalChannel.Stop(ctx)
-		m.signalChannel = nil
-		m.isRunning = false
-		m.ulog.Info("Signal channel stopped (no active sessions)").Log(ctx)
-	}
 	m.mu.Unlock()
 
 	if isProxy {
