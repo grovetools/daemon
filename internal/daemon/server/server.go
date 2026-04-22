@@ -1130,6 +1130,12 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var script strings.Builder
+		// Export GROVE_SCOPE so agent subprocesses (notify signal, flow,
+		// hooks) resolve back to this scoped daemon instead of the unscoped
+		// socket. The server holds its own scope, set at startup.
+		if s.scope != "" {
+			script.WriteString(fmt.Sprintf("export GROVE_SCOPE='%s'; ", s.scope))
+		}
 		for k, v := range payload.Env {
 			escapedVal := strings.ReplaceAll(v, "'", "'\\''")
 			script.WriteString(fmt.Sprintf("export %s='%s'; ", k, escapedVal))
