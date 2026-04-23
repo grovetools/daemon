@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/grovetools/core/pkg/env/services"
 )
 
 // buildDockerServiceArgs synthesizes the `docker run` arguments for a
@@ -82,7 +84,7 @@ func buildDockerServiceArgs(
 		sort.Strings(keys)
 		for _, k := range keys {
 			val, _ := envMap[k].(string)
-			resolved := resolveEnvVars(val, envVars)
+			resolved := services.ExpandEnvVars(val, envVars)
 			args = append(args, "-e", fmt.Sprintf("%s=%s", k, resolved))
 		}
 	}

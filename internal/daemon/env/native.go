@@ -4,19 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	coreenv "github.com/grovetools/core/pkg/env"
 )
-
-// serviceEntry holds parsed service config for ordered startup.
-type serviceEntry struct {
-	Name   string
-	Config map[string]interface{}
-	Order  int
-}
 
 // nativeUp starts a native environment by spawning bare processes.
 // Services are started in order (lowest first), with stdout/stderr logged to
@@ -32,7 +25,17 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		return nil, err
 	}
 
-	runningEnv := newRunningEnv("native", worktree, req.Profile, req.StateDir)
+	runningEnv := &RunningEnv{
+		Provider:        "native",
+		Worktree:        worktree,
+		Environment:     req.Profile,
+		StateDir:        req.StateDir,
+		Ports:           make(map[string]int),
+		Processes:       make(map[string]*exec.Cmd),
+		Cancels:         make(map[string]context.CancelFunc),
+		ServiceCommands: make(map[string]string),
+		ContainerNames:  make(map[string]string),
+	}
 	m.envs[worktree] = runningEnv
 	m.mu.Unlock()
 
@@ -141,11 +144,6 @@ func (m *Manager) nativeDown(ctx context.Context, req coreenv.EnvRequest) (*core
 			cancel()
 			// The background goroutine handles Wait() and log file cleanup.
 		}
-		// Cancel() / exec.CommandContext only SIGTERMs the immediate `sh -c`
-		// wrapper — grandchildren (cargo → target/debug/<bin>, npm → node)
-		// survive as orphans reparented to init. Signal the whole process
-		// group recorded at spawn time so the entire tree tears down.
-		reapPGIDs(ctx, m.ulog, m.Supervisor, runningEnv.NativePGIDs)
 	} else {
 		// Disk-lazy: in-memory record is gone (typical post-restart).
 		// Reap whatever the previous daemon recorded into state.json.
@@ -171,43 +169,6 @@ func (m *Manager) nativeDown(ctx context.Context, req coreenv.EnvRequest) (*core
 	m.Ports.ReleaseAll(worktree)
 
 	return &coreenv.EnvResponse{Status: "stopped"}, nil
-}
-
-// parseServiceEntries extracts services from the config map and returns them
-// sorted by the "order" field (ascending), then alphabetically by name.
-func parseServiceEntries(services map[string]interface{}) []serviceEntry {
-	entries := make([]serviceEntry, 0, len(services))
-	for svcName, svcConfigRaw := range services {
-		svcConfig, ok := svcConfigRaw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		order := 100 // default: high so explicitly-ordered services go first
-		if o, ok := svcConfig["order"].(int64); ok {
-			order = int(o)
-		} else if o, ok := svcConfig["order"].(float64); ok {
-			order = int(o)
-		}
-		entries = append(entries, serviceEntry{Name: svcName, Config: svcConfig, Order: order})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].Order != entries[j].Order {
-			return entries[i].Order < entries[j].Order
-		}
-		return entries[i].Name < entries[j].Name
-	})
-	return entries
-}
-
-// resolveEnvVars expands $VAR and ${VAR} references in val using the provided
-// env vars map, falling back to the process environment for unresolved vars.
-func resolveEnvVars(val string, envVars map[string]string) string {
-	return os.Expand(val, func(key string) string {
-		if v, ok := envVars[key]; ok {
-			return v
-		}
-		return os.Getenv(key)
-	})
 }
 
 // isDirEmpty returns true if the directory exists but contains no entries.

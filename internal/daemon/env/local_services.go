@@ -3,13 +3,13 @@ package env
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"time"
 
 	coreenv "github.com/grovetools/core/pkg/env"
+	"github.com/grovetools/core/pkg/env/services"
 )
 
 // startLocalServices spawns the bare processes described by req.Config["services"]
@@ -30,8 +30,8 @@ func (m *Manager) startLocalServices(
 	baseEnv []string,
 	logDir string,
 ) error {
-	services, ok := req.Config["services"].(map[string]interface{})
-	if !ok {
+	entries := services.ParseAndSort(req.Config)
+	if len(entries) == 0 {
 		return nil
 	}
 
@@ -51,18 +51,11 @@ func (m *Manager) startLocalServices(
 		}
 	}
 
-	entries := parseServiceEntries(services)
-
 	for _, entry := range entries {
 		svcName := entry.Name
-		svcConfig := entry.Config
+		svcConfig := entry.Raw
 
-		cmdStr, _ := svcConfig["command"].(string)
-		portEnv, _ := svcConfig["port_env"].(string)
-		route, _ := svcConfig["route"].(string)
-		svcType, _ := svcConfig["type"].(string)
-
-		if svcType != "docker" && cmdStr == "" {
+		if entry.Type != "docker" && entry.Command == "" {
 			continue
 		}
 
@@ -73,8 +66,8 @@ func (m *Manager) startLocalServices(
 		}
 		runningEnv.Ports[svcName] = port
 
-		if portEnv != "" {
-			resp.EnvVars[portEnv] = fmt.Sprintf("%d", port)
+		if entry.PortEnv != "" {
+			resp.EnvVars[entry.PortEnv] = fmt.Sprintf("%d", port)
 		}
 
 		svcCtx, cancel := context.WithCancel(context.Background())
@@ -82,7 +75,7 @@ func (m *Manager) startLocalServices(
 		var cmd *exec.Cmd
 		var containerName string
 
-		if svcType == "docker" {
+		if entry.Type == "docker" {
 			dockerArgs, cname, derr := buildDockerServiceArgs(worktree, svcName, svcConfig, port, req.Workspace.Path, resp.EnvVars)
 			if derr != nil {
 				cancel()
@@ -96,11 +89,9 @@ func (m *Manager) startLocalServices(
 
 			// Surface env vars declared on the service to resp.EnvVars so
 			// subsequent services can reference them (matches native behavior).
-			if envMap, ok := svcConfig["env"].(map[string]interface{}); ok {
-				for k, v := range envMap {
-					val, _ := v.(string)
-					resp.EnvVars[k] = resolveEnvVars(val, resp.EnvVars)
-				}
+			for k, v := range entry.Env {
+				val, _ := v.(string)
+				resp.EnvVars[k] = services.ExpandEnvVars(val, resp.EnvVars)
 			}
 
 			cmd = exec.CommandContext(svcCtx, "docker", dockerArgs...)
@@ -116,13 +107,14 @@ func (m *Manager) startLocalServices(
 			}
 			runningEnv.Cancels[svcName] = cancel
 		} else {
-			cmd = exec.CommandContext(svcCtx, "sh", "-c", cmdStr)
+			cmd = exec.CommandContext(svcCtx, "sh", "-c", entry.Command)
 			runningEnv.Cancels[svcName] = cancel
-			runningEnv.ServiceCommands[svcName] = cmdStr
+			runningEnv.ServiceCommands[svcName] = entry.Command
 		}
 
 		// Working directory resolution (working_dir or first volume's host_path)
-		if wd, ok := svcConfig["working_dir"].(string); ok && wd != "" {
+		if entry.WorkingDir != "" {
+			wd := entry.WorkingDir
 			if filepath.IsAbs(wd) {
 				cmd.Dir = wd
 			} else {
@@ -133,14 +125,14 @@ func (m *Manager) startLocalServices(
 				cleanupStarted()
 				return fmt.Errorf("failed to create working directory %s for service %s: %w", cmd.Dir, svcName, err)
 			}
-			if _, hasVolumes := svcConfig["volumes"]; !hasVolumes {
+			if entry.Volumes == nil {
 				resp.Volumes = append(resp.Volumes, coreenv.VolumeState{
 					Path:    wd,
 					Persist: false,
 				})
 			}
-		} else if volumes, ok := svcConfig["volumes"].(map[string]interface{}); ok {
-			for _, volCfgRaw := range volumes {
+		} else if entry.Volumes != nil {
+			for _, volCfgRaw := range entry.Volumes {
 				if volCfg, ok := volCfgRaw.(map[string]interface{}); ok {
 					if hp, ok := volCfg["host_path"].(string); ok && hp != "" {
 						if filepath.IsAbs(hp) {
@@ -165,106 +157,102 @@ func (m *Manager) startLocalServices(
 		for k, v := range resp.EnvVars {
 			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 		}
-		if portEnv != "" {
-			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", portEnv, port))
+		if entry.PortEnv != "" {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", entry.PortEnv, port))
 		}
 
-		if envMap, ok := svcConfig["env"].(map[string]interface{}); ok {
-			for k, v := range envMap {
-				val, _ := v.(string)
-				resolved := resolveEnvVars(val, resp.EnvVars)
-				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, resolved))
-				resp.EnvVars[k] = resolved
-			}
+		for k, v := range entry.Env {
+			val, _ := v.(string)
+			resolved := services.ExpandEnvVars(val, resp.EnvVars)
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, resolved))
+			resp.EnvVars[k] = resolved
 		}
 
 		// Volumes: create directories, run pre-start restore commands.
-		if volumes, ok := svcConfig["volumes"].(map[string]interface{}); ok {
-			for volName, volCfgRaw := range volumes {
-				volCfg, ok := volCfgRaw.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				hostPath, _ := volCfg["host_path"].(string)
-				if hostPath == "" {
-					continue
-				}
+		for volName, volCfgRaw := range entry.Volumes {
+			volCfg, ok := volCfgRaw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			hostPath, _ := volCfg["host_path"].(string)
+			if hostPath == "" {
+				continue
+			}
 
-				absPath := hostPath
-				if !filepath.IsAbs(hostPath) {
-					absPath = filepath.Join(req.Workspace.Path, hostPath)
-				}
-				if err := os.MkdirAll(absPath, 0755); err != nil {
-					m.ulog.Warn("Failed to create volume directory").
-						Err(err).
-						Field("path", absPath).
-						Field("service", svcName).
-						Log(ctx)
-					continue
-				}
+			absPath := hostPath
+			if !filepath.IsAbs(hostPath) {
+				absPath = filepath.Join(req.Workspace.Path, hostPath)
+			}
+			if err := os.MkdirAll(absPath, 0755); err != nil {
+				m.ulog.Warn("Failed to create volume directory").
+					Err(err).
+					Field("path", absPath).
+					Field("service", svcName).
+					Log(ctx)
+				continue
+			}
 
-				persist, _ := volCfg["persist"].(bool)
-				containerPath, _ := volCfg["container_path"].(string)
+			persist, _ := volCfg["persist"].(bool)
+			containerPath, _ := volCfg["container_path"].(string)
 
-				if persist {
-					for _, lockFile := range []string{"status", "lock"} {
-						lockPath := filepath.Join(absPath, lockFile)
-						if _, err := os.Stat(lockPath); err == nil {
-							os.Remove(lockPath)
-							m.ulog.Debug("Removed stale lock file").
-								Field("service", svcName).
-								Field("lock_file", lockFile).
-								Log(ctx)
-						}
+			if persist {
+				for _, lockFile := range []string{"status", "lock"} {
+					lockPath := filepath.Join(absPath, lockFile)
+					if _, err := os.Stat(lockPath); err == nil {
+						os.Remove(lockPath)
+						m.ulog.Debug("Removed stale lock file").
+							Field("service", svcName).
+							Field("lock_file", lockFile).
+							Log(ctx)
 					}
 				}
+			}
 
-				resp.Volumes = append(resp.Volumes, coreenv.VolumeState{
-					Path:          hostPath,
-					Persist:       persist,
-					ContainerPath: containerPath,
-				})
+			resp.Volumes = append(resp.Volumes, coreenv.VolumeState{
+				Path:          hostPath,
+				Persist:       persist,
+				ContainerPath: containerPath,
+			})
 
-				if restoreCfg, ok := volCfg["restore"].(map[string]interface{}); ok {
-					restoreCmd, _ := restoreCfg["command"].(string)
-					if restoreCmd != "" {
-						empty, _ := isDirEmpty(absPath)
-						if empty {
-							m.ulog.Info("Running volume restore command").
-								Field("service", svcName).
-								Field("volume", volName).
-								Log(ctx)
+			if restoreCfg, ok := volCfg["restore"].(map[string]interface{}); ok {
+				restoreCmd, _ := restoreCfg["command"].(string)
+				if restoreCmd != "" {
+					empty, _ := isDirEmpty(absPath)
+					if empty {
+						m.ulog.Info("Running volume restore command").
+							Field("service", svcName).
+							Field("volume", volName).
+							Log(ctx)
 
-							restoreEnv := append(os.Environ(), fmt.Sprintf("GROVE_VOLUME_HOST_PATH=%s", absPath))
-							for k, v := range resp.EnvVars {
-								restoreEnv = append(restoreEnv, fmt.Sprintf("%s=%s", k, v))
-							}
-
-							rc := exec.Command("sh", "-c", restoreCmd)
-							rc.Dir = req.Workspace.Path
-							rc.Env = restoreEnv
-
-							if logDir != "" {
-								restoreLogPath := filepath.Join(logDir, svcName+"-restore.log")
-								rlf, err := os.OpenFile(restoreLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-								if err == nil {
-									rc.Stdout = rlf
-									rc.Stderr = rlf
-									defer rlf.Close()
-								}
-							}
-
-							if err := rc.Run(); err != nil {
-								cancel()
-								cleanupStarted()
-								return fmt.Errorf("volume restore failed for service %s volume %s: %w", svcName, volName, err)
-							}
-
-							m.ulog.Info("Volume restore completed").
-								Field("service", svcName).
-								Field("volume", volName).
-								Log(ctx)
+						restoreEnv := append(os.Environ(), fmt.Sprintf("GROVE_VOLUME_HOST_PATH=%s", absPath))
+						for k, v := range resp.EnvVars {
+							restoreEnv = append(restoreEnv, fmt.Sprintf("%s=%s", k, v))
 						}
+
+						rc := exec.Command("sh", "-c", restoreCmd)
+						rc.Dir = req.Workspace.Path
+						rc.Env = restoreEnv
+
+						if logDir != "" {
+							restoreLogPath := filepath.Join(logDir, svcName+"-restore.log")
+							rlf, err := os.OpenFile(restoreLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+							if err == nil {
+								rc.Stdout = rlf
+								rc.Stderr = rlf
+								defer rlf.Close()
+							}
+						}
+
+						if err := rc.Run(); err != nil {
+							cancel()
+							cleanupStarted()
+							return fmt.Errorf("volume restore failed for service %s volume %s: %w", svcName, volName, err)
+						}
+
+						m.ulog.Info("Volume restore completed").
+							Field("service", svcName).
+							Field("volume", volName).
+							Log(ctx)
 					}
 				}
 			}
@@ -301,7 +289,7 @@ func (m *Manager) startLocalServices(
 
 		m.ulog.Info("Starting local service").
 			Field("service", svcName).
-			Field("command", cmdStr).
+			Field("command", entry.Command).
 			Field("port", port).
 			Field("order", entry.Order).
 			Log(ctx)
@@ -341,117 +329,97 @@ func (m *Manager) startLocalServices(
 		}(svcName, cmd, logFile)
 
 		// TCP health check
-		if hc, ok := svcConfig["health_check"].(map[string]interface{}); ok {
-			if hcType, _ := hc["type"].(string); hcType == "tcp" {
-				timeoutSec := 30
-				if ts, ok := hc["timeout_seconds"].(int64); ok {
-					timeoutSec = int(ts)
-				} else if ts, ok := hc["timeout_seconds"].(float64); ok {
-					timeoutSec = int(ts)
+		if entry.HealthCheck != nil && entry.HealthCheck.Type == "tcp" {
+			timeoutSec := entry.HealthCheck.TimeoutSeconds
+			target := fmt.Sprintf("127.0.0.1:%d", port)
+			deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+
+			m.ulog.Info("Waiting for TCP health check").
+				Field("service", svcName).
+				Field("target", target).
+				Field("timeout", timeoutSec).
+				Log(ctx)
+
+			healthy := false
+			for time.Now().Before(deadline) {
+				if services.ProbeTCP(target, 500*time.Millisecond) {
+					healthy = true
+					break
 				}
-
-				target := fmt.Sprintf("127.0.0.1:%d", port)
-				deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
-
-				m.ulog.Info("Waiting for TCP health check").
-					Field("service", svcName).
-					Field("target", target).
-					Field("timeout", timeoutSec).
-					Log(ctx)
-
-				healthy := false
-				for time.Now().Before(deadline) {
-					conn, err := net.DialTimeout("tcp", target, 500*time.Millisecond)
-					if err == nil {
-						conn.Close()
-						healthy = true
-						break
-					}
-					time.Sleep(500 * time.Millisecond)
-				}
-
-				if !healthy {
-					cancel()
-					cleanupStarted()
-					return fmt.Errorf("health check failed for service %s: port %d not ready after %ds", svcName, port, timeoutSec)
-				}
-
-				m.ulog.Info("Health check passed").Field("service", svcName).Log(ctx)
+				time.Sleep(500 * time.Millisecond)
 			}
+
+			if !healthy {
+				cancel()
+				cleanupStarted()
+				return fmt.Errorf("health check failed for service %s: port %d not ready after %ds", svcName, port, timeoutSec)
+			}
+
+			m.ulog.Info("Health check passed").Field("service", svcName).Log(ctx)
 		}
 
 		// Post-start lifecycle hook
-		if lifecycle, ok := svcConfig["lifecycle"].(map[string]interface{}); ok {
-			postStart, _ := lifecycle["post_start"].(string)
-			if postStart != "" {
-				mode, _ := lifecycle["post_start_mode"].(string)
-				if mode == "" {
-					mode = "always"
-				}
+		if lc := entry.Lifecycle; lc != nil {
+			shouldRun := true
+			var markerPath string
 
-				shouldRun := true
-				var markerPath string
-
-				if mode == "once" {
-					if volumes, ok := svcConfig["volumes"].(map[string]interface{}); ok {
-						for _, volCfgRaw := range volumes {
-							if volCfg, ok := volCfgRaw.(map[string]interface{}); ok {
-								if hp, _ := volCfg["host_path"].(string); hp != "" {
-									if filepath.IsAbs(hp) {
-										markerPath = filepath.Join(hp, ".grove_init")
-									} else {
-										markerPath = filepath.Join(req.Workspace.Path, hp, ".grove_init")
-									}
-									break
-								}
+			if lc.PostStartMode == "once" {
+				for _, volCfgRaw := range entry.Volumes {
+					if volCfg, ok := volCfgRaw.(map[string]interface{}); ok {
+						if hp, _ := volCfg["host_path"].(string); hp != "" {
+							if filepath.IsAbs(hp) {
+								markerPath = filepath.Join(hp, ".grove_init")
+							} else {
+								markerPath = filepath.Join(req.Workspace.Path, hp, ".grove_init")
 							}
-						}
-					}
-					if markerPath != "" {
-						if _, err := os.Stat(markerPath); err == nil {
-							shouldRun = false
-							m.ulog.Info("Skipping post_start (once mode, already initialized)").
-								Field("service", svcName).
-								Log(ctx)
+							break
 						}
 					}
 				}
+				if markerPath != "" {
+					if _, err := os.Stat(markerPath); err == nil {
+						shouldRun = false
+						m.ulog.Info("Skipping post_start (once mode, already initialized)").
+							Field("service", svcName).
+							Log(ctx)
+					}
+				}
+			}
 
-				if shouldRun {
-					m.ulog.Info("Running post-start lifecycle hook").
+			if shouldRun {
+				m.ulog.Info("Running post-start lifecycle hook").
+					Field("service", svcName).
+					Field("mode", lc.PostStartMode).
+					Log(ctx)
+
+				lcCmd := exec.Command("sh", "-c", lc.PostStart)
+				lcCmd.Dir = req.Workspace.Path
+				lcCmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
+				for k, v := range resp.EnvVars {
+					lcCmd.Env = append(lcCmd.Env, fmt.Sprintf("%s=%s", k, v))
+				}
+
+				if logDir != "" {
+					lcLogPath := filepath.Join(logDir, svcName+"-lifecycle.log")
+					llf, err := os.OpenFile(lcLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+					if err == nil {
+						lcCmd.Stdout = llf
+						lcCmd.Stderr = llf
+						defer llf.Close()
+					}
+				}
+
+				if err := lcCmd.Run(); err != nil {
+					m.ulog.Warn("Post-start lifecycle hook failed").
+						Err(err).
 						Field("service", svcName).
-						Field("mode", mode).
 						Log(ctx)
-
-					lcCmd := exec.Command("sh", "-c", postStart)
-					lcCmd.Dir = req.Workspace.Path
-					lcCmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
-					for k, v := range resp.EnvVars {
-						lcCmd.Env = append(lcCmd.Env, fmt.Sprintf("%s=%s", k, v))
-					}
-
-					if logDir != "" {
-						lcLogPath := filepath.Join(logDir, svcName+"-lifecycle.log")
-						llf, err := os.OpenFile(lcLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-						if err == nil {
-							lcCmd.Stdout = llf
-							lcCmd.Stderr = llf
-							defer llf.Close()
-						}
-					}
-
-					if err := lcCmd.Run(); err != nil {
-						m.ulog.Warn("Post-start lifecycle hook failed").
-							Err(err).
-							Field("service", svcName).
-							Log(ctx)
-					} else {
-						m.ulog.Info("Post-start lifecycle hook completed").
-							Field("service", svcName).
-							Log(ctx)
-						if mode == "once" && markerPath != "" {
-							os.WriteFile(markerPath, []byte("initialized\n"), 0644)
-						}
+				} else {
+					m.ulog.Info("Post-start lifecycle hook completed").
+						Field("service", svcName).
+						Log(ctx)
+					if lc.PostStartMode == "once" && markerPath != "" {
+						os.WriteFile(markerPath, []byte("initialized\n"), 0644)
 					}
 				}
 			}
@@ -465,88 +433,15 @@ func (m *Manager) startLocalServices(
 			}
 		}
 
-		if route != "" {
-			m.registerProxyRoute(ctx, worktree, route, port)
+		if entry.Route != "" {
+			m.registerProxyRoute(ctx, worktree, entry.Route, port)
 			if resp.ProxyRoutes == nil {
 				resp.ProxyRoutes = make(map[string]int)
 			}
-			resp.ProxyRoutes[route] = port
-			resp.Endpoints = append(resp.Endpoints, fmt.Sprintf("http://%s.%s.grove.local", route, worktree))
+			resp.ProxyRoutes[entry.Route] = port
+			resp.Endpoints = append(resp.Endpoints, fmt.Sprintf("http://%s.%s.grove.local", entry.Route, worktree))
 		}
 	}
 
-	return nil
-}
-
-// runServiceBootstrap executes a service's optional [bootstrap] block if the
-// declared missing_path does not exist. workDir + env match what the main
-// service will receive, so `cd foo && npm install` and $PORT substitution
-// behave the same way the service command would.
-//
-// Idempotency: decided freshly every call via os.Stat. No state-file caching;
-// if the user rm -rf's node_modules the next env up bootstraps again.
-func (m *Manager) runServiceBootstrap(
-	ctx context.Context,
-	svcName string,
-	svcConfig map[string]interface{},
-	workDir string,
-	env []string,
-	logDir string,
-) error {
-	bootRaw, ok := svcConfig["bootstrap"].(map[string]interface{})
-	if !ok {
-		return nil
-	}
-	missingPath, _ := bootRaw["missing_path"].(string)
-	command, _ := bootRaw["command"].(string)
-	if missingPath == "" || command == "" {
-		return nil
-	}
-	timeoutSec := toInt(bootRaw["timeout_seconds"])
-	if timeoutSec <= 0 {
-		timeoutSec = 300
-	}
-
-	missingAbs := missingPath
-	if !filepath.IsAbs(missingAbs) {
-		missingAbs = filepath.Join(workDir, missingAbs)
-	}
-	if _, err := os.Stat(missingAbs); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("bootstrap stat %s: %w", missingAbs, err)
-	}
-
-	m.ulog.Info("Running service bootstrap").
-		Field("service", svcName).
-		Field("missing_path", missingAbs).
-		Log(ctx)
-
-	bootCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
-	defer cancel()
-
-	bootCmd := exec.CommandContext(bootCtx, "sh", "-c", command)
-	bootCmd.Dir = workDir
-	bootCmd.Env = env
-
-	if logDir != "" {
-		bootLogPath := filepath.Join(logDir, svcName+"-bootstrap.log")
-		if bf, err := os.OpenFile(bootLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
-			bootCmd.Stdout = bf
-			bootCmd.Stderr = bf
-			defer bf.Close()
-		}
-	}
-
-	if err := bootCmd.Run(); err != nil {
-		m.ulog.Warn("Service bootstrap failed").
-			Err(err).
-			Field("service", svcName).
-			Log(ctx)
-		return fmt.Errorf("service bootstrap failed for %s: %w", svcName, err)
-	}
-	m.ulog.Info("Service bootstrap completed").
-		Field("service", svcName).
-		Log(ctx)
 	return nil
 }
