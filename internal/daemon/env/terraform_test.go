@@ -626,6 +626,84 @@ func TestTerraformDown_CleanFlag(t *testing.T) {
 	}
 }
 
+// TestTerraformDown_SkipDestroy_HonoredByDefault asserts that with
+// skip_destroy=true and no ForceDestroy flag, terraformDown returns
+// early without proceeding to the terraform destroy + tfvars cleanup
+// phase. Observable marker: a pre-existing grove_context.auto.tfvars.json
+// should NOT be removed (the unconditional cleanup at the end of the
+// non-skip path is never reached).
+func TestTerraformDown_SkipDestroy_HonoredByDefault(t *testing.T) {
+	m := NewManager()
+	tmpDir := t.TempDir()
+	tfvarsPath := filepath.Join(tmpDir, "grove_context.auto.tfvars.json")
+	if err := os.WriteFile(tfvarsPath, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := coreenv.EnvRequest{
+		Provider: "terraform",
+		PlanDir:  tmpDir,
+		StateDir: tmpDir,
+		Config: map[string]interface{}{
+			"path":         "./infra",
+			"skip_destroy": true,
+		},
+		Workspace: &workspace.WorkspaceNode{Name: "tf-skip-test", Path: tmpDir},
+	}
+
+	resp, err := m.terraformDown(context.TODO(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Status != "stopped" {
+		t.Errorf("expected status stopped, got %s", resp.Status)
+	}
+	// skip_destroy should have forced early return BEFORE the
+	// tfvars cleanup block — the file should still exist.
+	if _, err := os.Stat(tfvarsPath); os.IsNotExist(err) {
+		t.Error("expected tfvars preserved by skip_destroy early return; got removed")
+	}
+}
+
+// TestTerraformDown_ForceDestroy_OverridesSkipDestroy asserts that
+// with skip_destroy=true AND ForceDestroy=true, the early return is
+// bypassed and the function proceeds to the destroy + cleanup phase.
+// Observable marker: the pre-existing grove_context.auto.tfvars.json
+// is removed by the unconditional cleanup at the end.
+func TestTerraformDown_ForceDestroy_OverridesSkipDestroy(t *testing.T) {
+	m := NewManager()
+	tmpDir := t.TempDir()
+	tfvarsPath := filepath.Join(tmpDir, "grove_context.auto.tfvars.json")
+	if err := os.WriteFile(tfvarsPath, []byte("{}"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := coreenv.EnvRequest{
+		Provider: "terraform",
+		PlanDir:  tmpDir,
+		StateDir: tmpDir,
+		Config: map[string]interface{}{
+			"path":         "./infra",
+			"skip_destroy": true,
+		},
+		Workspace:    &workspace.WorkspaceNode{Name: "tf-force-test", Path: tmpDir},
+		ForceDestroy: true,
+	}
+
+	resp, err := m.terraformDown(context.TODO(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Status != "stopped" {
+		t.Errorf("expected status stopped, got %s", resp.Status)
+	}
+	// ForceDestroy bypasses skip_destroy early return, so the final
+	// tfvars cleanup runs and removes the file.
+	if _, err := os.Stat(tfvarsPath); !os.IsNotExist(err) {
+		t.Error("expected tfvars removed (ForceDestroy bypassed skip_destroy); still present")
+	}
+}
+
 func TestTerraformDown_NoCleanPreservesState(t *testing.T) {
 	m := NewManager()
 

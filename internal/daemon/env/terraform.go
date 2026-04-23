@@ -375,6 +375,15 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 	if req.Clean {
 		skipDestroy = false
 	}
+	// ForceDestroy also overrides skip_destroy. Set by `flow plan finish`
+	// when retiring a worktree — preserving cloud state across iteration
+	// no longer applies, so the semi-persistent contract is broken.
+	if req.ForceDestroy && skipDestroy {
+		m.ulog.Info("Cloud resources destroyed (skip_destroy overridden by flow plan finish)").
+			Field("worktree", worktree).
+			Log(ctx)
+		skipDestroy = false
+	}
 
 	m.mu.Lock()
 	runningEnv, exists := m.envs[worktree]
