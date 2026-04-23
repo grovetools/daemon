@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>grove env dashboard</title>
+<link rel="stylesheet" href="assets/dashboard.css">
+</head>
+<body>
+<header id="topbar">
+  <h1>grove <span class="muted">env dashboard</span></h1>
+  <div class="summary">
+    <select id="ecosystem-select" aria-label="ecosystem"></select>
+    <span id="status-summary" class="muted">…</span>
+    <span id="updated" class="muted" title="last refresh"></span>
+  </div>
+</header>
+<main>
+  <section id="grid" aria-label="worktrees"></section>
+  <aside id="sidebar">
+    <section class="card">
+      <h2>shared infra</h2>
+      <div id="shared"></div>
+    </section>
+    <section class="card">
+      <h2>orphans <span id="orphan-count" class="muted"></span></h2>
+      <div id="orphans"></div>
+    </section>
+  </aside>
+</main>
+<script src="assets/dashboard.js"></script>
+</body>
+</html>

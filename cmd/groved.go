@@ -342,6 +342,19 @@ func newGrovedStartCmd() *cobra.Command {
 			}
 			srv.SetLogStreamer(streamer)
 
+			// Dashboard: ephemeral TCP listener, global daemon only. The
+			// port is persisted so `grove env dashboard` can find us without
+			// any discovery protocol. Scoped daemons never serve it.
+			if scope == "" {
+				if dashAddr, err := srv.StartDashboard(ctx); err != nil {
+					ulog.Warn("dashboard server failed to start").Err(err).Log(ctx)
+				} else {
+					ulog.Info("Dashboard listening").
+						Field("url", "http://"+dashAddr+"/dashboard").
+						Log(ctx)
+				}
+			}
+
 			// PTY session manager for daemon-owned PTY sessions
 			ptyManager := daemonpty.NewManager()
 			srv.SetPtyManager(ptyManager)
