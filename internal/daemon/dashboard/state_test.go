@@ -7,38 +7,35 @@ import (
 	"testing"
 
 	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/pkg/workspace"
 )
 
-// TestAggregator_EmptyConfig returns a valid but empty snapshot when no
-// groves are configured — happy path for a fresh install.
-func TestAggregator_EmptyConfig(t *testing.T) {
+// TestAggregator_GeneratedAt stamps every payload so the browser can show
+// a "last updated" label. This is the only aspect of Build() that does
+// not depend on workspace.GetProjects (global state).
+func TestAggregator_GeneratedAt(t *testing.T) {
 	agg := New(nil)
 	s := agg.Build(context.Background(), &config.Config{}, false)
 	if s.GeneratedAt.IsZero() {
 		t.Error("GeneratedAt is zero")
 	}
-	if len(s.Ecosystems) != 0 {
-		t.Errorf("expected 0 ecosystems, got %d", len(s.Ecosystems))
-	}
 }
 
-// TestAggregator_DiscoversEcosystem builds a throwaway grove source with a
-// .grove-worktrees marker and confirms the aggregator picks it up as an
-// ecosystem root even without a populated workspace provider.
-func TestAggregator_DiscoversEcosystem(t *testing.T) {
-	tmp := t.TempDir()
-	eco := filepath.Join(tmp, "my-eco")
-	if err := os.MkdirAll(filepath.Join(eco, ".grove-worktrees"), 0755); err != nil {
-		t.Fatal(err)
+// TestAggregator_PicksEcosystemNodes filters allNodes down to just the
+// ecosystem roots — submodules and standalone projects should not make it
+// into the dashboard. This guards the regression that caused every grove
+// submodule to appear as its own "ecosystem" when we were globbing
+// grove.toml marker files.
+func TestAggregator_PicksEcosystemNodes(t *testing.T) {
+	nodes := []*workspace.WorkspaceNode{
+		{Name: "my-eco", Path: "/tmp/my-eco", Kind: workspace.KindEcosystemRoot},
+		{Name: "my-eco", Path: "/tmp/my-eco", Kind: workspace.KindEcosystemRoot}, // dup
+		{Name: "daemon", Path: "/tmp/daemon", Kind: workspace.KindStandaloneProject},
+		{Name: "wt", Path: "/tmp/my-eco/.grove-worktrees/wt", Kind: workspace.KindEcosystemWorktree},
 	}
-
-	cfg := &config.Config{Groves: map[string]config.GroveSourceConfig{
-		"tmp": {Path: tmp},
-	}}
-
-	roots := ecosystemRoots(cfg)
+	roots := ecosystemRoots(nil, nodes)
 	if len(roots) != 1 {
-		t.Fatalf("expected 1 root, got %d", len(roots))
+		t.Fatalf("expected 1 root, got %d: %+v", len(roots), roots)
 	}
 	if roots[0].Name != "my-eco" {
 		t.Errorf("name = %q", roots[0].Name)

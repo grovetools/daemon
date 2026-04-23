@@ -127,20 +127,22 @@ func (a *Aggregator) Build(ctx context.Context, cfg *config.Config, probeEndpoin
 		return out
 	}
 
-	roots := ecosystemRoots(cfg)
-	if len(roots) == 0 {
-		return out
-	}
-
 	logger := logrus.New()
 	logger.SetOutput(os.Stderr)
 	logger.SetLevel(logrus.ErrorLevel)
 
 	// workspace.GetProjects enumerates every known workspace from config —
-	// we call it once and bucket nodes by ecosystem.
+	// we call it once and pick ecosystem roots from its output (more
+	// reliable than globbing grove sources, which would pick up every
+	// submodule that ships a grove.toml).
 	allNodes, err := workspace.GetProjects(logger)
 	if err != nil {
 		out.Errors = append(out.Errors, "workspace discovery: "+err.Error())
+	}
+
+	roots := ecosystemRoots(cfg, allNodes)
+	if len(roots) == 0 {
+		return out
 	}
 
 	for _, root := range roots {
@@ -273,50 +275,25 @@ type ecosystemRoot struct {
 	Path string
 }
 
-func ecosystemRoots(cfg *config.Config) []ecosystemRoot {
+// ecosystemRoots picks the set of ecosystem roots to render. Source of
+// truth is workspace.GetProjects's KindEcosystemRoot nodes — the same
+// classifier the TUI used pre-shrink. cfg is accepted for forwards-compat
+// with a future enable/disable hook but is otherwise unused.
+func ecosystemRoots(_ *config.Config, allNodes []*workspace.WorkspaceNode) []ecosystemRoot {
 	seen := map[string]bool{}
 	var roots []ecosystemRoot
-	for _, src := range cfg.Groves {
-		if src.Enabled != nil && !*src.Enabled {
+	for _, n := range allNodes {
+		if n == nil || n.Kind != workspace.KindEcosystemRoot {
 			continue
 		}
-		if src.Path == "" {
+		key := strings.ToLower(filepath.Clean(n.Path))
+		if seen[key] {
 			continue
 		}
-		base := expandHome(src.Path)
-		entries, err := os.ReadDir(base)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			full := filepath.Join(base, e.Name())
-			if !isEcosystemRoot(full) {
-				continue
-			}
-			if seen[full] {
-				continue
-			}
-			seen[full] = true
-			roots = append(roots, ecosystemRoot{Name: e.Name(), Path: full})
-		}
+		seen[key] = true
+		roots = append(roots, ecosystemRoot{Name: n.Name, Path: n.Path})
 	}
 	return roots
-}
-
-// isEcosystemRoot is a cheap check: the path contains a grove.toml (or
-// .grove/) and a .grove-worktrees directory — the two signals every
-// ecosystem root carries.
-func isEcosystemRoot(path string) bool {
-	if _, err := os.Stat(filepath.Join(path, ".grove-worktrees")); err == nil {
-		return true
-	}
-	if _, err := os.Stat(filepath.Join(path, "grove.toml")); err == nil {
-		return true
-	}
-	return false
 }
 
 func expandHome(p string) string {
