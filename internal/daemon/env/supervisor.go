@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os/exec"
 	"syscall"
+	"time"
+
+	"github.com/grovetools/core/logging"
 )
 
 // NativeSupervisor abstracts how the daemon spawns and stops bare local
@@ -75,4 +78,74 @@ func (s *PGIDSupervisor) Stop(pgid int) error {
 		return err
 	}
 	return nil
+}
+
+// pgidAlive reports whether any member of the process group is still alive.
+// kill(-pgid, 0) returns ESRCH once every member has been reaped; any other
+// outcome (success, EPERM) is treated as "still alive" so the caller escalates
+// to SIGKILL rather than declaring a pgroup dead it can't observe.
+func pgidAlive(pgid int) bool {
+	if pgid <= 0 {
+		return false
+	}
+	err := syscall.Kill(-pgid, 0)
+	return err != syscall.ESRCH
+}
+
+// reapPGIDs stops every process group in pgids via sup.Stop (SIGTERM), polls
+// for up to 5 seconds for all members to exit, then escalates any survivors
+// to SIGKILL. Exists so the native-services hot path AND the disk-lazy path
+// share the same grandchild-killing contract. Errors are logged; teardown
+// always proceeds best-effort.
+func reapPGIDs(ctx context.Context, ulog *logging.UnifiedLogger, sup NativeSupervisor, pgids map[string]int) {
+	if len(pgids) == 0 {
+		return
+	}
+	for name, pgid := range pgids {
+		if pgid <= 0 {
+			continue
+		}
+		if err := sup.Stop(pgid); err != nil {
+			if ulog != nil {
+				ulog.Warn("Failed to SIGTERM native process group").
+					Err(err).
+					Field("name", name).
+					Field("pgid", pgid).
+					Log(ctx)
+			}
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		anyAlive := false
+		for _, pgid := range pgids {
+			if pgid > 0 && pgidAlive(pgid) {
+				anyAlive = true
+				break
+			}
+		}
+		if !anyAlive {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	for name, pgid := range pgids {
+		if pgid <= 0 || !pgidAlive(pgid) {
+			continue
+		}
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			if ulog != nil {
+				ulog.Warn("Failed to SIGKILL native process group").
+					Err(err).
+					Field("name", name).
+					Field("pgid", pgid).
+					Log(ctx)
+			}
+		} else if ulog != nil {
+			ulog.Warn("Process group survived SIGTERM; escalated to SIGKILL").
+				Field("name", name).
+				Field("pgid", pgid).
+				Log(ctx)
+		}
+	}
 }

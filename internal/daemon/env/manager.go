@@ -264,15 +264,7 @@ func (m *Manager) reapPersistedNatives(ctx context.Context, stateFile *coreenv.E
 	if stateFile == nil {
 		return
 	}
-	for name, pgid := range stateFile.NativePGIDs {
-		if err := m.Supervisor.Stop(pgid); err != nil {
-			m.ulog.Warn("Failed to stop native process group from state file").
-				Err(err).
-				Field("name", name).
-				Field("pgid", pgid).
-				Log(ctx)
-		}
-	}
+	reapPGIDs(ctx, m.ulog, m.Supervisor, stateFile.NativePGIDs)
 	for name, container := range stateFile.DockerContainers {
 		if container == "" {
 			continue
@@ -301,9 +293,14 @@ func (m *Manager) writeStateFile(ctx context.Context, req coreenv.EnvRequest, re
 	runningEnv := m.envs[worktree]
 	m.mu.Unlock()
 
+	lastProfile := req.Profile
+	if lastProfile == "" {
+		lastProfile = "default"
+	}
 	stateFile := coreenv.EnvStateFile{
 		Provider:      req.Provider,
 		Environment:   req.Profile,
+		LastProfile:   lastProfile,
 		ManagedBy:     req.ManagedBy,
 		WorkspaceName: req.Workspace.Name,
 		WorkspacePath: req.Workspace.Path,

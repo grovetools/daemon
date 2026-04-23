@@ -143,9 +143,13 @@ func (tm *TunnelManager) StopAll(worktree string) {
 	defer tm.mu.Unlock()
 
 	prefix := worktree + "/"
+	pgids := map[string]int{}
 	for key, tunnel := range tm.tunnels {
 		if strings.HasPrefix(key, prefix) {
 			tunnel.cancel()
+			if tunnel.pgid > 0 {
+				pgids[key] = tunnel.pgid
+			}
 			lf := tunnel.log
 			c := tunnel.cmd
 			// Wait for process cleanup in the background to avoid blocking
@@ -158,4 +162,8 @@ func (tm *TunnelManager) StopAll(worktree string) {
 			delete(tm.tunnels, key)
 		}
 	}
+	// cancel() SIGTERMs only the immediate `sh -c` wrapper; gcloud/aws
+	// CLI children survive the wrapper's exit and stay bound to the
+	// allocated local port. Signal the whole group recorded at spawn.
+	reapPGIDs(context.Background(), tm.ulog, tm.supervisor, pgids)
 }

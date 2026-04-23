@@ -141,6 +141,11 @@ func (m *Manager) nativeDown(ctx context.Context, req coreenv.EnvRequest) (*core
 			cancel()
 			// The background goroutine handles Wait() and log file cleanup.
 		}
+		// Cancel() / exec.CommandContext only SIGTERMs the immediate `sh -c`
+		// wrapper — grandchildren (cargo → target/debug/<bin>, npm → node)
+		// survive as orphans reparented to init. Signal the whole process
+		// group recorded at spawn time so the entire tree tears down.
+		reapPGIDs(ctx, m.ulog, m.Supervisor, runningEnv.NativePGIDs)
 	} else {
 		// Disk-lazy: in-memory record is gone (typical post-restart).
 		// Reap whatever the previous daemon recorded into state.json.
