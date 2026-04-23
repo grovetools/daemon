@@ -32,6 +32,25 @@ type RunningEnv struct {
 	NativePGIDs     map[string]int                // Service/tunnel name -> process group id (for cross-restart teardown; populated in Phase 2)
 }
 
+// newRunningEnv constructs a RunningEnv with all maps initialized. Every
+// call site must use this; a partial init risks nil-map panics when any
+// provider path writes to a map the caller forgot to initialize (hit this
+// on the terraform+native-service hybrid path — see impl-87 report).
+func newRunningEnv(provider, worktree, profile, stateDir string) *RunningEnv {
+	return &RunningEnv{
+		Provider:        provider,
+		Worktree:        worktree,
+		Environment:     profile,
+		StateDir:        stateDir,
+		Ports:           make(map[string]int),
+		Processes:       make(map[string]*exec.Cmd),
+		Cancels:         make(map[string]context.CancelFunc),
+		ServiceCommands: make(map[string]string),
+		ContainerNames:  make(map[string]string),
+		NativePGIDs:     make(map[string]int),
+	}
+}
+
 // Manager is the central coordinator for all active environments.
 type Manager struct {
 	Ports      *PortAllocator
@@ -469,14 +488,8 @@ func (m *Manager) Restore(basePaths []string) {
 		}
 
 		m.mu.Lock()
-		runningEnv := &RunningEnv{
-			Provider:    stateFile.Provider,
-			Worktree:    worktree,
-			Environment: stateFile.Environment,
-			ManagedBy:   stateFile.ManagedBy,
-			StateDir:    stateDir,
-			Ports:       make(map[string]int),
-		}
+		runningEnv := newRunningEnv(stateFile.Provider, worktree, stateFile.Environment, stateDir)
+		runningEnv.ManagedBy = stateFile.ManagedBy
 
 		for svcName, port := range stateFile.Ports {
 			label := fmt.Sprintf("%s/%s", worktree, svcName)

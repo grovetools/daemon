@@ -169,16 +169,7 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 		return nil, err
 	}
 
-	runningEnv := &RunningEnv{
-		Provider:        "terraform",
-		Worktree:        worktree,
-		Environment:     req.Profile,
-		StateDir:        req.StateDir,
-		Ports:           make(map[string]int),
-		Processes:       make(map[string]*exec.Cmd),
-		Cancels:         make(map[string]context.CancelFunc),
-		ServiceCommands: make(map[string]string),
-	}
+	runningEnv := newRunningEnv("terraform", worktree, req.Profile, req.StateDir)
 	m.envs[worktree] = runningEnv
 	m.mu.Unlock()
 
