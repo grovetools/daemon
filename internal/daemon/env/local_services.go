@@ -55,6 +55,13 @@ func (m *Manager) startLocalServices(
 		svcName := entry.Name
 		svcConfig := entry.Raw
 
+		for _, w := range entry.Warnings {
+			m.ulog.Warn("service config warning").
+				Field("service", svcName).
+				Field("warning", w).
+				Log(ctx)
+		}
+
 		if entry.Type != "docker" && entry.Command == "" {
 			continue
 		}

@@ -175,6 +175,11 @@ func (m *Manager) Up(ctx context.Context, req coreenv.EnvRequest) (*coreenv.EnvR
 				Field("worktree", req.Workspace.Name).
 				Log(ctx)
 		}
+
+		// Run any commands flagged with `startup = true` after services are
+		// healthy. Failures don't roll back Up — these are convenience hooks
+		// for CLI-managed sidecars (genohype pools, etc.), not load-bearing.
+		m.runStartupCommands(ctx, req, req.Workspace.Path, req.EffectiveStateDir(), resp.EnvVars)
 	}
 
 	return resp, err

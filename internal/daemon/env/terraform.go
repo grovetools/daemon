@@ -370,6 +370,11 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 	}
 	worktree := req.Workspace.Name
 
+	// Profile-level pre_stop hook runs before any destroy / local-process
+	// teardown so users can drain state from cloud resources or kill
+	// CLI-managed sidecars (genohype pools, etc.) up front.
+	m.runPreStopHook(ctx, req, req.Workspace.Path, req.EffectiveStateDir(), nil)
+
 	skipDestroy, _ := req.Config["skip_destroy"].(bool)
 	// --clean overrides skip_destroy: the user explicitly asked for a hard wipe.
 	if req.Clean {

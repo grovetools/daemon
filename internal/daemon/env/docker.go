@@ -527,6 +527,10 @@ func (m *Manager) dockerDown(ctx context.Context, req coreenv.EnvRequest) (*core
 	}
 	worktree := req.Workspace.Name
 
+	// Profile-level pre_stop hook fires before docker compose down so users
+	// can flush state in dependent containers / external services.
+	m.runPreStopHook(ctx, req, req.Workspace.Path, req.EffectiveStateDir(), nil)
+
 	m.mu.Lock()
 	_, exists := m.envs[worktree]
 	if exists {
