@@ -178,16 +178,6 @@ func (m *Manager) startLocalServices(
 			}
 		}
 
-		// Shared Rust build cache: when a service declares rust_build_cache=true,
-		// point CARGO_TARGET_DIR at <ecosystem-root>/.grove/shared-cargo-target so
-		// sibling worktrees reuse artifacts. Cargo's fingerprint locks handle
-		// concurrent access; target/ lives outside the workspace so docker build
-		// context hashes (core/pkg/build/fingerprint.go) are unaffected.
-		cargoCacheEnv := computeCargoCacheEnv(ctx, m, svcName, svcConfig, req.Workspace.Path)
-		if cargoCacheEnv != "" {
-			cmd.Env = append(cmd.Env, cargoCacheEnv)
-		}
-
 		// Volumes: create directories, run pre-start restore commands.
 		if volumes, ok := svcConfig["volumes"].(map[string]interface{}); ok {
 			for volName, volCfgRaw := range volumes {
@@ -438,9 +428,6 @@ func (m *Manager) startLocalServices(
 					lcCmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
 					for k, v := range resp.EnvVars {
 						lcCmd.Env = append(lcCmd.Env, fmt.Sprintf("%s=%s", k, v))
-					}
-					if cargoCacheEnv != "" {
-						lcCmd.Env = append(lcCmd.Env, cargoCacheEnv)
 					}
 
 					if logDir != "" {
