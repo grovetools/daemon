@@ -50,6 +50,20 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		EnvVars: make(map[string]string),
 	}
 
+	// Hybrid native + shared-infra: when the profile sets shared_backend_config,
+	// surface the shared TF outputs as UPPER_CASE env vars on resp.EnvVars so
+	// service env entries can $-substitute them via the existing expand path
+	// (mirrors terraformUp's mapTerraformOutputs default behavior).
+	if sharedCfg, ok := req.Config["shared_backend_config"].(map[string]interface{}); ok {
+		sharedOutputs, sErr := m.fetchSharedOutputs(ctx, sharedCfg)
+		if sErr != nil {
+			return nil, fmt.Errorf("failed to fetch shared outputs: %w", sErr)
+		}
+		for name, val := range sharedOutputs {
+			resp.EnvVars[strings.ToUpper(name)] = fmt.Sprintf("%v", val)
+		}
+	}
+
 	// Create log directory for service output
 	logDir := filepath.Join(req.Workspace.Path, ".grove", "env", "logs")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
@@ -130,6 +144,11 @@ func (m *Manager) nativeDown(ctx context.Context, req coreenv.EnvRequest) (*core
 		return nil, fmt.Errorf("native provider requires a workspace")
 	}
 	worktree := req.Workspace.Name
+
+	// Run profile-level pre_stop hook before any service teardown so users
+	// can clean up transient subsystems (e.g. CLI-managed pools spawned via
+	// startup commands).
+	m.runPreStopHook(ctx, req, req.Workspace.Path, req.EffectiveStateDir(), nil)
 
 	m.mu.Lock()
 	runningEnv, exists := m.envs[worktree]
