@@ -40,6 +40,19 @@ type JobRunner struct {
 	// Each one spawns external grove/aglogs processes; unbounded concurrency
 	// can overwhelm the system.
 	transcriptSem chan struct{}
+
+	// onJobDetached is called when an interactive_agent / headless_agent job
+	// returns from the executor with a non-terminal "running" status. The
+	// log streamer uses this to broadcast "running" to SSE subscribers and
+	// close them, so clients like `flow plan run` can return.
+	onJobDetached func(jobID string)
+}
+
+// SetOnJobDetached registers a callback invoked when a job completes its
+// executor with status="running" (interactive_agent / headless_agent launched
+// detached). Wired by the daemon to the LogStreamer.NotifyJobDetached method.
+func (jr *JobRunner) SetOnJobDetached(fn func(jobID string)) {
+	jr.onJobDetached = fn
 }
 
 // New creates a new JobRunner with the given store, runtime, and worker count.
@@ -452,6 +465,14 @@ func (jr *JobRunner) markDone(info *models.JobInfo, status, errMsg string) {
 		Field("status", status).
 		Field("error", errMsg).
 		Log(context.Background())
+
+	// For interactive/headless agents that finish their launch with "running",
+	// notify the log streamer so it can broadcast and close SSE subscribers.
+	// "running" is not in isTerminalStatus (the log file keeps growing), so
+	// the tail loop on its own would never release the streaming client.
+	if status == "running" && jr.onJobDetached != nil {
+		jr.onJobDetached(info.ID)
+	}
 
 	// Re-evaluate blocked jobs — this job's completion may unblock dependents.
 	jr.evaluateBlockedJobs()

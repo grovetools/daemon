@@ -304,6 +304,9 @@ func newGrovedStartCmd() *cobra.Command {
 			logMaxSubs := 10
 			logPollInterval := 500 * time.Millisecond
 			streamer := logstreamer.New(st, logBufSize, logMaxSubs, logPollInterval)
+			if jr != nil {
+				jr.SetOnJobDetached(streamer.NotifyJobDetached)
+			}
 
 			// 4. Setup Server with engine and env manager
 			envManager := daemonenv.NewManager()

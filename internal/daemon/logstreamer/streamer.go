@@ -275,6 +275,33 @@ func (ls *LogStreamer) processLine(stream *JobStream, normalizer *NormalizerWrap
 	stream.mu.Unlock()
 }
 
+// NotifyJobDetached signals that an interactive_agent / headless_agent job has
+// been launched and is now running detached. The streamer broadcasts the
+// "running" status to subscribers and closes them, allowing the SSE client
+// (e.g., `flow plan run`) to return without waiting for terminal status.
+//
+// This is necessary because "running" is not a terminal status for the tail
+// loop (the log file keeps growing), but for client semantics it marks the
+// boundary where the launch flow is complete.
+func (ls *LogStreamer) NotifyJobDetached(jobID string) {
+	ls.mu.Lock()
+	stream, exists := ls.streams[jobID]
+	ls.mu.Unlock()
+	if !exists {
+		return
+	}
+
+	job := ls.store.GetJob(jobID)
+	status := "running"
+	errMsg := ""
+	if job != nil {
+		status = job.Status
+		errMsg = job.Error
+	}
+	ls.broadcastStatus(stream, status, errMsg)
+	ls.closeSubscribers(stream)
+}
+
 // broadcastStatus sends a status event to all subscribers.
 func (ls *LogStreamer) broadcastStatus(stream *JobStream, status, errMsg string) {
 	stream.mu.Lock()
