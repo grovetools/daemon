@@ -124,7 +124,7 @@ func IndexNotesInProcess(nodes []*workspace.WorkspaceNode, locator *workspace.No
 
 			for _, entry := range entries {
 				if entry.IsDir() {
-					if strings.HasPrefix(entry.Name(), ".") {
+					if strings.HasPrefix(entry.Name(), ".") && !shouldDescendDotDir(entry.Name()) {
 						continue
 					}
 					subDirPath := filepath.Join(dir.Path, entry.Name())
@@ -151,8 +151,9 @@ func indexDirFiles(index map[string]*models.NoteIndexEntry, dirPath, wsName, con
 
 	for _, entry := range entries {
 		if entry.IsDir() {
-			// Recurse into nested subdirectories (e.g., plans/my-plan/jobs/)
-			if !strings.HasPrefix(entry.Name(), ".") {
+			// Recurse into nested subdirectories (e.g., plans/my-plan/jobs/).
+			// Skip hidden dirs except note-organisation ones like .archive/.artifacts/.closed.
+			if !strings.HasPrefix(entry.Name(), ".") || shouldDescendDotDir(entry.Name()) {
 				nestedSubDir := subDir + "/" + entry.Name()
 				indexDirFiles(index, filepath.Join(dirPath, entry.Name()), wsName, contentDirPath, contentDirType, nestedSubDir)
 			}
@@ -239,6 +240,18 @@ func indexFileEntry(filePath, wsName, contentDirPath, contentDirType string) *mo
 	}
 
 	return entry
+}
+
+// shouldDescendDotDir reports whether a hidden directory name is a
+// note-organisation dir (e.g. .archive, .artifacts, .closed) that should
+// still be indexed. Other dot dirs like .git or .grove are skipped.
+func shouldDescendDotDir(name string) bool {
+	switch name {
+	case ".archive", ".artifacts", ".closed":
+		return true
+	default:
+		return false
+	}
 }
 
 // IndexSingleNote creates a NoteIndexEntry for a single file path.
