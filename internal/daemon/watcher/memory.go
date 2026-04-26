@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -50,6 +51,9 @@ type MemoryHandler struct {
 	jobQueue    chan IndexJob
 	limiter     *rate.Limiter
 	initialSync sync.Once
+
+	jobsQueued   atomic.Int32
+	jobsInFlight atomic.Int32
 }
 
 // NewMemoryHandler creates a new MemoryHandler for auto-indexing content.
@@ -304,6 +308,7 @@ func resolveWorkspaceName(filePath string) string {
 // Sends on a goroutine so large reindex operations don't drop jobs.
 func (h *MemoryHandler) queueDirect(path string) {
 	wsName := resolveWorkspaceName(path)
+	h.jobsQueued.Add(1)
 	go func() {
 		h.jobQueue <- IndexJob{Path: path, Workspace: wsName}
 	}()
@@ -319,7 +324,7 @@ func (h *MemoryHandler) triggerJob(path string) {
 
 	h.timers[path] = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
 		wsName := resolveWorkspaceName(path)
-
+		h.jobsQueued.Add(1)
 		h.jobQueue <- IndexJob{
 			Path:      path,
 			Workspace: wsName,
@@ -397,9 +402,18 @@ func (h *MemoryHandler) worker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case job := <-h.jobQueue:
+			h.jobsQueued.Add(-1)
+			h.jobsInFlight.Add(1)
+			h.pushLiveProgress()
 			h.processJob(ctx, job)
+			h.jobsInFlight.Add(-1)
+			h.pushLiveProgress()
 		}
 	}
+}
+
+func (h *MemoryHandler) pushLiveProgress() {
+	h.memStore.SetLiveProgress(int(h.jobsQueued.Load()), int(h.jobsInFlight.Load()))
 }
 
 var (
