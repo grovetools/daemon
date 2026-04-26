@@ -42,7 +42,7 @@ type MemoryHandler struct {
 	ulog     *logging.UnifiedLogger
 
 	watchedPaths map[string]*workspace.WorkspaceNode
-	codePaths    map[string]bool // paths that contain Go source code (vs notebook content)
+	codePaths    map[string]bool // paths that contain source code (vs notebook content)
 	pathsMutex   sync.RWMutex
 
 	debounceMs  int
@@ -134,11 +134,14 @@ func (h *MemoryHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace
 		}
 
 		// Code source directories: ecosystem sub-projects and standalone projects
-		// that contain Go source code (identified by go.mod presence)
+		// that contain source code (detected via language-specific project markers)
 		if node.IsEcosystemChild() || node.Kind == workspace.KindStandaloneProject || node.Kind == workspace.KindStandaloneProjectWorktree {
-			goModPath := filepath.Join(node.Path, "go.mod")
-			if _, err := os.Stat(goModPath); err == nil {
-				addCodeDir(node.Path, node)
+			for _, marker := range allProjectMarkers() {
+				markerPath := filepath.Join(node.Path, marker)
+				if _, err := os.Stat(markerPath); err == nil {
+					addCodeDir(node.Path, node)
+					break
+				}
 			}
 		}
 	}
@@ -211,11 +214,14 @@ func (h *MemoryHandler) MatchesEvent(event fsnotify.Event) bool {
 	for watchedPath := range h.watchedPaths {
 		if event.Name == watchedPath || strings.HasPrefix(event.Name, watchedPath+string(filepath.Separator)) {
 			if h.codePaths[watchedPath] {
-				// Code paths: accept .go files, skip generated and test files
-				if ext == ".go" && !strings.HasSuffix(event.Name, "_test.go") {
-					return true
+				profile := profileForExt(ext)
+				if profile == nil {
+					return false
 				}
-				return false
+				if isTestFile(event.Name, profile) {
+					return false
+				}
+				return true
 			}
 			// Notebook paths: accept .md, .txt, .rules (cx context presets), and .yml/.yaml (concept manifests)
 			if ext == ".md" || ext == ".txt" || ext == ".rules" || ext == ".yml" || ext == ".yaml" {
@@ -347,6 +353,8 @@ func (h *MemoryHandler) fullSync(ctx context.Context) {
 
 	for _, dir := range pathsToScan {
 		isCodeDir := codePathsCopy[dir]
+		excludeDirs := allExcludeDirs()
+		supportedExts := allSupportedExtensions()
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil
@@ -356,11 +364,8 @@ func (h *MemoryHandler) fullSync(ctx context.Context) {
 				if name == ".artifacts" {
 					return filepath.SkipDir
 				}
-				// For code paths, skip non-source directories
-				if isCodeDir {
-					if name == "vendor" || name == "node_modules" || name == "dist" || name == ".git" || name == "testdata" {
-						return filepath.SkipDir
-					}
+				if isCodeDir && excludeDirs[name] {
+					return filepath.SkipDir
 				}
 				return nil
 			}
@@ -372,7 +377,11 @@ func (h *MemoryHandler) fullSync(ctx context.Context) {
 
 			ext := strings.ToLower(filepath.Ext(path))
 			if isCodeDir {
-				if ext != ".go" || strings.HasSuffix(path, "_test.go") {
+				profile := profileForExt(ext)
+				if profile == nil || isTestFile(path, profile) {
+					return nil
+				}
+				if !supportedExts[ext] {
 					return nil
 				}
 			} else {
@@ -439,6 +448,7 @@ type codeMetadata struct {
 	Repo          string   `json:"repo"`
 	Package       string   `json:"package"`
 	FilePath      string   `json:"file_path"`
+	Language      string   `json:"language"`
 	Imports       []string `json:"imports,omitempty"`
 	CanonicalPath string   `json:"canonical_path,omitempty"`
 	IsWorktree    bool     `json:"is_worktree,omitempty"`
@@ -502,10 +512,12 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 		}
 	}
 
-	isGoFile := strings.HasSuffix(job.Path, ".go")
+	ext := strings.ToLower(filepath.Ext(job.Path))
+	profile := profileForExt(ext)
+	isCodeFile := profile != nil
 
 	content := string(contentBytes)
-	if !isGoFile {
+	if !isCodeFile {
 		content = memory.StripFrontmatter(content)
 	}
 	if strings.TrimSpace(content) == "" {
@@ -514,7 +526,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	}
 
 	// Skip generated Go files
-	if isGoFile && isGeneratedGoFile(content) {
+	if profile != nil && profile.Name == "go" && isGeneratedGoFile(content) {
 		return
 	}
 
@@ -522,19 +534,24 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	var docType string
 	var metadataBytes []byte
 
-	if isGoFile {
+	if isCodeFile {
 		docType = "code"
-		pkgName := extractGoPackage(content)
-		modName, modRoot := findGoModule(filepath.Dir(job.Path))
-		relPath, err := filepath.Rel(modRoot, job.Path)
-		if err != nil {
-			relPath = job.Path
+		repo, pkg, imports := profile.ExtractMeta(content, job.Path)
+		// For Go, findGoModule returns modRoot needed for relPath
+		filePath := job.Path
+		if profile.Name == "go" {
+			_, modRoot := findGoModule(filepath.Dir(job.Path))
+			if rel, err := filepath.Rel(modRoot, job.Path); err == nil {
+				filePath = rel
+			}
+		} else {
+			filePath = filepath.Base(job.Path)
 		}
-		imports := extractGoImports(content)
 		meta := codeMetadata{
-			Repo:          modName,
-			Package:       pkgName,
-			FilePath:      relPath,
+			Repo:          repo,
+			Package:       pkg,
+			FilePath:      filePath,
+			Language:      profile.Name,
 			Imports:       imports,
 			CanonicalPath: canonicalFilePath,
 			IsWorktree:    isWorktreeOverride,
