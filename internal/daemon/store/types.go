@@ -78,6 +78,11 @@ const (
 	// to render a transient [Index Syncing…] indicator.
 	UpdateMemoryIndex UpdateType = "memory_index"
 
+	// Memory reindex trigger — the HTTP endpoint emits this so the
+	// MemoryHandler watcher can pick it up in HandleStoreUpdate and
+	// queue the requested re-indexing work asynchronously.
+	UpdateMemoryReindex UpdateType = "memory_reindex" // Payload: *MemoryReindexPayload
+
 	// Native agent pane lifecycle — these are pass-through events that the
 	// daemon relays from Flow (or the HTTP API) to groveterm via SSE.
 	// The daemon does NOT apply them to its own state; they exist purely
@@ -92,6 +97,12 @@ const (
 type MemoryIndexPayload struct {
 	Op   string `json:"op"`   // "upsert" | "delete"
 	Path string `json:"path"` // File path that was indexed / removed
+}
+
+// MemoryReindexPayload describes a reindex request triggered via the HTTP API.
+type MemoryReindexPayload struct {
+	Mode   string `json:"mode"`             // "stale", "all", "path"
+	Target string `json:"target,omitempty"` // File path (only for mode "path")
 }
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation

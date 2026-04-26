@@ -21,6 +21,7 @@ import (
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/memory/pkg/memory"
+	"golang.org/x/time/rate"
 )
 
 // IndexJob represents a file to be indexed into the memory store.
@@ -46,7 +47,9 @@ type MemoryHandler struct {
 	timers      map[string]*time.Timer
 	timersMutex sync.Mutex
 
-	jobQueue chan IndexJob
+	jobQueue    chan IndexJob
+	limiter     *rate.Limiter
+	initialSync sync.Once
 }
 
 // NewMemoryHandler creates a new MemoryHandler for auto-indexing content.
@@ -67,6 +70,7 @@ func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.Docum
 		timers:       make(map[string]*time.Timer),
 		debounceMs:   debounceMs,
 		jobQueue:     make(chan IndexJob, 1000),
+		limiter:      rate.NewLimiter(rate.Limit(2), 1), // 2 embeddings/sec
 	}
 
 	// Start a worker pool (2 workers) to handle embedding generation asynchronously
@@ -166,6 +170,11 @@ func (h *MemoryHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace
 	for p := range newWatches {
 		paths = append(paths, p)
 	}
+
+	h.initialSync.Do(func() {
+		go h.fullSync(context.Background())
+	})
+
 	return paths
 }
 
@@ -217,18 +226,57 @@ func (h *MemoryHandler) HandleEvents(ctx context.Context, events []fsnotify.Even
 }
 
 func (h *MemoryHandler) HandleStoreUpdate(update store.Update) {
-	if update.Type == store.UpdateConfigReload {
+	switch update.Type {
+	case store.UpdateConfigReload:
 		newCfg, err := config.LoadDefault()
 		if err == nil {
 			h.cfg = newCfg
 			h.locator = workspace.NewNotebookLocator(newCfg)
 		}
+	case store.UpdateMemoryReindex:
+		payload, ok := update.Payload.(*store.MemoryReindexPayload)
+		if !ok || payload == nil {
+			return
+		}
+		go h.handleReindex(payload)
+	}
+}
+
+func (h *MemoryHandler) handleReindex(payload *store.MemoryReindexPayload) {
+	ctx := context.Background()
+	switch payload.Mode {
+	case "path":
+		h.queueDirect(payload.Target)
+	case "all":
+		infos, err := h.memStore.GetDocumentPathInfos(ctx)
+		if err != nil {
+			h.ulog.Warn("Reindex: failed to query documents").Err(err).Log(ctx)
+			return
+		}
+		for _, info := range infos {
+			h.queueDirect(info.Path)
+		}
+	case "stale":
+		infos, err := h.memStore.GetDocumentPathInfos(ctx)
+		if err != nil {
+			h.ulog.Warn("Reindex: failed to query documents").Err(err).Log(ctx)
+			return
+		}
+		for _, info := range infos {
+			fi, err := os.Stat(info.Path)
+			if err != nil {
+				continue
+			}
+			if fi.ModTime().After(info.UpdatedAt) {
+				h.queueDirect(info.Path)
+			}
+		}
 	}
 }
 
 func (h *MemoryHandler) OnStart(ctx context.Context) {
-	// Trigger an initial background sync to catch any files modified while daemon was offline
-	go h.fullSync(ctx)
+	// Startup reconciliation is deferred to ComputeWatchPaths via initialSync
+	// to avoid a race where fullSync runs before watch paths are populated.
 }
 
 // resolveWorkspaceName extracts the workspace name from a file path by finding
@@ -245,6 +293,17 @@ func resolveWorkspaceName(filePath string) string {
 		return rest[:slash]
 	}
 	return rest
+}
+
+// queueDirect pushes a job directly onto the jobQueue without debounce timers.
+// Used by fullSync and reindex to avoid creating thousands of timers.
+func (h *MemoryHandler) queueDirect(path string) {
+	wsName := resolveWorkspaceName(path)
+	select {
+	case h.jobQueue <- IndexJob{Path: path, Workspace: wsName}:
+	default:
+		h.ulog.Debug("Job queue full, dropping direct queue").Field("path", path).Log(context.Background())
+	}
 }
 
 func (h *MemoryHandler) triggerJob(path string) {
@@ -321,7 +380,7 @@ func (h *MemoryHandler) fullSync(ctx context.Context) {
 			// Upsert if the file isn't in the DB or is newer than the DB timestamp
 			doc, err := h.memStore.GetDocumentByPath(ctx, path)
 			if err != nil || doc == nil || info.ModTime().After(doc.UpdatedAt) {
-				h.triggerJob(path)
+				h.queueDirect(path)
 			}
 
 			return nil
@@ -493,6 +552,9 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 
 	var newEmbeddings [][]float32
 	if len(textsToEmbed) > 0 {
+		if err := h.limiter.Wait(ctx); err != nil {
+			return
+		}
 		embedCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 

@@ -13,6 +13,7 @@ import (
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/daemon/internal/daemon/store"
 	memory "github.com/grovetools/memory/pkg/memory"
 )
 
@@ -30,6 +31,96 @@ func (s *Server) SetMemoryStore(store memory.DocumentStore, embedder *memory.Emb
 	s.memStore = store
 	s.memEmbedder = embedder
 	s.memDBPath = dbPath
+}
+
+// handleMemoryReindex handles POST /api/memory/reindex.
+// Returns 202 Accepted with a count of matched files; actual re-indexing
+// happens asynchronously via the MemoryHandler watcher.
+func (s *Server) handleMemoryReindex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.scope != "" {
+		var fwdReq models.MemoryReindexRequest
+		_ = json.NewDecoder(r.Body).Decode(&fwdReq)
+		resp, err := s.forwardToGlobal().ExecuteMemoryReindex(r.Context(), fwdReq)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("forward reindex failed: %v", err), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	if s.memStore == nil {
+		http.Error(w, "memory store not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req models.MemoryReindexRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Mode == "" {
+		req.Mode = "stale"
+	}
+
+	var queuedCount int
+	switch req.Mode {
+	case "path":
+		if req.Target == "" {
+			http.Error(w, "target path required for mode=path", http.StatusBadRequest)
+			return
+		}
+		queuedCount = 1
+	case "all":
+		infos, err := s.memStore.GetDocumentPathInfos(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to query documents: %v", err), http.StatusInternalServerError)
+			return
+		}
+		queuedCount = len(infos)
+	case "stale":
+		infos, err := s.memStore.GetDocumentPathInfos(r.Context())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to query documents: %v", err), http.StatusInternalServerError)
+			return
+		}
+		for _, info := range infos {
+			fi, err := os.Stat(info.Path)
+			if err != nil {
+				continue
+			}
+			if fi.ModTime().After(info.UpdatedAt) {
+				queuedCount++
+			}
+		}
+	default:
+		http.Error(w, fmt.Sprintf("unknown mode: %s", req.Mode), http.StatusBadRequest)
+		return
+	}
+
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:   store.UpdateMemoryReindex,
+		Source: "memory",
+		Payload: &store.MemoryReindexPayload{
+			Mode:   req.Mode,
+			Target: req.Target,
+		},
+	})
+
+	resp := models.MemoryReindexResponse{
+		QueuedCount: queuedCount,
+		Mode:        req.Mode,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleMemorySearch handles POST /api/memory/search.
