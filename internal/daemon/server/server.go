@@ -20,6 +20,7 @@ import (
 	"github.com/grovetools/core/config"
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/repo"
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/pkg/paths"
@@ -40,6 +41,7 @@ import (
 	"github.com/grovetools/memory/pkg/memory"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+	"golang.org/x/sync/singleflight"
 )
 
 // RunningConfig holds the active configuration intervals being used by the daemon.
@@ -89,6 +91,9 @@ type Server struct {
 	// terminalHub routes WebSocket messages for multi-attach
 	// (Primary/Follower groveterm instances).
 	terminalHub *TerminalHub
+
+	// repoGroup deduplicates concurrent /api/repos/ensure requests for the same URL+version.
+	repoGroup singleflight.Group
 
 	// OnReady, if non-nil, is invoked exactly once from inside ListenAndServe
 	// after the unix socket has been bound and chmod'd — i.e. the earliest
@@ -232,6 +237,8 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	// Global-proxy route registration (global daemon only)
 	mux.HandleFunc("/api/proxy/register", s.handleProxyRegister)
 	mux.HandleFunc("/api/proxy/unregister", s.handleProxyUnregister)
+	// Repo ensure endpoint (single-flighted clones).
+	mux.HandleFunc("/api/repos/ensure", s.handleRepoEnsure)
 	// Job management endpoints
 	mux.HandleFunc("/api/jobs/", s.handleJobByID)
 	mux.HandleFunc("/api/jobs", s.handleJobs)
@@ -1968,6 +1975,44 @@ func (s *Server) handleProxyUnregister(w http.ResponseWriter, r *http.Request) {
 	}
 	s.envManager.Proxy.Unregister(req.Worktree)
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleRepoEnsure handles POST /api/repos/ensure — clone+checkout, single-flighted per URL@version.
+func (s *Server) handleRepoEnsure(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req models.RepoEnsureRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.URL == "" {
+		http.Error(w, "url is required", http.StatusBadRequest)
+		return
+	}
+	key := req.URL + "@" + req.Version
+	ctx := r.Context()
+	v, err, _ := s.repoGroup.Do(key, func() (interface{}, error) {
+		mgr, mgrErr := repo.NewManager()
+		if mgrErr != nil {
+			return nil, mgrErr
+		}
+		path, commit, ensureErr := mgr.EnsureVersion(ctx, req.URL, req.Version)
+		if ensureErr != nil {
+			return nil, ensureErr
+		}
+		return &models.RepoEnsureResponse{WorktreePath: path, Commit: commit}, nil
+	})
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
 }
 
 // --- Channel Management Handlers ---
