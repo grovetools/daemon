@@ -124,6 +124,9 @@ func (h *MemoryHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace
 		if dir, err := h.locator.GetCompletedDir(node); err == nil {
 			addDir(dir, node)
 		}
+		if dir, err := h.locator.GetContextPresetsDir(node); err == nil {
+			addDir(dir, node)
+		}
 
 		// Code source directories: ecosystem sub-projects and standalone projects
 		// that contain Go source code (identified by go.mod presence)
