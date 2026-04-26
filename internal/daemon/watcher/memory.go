@@ -23,6 +23,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/memory/pkg/memory"
 	"golang.org/x/time/rate"
+	"gopkg.in/yaml.v3"
 )
 
 // IndexJob represents a file to be indexed into the memory store.
@@ -216,8 +217,8 @@ func (h *MemoryHandler) MatchesEvent(event fsnotify.Event) bool {
 				}
 				return false
 			}
-			// Notebook paths: accept .md, .txt, and .rules (cx context presets)
-			if ext == ".md" || ext == ".txt" || ext == ".rules" {
+			// Notebook paths: accept .md, .txt, .rules (cx context presets), and .yml/.yaml (concept manifests)
+			if ext == ".md" || ext == ".txt" || ext == ".rules" || ext == ".yml" || ext == ".yaml" {
 				return true
 			}
 			return false
@@ -375,7 +376,7 @@ func (h *MemoryHandler) fullSync(ctx context.Context) {
 					return nil
 				}
 			} else {
-				if ext != ".md" && ext != ".txt" && ext != ".rules" {
+				if ext != ".md" && ext != ".txt" && ext != ".rules" && ext != ".yml" && ext != ".yaml" {
 					return nil
 				}
 			}
@@ -420,6 +421,18 @@ var (
 	goPackageRegex = regexp.MustCompile(`^package\s+([a-zA-Z0-9_]+)`)
 	goModuleRegex  = regexp.MustCompile(`(?m)^module\s+([^\s]+)`)
 )
+
+// conceptManifest represents the YAML structure of concept-manifest.yml files.
+type conceptManifest struct {
+	ID              string   `yaml:"id"              json:"id"`
+	Title           string   `yaml:"title"           json:"title"`
+	Description     string   `yaml:"description"     json:"description"`
+	Status          string   `yaml:"status"          json:"status"`
+	RelatedConcepts []string `yaml:"related_concepts" json:"related_concepts,omitempty"`
+	RelatedPlans    []string `yaml:"related_plans"    json:"related_plans,omitempty"`
+	RelatedNotes    []string `yaml:"related_notes"    json:"related_notes,omitempty"`
+	RelatedSkills   []string `yaml:"related_skills"   json:"related_skills,omitempty"`
+}
 
 // codeMetadata mirrors the CodeMetadata struct from memory/cmd for JSON encoding.
 type codeMetadata struct {
@@ -527,6 +540,12 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 			IsWorktree:    isWorktreeOverride,
 		}
 		metadataBytes, _ = json.Marshal(meta)
+	} else if filepath.Base(job.Path) == "concept-manifest.yml" && strings.Contains(job.Path, "/concepts/") {
+		docType = "concept_manifest"
+		var manifest conceptManifest
+		if err := yaml.Unmarshal(contentBytes, &manifest); err == nil {
+			metadataBytes, _ = json.Marshal(manifest)
+		}
 	} else {
 		docType = "note"
 		if strings.Contains(job.Path, "/skills/") {
