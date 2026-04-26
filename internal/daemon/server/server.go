@@ -249,6 +249,17 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/memory/search", s.handleMemorySearch)
 	mux.HandleFunc("/api/memory/coverage", s.handleMemoryCoverage)
 	mux.HandleFunc("/api/memory/status", s.handleMemoryStatus)
+	// Memory analysis endpoints
+	mux.HandleFunc("/api/memory/analysis/gc", s.handleMemoryAnalysisGC)
+	mux.HandleFunc("/api/memory/analysis/workspaces", s.handleMemoryAnalysisWorkspaces)
+	mux.HandleFunc("/api/memory/analysis/ecosystems", s.handleMemoryAnalysisEcosystems)
+	mux.HandleFunc("/api/memory/analysis/code", s.handleMemoryAnalysisCode)
+	mux.HandleFunc("/api/memory/analysis/concepts", s.handleMemoryAnalysisConcepts)
+	mux.HandleFunc("/api/memory/analysis/embeddings", s.handleMemoryAnalysisEmbeddings)
+	mux.HandleFunc("/api/memory/analysis/freshness", s.handleMemoryAnalysisFreshness)
+	mux.HandleFunc("/api/memory/analysis/duplicates", s.handleMemoryAnalysisDuplicates)
+	mux.HandleFunc("/api/memory/analysis/notebooks", s.handleMemoryAnalysisNotebooks)
+	mux.HandleFunc("/api/memory/analysis/context", s.handleMemoryAnalysisContext)
 	// Treemux multi-attach WebSocket endpoint
 	mux.HandleFunc("/api/treemux/ws", s.HandleTerminalWS)
 	// Treemux SSE stream for web viewers
