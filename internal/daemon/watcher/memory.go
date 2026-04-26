@@ -301,13 +301,12 @@ func resolveWorkspaceName(filePath string) string {
 
 // queueDirect pushes a job directly onto the jobQueue without debounce timers.
 // Used by fullSync and reindex to avoid creating thousands of timers.
+// Sends on a goroutine so large reindex operations don't drop jobs.
 func (h *MemoryHandler) queueDirect(path string) {
 	wsName := resolveWorkspaceName(path)
-	select {
-	case h.jobQueue <- IndexJob{Path: path, Workspace: wsName}:
-	default:
-		h.ulog.Debug("Job queue full, dropping direct queue").Field("path", path).Log(context.Background())
-	}
+	go func() {
+		h.jobQueue <- IndexJob{Path: path, Workspace: wsName}
+	}()
 }
 
 func (h *MemoryHandler) triggerJob(path string) {
