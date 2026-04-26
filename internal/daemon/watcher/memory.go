@@ -156,6 +156,7 @@ func (h *MemoryHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace
 					h.ulog.Warn("Failed to GC memory for removed worktree").Err(err).Field("prefix", cleanPrefix).Log(ctx)
 				} else {
 					h.ulog.Info("GCed memory for removed worktree").Field("prefix", cleanPrefix).Log(ctx)
+					_ = h.memStore.LogAudit(ctx, "gc_worktree", cleanPrefix, nil)
 				}
 			}
 		}()
@@ -417,6 +418,7 @@ type codeMetadata struct {
 func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	if workspace.IsZombieWorktree(job.Path) {
 		_ = h.memStore.DeleteDocument(ctx, job.Path)
+		_ = h.memStore.LogAudit(ctx, "delete", job.Path, map[string]any{"reason": "zombie_worktree"})
 		h.broadcastMemoryEvent("delete", job.Path)
 		return
 	}
@@ -430,6 +432,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 					Field("path", job.Path).
 					Log(ctx)
 			} else {
+				_ = h.memStore.LogAudit(ctx, "delete", job.Path, map[string]any{"reason": "file_removed"})
 				h.broadcastMemoryEvent("delete", job.Path)
 			}
 			return
@@ -462,6 +465,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 			canonicalBytes, err := os.ReadFile(canonicalFilePath)
 			if err == nil && string(canonicalBytes) == string(contentBytes) {
 				_ = h.memStore.DeleteDocument(ctx, job.Path)
+				_ = h.memStore.LogAudit(ctx, "delete", job.Path, map[string]any{"reason": "worktree_duplicate"})
 				h.broadcastMemoryEvent("delete", job.Path)
 				return
 			}
@@ -610,6 +614,12 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 			Field("new_embeddings", len(textsToEmbed)).
 			Field("reused_embeddings", len(chunks)-len(textsToEmbed)).
 			Log(ctx)
+		_ = h.memStore.LogAudit(ctx, "upsert", job.Path, map[string]any{
+			"doc_type":       docType,
+			"chunks":         len(chunks),
+			"new_embeddings": len(textsToEmbed),
+			"reused":         len(chunks) - len(textsToEmbed),
+		})
 		h.broadcastMemoryEvent("upsert", job.Path)
 	}
 }
