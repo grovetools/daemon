@@ -212,8 +212,8 @@ func (h *MemoryHandler) MatchesEvent(event fsnotify.Event) bool {
 				}
 				return false
 			}
-			// Notebook paths: accept .md and .txt
-			if ext == ".md" || ext == ".txt" {
+			// Notebook paths: accept .md, .txt, and .rules (cx context presets)
+			if ext == ".md" || ext == ".txt" || ext == ".rules" {
 				return true
 			}
 			return false
@@ -371,7 +371,7 @@ func (h *MemoryHandler) fullSync(ctx context.Context) {
 					return nil
 				}
 			} else {
-				if ext != ".md" && ext != ".txt" {
+				if ext != ".md" && ext != ".txt" && ext != ".rules" {
 					return nil
 				}
 			}
