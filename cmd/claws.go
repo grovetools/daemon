@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/spf13/cobra"
 )
@@ -18,7 +20,7 @@ import (
 // a quick read of which agents are claw-enabled and which daemons own
 // their sessions, without needing to dial any daemon.
 func newGrovedClawsCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "claws",
 		Short: "Show active claws (agents with Signal enabled)",
 		Long: `List every agent currently designated as a Signal claw.
@@ -107,6 +109,8 @@ so you can tell which daemon owns each claw-enabled session.`,
 			return nil
 		},
 	}
+	cmd.AddCommand(newClawsCleanupCmd())
+	return cmd
 }
 
 // signalCLIProcess returns (pid, elapsed) for a running signal-cli daemon
@@ -197,4 +201,35 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func newClawsCleanupCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "cleanup",
+		Short: "Purge ghost jobs and stale routes from the signal channel table",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := daemon.NewGlobalClient()
+			defer client.Close()
+
+			if !client.IsRunning() {
+				fmt.Println("Daemon is not running.")
+				return nil
+			}
+
+			fmt.Println("Cleaning up orphaned claw sessions...")
+
+			resp, err := client.CleanupChannels(context.Background())
+			if err != nil {
+				return fmt.Errorf("failed to clean up channels: %w", err)
+			}
+
+			if resp.Purged > 0 {
+				fmt.Printf("Purged %d stale route(s).\n", resp.Purged)
+			} else {
+				fmt.Println("No stale routes found. Routing table is clean.")
+			}
+
+			return nil
+		},
+	}
 }

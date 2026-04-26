@@ -245,10 +245,12 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	// Channel management endpoints
 	mux.HandleFunc("/api/channels/send", s.handleChannelSend)
 	mux.HandleFunc("/api/channels/status", s.handleChannelStatus)
+	mux.HandleFunc("/api/channels/cleanup", s.handleChannelCleanup)
 	// Memory search endpoints
 	mux.HandleFunc("/api/memory/search", s.handleMemorySearch)
 	mux.HandleFunc("/api/memory/coverage", s.handleMemoryCoverage)
 	mux.HandleFunc("/api/memory/status", s.handleMemoryStatus)
+	mux.HandleFunc("/api/memory/reindex", s.handleMemoryReindex)
 	// Memory analysis endpoints
 	mux.HandleFunc("/api/memory/analysis/gc", s.handleMemoryAnalysisGC)
 	mux.HandleFunc("/api/memory/analysis/workspaces", s.handleMemoryAnalysisWorkspaces)
@@ -2069,6 +2071,27 @@ func (s *Server) handleChannelStatus(w http.ResponseWriter, r *http.Request) {
 	status := s.channelManager.Status()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
+}
+
+// handleChannelCleanup handles POST /api/channels/cleanup — purge stale routes.
+func (s *Server) handleChannelCleanup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.channelManager == nil {
+		http.Error(w, "channel manager not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	purged, err := s.channelManager.CleanupOrphans(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(models.ChannelCleanupResponse{Purged: purged})
 }
 
 // handleNavBindings handles GET /api/nav/bindings — return current nav binding state.

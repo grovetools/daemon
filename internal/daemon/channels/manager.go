@@ -201,6 +201,69 @@ func (m *Manager) pruneSession(jobID string) {
 	m.saveRoutes()
 }
 
+// CleanupOrphans purges stale routes and orphaned sessions.
+// It verifies that cross-daemon routes point to live sockets and that
+// activeSessions correspond to active sessions in the store or routing table.
+// Returns the number of purged entries.
+func (m *Manager) CleanupOrphans(ctx context.Context) (int, error) {
+	purgedCount := 0
+
+	// 1. Clean up stale inbound routes (routing.json) — dead sockets
+	inboundRouteMu.Lock()
+	routes, err := readInboundRoutes()
+	changedRoutes := false
+	if err == nil {
+		for jobID, sock := range routes {
+			if _, err := os.Stat(sock); os.IsNotExist(err) {
+				delete(routes, jobID)
+				changedRoutes = true
+				purgedCount++
+			}
+		}
+		if changedRoutes {
+			_ = writeInboundRoutesAtomic(routes)
+		}
+	}
+	inboundRouteMu.Unlock()
+
+	if routes == nil {
+		routes = make(map[string]string)
+	}
+
+	// 2. Clean up activeSessions — keep if routing.json or store says alive
+	m.mu.Lock()
+	var stale []string
+	for jobID := range m.activeSessions {
+		if _, ok := routes[jobID]; ok {
+			continue
+		}
+		if m.store.GetSession(jobID) != nil {
+			continue
+		}
+		stale = append(stale, jobID)
+	}
+
+	for _, jobID := range stale {
+		delete(m.activeSessions, jobID)
+		for ts, id := range m.routeTable {
+			if id == jobID {
+				delete(m.routeTable, ts)
+			}
+		}
+		purgedCount++
+	}
+	m.mu.Unlock()
+
+	if len(stale) > 0 {
+		m.saveRoutes()
+		for _, jobID := range stale {
+			m.ulog.Info("Purged orphan channel session").Field("job_id", jobID).Log(ctx)
+		}
+	}
+
+	return purgedCount, nil
+}
+
 // Stop shuts down the channel manager and signal-cli.
 func (m *Manager) Stop(ctx context.Context) {
 	m.mu.Lock()
@@ -598,15 +661,18 @@ func (m *Manager) replyWithAgentList(recipient string) {
 	}
 }
 
-// parseTag extracts "@tag rest" from a message.
+// parseTag extracts "@tag rest" from a message. Splits on the first
+// whitespace character (space, newline, etc.) so tags typed on a phone
+// with a newline separator still route correctly.
 func parseTag(text string) (tag, rest string) {
 	text = strings.TrimPrefix(text, "@")
-	parts := strings.SplitN(text, " ", 2)
-	tag = parts[0]
-	if len(parts) > 1 {
-		rest = parts[1]
+	idx := strings.IndexAny(text, " \t\n\r")
+	if idx < 0 {
+		return text, ""
 	}
-	return
+	return text[:idx], strings.TrimLeftFunc(text[idx:], func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
 }
 
 // watchSessionEnds listens for session end events and cleans up routes.
