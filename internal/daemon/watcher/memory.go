@@ -131,6 +131,32 @@ func (h *MemoryHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace
 		}
 	}
 
+	h.pathsMutex.RLock()
+	var removedPrefixes []string
+	for oldPath, oldNode := range h.watchedPaths {
+		if _, exists := newWatches[oldPath]; !exists {
+			if oldNode != nil && oldNode.IsProjectWorktreeChild() {
+				removedPrefixes = append(removedPrefixes, oldPath)
+			}
+		}
+	}
+	h.pathsMutex.RUnlock()
+
+	if len(removedPrefixes) > 0 {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			for _, prefix := range removedPrefixes {
+				cleanPrefix := strings.TrimRight(prefix, string(filepath.Separator)) + string(filepath.Separator)
+				if err := h.memStore.DeleteDocumentsByPrefix(ctx, cleanPrefix); err != nil {
+					h.ulog.Warn("Failed to GC memory for removed worktree").Err(err).Field("prefix", cleanPrefix).Log(ctx)
+				} else {
+					h.ulog.Info("GCed memory for removed worktree").Field("prefix", cleanPrefix).Log(ctx)
+				}
+			}
+		}()
+	}
+
 	h.pathsMutex.Lock()
 	h.watchedPaths = newWatches
 	h.codePaths = newCodePaths
@@ -321,13 +347,21 @@ var (
 
 // codeMetadata mirrors the CodeMetadata struct from memory/cmd for JSON encoding.
 type codeMetadata struct {
-	Repo     string   `json:"repo"`
-	Package  string   `json:"package"`
-	FilePath string   `json:"file_path"`
-	Imports  []string `json:"imports,omitempty"`
+	Repo          string   `json:"repo"`
+	Package       string   `json:"package"`
+	FilePath      string   `json:"file_path"`
+	Imports       []string `json:"imports,omitempty"`
+	CanonicalPath string   `json:"canonical_path,omitempty"`
+	IsWorktree    bool     `json:"is_worktree,omitempty"`
 }
 
 func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
+	if workspace.IsZombieWorktree(job.Path) {
+		_ = h.memStore.DeleteDocument(ctx, job.Path)
+		h.broadcastMemoryEvent("delete", job.Path)
+		return
+	}
+
 	contentBytes, err := os.ReadFile(job.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -346,6 +380,34 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 			Field("path", job.Path).
 			Log(ctx)
 		return
+	}
+
+	h.pathsMutex.RLock()
+	var bestNode *workspace.WorkspaceNode
+	var bestLen int
+	for watchPath, node := range h.watchedPaths {
+		if strings.HasPrefix(job.Path, watchPath) && len(watchPath) > bestLen {
+			bestLen = len(watchPath)
+			bestNode = node
+		}
+	}
+	h.pathsMutex.RUnlock()
+
+	var isWorktreeOverride bool
+	var canonicalFilePath string
+
+	if bestNode != nil && bestNode.IsProjectWorktreeChild() {
+		relPath, err := filepath.Rel(bestNode.Path, job.Path)
+		if err == nil {
+			canonicalFilePath = filepath.Join(bestNode.ParentProjectPath, relPath)
+			canonicalBytes, err := os.ReadFile(canonicalFilePath)
+			if err == nil && string(canonicalBytes) == string(contentBytes) {
+				_ = h.memStore.DeleteDocument(ctx, job.Path)
+				h.broadcastMemoryEvent("delete", job.Path)
+				return
+			}
+			isWorktreeOverride = true
+		}
 	}
 
 	isGoFile := strings.HasSuffix(job.Path, ".go")
@@ -378,10 +440,12 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 		}
 		imports := extractGoImports(content)
 		meta := codeMetadata{
-			Repo:     modName,
-			Package:  pkgName,
-			FilePath: relPath,
-			Imports:  imports,
+			Repo:          modName,
+			Package:       pkgName,
+			FilePath:      relPath,
+			Imports:       imports,
+			CanonicalPath: canonicalFilePath,
+			IsWorktree:    isWorktreeOverride,
 		}
 		metadataBytes, _ = json.Marshal(meta)
 	} else {
