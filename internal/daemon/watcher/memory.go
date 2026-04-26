@@ -560,6 +560,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	var newEmbeddings [][]float32
 	if len(textsToEmbed) > 0 {
 		if err := h.limiter.Wait(ctx); err != nil {
+			h.ulog.Debug("Rate limiter cancelled").Err(err).Field("path", job.Path).Log(ctx)
 			return
 		}
 		embedCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -570,7 +571,12 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 			h.ulog.Warn("Failed to embed document chunks").
 				Err(err).
 				Field("path", job.Path).
+				Field("chunks_to_embed", len(textsToEmbed)).
 				Log(ctx)
+			_ = h.memStore.LogAudit(ctx, "embed_error", job.Path, map[string]any{
+				"error":  err.Error(),
+				"chunks": len(textsToEmbed),
+			})
 			return
 		}
 	}
