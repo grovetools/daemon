@@ -270,6 +270,11 @@ func (s *Store) ApplyUpdate(u Update) {
 			s.applyTaskResult(payload)
 		}
 
+	case UpdateTestReport:
+		if payload, ok := u.Payload.(*TestReportPayload); ok {
+			s.applyTestReport(payload)
+		}
+
 	case UpdateNavBindings:
 		if bindings, ok := u.Payload.(*models.NavSessionsFile); ok {
 			s.state.NavBindings = bindings
@@ -392,6 +397,27 @@ func (s *Store) applyTaskResult(payload *TaskResultPayload) {
 			ws.TaskResults = make(map[string]*models.TaskResult)
 		}
 		ws.TaskResults[payload.Verb] = payload.Result
+		return
+	}
+}
+
+func (s *Store) applyTestReport(payload *TestReportPayload) {
+	normalizedInput, err := pathutil.NormalizeForLookup(payload.Workspace)
+	if err != nil {
+		return
+	}
+	for _, ws := range s.state.Workspaces {
+		if ws.WorkspaceNode == nil {
+			continue
+		}
+		normalizedPath, err := pathutil.NormalizeForLookup(ws.Path)
+		if err != nil || normalizedPath != normalizedInput {
+			continue
+		}
+		if ws.TestReports == nil {
+			ws.TestReports = make(map[string]*models.TestReport)
+		}
+		ws.TestReports[payload.Report.Verb] = payload.Report
 		return
 	}
 }

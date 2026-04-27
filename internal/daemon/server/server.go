@@ -364,6 +364,8 @@ func (s *Server) handleWorkspaceSubpath(w http.ResponseWriter, r *http.Request) 
 	switch parts[1] {
 	case "tasks":
 		s.handlePostTaskResult(w, r, workspace)
+	case "test-results":
+		s.handlePostTestReport(w, r, workspace)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -423,6 +425,44 @@ func (s *Server) handlePostTaskResult(w http.ResponseWriter, r *http.Request, wo
 			Workspace: workspace,
 			Verb:      payload.Verb,
 			Result:    result,
+		},
+	})
+
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+}
+
+func (s *Server) handlePostTestReport(w http.ResponseWriter, r *http.Request, workspace string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var report models.TestReport
+	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if report.Verb == "" {
+		http.Error(w, "verb is required", http.StatusBadRequest)
+		return
+	}
+	if workspace == "" {
+		http.Error(w, "workspace is required", http.StatusBadRequest)
+		return
+	}
+	report.Timestamp = time.Now()
+
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:   store.UpdateTestReport,
+		Source: "cli",
+		Payload: &store.TestReportPayload{
+			Workspace: workspace,
+			Report:    &report,
 		},
 	})
 
@@ -1496,6 +1536,20 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
+	case store.UpdateTaskResult:
+		if payload, ok := u.Payload.(*store.TaskResultPayload); ok {
+			delta := &models.WorkspaceDelta{
+				Path:        payload.Workspace,
+				TaskResults: map[string]*models.TaskResult{payload.Verb: payload.Result},
+			}
+			return &apiStateUpdate{
+				WorkspaceDeltas: []*models.WorkspaceDelta{delta},
+				UpdateType:      "workspaces_delta",
+				Source:          u.Source,
+				Scanned:         1,
+			}
+		}
+
 	// Session lifecycle updates - broadcast as session changes
 	case store.UpdateSessionIntent, store.UpdateSessionConfirmation,
 		store.UpdateSessionStatus, store.UpdateSessionEnd:

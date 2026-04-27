@@ -86,6 +86,7 @@ const (
 	// Task result reporting — stores the outcome of developer hygiene tasks
 	// (build, check, fmt, lint) per workspace, enabling cache-based skipping.
 	UpdateTaskResult UpdateType = "task_result" // Payload: *TaskResultPayload
+	UpdateTestReport UpdateType = "test_report" // Payload: *TestReportPayload
 
 	// Native agent pane lifecycle — these are pass-through events that the
 	// daemon relays from Flow (or the HTTP API) to groveterm via SSE.
@@ -223,6 +224,12 @@ type TaskResultPayload struct {
 	Workspace string             `json:"workspace"`
 	Verb      string             `json:"verb"`
 	Result    *models.TaskResult `json:"result"`
+}
+
+// TestReportPayload contains data for reporting structured test results.
+type TestReportPayload struct {
+	Workspace string             `json:"workspace"`
+	Report    *models.TestReport `json:"report"`
 }
 
 // Update represents a change to the state.
