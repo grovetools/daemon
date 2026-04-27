@@ -14,12 +14,12 @@ import (
 // Acquire writes the current PID to the file.
 // It returns an error if another instance is already running.
 func Acquire(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil { //nolint:gosec // G301: daemon runtime directory
 		return fmt.Errorf("failed to create pid directory: %w", err)
 	}
 
 	// Check if file exists
-	if content, err := os.ReadFile(path); err == nil {
+	if content, err := os.ReadFile(path); err == nil { //nolint:gosec // G304: path from daemon config
 		pidStr := strings.TrimSpace(string(content))
 		if pid, err := strconv.Atoi(pidStr); err == nil {
 			if process.IsProcessAlive(pid) {
@@ -32,7 +32,7 @@ func Acquire(path string) error {
 
 	// Write current PID
 	pid := os.Getpid()
-	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)), 0644); err != nil { //nolint:gosec // G306: pid file readable by other processes
 		return fmt.Errorf("failed to write pid file: %w", err)
 	}
 
@@ -46,7 +46,7 @@ func Release(path string) error {
 
 // Read returns the PID from the file, or 0 if not found/invalid.
 func Read(path string) (int, error) {
-	content, err := os.ReadFile(path)
+	content, err := os.ReadFile(path) //nolint:gosec // G304: path from daemon config
 	if err != nil {
 		return 0, err
 	}

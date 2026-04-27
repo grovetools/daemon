@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -144,7 +145,7 @@ func (h *SkillHandler) MatchesEvent(event fsnotify.Event) bool {
 	defer h.pathsMutex.RUnlock()
 
 	for watchedPath := range h.watchedPaths {
-		if event.Name == watchedPath || filepath.HasPrefix(event.Name, watchedPath+string(filepath.Separator)) {
+		if event.Name == watchedPath || strings.HasPrefix(event.Name, watchedPath+string(filepath.Separator)) {
 			return true
 		}
 	}
@@ -188,7 +189,7 @@ func (h *SkillHandler) skillNameForPath(changedPath string) (string, bool) {
 	defer h.pathsMutex.RUnlock()
 
 	for watchedPath := range h.watchedPaths {
-		if changedPath == watchedPath || filepath.HasPrefix(changedPath, watchedPath+string(filepath.Separator)) {
+		if changedPath == watchedPath || strings.HasPrefix(changedPath, watchedPath+string(filepath.Separator)) {
 			return extractSkillName(changedPath, watchedPath), true
 		}
 	}

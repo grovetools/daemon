@@ -66,7 +66,7 @@ func (m *Manager) nativeUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 
 	// Create log directory for service output
 	logDir := filepath.Join(req.Workspace.Path, ".grove", "env", "logs")
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	if err := os.MkdirAll(logDir, 0o755); err != nil { //nolint:gosec // G301: daemon dir
 		m.ulog.Warn("Failed to create log directory, process output will be discarded").
 			Err(err).
 			Log(ctx)

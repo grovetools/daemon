@@ -115,7 +115,7 @@ func (s *Session) ForegroundProcess() string {
 	if err != nil || pgid <= 0 {
 		return ""
 	}
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pgid), "-o", "comm=").Output()
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pgid), "-o", "comm=").Output() //nolint:gosec // G204: pgid from internal process group
 	if err != nil {
 		return ""
 	}

@@ -58,13 +58,13 @@ func (m *Manager) Create(req CreateRequest) (*Session, error) {
 
 	var cmd *exec.Cmd
 	if req.Command != "" {
-		cmd = exec.Command(req.Command, req.Args...)
+		cmd = exec.Command(req.Command, req.Args...) //nolint:gosec // G204: user-requested command for PTY session
 	} else {
 		shell := os.Getenv("SHELL")
 		if shell == "" {
 			shell = "/bin/sh"
 		}
-		cmd = exec.Command(shell)
+		cmd = exec.Command(shell) //nolint:gosec // G204: user's default shell
 	}
 	cmd.Dir = req.CWD
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "GROVE_PTY=1", "GROVE_TERMINAL=1")

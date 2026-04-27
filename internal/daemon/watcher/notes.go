@@ -105,7 +105,7 @@ func (h *NoteHandler) MatchesEvent(event fsnotify.Event) bool {
 	defer h.pathsMutex.RUnlock()
 
 	for watchedPath := range h.watchedPaths {
-		if event.Name == watchedPath || filepath.HasPrefix(event.Name, watchedPath+string(filepath.Separator)) {
+		if event.Name == watchedPath || strings.HasPrefix(event.Name, watchedPath+string(filepath.Separator)) {
 			return true
 		}
 	}

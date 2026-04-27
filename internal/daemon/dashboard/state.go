@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/grovetools/core/config"
@@ -35,11 +34,11 @@ type State struct {
 
 // Ecosystem holds every worktree under a single grove-root.
 type Ecosystem struct {
-	Name        string    `json:"name"`
-	Path        string    `json:"path"`
-	Worktrees   []Worktree `json:"worktrees"`
+	Name        string       `json:"name"`
+	Path        string       `json:"path"`
+	Worktrees   []Worktree   `json:"worktrees"`
 	SharedInfra *SharedInfra `json:"shared_infra,omitempty"`
-	Orphans     []Orphan    `json:"orphans"`
+	Orphans     []Orphan     `json:"orphans"`
 }
 
 // Worktree summarises a single deployable worktree.
@@ -73,11 +72,11 @@ type Service struct {
 // Drift is a compact terraform-drift summary. Populated from the on-disk
 // cache written by `grove env drift`.
 type Drift struct {
-	Profile  string    `json:"profile,omitempty"`
-	HasDrift bool      `json:"has_drift"`
-	Add      int       `json:"add"`
-	Change   int       `json:"change"`
-	Destroy  int       `json:"destroy"`
+	Profile   string    `json:"profile,omitempty"`
+	HasDrift  bool      `json:"has_drift"`
+	Add       int       `json:"add"`
+	Change    int       `json:"change"`
+	Destroy   int       `json:"destroy"`
 	CheckedAt time.Time `json:"checked_at,omitempty"`
 }
 
@@ -239,7 +238,7 @@ func (a *Aggregator) probeEndpoint(ctx context.Context, url string) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return resp.StatusCode < 500
 }
 
@@ -250,22 +249,6 @@ func WriteJSON(w http.ResponseWriter, s State) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(s)
-}
-
-// probeConcurrent fires probes in parallel; kept for future use if the
-// sequential path becomes a bottleneck.
-func (a *Aggregator) probeConcurrent(ctx context.Context, urls []string) []bool {
-	out := make([]bool, len(urls))
-	var wg sync.WaitGroup
-	for i, u := range urls {
-		wg.Add(1)
-		go func(i int, u string) {
-			defer wg.Done()
-			out[i] = a.probeEndpoint(ctx, u)
-		}(i, u)
-	}
-	wg.Wait()
-	return out
 }
 
 // ---- helpers ----
@@ -281,7 +264,7 @@ type ecosystemRoot struct {
 // with a future enable/disable hook but is otherwise unused.
 func ecosystemRoots(_ *config.Config, allNodes []*workspace.WorkspaceNode) []ecosystemRoot {
 	seen := map[string]bool{}
-	var roots []ecosystemRoot
+	roots := make([]ecosystemRoot, 0, len(allNodes))
 	for _, n := range allNodes {
 		if n == nil || n.Kind != workspace.KindEcosystemRoot {
 			continue
@@ -294,15 +277,6 @@ func ecosystemRoots(_ *config.Config, allNodes []*workspace.WorkspaceNode) []eco
 		roots = append(roots, ecosystemRoot{Name: n.Name, Path: n.Path})
 	}
 	return roots
-}
-
-func expandHome(p string) string {
-	if strings.HasPrefix(p, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, p[2:])
-		}
-	}
-	return p
 }
 
 func belongsToEcosystem(node *workspace.WorkspaceNode, root ecosystemRoot) bool {
@@ -323,7 +297,7 @@ func pathsEqual(a, b string) bool {
 }
 
 func readStateFile(path string) *coreenv.EnvStateFile {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path is constructed from known ecosystem roots
 	if err != nil {
 		return nil
 	}

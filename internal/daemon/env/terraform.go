@@ -18,7 +18,6 @@ import (
 // the envtf-prefixed names into every terraform.go line. They are purely a
 // naming convenience — the canonical definitions live in core/pkg/envtf.
 type groveContext = envtf.GroveContext
-type groveVolumeConfig = envtf.GroveVolumeConfig
 type backendConfig = envtf.BackendConfig
 type tfOutput = envtf.TfOutput
 
@@ -66,7 +65,7 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 	stateDir := req.EffectiveStateDir()
 
 	logsDir := filepath.Join(stateDir, "logs")
-	if err := os.MkdirAll(logsDir, 0755); err != nil {
+	if err := os.MkdirAll(logsDir, 0o755); err != nil { //nolint:gosec // G301: daemon dir
 		return nil, fmt.Errorf("failed to create logs directory: %w", err)
 	}
 
@@ -87,7 +86,7 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 		logFile := filepath.Join(logsDir, "build-"+key+".log")
 
 		if cmdStr, ok := imgCfg["cmd"].(string); ok && cmdStr != "" {
-			buildCmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
+			buildCmd := exec.CommandContext(ctx, "sh", "-c", cmdStr) //nolint:gosec // G204: build command from grove config
 			buildCmd.Dir = req.Workspace.Path
 			buildCmd.Env = append(os.Environ(),
 				"GROVE_IMAGE_TAG="+tag,
@@ -95,7 +94,7 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 				"GROVE_IMAGE_REGISTRY="+registry,
 			)
 			output, err := buildCmd.CombinedOutput()
-			_ = os.WriteFile(logFile, output, 0644)
+			_ = os.WriteFile(logFile, output, 0644) //nolint:gosec // G306: build log file
 			if err != nil {
 				return nil, fmt.Errorf("image build command failed for %q: %w\nSee log: %s", key, err, logFile)
 			}
@@ -117,16 +116,16 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 			}
 			buildArgs = append(buildArgs, contextPath)
 
-			buildCmd := exec.CommandContext(ctx, "docker", buildArgs...)
+			buildCmd := exec.CommandContext(ctx, "docker", buildArgs...) //nolint:gosec // G204: docker build args from config
 			buildOutput, err := buildCmd.CombinedOutput()
-			_ = os.WriteFile(logFile, buildOutput, 0644)
+			_ = os.WriteFile(logFile, buildOutput, 0644) //nolint:gosec // G306: build log file
 			if err != nil {
 				return nil, fmt.Errorf("docker build failed for %q: %w\nSee log: %s", key, err, logFile)
 			}
 
-			pushCmd := exec.CommandContext(ctx, "docker", "push", fullURI)
+			pushCmd := exec.CommandContext(ctx, "docker", "push", fullURI) //nolint:gosec // G204: docker push with internal URI
 			pushOutput, err := pushCmd.CombinedOutput()
-			_ = os.WriteFile(logFile, append(buildOutput, pushOutput...), 0644)
+			_ = os.WriteFile(logFile, append(buildOutput, pushOutput...), 0644) //nolint:gosec // G306: build log file
 			if err != nil {
 				return nil, fmt.Errorf("docker push failed for %q: %w\nSee log: %s", key, err, logFile)
 			}
@@ -234,12 +233,12 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 		return nil, err
 	}
 	if overridePath != "" {
-		defer os.Remove(overridePath)
+		defer func() { _ = os.Remove(overridePath) }()
 	}
 
 	// terraform init
 	initArgs := buildInitArgs(bc)
-	initCmd := exec.CommandContext(ctx, "terraform", initArgs...)
+	initCmd := exec.CommandContext(ctx, "terraform", initArgs...) //nolint:gosec // G204: terraform with internal args
 	initCmd.Dir = moduleAbs
 	initCmd.Env = tfEnv
 	if output, err := initCmd.CombinedOutput(); err != nil {
@@ -291,7 +290,7 @@ func (m *Manager) terraformUp(ctx context.Context, req coreenv.EnvRequest) (*cor
 
 	// Tunnel + local-services log directory (shared with native provider).
 	logDir := filepath.Join(req.Workspace.Path, ".grove", "env", "logs")
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	if err := os.MkdirAll(logDir, 0o755); err != nil { //nolint:gosec // G301: daemon dir
 		m.ulog.Warn("Failed to create log directory; tunnel + service output will be discarded").
 			Err(err).
 			Log(ctx)
@@ -498,12 +497,12 @@ func (m *Manager) terraformDown(ctx context.Context, req coreenv.EnvRequest) (*c
 			m.ulog.Warn("failed to write backend override for destroy").Err(err).Log(ctx)
 		}
 		if overridePath != "" {
-			defer os.Remove(overridePath)
+			defer func() { _ = os.Remove(overridePath) }()
 		}
 
 		// terraform init (needed for backend config)
 		initArgs := buildInitArgs(bc)
-		initCmd := exec.CommandContext(ctx, "terraform", initArgs...)
+		initCmd := exec.CommandContext(ctx, "terraform", initArgs...) //nolint:gosec // G204: terraform with internal args
 		initCmd.Dir = moduleAbs
 		initCmd.Env = tfEnvDown
 		if output, err := initCmd.CombinedOutput(); err != nil {

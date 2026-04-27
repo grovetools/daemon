@@ -47,10 +47,10 @@ func TestAggregator_PicksEcosystemNodes(t *testing.T) {
 func TestAggregator_OrphanDetection(t *testing.T) {
 	tmp := t.TempDir()
 	state := filepath.Join(tmp, ".grove-worktrees", "ghost", ".grove", "env", "state.json")
-	if err := os.MkdirAll(filepath.Dir(state), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(state), 0755); err != nil { //nolint:gosec // G301: test directory
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(state, []byte(`{"provider":"docker"}`), 0644); err != nil {
+	if err := os.WriteFile(state, []byte(`{"provider":"docker"}`), 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatal(err)
 	}
 

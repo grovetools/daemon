@@ -51,7 +51,6 @@ func TestProxyManager_DirectorLookupMiss(t *testing.T) {
 	}
 }
 
-
 func TestProxyManager_RegisterAndLookup(t *testing.T) {
 	pm := NewProxyManager()
 

@@ -355,7 +355,7 @@ func (h *MemoryHandler) fullSync(ctx context.Context) {
 		isCodeDir := codePathsCopy[dir]
 		excludeDirs := allExcludeDirs()
 		supportedExts := allSupportedExtensions()
-		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil
 			}
@@ -501,7 +501,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 		relPath, err := filepath.Rel(bestNode.Path, job.Path)
 		if err == nil {
 			canonicalFilePath = filepath.Join(bestNode.ParentProjectPath, relPath)
-			canonicalBytes, err := os.ReadFile(canonicalFilePath)
+			canonicalBytes, err := os.ReadFile(canonicalFilePath) //nolint:gosec // G304: path from indexed project
 			if err == nil && string(canonicalBytes) == string(contentBytes) {
 				_ = h.memStore.DeleteDocument(ctx, job.Path)
 				_ = h.memStore.LogAudit(ctx, "delete", job.Path, map[string]any{"reason": "worktree_duplicate"})
@@ -521,7 +521,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 		content = memory.StripFrontmatter(content)
 	}
 	if strings.TrimSpace(content) == "" {
-		h.memStore.DeleteDocument(ctx, job.Path)
+		_ = h.memStore.DeleteDocument(ctx, job.Path)
 		return
 	}
 
@@ -767,7 +767,7 @@ func findGoModule(startDir string) (string, string) {
 	current := startDir
 	for {
 		modPath := filepath.Join(current, "go.mod")
-		if b, err := os.ReadFile(modPath); err == nil {
+		if b, err := os.ReadFile(modPath); err == nil { //nolint:gosec // G304: go.mod from project tree
 			matches := goModuleRegex.FindStringSubmatch(string(b))
 			name := filepath.Base(current)
 			if len(matches) > 1 {

@@ -69,7 +69,7 @@ func buildDockerServiceArgs(
 			if !filepath.IsAbs(hostPath) {
 				absPath = filepath.Join(workspacePath, hostPath)
 			}
-			_ = os.MkdirAll(absPath, 0755)
+			_ = os.MkdirAll(absPath, 0o755) //nolint:gosec // G301: volume dir from config
 			args = append(args, "-v", fmt.Sprintf("%s:%s", absPath, containerPath))
 		}
 	}
@@ -111,7 +111,7 @@ func toInt(v interface{}) int {
 
 // shellJoin produces a shell-safe joined string for logging / state
 // persistence. It is NOT used to actually invoke commands — exec.Command
-// receives raw argv slices. Single quotes with '\'' escaping.
+// receives raw argv slices. Single quotes with '\” escaping.
 func shellJoin(args []string) string {
 	parts := make([]string, len(args))
 	for i, a := range args {

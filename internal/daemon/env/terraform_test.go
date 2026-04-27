@@ -355,7 +355,7 @@ func TestWriteTfVars(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	data, err := os.ReadFile(varsPath)
+	data, err := os.ReadFile(varsPath) //nolint:gosec // G304: test path
 	if err != nil {
 		t.Fatalf("failed to read tfvars: %v", err)
 	}
@@ -440,7 +440,7 @@ func TestWriteBackendOverride_GCS(t *testing.T) {
 		t.Fatal("expected override path for GCS backend")
 	}
 
-	data, err := os.ReadFile(overridePath)
+	data, err := os.ReadFile(overridePath) //nolint:gosec // G304: test path
 	if err != nil {
 		t.Fatalf("failed to read override: %v", err)
 	}
@@ -526,12 +526,12 @@ func TestGroveContext_Write(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal error: %v", err)
 	}
-	if err := os.WriteFile(varsPath, varsBytes, 0644); err != nil {
+	if err := os.WriteFile(varsPath, varsBytes, 0o644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write error: %v", err)
 	}
 
 	// Read back and verify
-	data, err := os.ReadFile(varsPath)
+	data, err := os.ReadFile(varsPath) //nolint:gosec // G304: test path
 	if err != nil {
 		t.Fatalf("read error: %v", err)
 	}
@@ -597,8 +597,8 @@ func TestTerraformDown_CleanFlag(t *testing.T) {
 
 	// Create fake state artifacts (no terraform.tfstate so destroy is skipped,
 	// but create .terraform dir and backup to test --clean removes them)
-	os.MkdirAll(filepath.Join(tmpDir, ".terraform"), 0755)
-	os.WriteFile(filepath.Join(tmpDir, "terraform.tfstate.backup"), []byte("{}"), 0644)
+	_ = os.MkdirAll(filepath.Join(tmpDir, ".terraform"), 0o755)                              //nolint:gosec // G301: test dir
+	_ = os.WriteFile(filepath.Join(tmpDir, "terraform.tfstate.backup"), []byte("{}"), 0o644) //nolint:gosec // G306: test file
 
 	req := coreenv.EnvRequest{
 		Provider:  "terraform",
@@ -636,7 +636,7 @@ func TestTerraformDown_SkipDestroy_HonoredByDefault(t *testing.T) {
 	m := NewManager()
 	tmpDir := t.TempDir()
 	tfvarsPath := filepath.Join(tmpDir, "grove_context.auto.tfvars.json")
-	if err := os.WriteFile(tfvarsPath, []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(tfvarsPath, []byte("{}"), 0o644); err != nil { //nolint:gosec // G306: test file
 		t.Fatal(err)
 	}
 
@@ -674,7 +674,7 @@ func TestTerraformDown_ForceDestroy_OverridesSkipDestroy(t *testing.T) {
 	m := NewManager()
 	tmpDir := t.TempDir()
 	tfvarsPath := filepath.Join(tmpDir, "grove_context.auto.tfvars.json")
-	if err := os.WriteFile(tfvarsPath, []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(tfvarsPath, []byte("{}"), 0o644); err != nil { //nolint:gosec // G306: test file
 		t.Fatal(err)
 	}
 
@@ -710,7 +710,7 @@ func TestTerraformDown_NoCleanPreservesState(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create fake state artifacts (no actual TF state, so destroy won't run)
-	os.MkdirAll(filepath.Join(tmpDir, ".terraform"), 0755)
+	_ = os.MkdirAll(filepath.Join(tmpDir, ".terraform"), 0o755) //nolint:gosec // G301: test dir
 
 	req := coreenv.EnvRequest{
 		Provider:  "terraform",

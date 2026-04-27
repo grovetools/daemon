@@ -18,8 +18,8 @@ import (
 // expensive operations downstream don't see more than one snapshot per
 // debounceWindow.
 type HUDWatcher struct {
-	store         *store.Store
-	path          string
+	store          *store.Store
+	path           string
 	debounceWindow time.Duration
 }
 
@@ -55,10 +55,10 @@ func (h *HUDWatcher) Watch(ctx context.Context) <-chan models.WorkspaceHUD {
 		}
 
 		var (
-			lastEmit  time.Time
-			pending   bool
-			timer     *time.Timer
-			timerC    <-chan time.Time
+			lastEmit time.Time
+			pending  bool
+			timer    *time.Timer
+			timerC   <-chan time.Time
 		)
 
 		emit := func() {

@@ -64,7 +64,7 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 
 	// Set up log directory for restore/lifecycle logs
 	logDir := filepath.Join(req.Workspace.Path, ".grove", "env", "logs")
-	_ = os.MkdirAll(logDir, 0755)
+	_ = os.MkdirAll(logDir, 0o755) //nolint:gosec // G301: daemon-internal log directory
 
 	// Parse services to map ports, proxy routes, and volumes
 	services, _ := req.Config["services"].(map[string]interface{})
@@ -126,7 +126,7 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 				if !filepath.IsAbs(hostPath) {
 					absPath = filepath.Join(req.Workspace.Path, hostPath)
 				}
-				if err := os.MkdirAll(absPath, 0755); err != nil {
+				if err := os.MkdirAll(absPath, 0o755); err != nil { //nolint:gosec // G301: volume dir from grove config
 					m.ulog.Warn("Failed to create volume directory").
 						Err(err).
 						Field("path", absPath).
@@ -165,15 +165,15 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 								restoreEnv = append(restoreEnv, fmt.Sprintf("%s=%s", k, v))
 							}
 
-							rc := exec.Command("sh", "-c", restoreCmd)
+							rc := exec.Command("sh", "-c", restoreCmd) //nolint:gosec // G204: restoreCmd from grove config
 							rc.Dir = req.Workspace.Path
 							rc.Env = restoreEnv
 
 							restoreLogPath := filepath.Join(logDir, svcName+"-restore.log")
-							if rlf, err := os.OpenFile(restoreLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+							if rlf, err := os.OpenFile(restoreLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); err == nil { //nolint:gosec // G304: log path from internal config
 								rc.Stdout = rlf
 								rc.Stderr = rlf
-								defer rlf.Close()
+								defer func() { _ = rlf.Close() }()
 							}
 
 							if err := rc.Run(); err != nil {
@@ -226,7 +226,7 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 		return nil, fmt.Errorf("failed to generate compose override: %w", err)
 	}
 	overridePath := filepath.Join(req.PlanDir, "docker-compose.override.yml")
-	if err := os.WriteFile(overridePath, overrideBytes, 0644); err != nil {
+	if err := os.WriteFile(overridePath, overrideBytes, 0o644); err != nil { //nolint:gosec // G306: generated compose override
 		return nil, fmt.Errorf("failed to write compose override: %w", err)
 	}
 
@@ -260,7 +260,7 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 	projectName := fmt.Sprintf("grove-%s", worktree)
 	baseComposeAbs := filepath.Join(req.Workspace.Path, baseComposeFile)
 
-	cmd := exec.CommandContext(ctx, "docker", "compose", "-p", projectName, "-f", baseComposeAbs, "-f", overridePath, "up", "-d")
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-p", projectName, "-f", baseComposeAbs, "-f", overridePath, "up", "-d") //nolint:gosec // G204: args are from internal compose config
 	cmd.Dir = req.Workspace.Path
 	cmd.Env = append([]string{}, baseEnv...)
 	for k, v := range resp.EnvVars {
@@ -325,7 +325,7 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 				Field("mode", mode).
 				Log(ctx)
 
-			lcCmd := exec.Command("sh", "-c", postStart)
+			lcCmd := exec.Command("sh", "-c", postStart) //nolint:gosec // G204: postStart from grove config
 			lcCmd.Dir = req.Workspace.Path
 			lcCmd.Env = os.Environ()
 			for k, v := range resp.EnvVars {
@@ -333,10 +333,10 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 			}
 
 			lcLogPath := filepath.Join(logDir, svcName+"-lifecycle.log")
-			if llf, err := os.OpenFile(lcLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+			if llf, err := os.OpenFile(lcLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); err == nil { //nolint:gosec // G302: log file for service output
 				lcCmd.Stdout = llf
 				lcCmd.Stderr = llf
-				defer llf.Close()
+				defer func() { _ = llf.Close() }()
 			}
 
 			if err := lcCmd.Run(); err != nil {
@@ -349,7 +349,7 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 					Field("service", svcName).
 					Log(ctx)
 				if mode == "once" && markerPath != "" {
-					os.WriteFile(markerPath, []byte("initialized\n"), 0644)
+					_ = os.WriteFile(markerPath, []byte("initialized\n"), 0o644) //nolint:gosec // G306: marker file
 				}
 			}
 		}
@@ -369,6 +369,7 @@ func (m *Manager) dockerUp(ctx context.Context, req coreenv.EnvRequest) (*coreen
 //   - Fingerprint compute error → return error (fail-closed).
 //   - Docker build error → return error, fingerprint NOT stored (next run retries).
 //   - Missing prior fingerprint → treated as a mismatch → rebuild (fail-open).
+//
 // buildFingerprintsFile is a sidecar that survives across env down so the
 // fingerprint cache isn't wiped when state.json is deleted.
 const buildFingerprintsFile = "build-fingerprints.json"
@@ -379,7 +380,7 @@ func readBuildFingerprints(stateDir string) map[string]string {
 	if stateDir == "" {
 		return map[string]string{}
 	}
-	data, err := os.ReadFile(filepath.Join(stateDir, buildFingerprintsFile))
+	data, err := os.ReadFile(filepath.Join(stateDir, buildFingerprintsFile)) //nolint:gosec // G304: path from daemon state dir
 	if err != nil {
 		return map[string]string{}
 	}
@@ -396,14 +397,14 @@ func writeBuildFingerprints(stateDir string, m map[string]string) error {
 	if stateDir == "" || len(m) == 0 {
 		return nil
 	}
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0o755); err != nil { //nolint:gosec // G301: daemon state dir
 		return err
 	}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(stateDir, buildFingerprintsFile), data, 0644)
+	return os.WriteFile(filepath.Join(stateDir, buildFingerprintsFile), data, 0o644) //nolint:gosec // G306: daemon state file
 }
 
 func (m *Manager) buildImagesIfStale(ctx context.Context, req coreenv.EnvRequest, resp *coreenv.EnvResponse, prior map[string]string) (map[string]string, error) {
@@ -418,7 +419,7 @@ func (m *Manager) buildImagesIfStale(ctx context.Context, req coreenv.EnvRequest
 	worktree := req.Workspace.Name
 	workspaceRoot := req.Workspace.Path
 	logsDir := filepath.Join(req.EffectiveStateDir(), "logs")
-	if err := os.MkdirAll(logsDir, 0755); err != nil {
+	if err := os.MkdirAll(logsDir, 0o755); err != nil { //nolint:gosec // G301: build logs dir
 		return nil, fmt.Errorf("create logs dir: %w", err)
 	}
 
@@ -499,11 +500,11 @@ func (m *Manager) buildImagesIfStale(ctx context.Context, req coreenv.EnvRequest
 		}
 		args = append(args, absCtx)
 
-		buildCmd := exec.CommandContext(ctx, "docker", args...)
+		buildCmd := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // G204: docker build with internal args
 		buildCmd.Dir = workspaceRoot
 		logFile := filepath.Join(logsDir, "build-"+svc+".log")
 		out, berr := buildCmd.CombinedOutput()
-		_ = os.WriteFile(logFile, out, 0644)
+		_ = os.WriteFile(logFile, out, 0o644) //nolint:gosec // G306: build log file
 		if berr != nil {
 			return nil, fmt.Errorf("docker build failed for %s: %w\nSee log: %s", svc, berr, logFile)
 		}
@@ -539,7 +540,7 @@ func (m *Manager) dockerDown(ctx context.Context, req coreenv.EnvRequest) (*core
 	m.mu.Unlock()
 
 	projectName := fmt.Sprintf("grove-%s", worktree)
-	cmd := exec.CommandContext(ctx, "docker", "compose", "-p", projectName, "down", "--volumes", "--remove-orphans")
+	cmd := exec.CommandContext(ctx, "docker", "compose", "-p", projectName, "down", "--volumes", "--remove-orphans") //nolint:gosec // G204: docker compose with internal project name
 	cmd.Dir = req.Workspace.Path
 	if output, err := cmd.CombinedOutput(); err != nil {
 		m.ulog.Warn("docker compose down failed").

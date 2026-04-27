@@ -31,7 +31,7 @@ func (pa *PortAllocator) Allocate(label string) (int, error) {
 			return 0, err
 		}
 		port := l.Addr().(*net.TCPAddr).Port
-		l.Close()
+		_ = l.Close()
 
 		if _, exists := pa.used[port]; !exists {
 			pa.used[port] = label

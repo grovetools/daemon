@@ -8,11 +8,11 @@ import (
 
 // State represents the complete world view of the daemon.
 type State struct {
-	Workspaces  map[string]*models.EnrichedWorkspace `json:"workspaces"`              // Keyed by path
-	Sessions    map[string]*models.Session           `json:"sessions"`                // Keyed by ID
-	Jobs        map[string]*models.JobInfo           `json:"jobs"`                    // Keyed by job ID
-	NoteIndex   map[string]*models.NoteIndexEntry    `json:"note_index,omitempty"`    // Keyed by file path
-	NavBindings *models.NavSessionsFile              `json:"nav_bindings,omitempty"`  // Nav key binding state
+	Workspaces  map[string]*models.EnrichedWorkspace `json:"workspaces"`             // Keyed by path
+	Sessions    map[string]*models.Session           `json:"sessions"`               // Keyed by ID
+	Jobs        map[string]*models.JobInfo           `json:"jobs"`                   // Keyed by job ID
+	NoteIndex   map[string]*models.NoteIndexEntry    `json:"note_index,omitempty"`   // Keyed by file path
+	NavBindings *models.NavSessionsFile              `json:"nav_bindings,omitempty"` // Nav key binding state
 	// Plans caches fully-parsed plan directories keyed by their containing
 	// plansDir. Populated by the flow watcher so TUI clients can fetch
 	// plan lists over the socket instead of hammering the filesystem
@@ -39,10 +39,10 @@ const (
 	UpdateSessionEnd          UpdateType = "session_end"          // Mark session as completed/interrupted/failed
 
 	// Job lifecycle update types for the daemon's JobRunner.
-	UpdateJobSubmitted UpdateType = "job_submitted"
-	UpdateJobStarted   UpdateType = "job_started"
-	UpdateJobCompleted UpdateType = "job_completed"
-	UpdateJobFailed    UpdateType = "job_failed"
+	UpdateJobSubmitted   UpdateType = "job_submitted"
+	UpdateJobStarted     UpdateType = "job_started"
+	UpdateJobCompleted   UpdateType = "job_completed"
+	UpdateJobFailed      UpdateType = "job_failed"
 	UpdateJobCancelled   UpdateType = "job_cancelled"
 	UpdateJobPendingUser UpdateType = "job_pending_user"
 
@@ -60,9 +60,9 @@ const (
 	UpdateWorkspacesDelta UpdateType = "workspaces_delta"
 
 	// Channel & Autonomous update types.
-	UpdateSessionChannels   UpdateType = "session_channels"   // Update channels for a session
-	UpdateSessionAutonomous UpdateType = "session_autonomous" // Update autonomous config for a session
-	UpdateSessionPing       UpdateType = "session_ping"       // Record idle ping timestamp
+	UpdateSessionChannels   UpdateType = "session_channels"    // Update channels for a session
+	UpdateSessionAutonomous UpdateType = "session_autonomous"  // Update autonomous config for a session
+	UpdateSessionPing       UpdateType = "session_ping"        // Record idle ping timestamp
 	UpdateSessionTmuxTarget UpdateType = "session_tmux_target" // Update tmux target after detach/attach
 	UpdateSessionLastSender UpdateType = "session_last_sender" // Track last Signal sender for routing
 
@@ -217,7 +217,7 @@ type CaptureRequestPayload struct {
 // Update represents a change to the state.
 type Update struct {
 	Type    UpdateType
-	Source  string      // Which collector sent this update (e.g., "git", "workspace", "session", "plan", "note")
-	Scanned int         // Number of items actually scanned (for focused updates)
+	Source  string // Which collector sent this update (e.g., "git", "workspace", "session", "plan", "note")
+	Scanned int    // Number of items actually scanned (for focused updates)
 	Payload interface{}
 }

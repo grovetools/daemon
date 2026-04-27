@@ -12,33 +12,32 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-
 	"syscall"
 	"time"
 
 	"github.com/grovetools/agentlogs/pkg/agentstream"
 	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/logging"
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/repo"
 	"github.com/grovetools/core/pkg/sessions"
-	"github.com/grovetools/core/pkg/workspace"
-	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/tmux"
-	navbindings "github.com/grovetools/nav/pkg/bindings"
+	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/channels"
-	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
-	daemonweb "github.com/grovetools/daemon/web"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
+	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/daemon/internal/enrichment"
-	"github.com/grovetools/core/logging"
+	daemonweb "github.com/grovetools/daemon/web"
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/memory/pkg/memory"
+	navbindings "github.com/grovetools/nav/pkg/bindings"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sync/singleflight"
@@ -57,12 +56,12 @@ type RunningConfig struct {
 
 // Server manages the daemon's HTTP server over a Unix socket.
 type Server struct {
-	ulog          *logging.UnifiedLogger
-	server        *http.Server
-	engine        *engine.Engine
-	runningConfig *RunningConfig
-	jobRunner     *jobrunner.JobRunner
-	logStreamer   *logstreamer.LogStreamer
+	ulog           *logging.UnifiedLogger
+	server         *http.Server
+	engine         *engine.Engine
+	runningConfig  *RunningConfig
+	jobRunner      *jobrunner.JobRunner
+	logStreamer    *logstreamer.LogStreamer
 	envManager     *daemonenv.Manager
 	channelManager *channels.Manager
 
@@ -183,7 +182,7 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	}
 
 	// Ensure directory exists
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0755); err != nil { //nolint:gosec // G301: daemon/test dir
 		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
 
@@ -193,7 +192,7 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	}
 
 	// Set restrictive permissions on socket
-	if err := os.Chmod(socketPath, 0600); err != nil {
+	if err := os.Chmod(socketPath, 0o600); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("failed to set socket permissions: %w", err)
 	}
@@ -211,7 +210,7 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	// Health check endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 
 	// State API endpoints
@@ -290,7 +289,8 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	handler := h2c.NewHandler(mux, &http2.Server{})
 
 	s.server = &http.Server{
-		Handler: handler,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	// Optionally start a TCP listener for browser access (web terminal viewer).
@@ -303,8 +303,9 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 				Field("addr", addr).
 				Log(bgCtx)
 			tcpServer := &http.Server{
-				Addr:    addr,
-				Handler: handler,
+				Addr:              addr,
+				Handler:           handler,
+				ReadHeaderTimeout: 10 * time.Second,
 			}
 			if err := tcpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				s.ulog.Error("HTTP server failed").Err(err).Log(bgCtx)
@@ -334,7 +335,7 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 
 	state := s.engine.Store().Get()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(state)
+	_ = json.NewEncoder(w).Encode(state)
 }
 
 // handleGetWorkspaces returns all enriched workspaces as JSON.
@@ -346,7 +347,7 @@ func (s *Server) handleGetWorkspaces(w http.ResponseWriter, r *http.Request) {
 
 	workspaces := s.engine.Store().GetWorkspaces()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(workspaces)
+	_ = json.NewEncoder(w).Encode(workspaces)
 }
 
 // handleGetPlans returns the cached list of fully-parsed plans for a
@@ -371,7 +372,7 @@ func (s *Server) handleGetPlans(w http.ResponseWriter, r *http.Request) {
 		plans = []*orchestration.Plan{}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(plans)
+	_ = json.NewEncoder(w).Encode(plans)
 }
 
 // handleSessions handles GET for all sessions (path: /api/sessions).
@@ -388,7 +389,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 
 	sessions := s.engine.Store().GetSessions()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(sessions)
+	_ = json.NewEncoder(w).Encode(sessions)
 }
 
 // handleSessionByID handles session-specific operations (path: /api/sessions/{id}/*).
@@ -426,7 +427,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]string{"status": "killed"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "killed"})
 			return
 		}
 		if r.Method == http.MethodPatch {
@@ -457,7 +458,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 			return
 		}
 		// GET /api/sessions/{id} - get single session
@@ -471,7 +472,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(session)
+		_ = json.NewEncoder(w).Encode(session)
 
 	case "status":
 		// PATCH /api/sessions/{id}/status - update status
@@ -508,7 +509,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 
 	case "end":
 		// POST /api/sessions/{id}/end - end session
@@ -532,7 +533,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "ended"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ended"})
 
 	case "channels":
 		// POST /api/sessions/{id}/channels — enable/disable channels
@@ -564,7 +565,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 
 	case "autonomous":
 		// POST /api/sessions/{id}/autonomous — enable/disable autonomous pinger
@@ -590,7 +591,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 
 	case "input":
 		// POST /api/sessions/{id}/input — send input text to an interactive agent
@@ -612,7 +613,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "sent"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "sent"})
 
 	case "interrupt":
 		// POST /api/sessions/{id}/interrupt — send Ctrl+C to interrupt an agent
@@ -627,7 +628,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "interrupted"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "interrupted"})
 
 	default:
 		http.Error(w, "unknown action", http.StatusNotFound)
@@ -702,7 +703,7 @@ func (s *Server) resolveInputMode(workDir string) string {
 			InputMode string `toml:"input_mode" yaml:"input_mode"`
 		} `toml:"providers" yaml:"providers"`
 	}
-	coreCfg.UnmarshalExtension("flow", &flowCfg)
+	_ = coreCfg.UnmarshalExtension("flow", &flowCfg)
 
 	providerName := "claude"
 	if flowCfg.InteractiveProvider != "" {
@@ -936,7 +937,7 @@ func (s *Server) handleSessionIntent(w http.ResponseWriter, r *http.Request) {
 
 	s.ulog.Debug("Session intent registered").Field("job_id", intent.JobID).Log(r.Context())
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"status": "registered", "job_id": intent.JobID})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "registered", "job_id": intent.JobID})
 }
 
 // handleSessionConfirm handles POST /api/sessions/confirm - confirm session with PID.
@@ -968,7 +969,7 @@ func (s *Server) handleSessionConfirm(w http.ResponseWriter, r *http.Request) {
 		Field("pid", confirmation.PID).
 		Log(r.Context())
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "confirmed"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "confirmed"})
 }
 
 // splitPath splits a URL path by "/" and removes empty parts.
@@ -1007,7 +1008,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	defer s.engine.Store().Unsubscribe(ch)
 
 	// Send initial ping to confirm connection
-	fmt.Fprintf(w, ": connected\n\n")
+	_, _ = fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
 	s.ulog.Debug("SSE client connected").StructuredOnly().Log(r.Context())
@@ -1024,7 +1025,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 			UpdateType: "initial",
 		}
 		if data, err := json.Marshal(initialUpdate); err == nil {
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		}
 	}
@@ -1047,7 +1048,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			// SSE format: "data: {json}\n\n"
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		}
 	}
@@ -1083,7 +1084,7 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 	out := hudWatcher.Watch(ctx)
 
 	// Send initial ping to confirm the connection is alive.
-	fmt.Fprintf(w, ": connected\n\n")
+	_, _ = fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
 	s.ulog.Debug("HUD SSE client connected").Field("path", path).StructuredOnly().Log(r.Context())
@@ -1102,7 +1103,7 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 				s.ulog.Error("Failed to marshal HUD update").Err(err).Log(r.Context())
 				continue
 			}
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		}
 	}
@@ -1116,7 +1117,7 @@ func (s *Server) handleTerminalStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	connected := s.terminalHub != nil && s.terminalHub.HasConnections()
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"connected":%t}`, connected)
+	_, _ = fmt.Fprintf(w, `{"connected":%t}`, connected)
 }
 
 // handleAgentSpawn handles POST /api/agents/spawn — creates a daemon-owned PTY
@@ -1205,7 +1206,7 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 		})
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "attached", "pty_id": ptyID})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "attached", "pty_id": ptyID})
 		return
 	}
 
@@ -1217,7 +1218,7 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "spawned"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "spawned"})
 }
 
 // handleAgentByID routes /api/agents/{id}/* actions (input, capture, capture_response).
@@ -1262,7 +1263,7 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		})
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "sent"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "sent"})
 
 	case "capture":
 		// GET /api/agents/{id}/capture — blocking request that waits for groveterm's response
@@ -1291,7 +1292,7 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		case text := <-ch:
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, text)
+			_, _ = io.WriteString(w, text)
 		case <-time.After(5 * time.Second):
 			s.captureWaitersMu.Lock()
 			delete(s.captureWaiters, agentID)
@@ -1329,7 +1330,7 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "received"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "received"})
 
 	default:
 		http.Error(w, "unknown action", http.StatusNotFound)
@@ -1495,7 +1496,7 @@ func (s *Server) handleNoteIndex(w http.ResponseWriter, r *http.Request) {
 		Field("entries", len(entries)).
 		Log(r.Context())
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(entries)
+	_ = json.NewEncoder(w).Encode(entries)
 }
 
 // handleNoteEvent handles POST /api/notes/event for incremental note count updates.
@@ -1536,7 +1537,7 @@ func (s *Server) handleNoteEvent(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // tryAttachIndexEntry attempts to parse frontmatter and attach a NoteIndexEntry to a NoteEvent.
@@ -1569,7 +1570,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(s.runningConfig)
+	_ = json.NewEncoder(w).Encode(s.runningConfig)
 }
 
 // handleFocus handles GET/POST for focused workspaces.
@@ -1592,7 +1593,7 @@ func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
 		s.engine.Store().SetFocus(req.Paths)
 		s.ulog.Debug("Focus updated").Field("count", len(req.Paths)).Log(r.Context())
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]int{"focused": len(req.Paths)})
+		_ = json.NewEncoder(w).Encode(map[string]int{"focused": len(req.Paths)})
 
 	case http.MethodGet:
 		focus := s.engine.Store().GetFocus()
@@ -1601,7 +1602,7 @@ func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
 			paths = append(paths, p)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string][]string{"paths": paths})
+		_ = json.NewEncoder(w).Encode(map[string][]string{"paths": paths})
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1643,7 +1644,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(info)
+		_ = json.NewEncoder(w).Encode(info)
 
 	case http.MethodGet:
 		statusFilter := r.URL.Query().Get("status")
@@ -1658,7 +1659,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 			results = []*models.JobInfo{}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(results)
+		_ = json.NewEncoder(w).Encode(results)
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1698,7 +1699,7 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(info)
+		_ = json.NewEncoder(w).Encode(info)
 
 	case http.MethodDelete:
 		if s.jobRunner == nil {
@@ -1710,7 +1711,7 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "cancelled", "job_id": jobID})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "cancelled", "job_id": jobID})
 
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1739,7 +1740,7 @@ func (s *Server) handleGetJobLogs(w http.ResponseWriter, r *http.Request, jobID 
 		lines = []models.LogLine{}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(lines)
+	_ = json.NewEncoder(w).Encode(lines)
 }
 
 // handleStreamJobLogs provides SSE streaming of log lines for a specific job.
@@ -1785,7 +1786,7 @@ func (s *Server) handleStreamJobLogs(w http.ResponseWriter, r *http.Request, job
 	w.Header().Set("Connection", "keep-alive")
 
 	// Send connection confirmation
-	fmt.Fprintf(w, ": connected to job %s log stream\n\n", jobID)
+	_, _ = fmt.Fprintf(w, ": connected to job %s log stream\n\n", jobID)
 	flusher.Flush()
 
 	// Send historical buffer
@@ -1794,7 +1795,7 @@ func (s *Server) handleStreamJobLogs(w http.ResponseWriter, r *http.Request, job
 		if err != nil {
 			continue
 		}
-		fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
+		_, _ = fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
 	}
 	flusher.Flush()
 
@@ -1814,7 +1815,7 @@ func (s *Server) handleStreamJobLogs(w http.ResponseWriter, r *http.Request, job
 					if err != nil {
 						continue
 					}
-					fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
+					_, _ = fmt.Fprintf(w, "event: log\ndata: %s\n\n", data)
 				}
 			case "status":
 				data, err := json.Marshal(map[string]string{
@@ -1824,7 +1825,7 @@ func (s *Server) handleStreamJobLogs(w http.ResponseWriter, r *http.Request, job
 				if err != nil {
 					continue
 				}
-				fmt.Fprintf(w, "event: status\ndata: %s\n\n", data)
+				_, _ = fmt.Fprintf(w, "event: status\ndata: %s\n\n", data)
 			}
 			flusher.Flush()
 		}
@@ -1866,7 +1867,7 @@ func (s *Server) handleEnvUp(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(coreenv.EnvResponse{
+		_ = json.NewEncoder(w).Encode(coreenv.EnvResponse{
 			Status: "failed",
 			Error:  err.Error(),
 		})
@@ -1874,7 +1875,7 @@ func (s *Server) handleEnvUp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleEnvStatus handles GET /api/env/status requests.
@@ -1896,7 +1897,7 @@ func (s *Server) handleEnvStatus(w http.ResponseWriter, r *http.Request) {
 
 	resp := s.envManager.Status(worktree)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleEnvDown handles POST /api/env/down requests.
@@ -1920,7 +1921,7 @@ func (s *Server) handleEnvDown(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(coreenv.EnvResponse{
+		_ = json.NewEncoder(w).Encode(coreenv.EnvResponse{
 			Status: "failed",
 			Error:  err.Error(),
 		})
@@ -1928,7 +1929,7 @@ func (s *Server) handleEnvDown(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleProxyRegister handles POST /api/proxy/register. The global
@@ -2021,11 +2022,11 @@ func (s *Server) handleRepoEnsure(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 // --- Channel Management Handlers ---
@@ -2054,7 +2055,7 @@ func (s *Server) handleChannelSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(sendResp)
+	_ = json.NewEncoder(w).Encode(sendResp)
 }
 
 // handleChannelStatus handles GET /api/channels/status — get channel system status.
@@ -2070,7 +2071,7 @@ func (s *Server) handleChannelStatus(w http.ResponseWriter, r *http.Request) {
 
 	status := s.channelManager.Status()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	_ = json.NewEncoder(w).Encode(status)
 }
 
 // handleChannelCleanup handles POST /api/channels/cleanup — purge stale routes.
@@ -2091,7 +2092,7 @@ func (s *Server) handleChannelCleanup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(models.ChannelCleanupResponse{Purged: purged})
+	_ = json.NewEncoder(w).Encode(models.ChannelCleanupResponse{Purged: purged})
 }
 
 // handleNavBindings handles GET /api/nav/bindings — return current nav binding state.
@@ -2119,7 +2120,7 @@ func (s *Server) handleNavBindings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(bindings)
+	_ = json.NewEncoder(w).Encode(bindings)
 }
 
 // handleNavConfig handles GET /api/nav/config — return the static nav configuration
@@ -2138,7 +2139,7 @@ func (s *Server) handleNavConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(cfg)
+	_ = json.NewEncoder(w).Encode(cfg)
 }
 
 // handleNavGroup handles PUT /api/nav/groups/{group} — update a single group's sessions.
@@ -2216,7 +2217,7 @@ func (s *Server) handleNavGroup(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 }
 
 // handleNavLockedKeys handles PUT /api/nav/locked-keys — update global locked keys.
@@ -2259,7 +2260,7 @@ func (s *Server) handleNavLockedKeys(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 }
 
 // handleNavLastAccessedGroup handles PUT /api/nav/last-accessed — update the last-accessed group.
@@ -2298,7 +2299,7 @@ func (s *Server) handleNavLastAccessedGroup(w http.ResponseWriter, r *http.Reque
 	})
 
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 }
 
 // loadNavGroupConfigs reads the grove config to get group prefix configurations for validation.
@@ -2317,7 +2318,7 @@ func (s *Server) loadNavGroupConfigs() map[string]navbindings.GroupConfig {
 			Prefix string `toml:"prefix" yaml:"prefix"`
 		} `toml:"groups" yaml:"groups"`
 	}
-	cfg.UnmarshalExtension("nav", &navCfg)
+	_ = cfg.UnmarshalExtension("nav", &navCfg)
 
 	if navCfg.Prefix != "" {
 		result["default"] = navbindings.GroupConfig{Prefix: navCfg.Prefix}
@@ -2336,7 +2337,7 @@ func (s *Server) loadNavGroupConfigs() map[string]navbindings.GroupConfig {
 func (s *Server) buildGroupBindings(file *models.NavSessionsFile) []navbindings.GroupBinding {
 	groupConfigs := s.loadNavGroupConfigs()
 
-	var bindings []navbindings.GroupBinding
+	bindings := make([]navbindings.GroupBinding, 0, len(groupConfigs)+1)
 
 	// Default group
 	defaultPrefix := "<prefix>"

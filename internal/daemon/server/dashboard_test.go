@@ -23,7 +23,7 @@ func TestDashboardStaticAssets(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 		if res.StatusCode != 200 {
 			t.Fatalf("status = %d", res.StatusCode)
 		}
@@ -41,7 +41,7 @@ func TestDashboardStaticAssets(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 		if res.StatusCode != 200 {
 			t.Fatalf("status = %d", res.StatusCode)
 		}
@@ -67,7 +67,7 @@ func TestDashboardStateEndpointJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode != 200 {
 		body, _ := io.ReadAll(res.Body)
 		t.Fatalf("status = %d, body = %s", res.StatusCode, body)

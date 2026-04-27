@@ -23,7 +23,7 @@ type RunningEnv struct {
 	Worktree        string
 	Environment     string // Named environment profile (empty = default)
 	ManagedBy       string
-	StateDir        string                         // Path to .grove/env/ directory
+	StateDir        string // Path to .grove/env/ directory
 	Ports           map[string]int
 	Processes       map[string]*exec.Cmd          // Tracked natively spawned processes
 	Cancels         map[string]context.CancelFunc // Used to terminate native processes
@@ -247,7 +247,7 @@ func (m *Manager) readStateFile(req coreenv.EnvRequest) (*coreenv.EnvStateFile, 
 		return nil, nil
 	}
 	statePath := filepath.Join(stateDir, "state.json")
-	data, err := os.ReadFile(statePath)
+	data, err := os.ReadFile(statePath) //nolint:gosec // G304: path from daemon state dir
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -274,7 +274,7 @@ func (m *Manager) reapPersistedNatives(ctx context.Context, stateFile *coreenv.E
 		if container == "" {
 			continue
 		}
-		if err := exec.Command("docker", "rm", "-f", container).Run(); err != nil {
+		if err := exec.Command("docker", "rm", "-f", container).Run(); err != nil { //nolint:gosec // G204: container from state
 			m.ulog.Debug("docker rm -f returned non-zero (likely already gone)").
 				Err(err).
 				Field("service", name).
@@ -350,7 +350,7 @@ func (m *Manager) writeStateFile(ctx context.Context, req coreenv.EnvRequest, re
 		}
 	}
 
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0o755); err != nil { //nolint:gosec // G301: daemon dir
 		return fmt.Errorf("create state dir: %w", err)
 	}
 	data, err := json.MarshalIndent(&stateFile, "", "  ")
@@ -358,7 +358,7 @@ func (m *Manager) writeStateFile(ctx context.Context, req coreenv.EnvRequest, re
 		return fmt.Errorf("marshal state file: %w", err)
 	}
 	statePath := filepath.Join(stateDir, "state.json")
-	if err := os.WriteFile(statePath, data, 0644); err != nil {
+	if err := os.WriteFile(statePath, data, 0o644); err != nil { //nolint:gosec // G306: daemon state file
 		return fmt.Errorf("write state file: %w", err)
 	}
 	m.ulog.Debug("Wrote env state file").
@@ -393,15 +393,6 @@ func (m *Manager) Status(worktree string) *coreenv.EnvResponse {
 	env, exists := m.envs[worktree]
 	if !exists {
 		return &coreenv.EnvResponse{Status: "stopped"}
-	}
-
-	services := make([]coreenv.ServiceState, 0, len(env.Ports))
-	for name, port := range env.Ports {
-		services = append(services, coreenv.ServiceState{
-			Name:   name,
-			Port:   port,
-			Status: "running",
-		})
 	}
 
 	state := map[string]string{
@@ -441,7 +432,7 @@ func (m *Manager) Restore(basePaths []string) {
 	for _, statePath := range statePaths {
 		stateDir := filepath.Dir(statePath)
 
-		data, err := os.ReadFile(statePath)
+		data, err := os.ReadFile(statePath) //nolint:gosec // G304: path from daemon state dir
 		if err != nil {
 			continue
 		}
@@ -478,13 +469,13 @@ func (m *Manager) Restore(basePaths []string) {
 		if stateFile.Provider == "native" {
 			for _, svc := range stateFile.Services {
 				containerName := fmt.Sprintf("grove-%s-%s", worktree, svc.Name)
-				_ = exec.Command("docker", "rm", "-f", containerName).Run()
+				_ = exec.Command("docker", "rm", "-f", containerName).Run() //nolint:gosec // G204: container from state
 			}
 			for _, container := range stateFile.DockerContainers {
 				if container == "" {
 					continue
 				}
-				_ = exec.Command("docker", "rm", "-f", container).Run()
+				_ = exec.Command("docker", "rm", "-f", container).Run() //nolint:gosec // G204: container from state
 			}
 			continue
 		}

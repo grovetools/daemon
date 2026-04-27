@@ -117,9 +117,8 @@ func goProfile() *LanguageProfile {
 // --- Rust ---
 
 var (
-	rustUseRegex       = regexp.MustCompile(`(?m)^use\s+([^;]+);`)
-	cargoNameRegex     = regexp.MustCompile(`(?m)^name\s*=\s*"([^"]+)"`)
-	rustGeneratedRegex = regexp.MustCompile(`(?m)^//.*generated`)
+	rustUseRegex   = regexp.MustCompile(`(?m)^use\s+([^;]+);`)
+	cargoNameRegex = regexp.MustCompile(`(?m)^name\s*=\s*"([^"]+)"`)
 )
 
 func rustProfile() *LanguageProfile {
@@ -226,7 +225,7 @@ func findManifestField(startDir, manifestName string, fieldRegex *regexp.Regexp)
 	current := startDir
 	for {
 		manifestPath := filepath.Join(current, manifestName)
-		if b, err := os.ReadFile(manifestPath); err == nil {
+		if b, err := os.ReadFile(manifestPath); err == nil { //nolint:gosec // G304: manifest from project tree
 			if matches := fieldRegex.FindStringSubmatch(string(b)); len(matches) > 1 {
 				return strings.TrimSpace(matches[1])
 			}

@@ -73,8 +73,8 @@ func TestPGIDSupervisor_PreservesSysProcAttr(t *testing.T) {
 	if _, err := s.Spawn(context.Background(), "sleeper", cmd); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	defer cmd.Process.Kill()
-	defer cmd.Wait()
+	defer func() { _ = cmd.Process.Kill() }()
+	defer func() { _ = cmd.Wait() }()
 
 	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
 		t.Errorf("Setpgid not set on cmd.SysProcAttr: %+v", cmd.SysProcAttr)
@@ -101,7 +101,7 @@ func TestReapPGIDs_KillsGrandchild(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	countInGroup := func(pgid int) int {
-		out, _ := exec.Command("pgrep", "-g", fmt.Sprintf("%d", pgid)).Output()
+		out, _ := exec.Command("pgrep", "-g", fmt.Sprintf("%d", pgid)).Output() //nolint:gosec // G204: test helper
 		s := strings.TrimSpace(string(out))
 		if s == "" {
 			return 0

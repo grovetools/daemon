@@ -19,10 +19,10 @@ func watch(ctx context.Context, pid int, onDeath func()) {
 		watchPoll(ctx, pid, onDeath)
 		return
 	}
-	defer unix.Close(kq)
+	defer func() { _ = unix.Close(kq) }()
 
 	change := unix.Kevent_t{
-		Ident:  uint64(pid),
+		Ident:  uint64(pid), //nolint:gosec // G115: pid is always positive
 		Filter: unix.EVFILT_PROC,
 		Flags:  unix.EV_ADD | unix.EV_ONESHOT,
 		Fflags: unix.NOTE_EXIT,

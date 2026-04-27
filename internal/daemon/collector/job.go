@@ -134,13 +134,13 @@ func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger
 				}
 
 				jobPath := filepath.Join(planPath, jobEntry.Name())
-				file, err := os.Open(jobPath)
+				file, err := os.Open(jobPath) //nolint:gosec // G304: path from plan directory
 				if err != nil {
 					continue
 				}
 
 				meta, err := frontmatter.Parse(file)
-				file.Close()
+				_ = file.Close()
 				if err != nil {
 					continue
 				}

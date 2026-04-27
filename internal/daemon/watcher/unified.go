@@ -76,7 +76,7 @@ func (w *UnifiedWatcher) Register(h DomainHandler) {
 func (w *UnifiedWatcher) Start(ctx context.Context) {
 	sub := w.store.Subscribe()
 	defer w.store.Unsubscribe(sub)
-	defer w.fsWatcher.Close()
+	defer func() { _ = w.fsWatcher.Close() }()
 
 	batchTicker := time.NewTicker(w.batchInterval)
 	defer batchTicker.Stop()

@@ -168,7 +168,7 @@ func groveHandler(s *Server) wish.Middleware {
 				}
 			}
 
-			cmd := exec.CommandContext(sess.Context(), binPath, args...)
+			cmd := exec.CommandContext(sess.Context(), binPath, args...) //nolint:gosec // G204: binPath is resolved internally
 
 			// Pass through environment, with TERM from the SSH client
 			cmd.Env = os.Environ()
@@ -186,18 +186,18 @@ func groveHandler(s *Server) wish.Middleware {
 				wish.Println(sess, "Error starting groveterm: "+err.Error())
 				return
 			}
-			defer ptmx.Close()
+			defer func() { _ = ptmx.Close() }()
 
 			_ = pty.Setsize(ptmx, &pty.Winsize{
-				Rows: uint16(ptyReq.Window.Height),
-				Cols: uint16(ptyReq.Window.Width),
+				Rows: uint16(ptyReq.Window.Height), //nolint:gosec // G115: terminal dimensions are always small
+				Cols: uint16(ptyReq.Window.Width),  //nolint:gosec // G115: terminal dimensions are always small
 			})
 
 			go func() {
 				for win := range winCh {
 					_ = pty.Setsize(ptmx, &pty.Winsize{
-						Rows: uint16(win.Height),
-						Cols: uint16(win.Width),
+						Rows: uint16(win.Height), //nolint:gosec // G115: terminal dimensions are always small
+						Cols: uint16(win.Width),  //nolint:gosec // G115: terminal dimensions are always small
 					})
 				}
 			}()

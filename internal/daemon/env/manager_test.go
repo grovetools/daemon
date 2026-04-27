@@ -22,7 +22,7 @@ func TestRestore_NativeStateSurvives(t *testing.T) {
 	tmp := t.TempDir()
 	wtPath := filepath.Join(tmp, "tier1-c")
 	stateDir := filepath.Join(wtPath, ".grove", "env")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0755); err != nil { //nolint:gosec // G301: test dir
 		t.Fatalf("mkdir state dir: %v", err)
 	}
 
@@ -36,16 +36,16 @@ func TestRestore_NativeStateSurvives(t *testing.T) {
 	stateBytes, _ := json.MarshalIndent(stateFile, "", "  ")
 
 	statePath := filepath.Join(stateDir, "state.json")
-	if err := os.WriteFile(statePath, stateBytes, 0644); err != nil {
+	if err := os.WriteFile(statePath, stateBytes, 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write state.json: %v", err)
 	}
 
 	envLocalStateDir := filepath.Join(stateDir, ".env.local")
-	if err := os.WriteFile(envLocalStateDir, []byte("FOO=bar\n"), 0644); err != nil {
+	if err := os.WriteFile(envLocalStateDir, []byte("FOO=bar\n"), 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write .env.local (stateDir): %v", err)
 	}
 	envLocalRoot := filepath.Join(wtPath, ".env.local")
-	if err := os.WriteFile(envLocalRoot, []byte("FOO=bar\n"), 0644); err != nil {
+	if err := os.WriteFile(envLocalRoot, []byte("FOO=bar\n"), 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write .env.local (root): %v", err)
 	}
 
@@ -72,7 +72,7 @@ func TestRestore_NativeSkipsEnvRegistration(t *testing.T) {
 	tmp := t.TempDir()
 	wtPath := filepath.Join(tmp, "tier1-c")
 	stateDir := filepath.Join(wtPath, ".grove", "env")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0755); err != nil { //nolint:gosec // G301: test dir
 		t.Fatalf("mkdir state dir: %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestRestore_NativeSkipsEnvRegistration(t *testing.T) {
 		Services:      []coreenv.ServiceState{{Name: "api", Port: 3000, Status: "running"}},
 	}
 	stateBytes, _ := json.MarshalIndent(stateFile, "", "  ")
-	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), stateBytes, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), stateBytes, 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write state.json: %v", err)
 	}
 
@@ -102,7 +102,7 @@ func TestWriteStateFile_DaemonOwned(t *testing.T) {
 	tmp := t.TempDir()
 	wtPath := filepath.Join(tmp, "tier1-c")
 	stateDir := filepath.Join(wtPath, ".grove", "env")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0755); err != nil { //nolint:gosec // G301: test dir
 		t.Fatalf("mkdir: %v", err)
 	}
 
@@ -135,7 +135,7 @@ func TestWriteStateFile_DaemonOwned(t *testing.T) {
 		t.Fatalf("writeStateFile: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(stateDir, "state.json"))
+	data, err := os.ReadFile(filepath.Join(stateDir, "state.json")) //nolint:gosec // G304: test path
 	if err != nil {
 		t.Fatalf("read state.json: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestWriteStateFile_DaemonOwned(t *testing.T) {
 func TestRemoveStateFile_NoOpWhenAbsent(t *testing.T) {
 	tmp := t.TempDir()
 	stateDir := filepath.Join(tmp, ".grove", "env")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0755); err != nil { //nolint:gosec // G301: test dir
 		t.Fatalf("mkdir: %v", err)
 	}
 
@@ -183,7 +183,7 @@ func TestRemoveStateFile_NoOpWhenAbsent(t *testing.T) {
 	m.removeStateFile(t.Context(), req)
 	// Second call after writing then removing.
 	statePath := filepath.Join(stateDir, "state.json")
-	if err := os.WriteFile(statePath, []byte("{}"), 0644); err != nil {
+	if err := os.WriteFile(statePath, []byte("{}"), 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write: %v", err)
 	}
 	m.removeStateFile(t.Context(), req)
@@ -220,7 +220,7 @@ func TestNativeDown_DiskLazyAfterRestart(t *testing.T) {
 	tmp := t.TempDir()
 	wtPath := filepath.Join(tmp, "tier1-c")
 	stateDir := filepath.Join(wtPath, ".grove", "env")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0755); err != nil { //nolint:gosec // G301: test dir
 		t.Fatalf("mkdir: %v", err)
 	}
 
@@ -231,7 +231,7 @@ func TestNativeDown_DiskLazyAfterRestart(t *testing.T) {
 		NativePGIDs:   map[string]int{"kitchen-api": 99001, "tunnel-clickhouse": 99002},
 	}
 	data, _ := json.MarshalIndent(&stateFile, "", "  ")
-	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write state.json: %v", err)
 	}
 
@@ -277,7 +277,7 @@ func TestDown_PatchesWorkspaceFromStateFile(t *testing.T) {
 	tmp := t.TempDir()
 	wtPath := filepath.Join(tmp, "tier1-c")
 	stateDir := filepath.Join(wtPath, ".grove", "env")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0755); err != nil { //nolint:gosec // G301: test dir
 		t.Fatalf("mkdir: %v", err)
 	}
 
@@ -288,7 +288,7 @@ func TestDown_PatchesWorkspaceFromStateFile(t *testing.T) {
 		NativePGIDs:   map[string]int{"kitchen-api": 99003},
 	}
 	data, _ := json.MarshalIndent(&stateFile, "", "  ")
-	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write state.json: %v", err)
 	}
 
@@ -317,7 +317,7 @@ func TestRestore_DockerEnvRegistered(t *testing.T) {
 	tmp := t.TempDir()
 	wtPath := filepath.Join(tmp, "tier1-a")
 	stateDir := filepath.Join(wtPath, ".grove", "env")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0755); err != nil { //nolint:gosec // G301: test dir
 		t.Fatalf("mkdir state dir: %v", err)
 	}
 
@@ -328,7 +328,7 @@ func TestRestore_DockerEnvRegistered(t *testing.T) {
 		Ports:         map[string]int{"API_PORT": 52000, "WEB_PORT": 52001},
 	}
 	stateBytes, _ := json.MarshalIndent(stateFile, "", "  ")
-	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), stateBytes, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), stateBytes, 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write state.json: %v", err)
 	}
 
@@ -355,7 +355,7 @@ func TestRestore_FindsDeeplyNestedStateFiles(t *testing.T) {
 	tmp := t.TempDir()
 	wtPath := filepath.Join(tmp, "kitchen-env", ".grove-worktrees", "tier1-d")
 	stateDir := filepath.Join(wtPath, ".grove", "env")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0755); err != nil { //nolint:gosec // G301: test dir
 		t.Fatalf("mkdir: %v", err)
 	}
 
@@ -366,7 +366,7 @@ func TestRestore_FindsDeeplyNestedStateFiles(t *testing.T) {
 		Ports:         map[string]int{"api": 51234},
 	}
 	data, _ := json.MarshalIndent(&stateFile, "", "  ")
-	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write: %v", err)
 	}
 

@@ -87,5 +87,5 @@ func (pm *ProxyManager) directRequest(req *http.Request) {
 func (pm *ProxyManager) ListenAndServe(addr string) error {
 	proxy := &httputil.ReverseProxy{Director: pm.directRequest}
 	pm.ulog.Info("Proxy server listening").Field("addr", addr).Log(context.Background())
-	return http.ListenAndServe(addr, proxy)
+	return http.ListenAndServe(addr, proxy) //nolint:gosec // G114: internal reverse proxy, no timeout needed
 }

@@ -214,7 +214,7 @@ func indexFileEntry(filePath, wsName, contentDirPath, contentDirType string) *mo
 		f, err := os.Open(filePath)
 		if err == nil {
 			meta, err := frontmatter.Parse(f)
-			f.Close()
+			_ = f.Close()
 			if err == nil {
 				entry.Title = meta.Title
 				entry.ID = meta.ID

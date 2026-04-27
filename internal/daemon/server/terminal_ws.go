@@ -125,7 +125,7 @@ func (s *Server) HandleTerminalWS(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		hub.removeConn(conn, isPrimary)
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	for {
@@ -204,7 +204,7 @@ func (h *TerminalHub) register(conn *websocket.Conn) bool {
 				Type:    "follower_joined",
 				Payload: json.RawMessage("{}"),
 			})
-			h.primary.WriteMessage(websocket.TextMessage, notify)
+			_ = h.primary.WriteMessage(websocket.TextMessage, notify)
 		}
 	}
 
@@ -212,7 +212,7 @@ func (h *TerminalHub) register(conn *websocket.Conn) bool {
 		Type:    "role",
 		Payload: json.RawMessage(`"` + role + `"`),
 	})
-	conn.WriteMessage(websocket.TextMessage, resp)
+	_ = conn.WriteMessage(websocket.TextMessage, resp)
 	return role == "primary"
 }
 

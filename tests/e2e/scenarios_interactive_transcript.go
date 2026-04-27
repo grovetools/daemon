@@ -34,7 +34,7 @@ func DaemonInteractiveTranscriptScenario() *harness.Scenario {
 
 				// Create workspace directory with git repo
 				workspaceDir := ctx.NewDir("test-workspace")
-				if err := os.MkdirAll(workspaceDir, 0755); err != nil {
+				if err := os.MkdirAll(workspaceDir, 0755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -65,13 +65,13 @@ func DaemonInteractiveTranscriptScenario() *harness.Scenario {
 
 				// Create notebook root
 				notebookRoot := filepath.Join(ctx.HomeDir(), ".grove", "notebooks", "main")
-				if err := os.MkdirAll(notebookRoot, 0755); err != nil {
+				if err := os.MkdirAll(notebookRoot, 0755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
 				// Create global config
 				globalConfigDir := filepath.Join(ctx.ConfigDir(), "grove")
-				if err := os.MkdirAll(globalConfigDir, 0755); err != nil {
+				if err := os.MkdirAll(globalConfigDir, 0755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 				globalConfig := filepath.Join(globalConfigDir, "grove.toml")
@@ -95,7 +95,7 @@ root_dir = "%s"
 
 				// Create a plan directory with job files
 				planDir := filepath.Join(notebookRoot, "workspaces", "test-workspace", "plans", "transcript-test")
-				if err := os.MkdirAll(planDir, 0755); err != nil {
+				if err := os.MkdirAll(planDir, 0755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -149,7 +149,7 @@ This job depends on the agent job completing.
 				// Create a mock 'grove' binary that returns transcript when called with 'aglogs read'
 				// and a mock 'aglogs' binary for direct invocation fallback
 				mockBinDir := filepath.Join(ctx.RootDir, "mock_bin")
-				if err := os.MkdirAll(mockBinDir, 0755); err != nil {
+				if err := os.MkdirAll(mockBinDir, 0755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -167,7 +167,7 @@ exit 0
 				if err := fs.WriteString(grovePath, mockGroveScript); err != nil {
 					return err
 				}
-				if err := os.Chmod(grovePath, 0755); err != nil {
+				if err := os.Chmod(grovePath, 0755); err != nil { //nolint:gosec // G302: test executable
 					return err
 				}
 
@@ -185,7 +185,7 @@ exit 0
 				if err := fs.WriteString(aglogsPath, mockAglogsScript); err != nil {
 					return err
 				}
-				if err := os.Chmod(aglogsPath, 0755); err != nil {
+				if err := os.Chmod(aglogsPath, 0755); err != nil { //nolint:gosec // G302: test executable
 					return err
 				}
 

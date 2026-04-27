@@ -125,9 +125,9 @@ func signalCLIProcess() (int, string) {
 	if pid == "" {
 		return 0, ""
 	}
-	age, _ := exec.Command("ps", "-o", "etime=", "-p", pid).Output()
+	age, _ := exec.Command("ps", "-o", "etime=", "-p", pid).Output() //nolint:gosec // G204: args are from daemon-internal pid
 	var pidNum int
-	fmt.Sscanf(pid, "%d", &pidNum)
+	_, _ = fmt.Sscanf(pid, "%d", &pidNum)
 	return pidNum, strings.TrimSpace(string(age))
 }
 
@@ -209,7 +209,7 @@ func newClawsCleanupCmd() *cobra.Command {
 		Short: "Purge ghost jobs and stale routes from the signal channel table",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := daemon.NewGlobalClient()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			if !client.IsRunning() {
 				fmt.Println("Daemon is not running.")

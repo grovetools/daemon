@@ -17,8 +17,8 @@ type pickerItem struct {
 }
 
 func (i pickerItem) Title() string       { return i.title }
-func (i pickerItem) Description() string  { return i.description }
-func (i pickerItem) FilterValue() string  { return i.title }
+func (i pickerItem) Description() string { return i.description }
+func (i pickerItem) FilterValue() string { return i.title }
 
 // pickerModel is the bubbletea model for the SSH session picker.
 type pickerModel struct {

@@ -67,7 +67,7 @@ func (e *Executor) executeHook(ctx context.Context, hook config.HookCommand, env
 	hookCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(hookCtx, "sh", "-c", hook.Command)
+	cmd := exec.CommandContext(hookCtx, "sh", "-c", hook.Command) //nolint:gosec // G204: hook command from grove config
 
 	// Set environment variables
 	cmd.Env = os.Environ()

@@ -39,7 +39,7 @@ func (s *Server) handlePtyCreate(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(sess.Metadata())
+	_ = json.NewEncoder(w).Encode(sess.Metadata())
 }
 
 // handlePtyList handles GET /api/pty/list.
@@ -54,7 +54,7 @@ func (s *Server) handlePtyList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(s.ptyManager.List())
+	_ = json.NewEncoder(w).Encode(s.ptyManager.List())
 }
 
 // handlePtyKill handles POST /api/pty/kill/{id}.
@@ -80,7 +80,7 @@ func (s *Server) handlePtyKill(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	_, _ = w.Write([]byte("ok"))
 }
 
 // handlePtyAttach handles GET /api/pty/attach/{id} — upgrades to WebSocket.
@@ -119,7 +119,7 @@ func (s *Server) handlePtyAttach(w http.ResponseWriter, r *http.Request) {
 	sess.AddClient(conn)
 	defer func() {
 		sess.RemoveClient(conn)
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	// Read loop: client → PTY

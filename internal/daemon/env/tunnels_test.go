@@ -66,8 +66,8 @@ func TestTunnelManager_StopAllSelectiveByWorktree(t *testing.T) {
 
 	ctx := context.Background()
 
-	tm.Start(ctx, "wt-a", "db", "sleep 60", 5432, "", nil, "")
-	tm.Start(ctx, "wt-b", "db", "sleep 60", 5433, "", nil, "")
+	_, _ = tm.Start(ctx, "wt-a", "db", "sleep 60", 5432, "", nil, "")
+	_, _ = tm.Start(ctx, "wt-b", "db", "sleep 60", 5433, "", nil, "")
 
 	tm.StopAll("wt-a")
 

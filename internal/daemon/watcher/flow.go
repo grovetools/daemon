@@ -96,7 +96,7 @@ func (h *FlowHandler) MatchesEvent(event fsnotify.Event) bool {
 	defer h.pathsMutex.RUnlock()
 
 	for watchedPath := range h.watchedPaths {
-		if event.Name == watchedPath || filepath.HasPrefix(event.Name, watchedPath+string(filepath.Separator)) {
+		if event.Name == watchedPath || strings.HasPrefix(event.Name, watchedPath+string(filepath.Separator)) {
 			return true
 		}
 	}
@@ -129,7 +129,7 @@ func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 		}
 
 		meta, err := frontmatter.Parse(file)
-		file.Close()
+		_ = file.Close()
 
 		if err == nil && meta.ID != "" {
 			submittedAt := meta.StartedAt

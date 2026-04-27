@@ -33,7 +33,7 @@ func enumerateDaemons() ([]daemonEntry, error) {
 		return nil, err
 	}
 
-	var entries []daemonEntry
+	entries := make([]daemonEntry, 0, len(matches))
 	for _, pidPath := range matches {
 		scope := scopeFromPidFilename(filepath.Base(pidPath))
 		var sockPath string

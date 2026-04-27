@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	_ "net/http/pprof"
+	_ "net/http/pprof" //nolint:gosec // G108: intentional debug endpoint for daemon operator use
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,26 +20,26 @@ import (
 	"github.com/grovetools/core/pkg/logging/logutil"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
-	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/util/pathutil"
+	"github.com/grovetools/daemon/internal/daemon/autonomous"
+	daemonchannels "github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
-	"github.com/grovetools/daemon/internal/daemon/autonomous"
-	daemonchannels "github.com/grovetools/daemon/internal/daemon/channels"
-	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
 	"github.com/grovetools/daemon/internal/daemon/pairwatch"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
+	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
 	"github.com/grovetools/daemon/internal/daemon/server"
 	daemonssh "github.com/grovetools/daemon/internal/daemon/ssh"
 	"github.com/grovetools/daemon/internal/daemon/store"
-	notifyconfig "github.com/grovetools/notify/pkg/config"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/grove-gemini/pkg/gemini"
 	"github.com/grovetools/memory/pkg/memory"
+	notifyconfig "github.com/grovetools/notify/pkg/config"
 	"github.com/spf13/cobra"
 )
 
@@ -70,7 +70,7 @@ func envBasePathsFromConfig(cfg *config.Config) []string {
 		return nil
 	}
 	seen := make(map[string]bool)
-	var paths []string
+	paths := make([]string, 0, len(cfg.Groves))
 	for _, src := range cfg.Groves {
 		if src.Enabled != nil && !*src.Enabled {
 			continue
@@ -128,7 +128,7 @@ func newGrovedStartCmd() *cobra.Command {
 			}
 			// Export GROVE_SCOPE so jobrunner and any PTYs spawned by this
 			// daemon inherit the scope naturally via os.Environ().
-			os.Setenv("GROVE_SCOPE", scope)
+			_ = os.Setenv("GROVE_SCOPE", scope)
 
 			pidPath, _ := cmd.Flags().GetString("pidfile")
 			if pidPath == "" {
@@ -149,7 +149,7 @@ func newGrovedStartCmd() *cobra.Command {
 					bgCtx := context.Background()
 					addr := fmt.Sprintf("localhost:%d", port)
 					ulog.Info("Starting pprof server").Field("addr", addr).Log(bgCtx)
-					if err := http.ListenAndServe(addr, nil); err != nil {
+					if err := http.ListenAndServe(addr, nil); err != nil { //nolint:gosec // G114: pprof debug server, no timeout needed
 						ulog.Error("Failed to start pprof server").Err(err).Log(bgCtx)
 					}
 				}()
@@ -543,30 +543,30 @@ func newGrovedStartCmd() *cobra.Command {
 				// Only the global daemon owns the SQLite DB and embedder; scoped
 				// daemons proxy /api/memory/* to global via server-side forwarding.
 				if scope == "" {
-				dbPath, err := pathutil.Expand("~/.local/share/grove/memory/memory.db")
-				if err == nil {
-					memStore, err := memory.Open(dbPath, 3072) // gemini-embedding-001 outputs 3072 dimensions
-					if err != nil {
-						ulog.Warn("Failed to initialize memory store, indexing disabled").Err(err).Log(ctx)
-					} else {
-						// Use grove-gemini's config resolver (secrets.toml, env var, api_key_command)
-						geminiClient, err := gemini.NewClient(ctx, "")
+					dbPath, err := pathutil.Expand("~/.local/share/grove/memory/memory.db")
+					if err == nil {
+						memStore, err := memory.Open(dbPath, 3072) // gemini-embedding-001 outputs 3072 dimensions
 						if err != nil {
-							ulog.Warn("Failed to initialize Gemini client, memory indexing disabled").Err(err).Log(ctx)
+							ulog.Warn("Failed to initialize memory store, indexing disabled").Err(err).Log(ctx)
 						} else {
-							embedder := memory.NewEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
+							// Use grove-gemini's config resolver (secrets.toml, env var, api_key_command)
+							geminiClient, err := gemini.NewClient(ctx, "")
+							if err != nil {
+								ulog.Warn("Failed to initialize Gemini client, memory indexing disabled").Err(err).Log(ctx)
+							} else {
+								embedder := memory.NewEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
 
-							memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
-							unifiedWatcher.Register(memoryHandler)
-							ulog.Info("Memory handler registered with unified watcher").Log(ctx)
+								memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
+								unifiedWatcher.Register(memoryHandler)
+								ulog.Info("Memory handler registered with unified watcher").Log(ctx)
 
-							// Share the same store + embedder with the HTTP server so
-							// /api/memory/* handlers can serve TUI clients without
-							// opening a second SQLite connection.
-							srv.SetMemoryStore(memStore, embedder, dbPath)
+								// Share the same store + embedder with the HTTP server so
+								// /api/memory/* handlers can serve TUI clients without
+								// opening a second SQLite connection.
+								srv.SetMemoryStore(memStore, embedder, dbPath)
+							}
 						}
 					}
-				}
 				}
 
 				ulog.Info("Unified watcher started").Log(ctx)
@@ -741,7 +741,7 @@ func newGrovedConfigCmd() *cobra.Command {
 		Long:  "Query the running daemon to show its active configuration intervals.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := daemon.New()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			if !client.IsRunning() {
 				fmt.Println("Daemon is not running")
@@ -785,7 +785,7 @@ func newGrovedMonitorCmd() *cobra.Command {
 			compact, _ := cmd.Flags().GetBool("compact")
 
 			client := daemon.New()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			if !client.IsRunning() {
 				fmt.Println("Daemon is not running")
@@ -898,10 +898,6 @@ func newGrovedMonitorCmd() *cobra.Command {
 					}
 				case "session":
 					if p, ok := update.Payload.(map[string]interface{}); ok {
-						jobID, _ := p["job_id"].(string)
-						if jobID == "" {
-							jobID, _ = p["session_id"].(string)
-						}
 						if _, hasNativeID := p["native_id"]; hasNativeID {
 							emit("info", "Session Confirmed", p)
 						} else if _, hasStatus := p["status"].(string); hasStatus {

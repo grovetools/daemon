@@ -7,8 +7,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/grovetools/core/git"
 	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/git"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
 )

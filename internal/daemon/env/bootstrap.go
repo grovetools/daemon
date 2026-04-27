@@ -56,16 +56,16 @@ func (m *Manager) runServiceBootstrap(
 	bootCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	bootCmd := exec.CommandContext(bootCtx, "sh", "-c", command)
+	bootCmd := exec.CommandContext(bootCtx, "sh", "-c", command) //nolint:gosec // G204: command from grove config
 	bootCmd.Dir = workDir
 	bootCmd.Env = env
 
 	if logDir != "" {
 		bootLogPath := filepath.Join(logDir, svcName+"-bootstrap.log")
-		if bf, err := os.OpenFile(bootLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+		if bf, err := os.OpenFile(bootLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil { //nolint:gosec // G304: log path from internal config
 			bootCmd.Stdout = bf
 			bootCmd.Stderr = bf
-			defer bf.Close()
+			defer func() { _ = bf.Close() }()
 		}
 	}
 

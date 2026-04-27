@@ -16,13 +16,13 @@ import (
 // LogStreamer manages log file tailing, caching via ring buffers, and broadcasting
 // log events to SSE subscribers on a per-job basis.
 type LogStreamer struct {
-	store             *store.Store
-	streams           map[string]*JobStream
-	mu                sync.Mutex
-	bufferSize        int
-	maxSubscribers    int
-	tailPollInterval  time.Duration
-	ulog              *logging.UnifiedLogger
+	store            *store.Store
+	streams          map[string]*JobStream
+	mu               sync.Mutex
+	bufferSize       int
+	maxSubscribers   int
+	tailPollInterval time.Duration
+	ulog             *logging.UnifiedLogger
 }
 
 // JobStream holds the state for tailing a single job's log file.
@@ -192,7 +192,7 @@ func (ls *LogStreamer) tailJob(ctx context.Context, stream *JobStream) {
 		}
 		time.Sleep(ls.tailPollInterval)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	ls.ulog.Debug("Tailing log file").
 		Field("job_id", stream.jobID).

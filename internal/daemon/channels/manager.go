@@ -39,9 +39,9 @@ type Manager struct {
 	store          *store.Store
 	signalCfg      SignalConfig
 	signalChannel  channels.Channel
-	activeSessions map[string]bool // jobID → true for sessions with signal enabled
+	activeSessions map[string]bool  // jobID → true for sessions with signal enabled
 	routeTable     map[int64]string // signal timestamp → jobID
-	ready          chan struct{}     // closed when signal-cli is ready
+	ready          chan struct{}    // closed when signal-cli is ready
 	isRunning      bool
 	ulog           *logging.UnifiedLogger
 	ctx            context.Context
@@ -159,7 +159,7 @@ func (m *Manager) Start(ctx context.Context) {
 // jobIDs. Persists the updated route file if anything changed.
 func (m *Manager) pruneStaleSessions(ctx context.Context) {
 	m.mu.Lock()
-	var stale []string
+	stale := make([]string, 0, len(m.activeSessions))
 	for jobID := range m.activeSessions {
 		if m.store.GetSession(jobID) == nil {
 			stale = append(stale, jobID)
@@ -183,22 +183,6 @@ func (m *Manager) pruneStaleSessions(ctx context.Context) {
 	if len(stale) > 0 {
 		m.saveRoutes()
 	}
-}
-
-// pruneSession removes a single jobID from activeSessions and purges any
-// routeTable entries pointing at it. Used as inline self-healing when a
-// routed inbound message resolves a jobID that no longer has a store
-// session.
-func (m *Manager) pruneSession(jobID string) {
-	m.mu.Lock()
-	delete(m.activeSessions, jobID)
-	for ts, id := range m.routeTable {
-		if id == jobID {
-			delete(m.routeTable, ts)
-		}
-	}
-	m.mu.Unlock()
-	m.saveRoutes()
 }
 
 // CleanupOrphans purges stale routes and orphaned sessions.
@@ -232,7 +216,7 @@ func (m *Manager) CleanupOrphans(ctx context.Context) (int, error) {
 
 	// 2. Clean up activeSessions — keep if routing.json or store says alive
 	m.mu.Lock()
-	var stale []string
+	stale := make([]string, 0, len(m.activeSessions))
 	for jobID := range m.activeSessions {
 		if _, ok := routes[jobID]; ok {
 			continue
@@ -274,7 +258,7 @@ func (m *Manager) Stop(ctx context.Context) {
 	}
 
 	if m.signalChannel != nil {
-		m.signalChannel.Stop(ctx)
+		_ = m.signalChannel.Stop(ctx)
 		m.signalChannel = nil
 		m.isRunning = false
 	}
@@ -654,7 +638,7 @@ func (m *Manager) replyWithAgentList(recipient string) {
 
 	if ch != nil {
 		msg := "Multiple agents active. Reply to a specific message or use @tag:\n" + strings.Join(agents, "\n")
-		ch.Send(context.Background(), channels.OutboundMessage{
+		_, _ = ch.Send(context.Background(), channels.OutboundMessage{
 			Recipient: recipient,
 			Message:   msg,
 		})
@@ -716,7 +700,7 @@ func (m *Manager) routeCleanup(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
-	cutoff := time.Duration(7 * 24 * time.Hour)
+	cutoff := 7 * 24 * time.Hour
 
 	for {
 		select {
@@ -750,7 +734,7 @@ func (m *Manager) loadRoutes() {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	json.Unmarshal(data, &m.routeTable)
+	_ = json.Unmarshal(data, &m.routeTable)
 }
 
 func (m *Manager) saveRoutes() {
@@ -762,8 +746,8 @@ func (m *Manager) saveRoutes() {
 	}
 
 	dir := filepath.Dir(m.routeFilePath())
-	os.MkdirAll(dir, 0755)
-	os.WriteFile(m.routeFilePath(), data, 0644)
+	_ = os.MkdirAll(dir, 0o755)                      //nolint:gosec // G301: daemon state directory
+	_ = os.WriteFile(m.routeFilePath(), data, 0o644) //nolint:gosec // G306: daemon route table
 }
 
 // --- Cross-daemon inbound routing (routing.json) ---
@@ -803,7 +787,7 @@ func readInboundRoutes() (map[string]string, error) {
 // tmp-file + rename so readers never observe a torn file.
 func writeInboundRoutesAtomic(routes map[string]string) error {
 	path := inboundRouteFile()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // G301: daemon state directory
 		return err
 	}
 	data, err := json.Marshal(routes)
@@ -815,12 +799,12 @@ func writeInboundRoutesAtomic(routes map[string]string) error {
 		return err
 	}
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
+		_ = os.Remove(tmp.Name())
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
@@ -894,7 +878,7 @@ func (m *Manager) forwardSessionInput(ctx context.Context, socketPath, jobID, in
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("scoped daemon returned %s", resp.Status)
 	}

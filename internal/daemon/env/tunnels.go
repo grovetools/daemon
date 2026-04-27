@@ -80,7 +80,7 @@ func (tm *TunnelManager) Start(parentCtx context.Context, worktree, name, cmdTem
 	renderedCmd := buf.String()
 
 	ctx, cancel := context.WithCancel(parentCtx)
-	cmd := exec.CommandContext(ctx, "sh", "-c", renderedCmd)
+	cmd := exec.CommandContext(ctx, "sh", "-c", renderedCmd) //nolint:gosec // G204: tunnel command from grove config
 	if workspaceDir != "" {
 		cmd.Dir = workspaceDir
 	}
@@ -93,14 +93,14 @@ func (tm *TunnelManager) Start(parentCtx context.Context, worktree, name, cmdTem
 
 	var logFile *os.File
 	if logDir != "" {
-		if err := os.MkdirAll(logDir, 0755); err != nil {
+		if err := os.MkdirAll(logDir, 0755); err != nil { //nolint:gosec // G301: daemon/test dir
 			tm.ulog.Warn("Failed to create tunnel log directory").
 				Err(err).
 				Field("log_dir", logDir).
 				Log(parentCtx)
 		} else {
 			logPath := filepath.Join(logDir, "tunnel-"+name+".log")
-			lf, lerr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			lf, lerr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644) //nolint:gosec // G302: tunnel log file
 			if lerr != nil {
 				tm.ulog.Warn("Failed to create tunnel log file").
 					Err(lerr).
@@ -118,7 +118,7 @@ func (tm *TunnelManager) Start(parentCtx context.Context, worktree, name, cmdTem
 	if err != nil {
 		cancel()
 		if logFile != nil {
-			logFile.Close()
+			_ = logFile.Close()
 		}
 		return 0, fmt.Errorf("failed to start tunnel %s: %w", name, err)
 	}
@@ -156,7 +156,7 @@ func (tm *TunnelManager) StopAll(worktree string) {
 			go func() {
 				_ = c.Wait()
 				if lf != nil {
-					lf.Close()
+					_ = lf.Close()
 				}
 			}()
 			delete(tm.tunnels, key)

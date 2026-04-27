@@ -30,7 +30,7 @@ func (s *Server) handleTerminalStream(w http.ResponseWriter, r *http.Request) {
 	defer hub.UnsubscribeSSE(ch)
 
 	// Confirm connection
-	fmt.Fprintf(w, ": connected\n\n")
+	_, _ = fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
 	ctx := r.Context()
@@ -50,7 +50,7 @@ func (s *Server) handleTerminalStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			fmt.Fprint(w, data)
+			_, _ = fmt.Fprint(w, data)
 			flusher.Flush()
 		}
 	}

@@ -125,7 +125,7 @@ func TestRestore_RegistersProxyRoutesFromStateFile(t *testing.T) {
 	tmp := t.TempDir()
 	wtPath := filepath.Join(tmp, "tier1-c")
 	stateDir := filepath.Join(wtPath, ".grove", "env")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0755); err != nil { //nolint:gosec // G301: daemon/test dir
 		t.Fatalf("mkdir state dir: %v", err)
 	}
 
@@ -137,7 +137,7 @@ func TestRestore_RegistersProxyRoutesFromStateFile(t *testing.T) {
 		ProxyRoutes:   map[string]int{"api": 45000, "web": 45001},
 	}
 	data, _ := json.MarshalIndent(&stateFile, "", "  ")
-	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0644); err != nil { //nolint:gosec // G306: test file
 		t.Fatalf("write state.json: %v", err)
 	}
 
@@ -167,7 +167,7 @@ func TestWriteStateFile_PersistsProxyRoutes(t *testing.T) {
 	tmp := t.TempDir()
 	wtPath := filepath.Join(tmp, "tier1-c")
 	stateDir := filepath.Join(wtPath, ".grove", "env")
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(stateDir, 0755); err != nil { //nolint:gosec // G301: daemon/test dir
 		t.Fatalf("mkdir: %v", err)
 	}
 
@@ -193,7 +193,7 @@ func TestWriteStateFile_PersistsProxyRoutes(t *testing.T) {
 		t.Fatalf("writeStateFile: %v", err)
 	}
 
-	raw, err := os.ReadFile(filepath.Join(stateDir, "state.json"))
+	raw, err := os.ReadFile(filepath.Join(stateDir, "state.json")) //nolint:gosec // G304: test path
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}

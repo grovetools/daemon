@@ -92,7 +92,7 @@ func (m *Manager) startLocalServices(
 			containerName = cname
 			// Eagerly remove any stale container with this name (e.g. from a
 			// previous crashed daemon that didn't clean up).
-			_ = exec.Command("docker", "rm", "-f", containerName).Run()
+			_ = exec.Command("docker", "rm", "-f", containerName).Run() //nolint:gosec // G204: containerName from grove config
 
 			// Surface env vars declared on the service to resp.EnvVars so
 			// subsequent services can reference them (matches native behavior).
@@ -101,7 +101,7 @@ func (m *Manager) startLocalServices(
 				resp.EnvVars[k] = services.ExpandEnvVars(val, resp.EnvVars)
 			}
 
-			cmd = exec.CommandContext(svcCtx, "docker", dockerArgs...)
+			cmd = exec.CommandContext(svcCtx, "docker", dockerArgs...) //nolint:gosec // G204: docker args from grove config
 			runningEnv.ServiceCommands[svcName] = "docker " + shellJoin(dockerArgs)
 			runningEnv.ContainerNames[svcName] = containerName
 
@@ -109,12 +109,12 @@ func (m *Manager) startLocalServices(
 			// if the docker CLI was SIGKILLed before it could clean up.
 			baseCancel := cancel
 			cancel = func() {
-				_ = exec.Command("docker", "rm", "-f", containerName).Run()
+				_ = exec.Command("docker", "rm", "-f", containerName).Run() //nolint:gosec // G204: containerName from grove config
 				baseCancel()
 			}
 			runningEnv.Cancels[svcName] = cancel
 		} else {
-			cmd = exec.CommandContext(svcCtx, "sh", "-c", entry.Command)
+			cmd = exec.CommandContext(svcCtx, "sh", "-c", entry.Command) //nolint:gosec // G204: service command from grove config
 			runningEnv.Cancels[svcName] = cancel
 			runningEnv.ServiceCommands[svcName] = entry.Command
 		}
@@ -127,7 +127,7 @@ func (m *Manager) startLocalServices(
 			} else {
 				cmd.Dir = filepath.Join(req.Workspace.Path, wd)
 			}
-			if err := os.MkdirAll(cmd.Dir, 0755); err != nil {
+			if err := os.MkdirAll(cmd.Dir, 0755); err != nil { //nolint:gosec // G301: daemon dir
 				cancel()
 				cleanupStarted()
 				return fmt.Errorf("failed to create working directory %s for service %s: %w", cmd.Dir, svcName, err)
@@ -190,7 +190,7 @@ func (m *Manager) startLocalServices(
 			if !filepath.IsAbs(hostPath) {
 				absPath = filepath.Join(req.Workspace.Path, hostPath)
 			}
-			if err := os.MkdirAll(absPath, 0755); err != nil {
+			if err := os.MkdirAll(absPath, 0755); err != nil { //nolint:gosec // G301: daemon dir
 				m.ulog.Warn("Failed to create volume directory").
 					Err(err).
 					Field("path", absPath).
@@ -206,7 +206,7 @@ func (m *Manager) startLocalServices(
 				for _, lockFile := range []string{"status", "lock"} {
 					lockPath := filepath.Join(absPath, lockFile)
 					if _, err := os.Stat(lockPath); err == nil {
-						os.Remove(lockPath)
+						_ = os.Remove(lockPath)
 						m.ulog.Debug("Removed stale lock file").
 							Field("service", svcName).
 							Field("lock_file", lockFile).
@@ -236,17 +236,17 @@ func (m *Manager) startLocalServices(
 							restoreEnv = append(restoreEnv, fmt.Sprintf("%s=%s", k, v))
 						}
 
-						rc := exec.Command("sh", "-c", restoreCmd)
+						rc := exec.Command("sh", "-c", restoreCmd) //nolint:gosec // G204: restore command from grove config
 						rc.Dir = req.Workspace.Path
 						rc.Env = restoreEnv
 
 						if logDir != "" {
 							restoreLogPath := filepath.Join(logDir, svcName+"-restore.log")
-							rlf, err := os.OpenFile(restoreLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+							rlf, err := os.OpenFile(restoreLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644) //nolint:gosec // G302: service restore log
 							if err == nil {
 								rc.Stdout = rlf
 								rc.Stderr = rlf
-								defer rlf.Close()
+								defer func() { _ = rlf.Close() }()
 							}
 						}
 
@@ -281,7 +281,7 @@ func (m *Manager) startLocalServices(
 		var logFile *os.File
 		if logDir != "" {
 			logPath := filepath.Join(logDir, svcName+".log")
-			lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644) //nolint:gosec // G302: service log file
 			if err != nil {
 				m.ulog.Warn("Failed to create log file").
 					Err(err).
@@ -305,7 +305,7 @@ func (m *Manager) startLocalServices(
 		if err != nil {
 			cancel()
 			if logFile != nil {
-				logFile.Close()
+				_ = logFile.Close()
 			}
 			cleanupStarted()
 			return fmt.Errorf("failed to start service %s: %w", svcName, err)
@@ -323,7 +323,7 @@ func (m *Manager) startLocalServices(
 			bgCtx := context.Background()
 			err := c.Wait()
 			if lf != nil {
-				lf.Close()
+				_ = lf.Close()
 			}
 			if err != nil {
 				m.ulog.Warn("Service exited with error").
@@ -399,7 +399,7 @@ func (m *Manager) startLocalServices(
 					Field("mode", lc.PostStartMode).
 					Log(ctx)
 
-				lcCmd := exec.Command("sh", "-c", lc.PostStart)
+				lcCmd := exec.Command("sh", "-c", lc.PostStart) //nolint:gosec // G204: lifecycle hook from grove config
 				lcCmd.Dir = req.Workspace.Path
 				lcCmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
 				for k, v := range resp.EnvVars {
@@ -408,11 +408,11 @@ func (m *Manager) startLocalServices(
 
 				if logDir != "" {
 					lcLogPath := filepath.Join(logDir, svcName+"-lifecycle.log")
-					llf, err := os.OpenFile(lcLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+					llf, err := os.OpenFile(lcLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644) //nolint:gosec // G302: lifecycle log file
 					if err == nil {
 						lcCmd.Stdout = llf
 						lcCmd.Stderr = llf
-						defer llf.Close()
+						defer func() { _ = llf.Close() }()
 					}
 				}
 
@@ -426,7 +426,7 @@ func (m *Manager) startLocalServices(
 						Field("service", svcName).
 						Log(ctx)
 					if lc.PostStartMode == "once" && markerPath != "" {
-						os.WriteFile(markerPath, []byte("initialized\n"), 0644)
+						_ = os.WriteFile(markerPath, []byte("initialized\n"), 0644) //nolint:gosec // G306: marker file
 					}
 				}
 			}

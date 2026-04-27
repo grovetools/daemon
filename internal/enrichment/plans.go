@@ -78,7 +78,7 @@ func FetchPlanStatsMap() (map[string]*models.PlanStats, error) {
 func processPlanDir(planPath string, stats *models.PlanStats, node *workspace.WorkspaceNode) {
 	// Read plan config to check status
 	configPath := filepath.Join(planPath, "config.yml")
-	configData, err := os.ReadFile(configPath)
+	configData, err := os.ReadFile(configPath) //nolint:gosec // G304: path from known plan directory
 	planFinished := false
 	var planWorktree string
 
@@ -138,13 +138,13 @@ func processPlanDir(planPath string, stats *models.PlanStats, node *workspace.Wo
 		}
 
 		jobPath := filepath.Join(planPath, entry.Name())
-		file, err := os.Open(jobPath)
+		file, err := os.Open(jobPath) //nolint:gosec // G304: path from known plan directory
 		if err != nil {
 			continue
 		}
 
 		meta, _ := frontmatter.Parse(file)
-		file.Close()
+		_ = file.Close()
 
 		switch meta.Status {
 		case "completed":
@@ -179,7 +179,7 @@ func getActivePlanForPath(node *workspace.WorkspaceNode, locator *workspace.Note
 		}
 	}
 
-	data, err := os.ReadFile(stateFilePath)
+	data, err := os.ReadFile(stateFilePath) //nolint:gosec // G304: path from known plan directory
 	if err != nil {
 		return ""
 	}
