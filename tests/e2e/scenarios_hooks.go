@@ -20,7 +20,7 @@ func DaemonHooksScenario() *harness.Scenario {
 	return harness.NewScenario(
 		"daemon-hooks",
 		"Verify daemon executes on_skill_sync hooks when skills change",
-		[]string{"daemon", "hooks", "skills"},
+		[]string{"daemon", "hooks", "skills", "slow"},
 		[]harness.Step{
 			harness.NewStep("setup hooks config", func(ctx *harness.Context) error {
 				// Create workspace directory with git repo

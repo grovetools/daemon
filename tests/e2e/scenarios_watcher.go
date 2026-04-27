@@ -23,7 +23,7 @@ func DaemonSkillWatcherScenario() *harness.Scenario {
 	return harness.NewScenario(
 		"daemon-skill-watcher",
 		"Verify daemon background skill watcher syncs skills on file changes",
-		[]string{"daemon", "watcher", "skills"},
+		[]string{"daemon", "watcher", "skills", "slow"},
 		[]harness.Step{
 			harness.NewStep("setup workspace and skill directories", func(ctx *harness.Context) error {
 				// Create a workspace directory with git repo (required for workspace detection)
@@ -278,7 +278,7 @@ func DaemonSkillWatcherPruneScenario() *harness.Scenario {
 	return harness.NewScenario(
 		"daemon-skill-watcher-prune",
 		"Verify daemon prunes skills when removed from config",
-		[]string{"daemon", "watcher", "skills", "prune"},
+		[]string{"daemon", "watcher", "skills", "prune", "slow"},
 		[]harness.Step{
 			harness.NewStep("setup workspace with skills", func(ctx *harness.Context) error {
 				// Create workspace with git repo

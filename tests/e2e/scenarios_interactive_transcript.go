@@ -23,7 +23,7 @@ func DaemonInteractiveTranscriptScenario() *harness.Scenario {
 	return harness.NewScenario(
 		"daemon-interactive-transcript",
 		"Verify daemon auto-appends transcript and unblocks deps when interactive_agent completes",
-		[]string{"daemon", "transcript", "interactive_agent"},
+		[]string{"daemon", "transcript", "interactive_agent", "slow"},
 		[]harness.Step{
 			harness.NewStep("setup workspace with plan and jobs", func(ctx *harness.Context) error {
 				binary, err := FindBinary()

@@ -17,7 +17,7 @@ func DaemonLifecycleScenario() *harness.Scenario {
 	return harness.NewScenario(
 		"daemon-lifecycle",
 		"Verify daemon lifecycle commands (start, status, config, stop)",
-		[]string{"daemon", "lifecycle"},
+		[]string{"daemon", "lifecycle", "slow"},
 		[]harness.Step{
 			harness.NewStep("start daemon", func(ctx *harness.Context) error {
 				binary, err := FindBinary()
