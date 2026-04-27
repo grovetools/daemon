@@ -15,3 +15,5 @@ linters-settings:
 
 issues:
   exclude-use-default: false
+run:
+  allow-parallel-runners: true
