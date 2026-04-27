@@ -384,11 +384,12 @@ func (s *Server) handlePostTaskResult(w http.ResponseWriter, r *http.Request, wo
 	}
 
 	var payload struct {
-		Workspace  string `json:"workspace"`
-		Verb       string `json:"verb"`
-		ExitCode   int    `json:"exit_code"`
-		CommitHash string `json:"commit_hash"`
-		DurationMs int64  `json:"duration_ms"`
+		Workspace    string `json:"workspace"`
+		Verb         string `json:"verb"`
+		ExitCode     int    `json:"exit_code"`
+		CommitHash   string `json:"commit_hash"`
+		DurationMs   int64  `json:"duration_ms"`
+		ErrorSummary string `json:"error_summary"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -408,10 +409,11 @@ func (s *Server) handlePostTaskResult(w http.ResponseWriter, r *http.Request, wo
 	}
 
 	result := &models.TaskResult{
-		ExitCode:   payload.ExitCode,
-		CommitHash: payload.CommitHash,
-		DurationMs: payload.DurationMs,
-		Timestamp:  time.Now(),
+		ExitCode:     payload.ExitCode,
+		CommitHash:   payload.CommitHash,
+		DurationMs:   payload.DurationMs,
+		Timestamp:    time.Now(),
+		ErrorSummary: payload.ErrorSummary,
 	}
 
 	s.engine.Store().ApplyUpdate(store.Update{
