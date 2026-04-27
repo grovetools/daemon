@@ -83,6 +83,10 @@ const (
 	// queue the requested re-indexing work asynchronously.
 	UpdateMemoryReindex UpdateType = "memory_reindex" // Payload: *MemoryReindexPayload
 
+	// Task result reporting — stores the outcome of developer hygiene tasks
+	// (build, check, fmt, lint) per workspace, enabling cache-based skipping.
+	UpdateTaskResult UpdateType = "task_result" // Payload: *TaskResultPayload
+
 	// Native agent pane lifecycle — these are pass-through events that the
 	// daemon relays from Flow (or the HTTP API) to groveterm via SSE.
 	// The daemon does NOT apply them to its own state; they exist purely
@@ -212,6 +216,13 @@ type AgentInputPayload struct {
 // CaptureRequestPayload requests a screen capture from a native agent pane.
 type CaptureRequestPayload struct {
 	JobID string `json:"job_id"`
+}
+
+// TaskResultPayload contains data for reporting a task execution result.
+type TaskResultPayload struct {
+	Workspace string             `json:"workspace"`
+	Verb      string             `json:"verb"`
+	Result    *models.TaskResult `json:"result"`
 }
 
 // Update represents a change to the state.

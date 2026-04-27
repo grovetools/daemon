@@ -264,6 +264,11 @@ func (s *Store) ApplyUpdate(u Update) {
 			}
 		}
 
+	case UpdateTaskResult:
+		if payload, ok := u.Payload.(*TaskResultPayload); ok {
+			s.applyTaskResult(payload)
+		}
+
 	case UpdateNavBindings:
 		if bindings, ok := u.Payload.(*models.NavSessionsFile); ok {
 			s.state.NavBindings = bindings
@@ -366,6 +371,21 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload) {
 	if job, exists := s.state.Jobs[payload.JobID]; exists {
 		job.Status = payload.Outcome
 		job.CompletedAt = &now
+	}
+}
+
+// applyTaskResult stores a task execution result for a workspace.
+// The workspace is matched by name (not path) since CLI callers identify repos by name.
+func (s *Store) applyTaskResult(payload *TaskResultPayload) {
+	for _, ws := range s.state.Workspaces {
+		if ws.WorkspaceNode == nil || ws.Name != payload.Workspace {
+			continue
+		}
+		if ws.TaskResults == nil {
+			ws.TaskResults = make(map[string]*models.TaskResult)
+		}
+		ws.TaskResults[payload.Verb] = payload.Result
+		return
 	}
 }
 

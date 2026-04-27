@@ -215,6 +215,7 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 
 	// State API endpoints
 	mux.HandleFunc("/api/state", s.handleGetState)
+	mux.HandleFunc("/api/workspaces/", s.handleWorkspaceSubpath)
 	mux.HandleFunc("/api/workspaces", s.handleGetWorkspaces)
 	mux.HandleFunc("/api/plans", s.handleGetPlans)
 	// Session endpoints - order matters! Most specific routes first.
@@ -348,6 +349,69 @@ func (s *Server) handleGetWorkspaces(w http.ResponseWriter, r *http.Request) {
 	workspaces := s.engine.Store().GetWorkspaces()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(workspaces)
+}
+
+// handleWorkspaceSubpath routes /api/workspaces/{workspace}/tasks to the task report handler.
+func (s *Server) handleWorkspaceSubpath(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path[len("/api/workspaces/"):]
+	parts := splitPath(path)
+	if len(parts) < 2 {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	workspace := parts[0]
+	switch parts[1] {
+	case "tasks":
+		s.handlePostTaskResult(w, r, workspace)
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
+func (s *Server) handlePostTaskResult(w http.ResponseWriter, r *http.Request, workspace string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	var payload struct {
+		Verb       string `json:"verb"`
+		ExitCode   int    `json:"exit_code"`
+		CommitHash string `json:"commit_hash"`
+		DurationMs int64  `json:"duration_ms"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if payload.Verb == "" {
+		http.Error(w, "verb is required", http.StatusBadRequest)
+		return
+	}
+
+	result := &models.TaskResult{
+		ExitCode:   payload.ExitCode,
+		CommitHash: payload.CommitHash,
+		DurationMs: payload.DurationMs,
+		Timestamp:  time.Now(),
+	}
+
+	s.engine.Store().ApplyUpdate(store.Update{
+		Type:   store.UpdateTaskResult,
+		Source: "cli",
+		Payload: &store.TaskResultPayload{
+			Workspace: workspace,
+			Verb:      payload.Verb,
+			Result:    result,
+		},
+	})
+
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 }
 
 // handleGetPlans returns the cached list of fully-parsed plans for a
