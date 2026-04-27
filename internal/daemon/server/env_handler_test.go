@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,7 +21,7 @@ func TestHandleEnvUp_POST(t *testing.T) {
 	s := newTestServer()
 
 	// Native provider requires a workspace — without one it returns a JSON error
-	body := strings.NewReader(`{"provider":"native","plan_dir":"/tmp/test"}`)
+	body := strings.NewReader(fmt.Sprintf(`{"provider":"native","plan_dir":"%s"}`, t.TempDir()))
 	req := httptest.NewRequest(http.MethodPost, "/api/env/up", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -47,13 +48,14 @@ func TestHandleEnvUp_POST(t *testing.T) {
 
 func TestHandleEnvUp_WithWorkspace(t *testing.T) {
 	s := newTestServer()
+	planDir := t.TempDir()
 
 	// Valid request with workspace and no services — should succeed with "running" status
-	body := strings.NewReader(`{
+	body := strings.NewReader(fmt.Sprintf(`{
 		"provider":"native",
-		"plan_dir":"/tmp/test",
-		"workspace":{"name":"test-wt","path":"/tmp/test-wt"}
-	}`)
+		"plan_dir":"%s",
+		"workspace":{"name":"test-wt","path":"%s"}
+	}`, planDir, t.TempDir()))
 	req := httptest.NewRequest(http.MethodPost, "/api/env/up", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -150,7 +152,7 @@ func TestHandleEnvDown_POST(t *testing.T) {
 	s := newTestServer()
 
 	// Docker provider requires a workspace — without one it returns a JSON error
-	body := strings.NewReader(`{"provider":"docker","plan_dir":"/tmp/test"}`)
+	body := strings.NewReader(fmt.Sprintf(`{"provider":"docker","plan_dir":"%s"}`, t.TempDir()))
 	req := httptest.NewRequest(http.MethodPost, "/api/env/down", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -174,13 +176,14 @@ func TestHandleEnvDown_POST(t *testing.T) {
 
 func TestHandleEnvDown_WithWorkspace(t *testing.T) {
 	s := newTestServer()
+	planDir := t.TempDir()
 
 	// Down on a non-running environment should return "stopped"
-	body := strings.NewReader(`{
+	body := strings.NewReader(fmt.Sprintf(`{
 		"provider":"native",
-		"plan_dir":"/tmp/test",
-		"workspace":{"name":"test-wt","path":"/tmp/test-wt"}
-	}`)
+		"plan_dir":"%s",
+		"workspace":{"name":"test-wt","path":"%s"}
+	}`, planDir, t.TempDir()))
 	req := httptest.NewRequest(http.MethodPost, "/api/env/down", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

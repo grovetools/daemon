@@ -12,15 +12,17 @@ import (
 // Store is the in-memory state store for the daemon.
 // It is thread-safe and supports pub/sub for real-time updates.
 type Store struct {
-	mu          sync.RWMutex
-	state       *State
-	subscribers map[chan Update]struct{}
-	focus       map[string]struct{} // Focused workspace paths for priority scanning
+	mu             sync.RWMutex
+	state          *State
+	subscribers    map[chan Update]struct{}
+	focus          map[string]struct{} // Focused workspace paths for priority scanning
+	persister      *Persister
+	pendingRestore persistedState // Loaded from disk, applied when workspaces arrive
 }
 
-// New creates a new Store instance.
+// New creates a new Store instance, loading any persisted task results from disk.
 func New() *Store {
-	return &Store{
+	s := &Store{
 		state: &State{
 			Workspaces: make(map[string]*models.EnrichedWorkspace),
 			Sessions:   make(map[string]*models.Session),
@@ -30,7 +32,20 @@ func New() *Store {
 		},
 		subscribers: make(map[chan Update]struct{}),
 		focus:       make(map[string]struct{}),
+		persister:   newPersister(),
 	}
+	s.loadPersistedResults()
+	return s
+}
+
+// loadPersistedResults reads task results from disk and stashes them for
+// later restoration once workspaces are populated.
+func (s *Store) loadPersistedResults() {
+	persisted, err := s.persister.load()
+	if err != nil || len(persisted) == 0 {
+		return
+	}
+	s.pendingRestore = persisted
 }
 
 // Get returns a copy of the current state.
@@ -136,6 +151,10 @@ func (s *Store) ApplyUpdate(u Update) {
 	case UpdateWorkspaces:
 		if workspaces, ok := u.Payload.(map[string]*models.EnrichedWorkspace); ok {
 			s.state.Workspaces = workspaces
+			if s.pendingRestore != nil {
+				restoreResults(s.state.Workspaces, s.pendingRestore)
+				s.pendingRestore = nil
+			}
 		}
 	case UpdateSessions:
 		if sessions, ok := u.Payload.([]*models.Session); ok {
@@ -268,11 +287,13 @@ func (s *Store) ApplyUpdate(u Update) {
 	case UpdateTaskResult:
 		if payload, ok := u.Payload.(*TaskResultPayload); ok {
 			s.applyTaskResult(payload)
+			s.persistAsync()
 		}
 
 	case UpdateTestReport:
 		if payload, ok := u.Payload.(*TestReportPayload); ok {
 			s.applyTestReport(payload)
+			s.persistAsync()
 		}
 
 	case UpdateNavBindings:
@@ -420,6 +441,13 @@ func (s *Store) applyTestReport(payload *TestReportPayload) {
 		ws.TestReports[payload.Report.Verb] = payload.Report
 		return
 	}
+}
+
+// persistAsync snapshots task/test results and writes to disk in a goroutine.
+// Must be called under the store's write lock.
+func (s *Store) persistAsync() {
+	snap := snapshot(s.state.Workspaces)
+	go s.persister.save(snap)
 }
 
 // SetSessionPtyID associates a daemon PTY session ID with a session entry.

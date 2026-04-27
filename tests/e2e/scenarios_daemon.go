@@ -116,9 +116,9 @@ func DaemonLifecycleScenario() *harness.Scenario {
 
 				return ctx.Verify(func(v *verify.Collector) {
 					v.Equal("exit code is 0", 0, result.ExitCode)
-					v.True("stdout contains Running", strings.Contains(result.Stdout, "Running"))
-					v.True("stdout contains PID", strings.Contains(result.Stdout, "PID:"))
-					v.True("stdout contains socket path", strings.Contains(result.Stdout, "Socket:"))
+					v.True("stdout contains PID header", strings.Contains(result.Stdout, "PID"))
+					v.True("stdout contains SCOPE header", strings.Contains(result.Stdout, "SCOPE"))
+					v.True("stdout contains SOCKET header", strings.Contains(result.Stdout, "SOCKET"))
 				})
 			}),
 			harness.NewStep("check config shows intervals", func(ctx *harness.Context) error {
@@ -203,7 +203,7 @@ func DaemonLifecycleScenario() *harness.Scenario {
 
 				return ctx.Verify(func(v *verify.Collector) {
 					v.Equal("exit code is 1 (stopped)", 1, statusResult.ExitCode)
-					v.True("stdout contains Stopped", strings.Contains(statusResult.Stdout, "Stopped"))
+					v.True("stdout contains no daemons", strings.Contains(statusResult.Stdout, "No daemons running"))
 				})
 			}),
 		},

@@ -212,6 +212,9 @@ This skill was added after the initial config.
 					return err
 				}
 
+				// Let fsnotify process skill file events before modifying config
+				time.Sleep(500 * time.Millisecond)
+
 				// Update grove.toml to include the new skill
 				groveToml := filepath.Join(workspaceDir, "grove.toml")
 				newConfig := `name = "test-workspace"

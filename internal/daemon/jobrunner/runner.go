@@ -504,6 +504,7 @@ func (jr *JobRunner) watchTransitions(ctx context.Context) {
 	defer jr.store.Unsubscribe(sub)
 
 	processed := make(map[string]struct{})
+	seenActive := make(map[string]struct{})
 
 	for {
 		select {
@@ -512,22 +513,27 @@ func (jr *JobRunner) watchTransitions(ctx context.Context) {
 		case update := <-sub:
 			switch update.Type {
 			case store.UpdateJobsDiscovered:
-				// Jobs discovered from filesystem scan — these are historical jobs
-				// that already exist on disk. Only evaluate blocked dependencies;
-				// do NOT run appendTranscriptAsync, which spawns expensive external
-				// processes (grove aglogs read). On a large plan history this would
-				// launch thousands of processes and bring the machine to a halt.
+				// Jobs discovered from filesystem scan. On the first scan,
+				// already-terminal jobs only trigger dependency evaluation.
+				// On subsequent scans, if a previously-active job is now
+				// terminal, treat it as a real transition and append transcript.
 				if jobs, ok := update.Payload.([]*models.JobInfo); ok {
 					needsEval := false
 					for _, job := range jobs {
 						if isJobTerminal(job.Status) {
 							if _, ok := processed[job.ID]; !ok {
 								processed[job.ID] = struct{}{}
-								needsEval = true
+								_, wasActive := seenActive[job.ID]
+								delete(seenActive, job.ID)
+								if wasActive && (job.Type == "interactive_agent" || job.Type == "headless_agent") {
+									jr.appendTranscriptAsync(job)
+								} else {
+									needsEval = true
+								}
 							}
 						} else {
-							// If job reverts to active state, remove from processed map
 							delete(processed, job.ID)
+							seenActive[job.ID] = struct{}{}
 						}
 					}
 					if needsEval {
