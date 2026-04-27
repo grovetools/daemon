@@ -442,10 +442,17 @@ func (s *Server) handlePostTestReport(w http.ResponseWriter, r *http.Request, wo
 		return
 	}
 
-	var report models.TestReport
-	if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+	var payload struct {
+		Workspace string `json:"workspace"`
+		models.TestReport
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
+	}
+	report := payload.TestReport
+	if payload.Workspace != "" {
+		workspace = payload.Workspace
 	}
 	if report.Verb == "" {
 		http.Error(w, "verb is required", http.StatusBadRequest)
