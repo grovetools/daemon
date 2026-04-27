@@ -63,7 +63,7 @@ func New(cfg *config.DaemonSSHConfig) (*Server, error) {
 	}
 
 	// Ensure host key directory exists
-	if err := os.MkdirAll(filepath.Dir(hostKeyPath), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(hostKeyPath), 0o700); err != nil {
 		return nil, fmt.Errorf("creating host key directory: %w", err)
 	}
 

@@ -10,7 +10,7 @@ import (
 
 func TestBootstrap_SkipsWhenPathPresent(t *testing.T) {
 	tmp := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(tmp, "node_modules"), 0755); err != nil { //nolint:gosec // G301: daemon/test dir
+	if err := os.MkdirAll(filepath.Join(tmp, "node_modules"), 0o755); err != nil { //nolint:gosec // G301: daemon/test dir
 		t.Fatal(err)
 	}
 	sentinel := filepath.Join(tmp, "sentinel")

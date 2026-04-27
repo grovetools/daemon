@@ -62,7 +62,7 @@ func (m *Manager) runServiceBootstrap(
 
 	if logDir != "" {
 		bootLogPath := filepath.Join(logDir, svcName+"-bootstrap.log")
-		if bf, err := os.OpenFile(bootLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil { //nolint:gosec // G304: log path from internal config
+		if bf, err := os.OpenFile(bootLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); err == nil { //nolint:gosec // G304: log path from internal config
 			bootCmd.Stdout = bf
 			bootCmd.Stderr = bf
 			defer func() { _ = bf.Close() }()

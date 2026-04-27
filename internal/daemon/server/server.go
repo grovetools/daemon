@@ -182,7 +182,7 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	}
 
 	// Ensure directory exists
-	if err := os.MkdirAll(filepath.Dir(socketPath), 0755); err != nil { //nolint:gosec // G301: daemon/test dir
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil { //nolint:gosec // G301: daemon/test dir
 		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
 

@@ -127,7 +127,7 @@ func (m *Manager) startLocalServices(
 			} else {
 				cmd.Dir = filepath.Join(req.Workspace.Path, wd)
 			}
-			if err := os.MkdirAll(cmd.Dir, 0755); err != nil { //nolint:gosec // G301: daemon dir
+			if err := os.MkdirAll(cmd.Dir, 0o755); err != nil { //nolint:gosec // G301: daemon dir
 				cancel()
 				cleanupStarted()
 				return fmt.Errorf("failed to create working directory %s for service %s: %w", cmd.Dir, svcName, err)
@@ -190,7 +190,7 @@ func (m *Manager) startLocalServices(
 			if !filepath.IsAbs(hostPath) {
 				absPath = filepath.Join(req.Workspace.Path, hostPath)
 			}
-			if err := os.MkdirAll(absPath, 0755); err != nil { //nolint:gosec // G301: daemon dir
+			if err := os.MkdirAll(absPath, 0o755); err != nil { //nolint:gosec // G301: daemon dir
 				m.ulog.Warn("Failed to create volume directory").
 					Err(err).
 					Field("path", absPath).
@@ -242,7 +242,7 @@ func (m *Manager) startLocalServices(
 
 						if logDir != "" {
 							restoreLogPath := filepath.Join(logDir, svcName+"-restore.log")
-							rlf, err := os.OpenFile(restoreLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644) //nolint:gosec // G302: service restore log
+							rlf, err := os.OpenFile(restoreLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644) //nolint:gosec // G302: service restore log
 							if err == nil {
 								rc.Stdout = rlf
 								rc.Stderr = rlf
@@ -281,7 +281,7 @@ func (m *Manager) startLocalServices(
 		var logFile *os.File
 		if logDir != "" {
 			logPath := filepath.Join(logDir, svcName+".log")
-			lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644) //nolint:gosec // G302: service log file
+			lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644) //nolint:gosec // G302: service log file
 			if err != nil {
 				m.ulog.Warn("Failed to create log file").
 					Err(err).
@@ -408,7 +408,7 @@ func (m *Manager) startLocalServices(
 
 				if logDir != "" {
 					lcLogPath := filepath.Join(logDir, svcName+"-lifecycle.log")
-					llf, err := os.OpenFile(lcLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644) //nolint:gosec // G302: lifecycle log file
+					llf, err := os.OpenFile(lcLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644) //nolint:gosec // G302: lifecycle log file
 					if err == nil {
 						lcCmd.Stdout = llf
 						lcCmd.Stderr = llf
@@ -426,7 +426,7 @@ func (m *Manager) startLocalServices(
 						Field("service", svcName).
 						Log(ctx)
 					if lc.PostStartMode == "once" && markerPath != "" {
-						_ = os.WriteFile(markerPath, []byte("initialized\n"), 0644) //nolint:gosec // G306: marker file
+						_ = os.WriteFile(markerPath, []byte("initialized\n"), 0o644) //nolint:gosec // G306: marker file
 					}
 				}
 			}

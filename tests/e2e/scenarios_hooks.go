@@ -25,7 +25,7 @@ func DaemonHooksScenario() *harness.Scenario {
 			harness.NewStep("setup hooks config", func(ctx *harness.Context) error {
 				// Create workspace directory with git repo
 				workspaceDir := ctx.NewDir("hooks-workspace")
-				if err := os.MkdirAll(workspaceDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(workspaceDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -43,13 +43,13 @@ func DaemonHooksScenario() *harness.Scenario {
 				// Create notebook root for skills
 				notebookRoot := filepath.Join(ctx.HomeDir(), ".grove", "notebooks", "main")
 				notebookSkillsDir := filepath.Join(notebookRoot, "workspaces", "hooks-workspace", "skills")
-				if err := os.MkdirAll(notebookSkillsDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(notebookSkillsDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
 				// Create global config directory
 				configGroveDir := filepath.Join(ctx.ConfigDir(), "grove")
-				if err := os.MkdirAll(configGroveDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(configGroveDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -77,7 +77,7 @@ run_if = "changes"
 name = "always-hook"
 command = "echo 'skill_sync_triggered' >> '` + logFile + `'"
 `
-				if err := os.WriteFile(groveToml, []byte(groveTomlContent), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(groveToml, []byte(groveTomlContent), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 
@@ -89,7 +89,7 @@ command = "echo 'skill_sync_triggered' >> '` + logFile + `'"
 use = ["hook-test-skill"]
 providers = ["claude"]
 `
-				if err := os.WriteFile(wsGroveToml, []byte(wsConfig), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(wsGroveToml, []byte(wsConfig), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 
@@ -152,7 +152,7 @@ providers = ["claude"]
 
 				// Create the skill that the workspace is configured to use
 				skillDir := filepath.Join(notebookSkillsDir, "hook-test-skill")
-				if err := os.MkdirAll(skillDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(skillDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -165,7 +165,7 @@ description: A skill to test on_skill_sync hooks
 
 This skill tests the on_skill_sync hook.
 `
-				if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillContent), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillContent), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 
@@ -220,7 +220,7 @@ This skill tests the on_skill_sync hook.
 				if err != nil {
 					return err
 				}
-				if err := os.WriteFile(skillFile, skillContent, 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(skillFile, skillContent, 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 

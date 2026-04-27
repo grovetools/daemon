@@ -17,9 +17,11 @@ import (
 // Local aliases keep the daemon package's call sites terse without dragging
 // the envtf-prefixed names into every terraform.go line. They are purely a
 // naming convenience — the canonical definitions live in core/pkg/envtf.
-type groveContext = envtf.GroveContext
-type backendConfig = envtf.BackendConfig
-type tfOutput = envtf.TfOutput
+type (
+	groveContext  = envtf.GroveContext
+	backendConfig = envtf.BackendConfig
+	tfOutput      = envtf.TfOutput
+)
 
 // generateEnvId is retained as a package-local shim over envtf.GenerateEnvId
 // so existing tests (e.g. TestGenerateEnvId) and daemon call sites don't have
@@ -94,7 +96,7 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 				"GROVE_IMAGE_REGISTRY="+registry,
 			)
 			output, err := buildCmd.CombinedOutput()
-			_ = os.WriteFile(logFile, output, 0644) //nolint:gosec // G306: build log file
+			_ = os.WriteFile(logFile, output, 0o644) //nolint:gosec // G306: build log file
 			if err != nil {
 				return nil, fmt.Errorf("image build command failed for %q: %w\nSee log: %s", key, err, logFile)
 			}
@@ -118,14 +120,14 @@ func (m *Manager) buildImages(ctx context.Context, req coreenv.EnvRequest) (map[
 
 			buildCmd := exec.CommandContext(ctx, "docker", buildArgs...) //nolint:gosec // G204: docker build args from config
 			buildOutput, err := buildCmd.CombinedOutput()
-			_ = os.WriteFile(logFile, buildOutput, 0644) //nolint:gosec // G306: build log file
+			_ = os.WriteFile(logFile, buildOutput, 0o644) //nolint:gosec // G306: build log file
 			if err != nil {
 				return nil, fmt.Errorf("docker build failed for %q: %w\nSee log: %s", key, err, logFile)
 			}
 
 			pushCmd := exec.CommandContext(ctx, "docker", "push", fullURI) //nolint:gosec // G204: docker push with internal URI
 			pushOutput, err := pushCmd.CombinedOutput()
-			_ = os.WriteFile(logFile, append(buildOutput, pushOutput...), 0644) //nolint:gosec // G306: build log file
+			_ = os.WriteFile(logFile, append(buildOutput, pushOutput...), 0o644) //nolint:gosec // G306: build log file
 			if err != nil {
 				return nil, fmt.Errorf("docker push failed for %q: %w\nSee log: %s", key, err, logFile)
 			}

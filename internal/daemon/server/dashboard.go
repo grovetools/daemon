@@ -97,8 +97,8 @@ func (s *Server) StartDashboard(ctx context.Context) (string, error) {
 	// broadcast/discovery protocol.
 	portPath := DashboardPortFile()
 	if portPath != "" {
-		if err := os.MkdirAll(filepath.Dir(portPath), 0755); err == nil { //nolint:gosec // G301: daemon/test dir
-			_ = os.WriteFile(portPath, []byte(fmt.Sprintf("%d\n", addr.Port)), 0644) //nolint:gosec // G306: daemon port file
+		if err := os.MkdirAll(filepath.Dir(portPath), 0o755); err == nil { //nolint:gosec // G301: daemon/test dir
+			_ = os.WriteFile(portPath, []byte(fmt.Sprintf("%d\n", addr.Port)), 0o644) //nolint:gosec // G306: daemon port file
 		}
 	}
 

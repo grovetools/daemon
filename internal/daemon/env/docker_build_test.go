@@ -20,14 +20,14 @@ import (
 func TestBuildImagesIfStale_SkipOnFingerprintMatch(t *testing.T) {
 	ws := t.TempDir()
 	ctxDir := filepath.Join(ws, "app")
-	if err := os.MkdirAll(ctxDir, 0755); err != nil { //nolint:gosec // G301: daemon/test dir
+	if err := os.MkdirAll(ctxDir, 0o755); err != nil { //nolint:gosec // G301: daemon/test dir
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(ctxDir, "main.go"), []byte("package main\n"), 0644); err != nil { //nolint:gosec // G306: test file
+	if err := os.WriteFile(filepath.Join(ctxDir, "main.go"), []byte("package main\n"), 0o644); err != nil { //nolint:gosec // G306: test file
 		t.Fatal(err)
 	}
 	df := filepath.Join(ctxDir, "Dockerfile")
-	if err := os.WriteFile(df, []byte("FROM scratch\n"), 0644); err != nil { //nolint:gosec // G306: test file
+	if err := os.WriteFile(df, []byte("FROM scratch\n"), 0o644); err != nil { //nolint:gosec // G306: test file
 		t.Fatal(err)
 	}
 

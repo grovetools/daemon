@@ -1,6 +1,6 @@
 linters:
   enable:
-    - gofmt
+    - gofumpt
     - govet
     - gosec
     - ineffassign

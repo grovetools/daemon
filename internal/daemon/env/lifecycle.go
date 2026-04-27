@@ -41,9 +41,9 @@ func (m *Manager) runPreStopHook(ctx context.Context, req coreenv.EnvRequest, wo
 
 	if stateDir != "" {
 		logsDir := filepath.Join(stateDir, "logs")
-		if err := os.MkdirAll(logsDir, 0755); err == nil { //nolint:gosec // G301: daemon dir
+		if err := os.MkdirAll(logsDir, 0o755); err == nil { //nolint:gosec // G301: daemon dir
 			logPath := filepath.Join(logsDir, "env-prestop.log")
-			if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil { //nolint:gosec // G302: log file for service output
+			if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); err == nil { //nolint:gosec // G302: log file for service output
 				cmd.Stdout = lf
 				cmd.Stderr = lf
 				defer func() { _ = lf.Close() }()
@@ -78,7 +78,7 @@ func (m *Manager) runStartupCommands(ctx context.Context, req coreenv.EnvRequest
 	var logsDir string
 	if stateDir != "" {
 		logsDir = filepath.Join(stateDir, "logs")
-		_ = os.MkdirAll(logsDir, 0755) //nolint:gosec // G301: daemon dir
+		_ = os.MkdirAll(logsDir, 0o755) //nolint:gosec // G301: daemon dir
 	}
 
 	for _, name := range names {
@@ -108,7 +108,7 @@ func (m *Manager) runStartupCommands(ctx context.Context, req coreenv.EnvRequest
 
 		if logsDir != "" {
 			logPath := filepath.Join(logsDir, "cmd-"+name+"-startup.log")
-			if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil { //nolint:gosec // G302: log file for service output
+			if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); err == nil { //nolint:gosec // G302: log file for service output
 				c.Stdout = lf
 				c.Stderr = lf
 				defer func() { _ = lf.Close() }()

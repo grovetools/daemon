@@ -14,7 +14,7 @@ import (
 // Acquire writes the current PID to the file.
 // It returns an error if another instance is already running.
 func Acquire(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil { //nolint:gosec // G301: daemon runtime directory
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // G301: daemon runtime directory
 		return fmt.Errorf("failed to create pid directory: %w", err)
 	}
 
@@ -32,7 +32,7 @@ func Acquire(path string) error {
 
 	// Write current PID
 	pid := os.Getpid()
-	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)), 0644); err != nil { //nolint:gosec // G306: pid file readable by other processes
+	if err := os.WriteFile(path, []byte(strconv.Itoa(pid)), 0o644); err != nil { //nolint:gosec // G306: pid file readable by other processes
 		return fmt.Errorf("failed to write pid file: %w", err)
 	}
 

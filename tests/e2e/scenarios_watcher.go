@@ -28,7 +28,7 @@ func DaemonSkillWatcherScenario() *harness.Scenario {
 			harness.NewStep("setup workspace and skill directories", func(ctx *harness.Context) error {
 				// Create a workspace directory with git repo (required for workspace detection)
 				workspaceDir := ctx.NewDir("test-workspace")
-				if err := os.MkdirAll(workspaceDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(workspaceDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -46,20 +46,20 @@ func DaemonSkillWatcherScenario() *harness.Scenario {
 use = ["test-skill"]
 providers = ["claude"]
 `
-				if err := os.WriteFile(groveToml, []byte(groveTomlContent), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(groveToml, []byte(groveTomlContent), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 
 				// Create notebook root for skills
 				notebookRoot := filepath.Join(ctx.HomeDir(), ".grove", "notebooks", "main")
-				if err := os.MkdirAll(notebookRoot, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(notebookRoot, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
 				// Create global config that registers the test workspace as a grove
 				// and configures notebook for skill discovery (following skills test pattern)
 				globalConfigDir := filepath.Join(ctx.ConfigDir(), "grove")
-				if err := os.MkdirAll(globalConfigDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(globalConfigDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 				globalConfig := filepath.Join(globalConfigDir, "grove.toml")
@@ -74,13 +74,13 @@ default = "main"
 [notebooks.definitions.main]
 root_dir = "` + notebookRoot + `"
 `
-				if err := os.WriteFile(globalConfig, []byte(globalConfigContent), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(globalConfig, []byte(globalConfigContent), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 
 				// Create skills directory in notebook for the workspace
 				notebookSkillsDir := filepath.Join(notebookRoot, "workspaces", "test-workspace", "skills")
-				if err := os.MkdirAll(notebookSkillsDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(notebookSkillsDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -145,7 +145,7 @@ root_dir = "` + notebookRoot + `"
 				skillDir := filepath.Join(notebookSkillsDir, "test-skill")
 
 				// Create the skill directory and SKILL.md file in the notebook
-				if err := os.MkdirAll(skillDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(skillDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -163,7 +163,7 @@ This is a test skill for daemon watcher E2E testing.
 Use this skill to verify the daemon's skill sync functionality.
 `
 				skillFile := filepath.Join(skillDir, "SKILL.md")
-				if err := os.WriteFile(skillFile, []byte(skillContent), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(skillFile, []byte(skillContent), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 
@@ -195,7 +195,7 @@ Use this skill to verify the daemon's skill sync functionality.
 
 				// Create a new skill in the notebook
 				newSkillDir := filepath.Join(notebookSkillsDir, "new-skill")
-				if err := os.MkdirAll(newSkillDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(newSkillDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -208,7 +208,7 @@ description: A new skill added after initial config
 
 This skill was added after the initial config.
 `
-				if err := os.WriteFile(filepath.Join(newSkillDir, "SKILL.md"), []byte(newSkillContent), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(filepath.Join(newSkillDir, "SKILL.md"), []byte(newSkillContent), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 
@@ -220,7 +220,7 @@ This skill was added after the initial config.
 use = ["test-skill", "new-skill"]
 providers = ["claude"]
 `
-				if err := os.WriteFile(groveToml, []byte(newConfig), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(groveToml, []byte(newConfig), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 
@@ -283,7 +283,7 @@ func DaemonSkillWatcherPruneScenario() *harness.Scenario {
 			harness.NewStep("setup workspace with skills", func(ctx *harness.Context) error {
 				// Create workspace with git repo
 				workspaceDir := ctx.NewDir("prune-workspace")
-				if err := os.MkdirAll(workspaceDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(workspaceDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
@@ -301,20 +301,20 @@ func DaemonSkillWatcherPruneScenario() *harness.Scenario {
 use = ["keep-skill", "remove-skill"]
 providers = ["claude"]
 `
-				if err := os.WriteFile(groveToml, []byte(groveTomlContent), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(groveToml, []byte(groveTomlContent), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 
 				// Create notebook root for skills
 				notebookRoot := filepath.Join(ctx.HomeDir(), ".grove", "notebooks", "main")
 				notebookSkillsDir := filepath.Join(notebookRoot, "workspaces", "prune-workspace", "skills")
-				if err := os.MkdirAll(notebookSkillsDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(notebookSkillsDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 
 				// Create global config
 				globalConfigDir := filepath.Join(ctx.ConfigDir(), "grove")
-				if err := os.MkdirAll(globalConfigDir, 0755); err != nil { //nolint:gosec // G301: test dir
+				if err := os.MkdirAll(globalConfigDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 					return err
 				}
 				globalConfig := filepath.Join(globalConfigDir, "grove.toml")
@@ -329,14 +329,14 @@ default = "main"
 [notebooks.definitions.main]
 root_dir = "` + notebookRoot + `"
 `
-				if err := os.WriteFile(globalConfig, []byte(globalConfigContent), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(globalConfig, []byte(globalConfigContent), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 
 				// Create skills in notebook
 				for _, skillName := range []string{"keep-skill", "remove-skill"} {
 					skillDir := filepath.Join(notebookSkillsDir, skillName)
-					if err := os.MkdirAll(skillDir, 0755); err != nil { //nolint:gosec // G301: test dir
+					if err := os.MkdirAll(skillDir, 0o755); err != nil { //nolint:gosec // G301: test dir
 						return err
 					}
 					content := `---
@@ -348,7 +348,7 @@ description: Test skill for pruning
 
 Skill content.
 `
-					if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0644); err != nil { //nolint:gosec // G306: test file
+					if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0o644); err != nil { //nolint:gosec // G306: test file
 						return err
 					}
 				}
@@ -437,7 +437,7 @@ Skill content.
 use = ["keep-skill"]
 providers = ["claude"]
 `
-				if err := os.WriteFile(groveToml, []byte(newConfig), 0644); err != nil { //nolint:gosec // G306: test file
+				if err := os.WriteFile(groveToml, []byte(newConfig), 0o644); err != nil { //nolint:gosec // G306: test file
 					return err
 				}
 

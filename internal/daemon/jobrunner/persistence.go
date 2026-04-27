@@ -28,7 +28,7 @@ func NewPersistenceWithDir(dir string) *Persistence {
 	if dir == "" {
 		dir = filepath.Join(paths.StateDir(), "daemon", "jobs")
 	}
-	_ = os.MkdirAll(dir, 0755) //nolint:gosec // G301: daemon state directory
+	_ = os.MkdirAll(dir, 0o755) //nolint:gosec // G301: daemon state directory
 	return &Persistence{dir: dir}
 }
 
@@ -40,7 +40,7 @@ func (p *Persistence) Save(job *models.JobInfo) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(p.dir, job.ID+".json"), b, 0644) //nolint:gosec // G306: daemon state file
+	_ = os.WriteFile(filepath.Join(p.dir, job.ID+".json"), b, 0o644) //nolint:gosec // G306: daemon state file
 }
 
 // Load reads all persisted job files from disk.
