@@ -215,6 +215,7 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 
 	// State API endpoints
 	mux.HandleFunc("/api/state", s.handleGetState)
+	mux.HandleFunc("/api/tasks", s.handlePostTaskReport)
 	mux.HandleFunc("/api/workspaces/", s.handleWorkspaceSubpath)
 	mux.HandleFunc("/api/workspaces", s.handleGetWorkspaces)
 	mux.HandleFunc("/api/plans", s.handleGetPlans)
@@ -368,6 +369,10 @@ func (s *Server) handleWorkspaceSubpath(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+func (s *Server) handlePostTaskReport(w http.ResponseWriter, r *http.Request) {
+	s.handlePostTaskResult(w, r, "")
+}
+
 func (s *Server) handlePostTaskResult(w http.ResponseWriter, r *http.Request, workspace string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -379,6 +384,7 @@ func (s *Server) handlePostTaskResult(w http.ResponseWriter, r *http.Request, wo
 	}
 
 	var payload struct {
+		Workspace  string `json:"workspace"`
 		Verb       string `json:"verb"`
 		ExitCode   int    `json:"exit_code"`
 		CommitHash string `json:"commit_hash"`
@@ -390,6 +396,14 @@ func (s *Server) handlePostTaskResult(w http.ResponseWriter, r *http.Request, wo
 	}
 	if payload.Verb == "" {
 		http.Error(w, "verb is required", http.StatusBadRequest)
+		return
+	}
+	// Prefer workspace from body; fall back to URL-based workspace for old clients.
+	if payload.Workspace != "" {
+		workspace = payload.Workspace
+	}
+	if workspace == "" {
+		http.Error(w, "workspace is required", http.StatusBadRequest)
 		return
 	}
 

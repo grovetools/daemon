@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/flow/pkg/orchestration"
 )
 
@@ -374,11 +375,17 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload) {
 	}
 }
 
-// applyTaskResult stores a task execution result for a workspace.
-// The workspace is matched by name (not path) since CLI callers identify repos by name.
 func (s *Store) applyTaskResult(payload *TaskResultPayload) {
+	normalizedInput, err := pathutil.NormalizeForLookup(payload.Workspace)
+	if err != nil {
+		return
+	}
 	for _, ws := range s.state.Workspaces {
-		if ws.WorkspaceNode == nil || ws.Name != payload.Workspace {
+		if ws.WorkspaceNode == nil {
+			continue
+		}
+		normalizedPath, err := pathutil.NormalizeForLookup(ws.Path)
+		if err != nil || normalizedPath != normalizedInput {
 			continue
 		}
 		if ws.TaskResults == nil {
