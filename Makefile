@@ -103,6 +103,7 @@ build-all:
 # Pass arguments via ARGS, e.g., make test-e2e ARGS="-i"
 test-e2e: build
 	@echo "Running E2E tests..."
+	@go build -o bin/tend-e2e ./tests/e2e/
 	@tend run $(ARGS)
 
 # Show available targets
