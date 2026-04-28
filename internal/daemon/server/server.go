@@ -21,8 +21,8 @@ import (
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
-	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/repo"
+	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/tmux"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/channels"
@@ -902,6 +902,15 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 	}
 	if session == nil {
 		return fmt.Errorf("session not found: %s", jobID)
+	}
+
+	// Enrich with persisted delivery info if store session lacks mux
+	if effectiveMux(session) == models.MuxNone {
+		if info := channels.GetSessionDelivery(jobID); info != nil {
+			session.Mux = info.Mux
+			session.TmuxTarget = info.TmuxTarget
+			session.PtyID = info.PtyID
+		}
 	}
 
 	inputMode := s.resolveInputMode(session.WorkingDirectory)
