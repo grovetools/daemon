@@ -63,10 +63,10 @@ type Manager struct {
 	// resolves the mux + PTY/tmux target internally).
 	SendInput func(ctx context.Context, jobID, message string) error
 
-	recentInbound     [10]models.InboundRecord
-	recentInboundIdx  int
-	recentInboundLen  int
-	lastInboundAt     time.Time
+	recentInbound    [10]models.InboundRecord
+	recentInboundIdx int
+	recentInboundLen int
+	lastInboundAt    time.Time
 }
 
 // NewManager creates a new ChannelManager. scope is the daemon's scope
@@ -730,6 +730,15 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 			switch u.Type {
 			case store.UpdateSessionEnd:
 				if payload, ok := u.Payload.(*store.SessionEndPayload); ok {
+					// Don't disable channels for sessions that have channels
+					// in their frontmatter — the frontmatter is the source of
+					// truth for claw state. The session collector may emit
+					// spurious ends (e.g., PID=0 after daemon restart) but the
+					// agent is still running.
+					session := m.store.GetSession(payload.JobID)
+					if session != nil && hasSignalChannel(session.Channels) {
+						continue
+					}
 					m.DisableChannel(ctx, payload.JobID)
 					m.cleanupRoutesForJob(payload.JobID)
 				}
@@ -849,9 +858,9 @@ func (m *Manager) routeFilePath() string {
 // messages can still be delivered to running agents.
 
 type deliveryInfo struct {
-	Mux         string `json:"mux"`
-	TmuxTarget  string `json:"tmux_target,omitempty"`
-	PtyID       string `json:"pty_id,omitempty"`
+	Mux        string `json:"mux"`
+	TmuxTarget string `json:"tmux_target,omitempty"`
+	PtyID      string `json:"pty_id,omitempty"`
 }
 
 func deliveryFilePath() string {
