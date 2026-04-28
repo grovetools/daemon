@@ -540,7 +540,7 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 				Field("active_sessions", count).
 				Log(ctx)
 			m.recordInbound(msg.Source, "dropped", "", "multiple active agents", false)
-			m.replyWithAgentList(msg.Source)
+			m.replyWithAgentList(msg.Source, activeIDs)
 			return
 		} else {
 			m.mu.Unlock()
@@ -769,17 +769,21 @@ func (m *Manager) extractTagFromText(text string, activeIDs map[string]bool) str
 }
 
 // replyWithAgentList sends a Signal message listing active agents.
-func (m *Manager) replyWithAgentList(recipient string) {
+func (m *Manager) replyWithAgentList(recipient string, activeIDs map[string]bool) {
 	m.mu.Lock()
 	ch := m.signalChannel
-	var agents []string
-	for id := range m.activeSessions {
-		session := m.store.GetSession(id)
-		if session != nil {
-			agents = append(agents, fmt.Sprintf("  @%s", session.JobTitle))
-		}
-	}
 	m.mu.Unlock()
+
+	var agents []string
+	for id := range activeIDs {
+		title := id
+		if session := m.store.GetSession(id); session != nil && session.JobTitle != "" {
+			title = session.JobTitle
+		} else if idx := strings.LastIndex(id, "-"); idx > 0 {
+			title = id[:idx]
+		}
+		agents = append(agents, fmt.Sprintf("  @%s", title))
+	}
 
 	if ch != nil {
 		msg := "Multiple agents active. Reply to a specific message or use @tag:\n" + strings.Join(agents, "\n")
