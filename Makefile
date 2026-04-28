@@ -104,7 +104,7 @@ build-all:
 test-e2e: build
 	@echo "Running E2E tests..."
 	@go build -o bin/tend-e2e ./tests/e2e/
-	@tend run $(ARGS)
+	@tend run -p $(ARGS)
 
 # Show available targets
 help:
