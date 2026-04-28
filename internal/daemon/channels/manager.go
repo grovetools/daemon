@@ -102,24 +102,17 @@ func (m *Manager) Start(ctx context.Context) {
 	m.loadRoutes()
 
 	if m.scope == "" && m.globalClient == nil {
-		// Global daemon: the local session store is ephemeral (empty
-		// immediately after restart; sessions live in scoped daemons OR
-		// get re-registered lazily by hooks on the next agent activity).
-		// Rebuild activeSessions from persisted state so cross-daemon
-		// claw survives a global-daemon restart.
-		//
-		// Two sources:
-		//   1. routing.json — jobIDs owned by scoped daemons (cross-daemon).
-		//   2. routeTable — jobIDs that had recent outbound traffic (local
-		//      sessions whose store entry will re-register via hooks).
+		// Global daemon: hydrate activeSessions from the unified state file.
+		// InboundRoutes has jobIDs owned by scoped daemons; QuoteRoutes
+		// has jobIDs with recent outbound traffic.
 		m.mu.Lock()
-		if routes, err := readInboundRoutes(); err == nil {
-			for jobID := range routes {
+		if state, err := loadChannelState(); err == nil {
+			for jobID := range state.InboundRoutes {
 				m.activeSessions[jobID] = true
 			}
-		}
-		for _, jobID := range m.routeTable {
-			m.activeSessions[jobID] = true
+			for _, jobID := range state.QuoteRoutes {
+				m.activeSessions[jobID] = true
+			}
 		}
 		m.mu.Unlock()
 	}
@@ -197,29 +190,30 @@ func (m *Manager) pruneStaleSessions(ctx context.Context) {
 func (m *Manager) CleanupOrphans(ctx context.Context) (int, error) {
 	purgedCount := 0
 
-	// 1. Clean up stale inbound routes (routing.json) — dead sockets
-	inboundRouteMu.Lock()
-	routes, err := readInboundRoutes()
+	// 1. Clean up stale inbound routes — dead sockets
+	stateMu.Lock()
+	state, err := loadChannelState()
 	changedRoutes := false
 	if err == nil {
-		for jobID, sock := range routes {
+		for jobID, sock := range state.InboundRoutes {
 			if _, err := os.Stat(sock); os.IsNotExist(err) {
-				delete(routes, jobID)
+				delete(state.InboundRoutes, jobID)
 				changedRoutes = true
 				purgedCount++
 			}
 		}
 		if changedRoutes {
-			_ = writeInboundRoutesAtomic(routes)
+			_ = saveStateAtomic(state)
 		}
 	}
-	inboundRouteMu.Unlock()
+	stateMu.Unlock()
 
-	if routes == nil {
-		routes = make(map[string]string)
+	routes := make(map[string]string)
+	if state != nil {
+		routes = state.InboundRoutes
 	}
 
-	// 2. Clean up activeSessions — keep if routing.json or store says alive
+	// 2. Clean up activeSessions — keep if inbound routes or store says alive
 	m.mu.Lock()
 	stale := make([]string, 0, len(m.activeSessions))
 	for jobID := range m.activeSessions {
@@ -300,7 +294,6 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 	}
 
 	m.ulog.Info("Channel enabled for session").Field("job_id", jobID).Log(m.ctx)
-	m.saveDeliveryState()
 	return nil
 }
 
@@ -750,25 +743,12 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 				for _, job := range jobs {
 					if hasSignalChannel(job.Channels) && !m.isActive(job.ID) {
 						if err := m.EnableChannel(ctx, job.ID); err == nil {
-							m.restoreDeliveryInfo(job.ID)
 							m.ulog.Info("Rehydrated channel from discovered job").
 								Field("job_id", job.ID).
 								Log(ctx)
 						}
 					}
 				}
-			case store.UpdateSessionTmuxTarget:
-				m.saveDeliveryState()
-			case store.UpdateSessions, store.UpdateSessionConfirmation, store.UpdateSessionIntent:
-				// When sessions appear in the store, try restoring delivery
-				// info for any active channel sessions that lack mux info.
-				m.mu.Lock()
-				for jobID := range m.activeSessions {
-					m.mu.Unlock()
-					m.restoreDeliveryInfo(jobID)
-					m.mu.Lock()
-				}
-				m.mu.Unlock()
 			}
 		}
 	}
@@ -855,167 +835,57 @@ func (m *Manager) routeCleanup(ctx context.Context) {
 	}
 }
 
-// Persistence
-
-func (m *Manager) routeFilePath() string {
-	return filepath.Join(paths.StateDir(), "channels", "signal_routes.json")
-}
-
-// --- Session delivery state persistence ---
+// --- Unified channel state persistence (channels/state.json) ---
 //
-// session-delivery.json maps jobID → {mux, tmux_target, pty_id} for
-// channel-enabled sessions. This survives daemon restarts so inbound
-// messages can still be delivered to running agents.
+// state.json consolidates the formerly separate routing.json (cross-daemon
+// inbound routes) and signal_routes.json (quote-reply routing) into a
+// single atomic file. Writes use tmp-file + rename.
 
-type deliveryInfo struct {
-	Mux        string `json:"mux"`
-	TmuxTarget string `json:"tmux_target,omitempty"`
-	PtyID      string `json:"pty_id,omitempty"`
+// ChannelState is the on-disk representation of all channel routing state.
+type ChannelState struct {
+	InboundRoutes map[string]string `json:"inbound_routes"` // jobID → socketPath
+	QuoteRoutes   map[int64]string  `json:"quote_routes"`   // timestamp → jobID
 }
 
-func deliveryFilePath() string {
-	return filepath.Join(paths.StateDir(), "channels", "session-delivery.json")
+func stateFilePath() string {
+	return filepath.Join(paths.StateDir(), "channels", "state.json")
 }
 
-func (m *Manager) loadDeliveryState() map[string]deliveryInfo {
-	data, err := os.ReadFile(deliveryFilePath())
-	if err != nil {
-		return nil
-	}
-	var state map[string]deliveryInfo
-	_ = json.Unmarshal(data, &state)
-	return state
-}
-
-func (m *Manager) saveDeliveryState() {
-	// Load existing state to merge with — don't clobber entries for
-	// sessions that haven't had their mux set yet this lifecycle.
-	state := m.loadDeliveryState()
-	if state == nil {
-		state = make(map[string]deliveryInfo)
-	}
-
-	m.mu.Lock()
-	for jobID := range m.activeSessions {
-		session := m.store.GetSession(jobID)
-		if session == nil {
-			continue
-		}
-		if session.Mux != "" || session.TmuxTarget != "" || session.PtyID != "" {
-			state[jobID] = deliveryInfo{
-				Mux:        session.Mux,
-				TmuxTarget: session.TmuxTarget,
-				PtyID:      session.PtyID,
-			}
-		}
-	}
-	m.mu.Unlock()
-
-	data, err := json.Marshal(state)
-	if err != nil {
-		return
-	}
-	dir := filepath.Dir(deliveryFilePath())
-	_ = os.MkdirAll(dir, 0o755)
-	_ = os.WriteFile(deliveryFilePath(), data, 0o644)
-}
-
-// restoreDeliveryInfo patches sessions in the store with persisted mux/target
-// info so inbound messages can be delivered after a daemon restart.
-func (m *Manager) restoreDeliveryInfo(jobID string) {
-	state := m.loadDeliveryState()
-	if state == nil {
-		return
-	}
-	info, ok := state[jobID]
-	if !ok {
-		return
-	}
-	session := m.store.GetSession(jobID)
-	if session == nil {
-		return
-	}
-	if session.Mux == "" && info.Mux != "" {
-		session.Mux = info.Mux
-		session.TmuxTarget = info.TmuxTarget
-		session.PtyID = info.PtyID
-		m.ulog.Info("Restored delivery info for session").
-			Field("job_id", jobID).
-			Field("mux", info.Mux).
-			Field("tmux_target", info.TmuxTarget).
-			Log(m.ctx)
-	}
-}
-
-func (m *Manager) loadRoutes() {
-	data, err := os.ReadFile(m.routeFilePath())
-	if err != nil {
-		return // File doesn't exist yet
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	_ = json.Unmarshal(data, &m.routeTable)
-}
-
-func (m *Manager) saveRoutes() {
-	m.mu.Lock()
-	data, err := json.Marshal(m.routeTable)
-	m.mu.Unlock()
-	if err != nil {
-		return
-	}
-
-	dir := filepath.Dir(m.routeFilePath())
-	_ = os.MkdirAll(dir, 0o755)                      //nolint:gosec // G301: daemon state directory
-	_ = os.WriteFile(m.routeFilePath(), data, 0o644) //nolint:gosec // G306: daemon route table
-}
-
-// --- Cross-daemon inbound routing (routing.json) ---
-//
-// routing.json maps jobID → absolute socketPath of the scoped daemon that
-// owns that session. Scoped daemons write entries when a user enables the
-// Signal channel on a session; the global daemon reads entries when an
-// inbound Signal message resolves to that jobID and forwards SendInput
-// across daemons via HTTP over the scoped socket.
-//
-// Writes use a tmp-file + atomic rename to avoid torn reads from the
-// global daemon's inbound goroutine.
-
-func inboundRouteFile() string {
-	return filepath.Join(paths.StateDir(), "channels", "routing.json")
-}
-
-func readInboundRoutes() (map[string]string, error) {
-	data, err := os.ReadFile(inboundRouteFile())
+func loadChannelState() (*ChannelState, error) {
+	data, err := os.ReadFile(stateFilePath())
 	if err != nil {
 		if os.IsNotExist(err) {
-			return map[string]string{}, nil
+			return &ChannelState{
+				InboundRoutes: map[string]string{},
+				QuoteRoutes:   map[int64]string{},
+			}, nil
 		}
 		return nil, err
 	}
-	out := map[string]string{}
-	if len(data) == 0 {
-		return out, nil
-	}
-	if err := json.Unmarshal(data, &out); err != nil {
+	var state ChannelState
+	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, err
 	}
-	return out, nil
+	if state.InboundRoutes == nil {
+		state.InboundRoutes = map[string]string{}
+	}
+	if state.QuoteRoutes == nil {
+		state.QuoteRoutes = map[int64]string{}
+	}
+	return &state, nil
 }
 
-// writeInboundRoutesAtomic writes the routing.json atomically via a
-// tmp-file + rename so readers never observe a torn file.
-func writeInboundRoutesAtomic(routes map[string]string) error {
-	path := inboundRouteFile()
+// saveStateAtomic writes the unified state file atomically via tmp + rename.
+func saveStateAtomic(state *ChannelState) error {
+	path := stateFilePath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // G301: daemon state directory
 		return err
 	}
-	data, err := json.Marshal(routes)
+	data, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".routing-*.tmp")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".state-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -1031,44 +901,75 @@ func writeInboundRoutesAtomic(routes map[string]string) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-// inboundRouteMu serializes read-modify-write cycles across goroutines in
-// the same daemon. Cross-daemon concurrency is covered by atomic rename.
-var inboundRouteMu sync.Mutex
+// stateMu serializes read-modify-write cycles within the same daemon.
+var stateMu sync.Mutex
+
+func (m *Manager) loadRoutes() {
+	state, err := loadChannelState()
+	if err != nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.routeTable = state.QuoteRoutes
+}
+
+func (m *Manager) saveRoutes() {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+
+	state, err := loadChannelState()
+	if err != nil {
+		state = &ChannelState{InboundRoutes: map[string]string{}, QuoteRoutes: map[int64]string{}}
+	}
+
+	m.mu.Lock()
+	state.QuoteRoutes = m.routeTable
+	m.mu.Unlock()
+
+	_ = saveStateAtomic(state)
+}
 
 func (m *Manager) addInboundRoute(jobID string) error {
 	if m.socketPath == "" {
 		return fmt.Errorf("manager has no socketPath; cannot register inbound route")
 	}
-	inboundRouteMu.Lock()
-	defer inboundRouteMu.Unlock()
-	routes, err := readInboundRoutes()
+	if m.isSandboxScope() {
+		m.mu.Lock()
+		m.activeSessions[jobID] = true
+		m.mu.Unlock()
+		return nil
+	}
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	state, err := loadChannelState()
 	if err != nil {
 		return err
 	}
-	routes[jobID] = m.socketPath
-	return writeInboundRoutesAtomic(routes)
+	state.InboundRoutes[jobID] = m.socketPath
+	return saveStateAtomic(state)
 }
 
 func (m *Manager) removeInboundRoute(jobID string) error {
-	inboundRouteMu.Lock()
-	defer inboundRouteMu.Unlock()
-	routes, err := readInboundRoutes()
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	state, err := loadChannelState()
 	if err != nil {
 		return err
 	}
-	if _, ok := routes[jobID]; !ok {
+	if _, ok := state.InboundRoutes[jobID]; !ok {
 		return nil
 	}
-	delete(routes, jobID)
-	return writeInboundRoutesAtomic(routes)
+	delete(state.InboundRoutes, jobID)
+	return saveStateAtomic(state)
 }
 
 func (m *Manager) lookupInboundRoute(jobID string) (string, bool) {
-	routes, err := readInboundRoutes()
+	state, err := loadChannelState()
 	if err != nil {
 		return "", false
 	}
-	sock, ok := routes[jobID]
+	sock, ok := state.InboundRoutes[jobID]
 	return sock, ok
 }
 

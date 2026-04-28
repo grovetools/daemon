@@ -573,6 +573,17 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 						TmuxTarget: req.TmuxTarget,
 					},
 				})
+				// Persist to filesystem registry for restart resilience
+				if registry, err := sessions.NewFileSystemRegistry(); err == nil {
+					session := s.engine.Store().GetSession(sessionID)
+					dirName := sessionID
+					if session != nil && session.ClaudeSessionID != "" {
+						dirName = session.ClaudeSessionID
+					}
+					_ = registry.UpdateFields(dirName, func(m *sessions.SessionMetadata) {
+						m.TmuxTarget = req.TmuxTarget
+					})
+				}
 			}
 			if req.LastSender != "" {
 				s.engine.Store().ApplyUpdate(store.Update{
@@ -843,6 +854,27 @@ func (s *Server) resolveInputMode(workDir string) string {
 	return "vim"
 }
 
+// sessionFromRegistry constructs a minimal Session from the filesystem
+// registry. Used as a fallback when the in-memory store hasn't been
+// populated yet (e.g., immediately after daemon restart).
+func (s *Server) sessionFromRegistry(jobID string) *models.Session {
+	registry, err := sessions.NewFileSystemRegistry()
+	if err != nil {
+		return nil
+	}
+	meta, err := registry.Find(jobID)
+	if err != nil {
+		return nil
+	}
+	return &models.Session{
+		ID:               meta.SessionID,
+		Mux:              meta.Mux,
+		TmuxTarget:       meta.TmuxTarget,
+		PtyID:            meta.PtyID,
+		WorkingDirectory: meta.WorkingDirectory,
+	}
+}
+
 // effectiveMux returns the mux to use for routing input/interrupt to a
 // session. An explicit session.Mux wins; otherwise we fall back to the
 // legacy implicit inference (PtyID→treemux, TmuxTarget→tmux) so pre-upgrade
@@ -871,6 +903,9 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 		return fmt.Errorf("engine not initialized")
 	}
 	session := s.engine.Store().GetSession(jobID)
+	if session == nil {
+		session = s.sessionFromRegistry(jobID)
+	}
 	if session == nil {
 		return fmt.Errorf("session not found: %s", jobID)
 	}
@@ -956,6 +991,9 @@ func (s *Server) SendSessionInterrupt(ctx context.Context, jobID string) error {
 		return fmt.Errorf("engine not initialized")
 	}
 	session := s.engine.Store().GetSession(jobID)
+	if session == nil {
+		session = s.sessionFromRegistry(jobID)
+	}
 	if session == nil {
 		return fmt.Errorf("session not found: %s", jobID)
 	}
@@ -1314,6 +1352,18 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 		// Update the session registry with the PTY ID so re-attachment works.
 		if st := s.engine.Store(); st != nil {
 			st.SetSessionPtyID(payload.JobID, ptyID)
+		}
+
+		// Persist PtyID to filesystem registry for restart resilience.
+		if reg, err := sessions.NewFileSystemRegistry(); err == nil {
+			session := s.engine.Store().GetSession(payload.JobID)
+			dirName := payload.JobID
+			if session != nil && session.ClaudeSessionID != "" {
+				dirName = session.ClaudeSessionID
+			}
+			_ = reg.UpdateFields(dirName, func(m *sessions.SessionMetadata) {
+				m.PtyID = ptyID
+			})
 		}
 
 		// Send attach event to groveterm via SSE.

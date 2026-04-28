@@ -87,8 +87,13 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 						continue
 					}
 
-					// PID 0 means the real PID was never discovered (e.g., groveterm-native agent crashed
-					// before async PID discovery completed). After the grace period, treat as dead.
+					// PID 0 with a recent start means the intent was registered but
+					// the agent hasn't confirmed yet — give it 2 minutes to survive
+					// daemon restarts between RegisterSessionIntent and ConfirmSession.
+					if session.PID == 0 && time.Since(session.StartedAt) < 2*time.Minute {
+						continue
+					}
+
 					if session.PID == 0 || !process.IsProcessAlive(session.PID) {
 						c.ulog.Warn("Session process died unexpectedly").
 							Field("job_id", session.ID).
