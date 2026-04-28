@@ -104,8 +104,70 @@ func NewGrovedCmd() *cobra.Command {
 	cmd.AddCommand(newGrovedStatusCmd())
 	cmd.AddCommand(newGrovedConfigCmd())
 	cmd.AddCommand(newGrovedMonitorCmd())
+	cmd.AddCommand(newGrovedHealthCmd())
 
 	return cmd
+}
+
+func newGrovedHealthCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "health",
+		Short: "Single-pane-of-glass daemon health check",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := daemon.NewGlobalClient()
+			defer func() { _ = client.Close() }()
+
+			if !client.IsRunning() {
+				fmt.Println("Daemon is not running")
+				os.Exit(1)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			cfg, cfgErr := client.GetConfig(ctx)
+			chStatus, chErr := client.GetChannelStatus(ctx)
+
+			fmt.Println("=== groved health ===")
+			fmt.Println()
+
+			if cfgErr == nil {
+				fmt.Printf("Daemon uptime:      %s\n", time.Since(cfg.StartedAt).Round(time.Second))
+			} else {
+				fmt.Printf("Daemon uptime:      (error: %v)\n", cfgErr)
+			}
+
+			sigPID, sigAge := signalCLIProcess()
+			if sigPID > 0 {
+				fmt.Printf("signal-cli PID:     %d (running %s)\n", sigPID, sigAge)
+			} else {
+				fmt.Println("signal-cli PID:     not running")
+			}
+
+			if chErr == nil {
+				aliveStr := "dead"
+				if chStatus.SignalIsAlive {
+					aliveStr = "alive"
+				}
+				fmt.Printf("Inbound reader:     %s\n", aliveStr)
+				fmt.Printf("Restart count:      %d\n", chStatus.SignalRestartCount)
+				if chStatus.SignalLastRestart != nil {
+					fmt.Printf("Last restart:       %s\n", chStatus.SignalLastRestart.Format(time.RFC3339))
+				}
+				fmt.Printf("Route table size:   %d\n", chStatus.ActiveRoutes)
+				fmt.Printf("Registered claws:   %d\n", chStatus.RefCount)
+				if chStatus.LastInboundTimestamp != nil {
+					fmt.Printf("Last inbound:       %s\n", chStatus.LastInboundTimestamp.Format(time.RFC3339))
+				} else {
+					fmt.Println("Last inbound:       (none)")
+				}
+			} else {
+				fmt.Printf("Channel status:     (error: %v)\n", chErr)
+			}
+
+			return nil
+		},
+	}
 }
 
 func newGrovedStartCmd() *cobra.Command {
@@ -697,6 +759,23 @@ Exits 0 if at least one running daemon is found; exits 1 if none.`,
 				for _, e := range running {
 					fmt.Printf("%-8d  %-32s  %-10s  %s\n",
 						e.PID, displayScope(e.Scope), e.Age, filepath.Base(e.SockPath))
+				}
+
+				client := daemon.NewGlobalClient()
+				defer func() { _ = client.Close() }()
+				if client.IsRunning() {
+					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+					defer cancel()
+					if chStatus, err := client.GetChannelStatus(ctx); err == nil {
+						fmt.Println()
+						fmt.Println("Signal pipeline:")
+						aliveStr := "dead"
+						if chStatus.SignalIsAlive {
+							aliveStr = "alive"
+						}
+						fmt.Printf("  inbound reader: %s  restarts: %d  claws: %d\n",
+							aliveStr, chStatus.SignalRestartCount, chStatus.RefCount)
+					}
 				}
 			} else {
 				fmt.Println("No daemons running")

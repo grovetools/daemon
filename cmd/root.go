@@ -28,6 +28,7 @@ func init() {
 	rootCmd.AddCommand(newGrovedClawsCmd())
 	rootCmd.AddCommand(newGrovedConfigCmd())
 	rootCmd.AddCommand(newGrovedMonitorCmd())
+	rootCmd.AddCommand(newGrovedHealthCmd())
 }
 
 func Execute() error {

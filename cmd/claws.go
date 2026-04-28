@@ -96,6 +96,33 @@ so you can tell which daemon owns each claw-enabled session.`,
 			}
 			fmt.Printf("Total distinct claw-designated sessions: %d\n", len(unique))
 
+			// --- Recent inbound routing log -----------------------------------
+			client := daemon.NewGlobalClient()
+			defer func() { _ = client.Close() }()
+			if client.IsRunning() {
+				ctx := context.Background()
+				if chStatus, err := client.GetChannelStatus(ctx); err == nil && len(chStatus.RecentInbound) > 0 {
+					fmt.Println("Recent inbound routing log:")
+					for _, rec := range chStatus.RecentInbound {
+						status := "✓"
+						if !rec.Delivered {
+							status = "✗"
+						}
+						detail := rec.TargetJob
+						if rec.Error != "" {
+							detail = rec.Error
+						}
+						fmt.Printf("  %s %s  %-22s  %-20s  %s\n",
+							status,
+							rec.Timestamp.Format("15:04:05"),
+							rec.Sender,
+							rec.Strategy,
+							detail)
+					}
+					fmt.Println()
+				}
+			}
+
 			// --- Sanity check: daemon process listing -------------------------
 			entries, _ := enumerateDaemons()
 			running := 0

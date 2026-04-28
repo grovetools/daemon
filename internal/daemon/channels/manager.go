@@ -62,6 +62,11 @@ type Manager struct {
 	// Set by the server at initialization. It takes a jobID (the server
 	// resolves the mux + PTY/tmux target internally).
 	SendInput func(ctx context.Context, jobID, message string) error
+
+	recentInbound     [10]models.InboundRecord
+	recentInboundIdx  int
+	recentInboundLen  int
+	lastInboundAt     time.Time
 }
 
 // NewManager creates a new ChannelManager. scope is the daemon's scope
@@ -392,16 +397,62 @@ func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*mod
 	}, nil
 }
 
+// recordInbound appends an inbound routing decision to the circular buffer.
+// Must be called with m.mu NOT held (it acquires the lock internally).
+func (m *Manager) recordInbound(sender, strategy, targetJob, errMsg string, delivered bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastInboundAt = time.Now()
+	m.recentInbound[m.recentInboundIdx] = models.InboundRecord{
+		Timestamp: m.lastInboundAt,
+		Sender:    sender,
+		Strategy:  strategy,
+		TargetJob: targetJob,
+		Delivered: delivered,
+		Error:     errMsg,
+	}
+	m.recentInboundIdx = (m.recentInboundIdx + 1) % len(m.recentInbound)
+	if m.recentInboundLen < len(m.recentInbound) {
+		m.recentInboundLen++
+	}
+}
+
 // Status returns the current status of the channel system.
 func (m *Manager) Status() *models.ChannelStatusResponse {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return &models.ChannelStatusResponse{
+	resp := &models.ChannelStatusResponse{
 		SignalCLIRunning: m.isRunning,
 		ActiveRoutes:     len(m.routeTable),
 		RefCount:         len(m.activeSessions),
 	}
+
+	if m.signalChannel != nil {
+		st := m.signalChannel.Status()
+		resp.SignalIsAlive = st.IsAlive
+		resp.SignalRestartCount = st.RestartCount
+		if !st.LastRestartAt.IsZero() {
+			resp.SignalLastRestart = &st.LastRestartAt
+		}
+	}
+
+	if !m.lastInboundAt.IsZero() {
+		resp.LastInboundTimestamp = &m.lastInboundAt
+	}
+
+	records := make([]models.InboundRecord, 0, m.recentInboundLen)
+	start := m.recentInboundIdx - m.recentInboundLen
+	if start < 0 {
+		start += len(m.recentInbound)
+	}
+	for i := 0; i < m.recentInboundLen; i++ {
+		idx := (start + i) % len(m.recentInbound)
+		records = append(records, m.recentInbound[idx])
+	}
+	resp.RecentInbound = records
+
+	return resp
 }
 
 // handleInbound routes an inbound message to the correct agent session.
@@ -466,12 +517,13 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 			m.ulog.Warn("Inbound message unroutable — multiple active agents").
 				Field("active_sessions", count).
 				Log(ctx)
-			// Reply with active agent list
+			m.recordInbound(msg.Source, "dropped", "", "multiple active agents", false)
 			m.replyWithAgentList(msg.Source)
 			return
 		} else {
 			m.mu.Unlock()
 			m.ulog.Warn("Inbound message dropped — no active agents").Log(ctx)
+			m.recordInbound(msg.Source, "dropped", "", "no active agents", false)
 			return
 		}
 	}
@@ -505,12 +557,14 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 				Field("socket", sockPath).
 				Log(ctx)
 			_ = m.removeInboundRoute(targetJobID)
+			m.recordInbound(msg.Source, resolvedVia, targetJobID, err.Error(), false)
 			return
 		}
 		m.ulog.Success("Signal message forwarded to scoped daemon").
 			Field("job_id", targetJobID).
 			Field("socket", sockPath).
 			Log(ctx)
+		m.recordInbound(msg.Source, resolvedVia, targetJobID, "", true)
 		return
 	}
 
@@ -528,6 +582,7 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 		m.ulog.Error("SendInput not wired on Manager — message dropped").
 			Field("job_id", targetJobID).
 			Log(ctx)
+		m.recordInbound(msg.Source, resolvedVia, targetJobID, "SendInput not wired", false)
 		return
 	}
 
@@ -551,9 +606,11 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 			Err(err).
 			Field("job_id", targetJobID).
 			Log(ctx)
+		m.recordInbound(msg.Source, resolvedVia, targetJobID, err.Error(), false)
 		return
 	}
 	m.ulog.Success("Signal message injected").Field("job_id", targetJobID).Log(ctx)
+	m.recordInbound(msg.Source, resolvedVia, targetJobID, "", true)
 }
 
 // startSignalChannel starts the signal-cli daemon process.
