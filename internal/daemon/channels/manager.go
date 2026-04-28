@@ -872,10 +872,12 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 					m.cleanupRoutesForJob(payload.JobID)
 				}
 			case store.UpdateSessionTmuxTarget:
-				// Persist delivery info to state.json for restart resilience
+				// Persist delivery info to state.json for restart resilience.
+				// Save directly from the payload — the store may not have
+				// the session yet (e.g., claw before session collector runs).
 				if payload, ok := u.Payload.(*store.SessionTmuxTargetPayload); ok {
 					if m.isActive(payload.JobID) {
-						m.saveSessionDelivery(payload.JobID)
+						m.saveSessionDeliveryDirect(payload.JobID, "tmux", payload.TmuxTarget, "")
 					}
 				}
 			case store.UpdateJobsDiscovered:
@@ -941,6 +943,23 @@ func (m *Manager) saveSessionDelivery(jobID string) {
 		Mux:        session.Mux,
 		TmuxTarget: session.TmuxTarget,
 		PtyID:      session.PtyID,
+	}
+	_ = saveStateAtomic(state)
+}
+
+// saveSessionDeliveryDirect persists delivery info from explicit values
+// instead of reading from the store (which may not have the session yet).
+func (m *Manager) saveSessionDeliveryDirect(jobID, mux, tmuxTarget, ptyID string) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	state, err := loadChannelState()
+	if err != nil {
+		return
+	}
+	state.SessionDelivery[jobID] = SessionDeliveryInfo{
+		Mux:        mux,
+		TmuxTarget: tmuxTarget,
+		PtyID:      ptyID,
 	}
 	_ = saveStateAtomic(state)
 }
