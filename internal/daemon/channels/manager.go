@@ -494,6 +494,7 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 
 	// 0. Handle !commands (meta-commands from user)
 	if strings.HasPrefix(text, "!") {
+		m.mu.Unlock()
 		go m.handleCommand(ctx, msg.Source, text, activeIDs)
 		return
 	}
