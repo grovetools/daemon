@@ -855,24 +855,34 @@ func (s *Server) resolveInputMode(workDir string) string {
 }
 
 // sessionFromRegistry constructs a minimal Session from the filesystem
-// registry. Used as a fallback when the in-memory store hasn't been
-// populated yet (e.g., immediately after daemon restart).
+// registry or channel state file. Used as a fallback when the in-memory
+// store hasn't been populated yet (e.g., immediately after daemon restart).
 func (s *Server) sessionFromRegistry(jobID string) *models.Session {
+	// Try filesystem session registry first
 	registry, err := sessions.NewFileSystemRegistry()
-	if err != nil {
-		return nil
+	if err == nil {
+		if meta, err := registry.Find(jobID); err == nil {
+			return &models.Session{
+				ID:               meta.SessionID,
+				Mux:              meta.Mux,
+				TmuxTarget:       meta.TmuxTarget,
+				PtyID:            meta.PtyID,
+				WorkingDirectory: meta.WorkingDirectory,
+			}
+		}
 	}
-	meta, err := registry.Find(jobID)
-	if err != nil {
-		return nil
+
+	// Fall back to channel state file (has delivery info persisted by claw)
+	if info := channels.GetSessionDelivery(jobID); info != nil {
+		return &models.Session{
+			ID:         jobID,
+			Mux:        info.Mux,
+			TmuxTarget: info.TmuxTarget,
+			PtyID:      info.PtyID,
+		}
 	}
-	return &models.Session{
-		ID:               meta.SessionID,
-		Mux:              meta.Mux,
-		TmuxTarget:       meta.TmuxTarget,
-		PtyID:            meta.PtyID,
-		WorkingDirectory: meta.WorkingDirectory,
-	}
+
+	return nil
 }
 
 // effectiveMux returns the mux to use for routing input/interrupt to a

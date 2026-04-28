@@ -735,6 +735,13 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 					m.DisableChannel(ctx, payload.JobID)
 					m.cleanupRoutesForJob(payload.JobID)
 				}
+			case store.UpdateSessionTmuxTarget:
+				// Persist delivery info to state.json for restart resilience
+				if payload, ok := u.Payload.(*store.SessionTmuxTargetPayload); ok {
+					if m.isActive(payload.JobID) {
+						m.saveSessionDelivery(payload.JobID)
+					}
+				}
 			case store.UpdateJobsDiscovered:
 				jobs, ok := u.Payload.([]*models.JobInfo)
 				if !ok {
@@ -771,6 +778,42 @@ func (m *Manager) isSandboxScope() bool {
 		strings.HasPrefix(m.scope, os.TempDir()) ||
 		strings.HasPrefix(m.scope, "/private/var/folders/") ||
 		strings.HasPrefix(m.scope, "/tmp/")
+}
+
+// saveSessionDelivery persists a session's mux/target to state.json.
+func (m *Manager) saveSessionDelivery(jobID string) {
+	session := m.store.GetSession(jobID)
+	if session == nil {
+		return
+	}
+	if session.Mux == "" && session.TmuxTarget == "" && session.PtyID == "" {
+		return
+	}
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	state, err := loadChannelState()
+	if err != nil {
+		return
+	}
+	state.SessionDelivery[jobID] = SessionDeliveryInfo{
+		Mux:        session.Mux,
+		TmuxTarget: session.TmuxTarget,
+		PtyID:      session.PtyID,
+	}
+	_ = saveStateAtomic(state)
+}
+
+// GetSessionDelivery returns persisted delivery info for a job ID.
+func GetSessionDelivery(jobID string) *SessionDeliveryInfo {
+	state, err := loadChannelState()
+	if err != nil {
+		return nil
+	}
+	info, ok := state.SessionDelivery[jobID]
+	if !ok {
+		return nil
+	}
+	return &info
 }
 
 func (m *Manager) isActive(jobID string) bool {
@@ -841,10 +884,18 @@ func (m *Manager) routeCleanup(ctx context.Context) {
 // inbound routes) and signal_routes.json (quote-reply routing) into a
 // single atomic file. Writes use tmp-file + rename.
 
+// SessionDeliveryInfo holds mux delivery state for a channel-enabled session.
+type SessionDeliveryInfo struct {
+	Mux        string `json:"mux,omitempty"`
+	TmuxTarget string `json:"tmux_target,omitempty"`
+	PtyID      string `json:"pty_id,omitempty"`
+}
+
 // ChannelState is the on-disk representation of all channel routing state.
 type ChannelState struct {
-	InboundRoutes map[string]string `json:"inbound_routes"` // jobID → socketPath
-	QuoteRoutes   map[int64]string  `json:"quote_routes"`   // timestamp → jobID
+	InboundRoutes   map[string]string              `json:"inbound_routes"`            // jobID → socketPath
+	QuoteRoutes     map[int64]string               `json:"quote_routes"`              // timestamp → jobID
+	SessionDelivery map[string]SessionDeliveryInfo  `json:"session_delivery,omitempty"` // jobID → delivery info
 }
 
 func stateFilePath() string {
@@ -856,8 +907,9 @@ func loadChannelState() (*ChannelState, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &ChannelState{
-				InboundRoutes: map[string]string{},
-				QuoteRoutes:   map[int64]string{},
+				InboundRoutes:   map[string]string{},
+				QuoteRoutes:     map[int64]string{},
+				SessionDelivery: map[string]SessionDeliveryInfo{},
 			}, nil
 		}
 		return nil, err
@@ -871,6 +923,9 @@ func loadChannelState() (*ChannelState, error) {
 	}
 	if state.QuoteRoutes == nil {
 		state.QuoteRoutes = map[int64]string{}
+	}
+	if state.SessionDelivery == nil {
+		state.SessionDelivery = map[string]SessionDeliveryInfo{}
 	}
 	return &state, nil
 }
