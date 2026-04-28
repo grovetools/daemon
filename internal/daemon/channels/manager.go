@@ -492,6 +492,12 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 		Field("route_table_size", len(m.routeTable)).
 		Log(ctx)
 
+	// 0. Handle !commands (meta-commands from user)
+	if strings.HasPrefix(text, "!") {
+		m.handleCommand(ctx, msg.Source, text, activeIDs)
+		return
+	}
+
 	// 1. Check for Quote (Reply)
 	if msg.Quote != nil {
 		if jobID, exists := m.routeTable[msg.Quote.ID]; exists {
@@ -667,6 +673,50 @@ func (m *Manager) tagMessage(jobID, jobTitle, message string) string {
 	return message
 }
 
+// handleCommand processes !commands sent via Signal.
+func (m *Manager) handleCommand(ctx context.Context, sender, text string, activeIDs map[string]bool) {
+	cmd := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(text)), "!")
+	cmd = strings.SplitN(cmd, " ", 2)[0]
+
+	var reply string
+	switch cmd {
+	case "claws", "agents", "status":
+		if len(activeIDs) == 0 {
+			reply = "No active claws."
+		} else {
+			lines := []string{fmt.Sprintf("Active claws (%d):", len(activeIDs))}
+			for id := range activeIDs {
+				title := id
+				if session := m.store.GetSession(id); session != nil && session.JobTitle != "" {
+					title = session.JobTitle
+				} else if idx := strings.LastIndex(id, "-"); idx > 0 {
+					title = id[:idx]
+				}
+				lines = append(lines, fmt.Sprintf("  @%s", title))
+			}
+			reply = strings.Join(lines, "\n")
+		}
+	case "health":
+		status := "alive"
+		if m.signalChannel != nil {
+			st := m.signalChannel.Status()
+			if !st.IsAlive {
+				status = fmt.Sprintf("dead (restarts: %d)", st.RestartCount)
+			}
+		}
+		reply = fmt.Sprintf("Signal: %s\nClaws: %d\nRoutes: %d", status, len(activeIDs), len(m.routeTable))
+	default:
+		reply = "Commands: !claws, !health"
+	}
+
+	m.mu.Lock()
+	ch := m.signalChannel
+	m.mu.Unlock()
+	if ch != nil && reply != "" {
+		_, _ = ch.Send(ctx, channels.OutboundMessage{Recipient: sender, Message: reply})
+	}
+}
+
 // recordRoute stores a timestamp→jobID mapping and persists to disk.
 func (m *Manager) recordRoute(timestamp int64, jobID string) {
 	m.mu.Lock()
@@ -683,14 +733,24 @@ func (m *Manager) resolveTagFrom(tag string, activeIDs map[string]bool) string {
 	for id := range activeIDs {
 		session := m.store.GetSession(id)
 		if session != nil {
-			if strings.EqualFold(session.JobTitle, tag) || strings.EqualFold(session.ID, tag) {
+			title := session.JobTitle
+			m.ulog.Debug("tag match attempt (store)").
+				Field("tag", tag).
+				Field("id", id).
+				Field("job_title", title).
+				StructuredOnly().Log(m.ctx)
+			if strings.EqualFold(title, tag) || strings.EqualFold(id, tag) {
 				return id
 			}
 			continue
 		}
 		// Fallback for scoped sessions missing from the global store
 		idLower := strings.ToLower(id)
-		if idLower == tag || strings.HasPrefix(idLower, tag+"-") || strings.Contains(idLower, "-"+tag+"-") {
+		m.ulog.Debug("tag match attempt (id fallback)").
+			Field("tag", tag).
+			Field("id", id).
+			StructuredOnly().Log(m.ctx)
+		if idLower == tag || strings.HasPrefix(idLower, tag+"-") {
 			return id
 		}
 	}
