@@ -709,11 +709,26 @@ func (m *Manager) handleCommand(ctx context.Context, sender, text string, active
 		reply = "Commands: !claws, !health"
 	}
 
+	m.ulog.Info("handling !command").
+		Field("cmd", cmd).
+		Field("reply_len", len(reply)).
+		Field("sender", sender).
+		StructuredOnly().Log(ctx)
+
 	m.mu.Lock()
 	ch := m.signalChannel
 	m.mu.Unlock()
 	if ch != nil && reply != "" {
-		_, _ = ch.Send(ctx, channels.OutboundMessage{Recipient: sender, Message: reply})
+		sendCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err := ch.Send(sendCtx, channels.OutboundMessage{Recipient: sender, Message: reply})
+		if err != nil {
+			m.ulog.Error("!command reply failed").Err(err).Field("cmd", cmd).StructuredOnly().Log(ctx)
+		} else {
+			m.ulog.Info("!command reply sent").Field("cmd", cmd).StructuredOnly().Log(ctx)
+		}
+	} else {
+		m.ulog.Warn("!command reply skipped").Field("ch_nil", ch == nil).Field("reply_empty", reply == "").StructuredOnly().Log(ctx)
 	}
 }
 
