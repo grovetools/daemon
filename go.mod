@@ -7,6 +7,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/grovetools/core v0.6.3
 	github.com/grovetools/flow v0.6.3
+	github.com/grovetools/tuimux v0.0.1
 	github.com/grovetools/skills v0.6.3
 	github.com/grovetools/tend v0.6.0
 	github.com/grovetools/memory v0.6.3

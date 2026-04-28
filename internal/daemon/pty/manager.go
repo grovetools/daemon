@@ -1,36 +1,23 @@
 package pty
 
 import (
-	"context"
 	"fmt"
+	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
-	"time"
 
-	creackpty "github.com/creack/pty"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-	"github.com/grovetools/core/logging"
+	tuimuxpty "github.com/grovetools/tuimux/pty"
 )
 
-// Manager is a thread-safe registry of daemon-owned PTY sessions.
+// Manager is a shim around tuimux/pty.Manager that translates Grove-specific fields.
 type Manager struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
-	ulog     *logging.UnifiedLogger
+	inner *tuimuxpty.Manager
+	mu    sync.RWMutex
+	grove map[string]*Session // Grove wrappers keyed by session ID
 }
 
-// NewManager creates a new PTY session manager.
-func NewManager() *Manager {
-	return &Manager{
-		sessions: make(map[string]*Session),
-		ulog:     logging.NewUnifiedLogger("groved.pty"),
-	}
-}
-
-// CreateRequest holds the parameters for creating a new PTY session.
+// CreateRequest holds Grove-specific PTY creation parameters.
 type CreateRequest struct {
 	CWD       string            `json:"cwd"`
 	Env       []string          `json:"env,omitempty"`
@@ -47,99 +34,99 @@ type CreateRequest struct {
 	Args      []string          `json:"args,omitempty"`
 }
 
-// Create spawns a new shell in a PTY, registers it, and starts the read loop.
-func (m *Manager) Create(req CreateRequest) (*Session, error) {
-	id := uuid.New().String()
+// NewManager creates a new PTY session manager.
+func NewManager() *Manager {
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return &Manager{
+		inner: tuimuxpty.NewManager(logger.With(slog.String("component", "groved.pty"))),
+		grove: make(map[string]*Session),
+	}
+}
 
+// Create spawns a new PTY session, mapping Grove fields to tuimux Tags.
+func (m *Manager) Create(req CreateRequest) (*Session, error) {
 	name := req.Workspace
 	if name == "" {
 		name = filepath.Base(req.CWD)
 	}
 
-	var cmd *exec.Cmd
-	if req.Command != "" {
-		cmd = exec.Command(req.Command, req.Args...) //nolint:gosec // G204: user-requested command for PTY session
-	} else {
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/sh"
-		}
-		cmd = exec.Command(shell) //nolint:gosec // G204: user's default shell
+	// Merge Grove-specific fields into tags
+	tags := make(map[string]string)
+	for k, v := range req.Labels {
+		tags[k] = v
 	}
-	cmd.Dir = req.CWD
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "GROVE_PTY=1", "GROVE_TERMINAL=1")
-	if len(req.Env) > 0 {
-		cmd.Env = append(cmd.Env, req.Env...)
+	if req.Origin != "" {
+		tags["origin"] = req.Origin
 	}
-
-	// NOTE: Do NOT set Setpgid here. creack/pty v1.1.20+ has a regression
-	// where Setpgid combined with pty.Start causes EPERM on macOS.
-	// The shell will still get its own session via the PTY's Setsid.
-
-	rows := req.Rows
-	cols := req.Cols
-	if rows == 0 {
-		rows = 40
+	if req.PanelID != "" {
+		tags["panel_id"] = req.PanelID
 	}
-	if cols == 0 {
-		cols = 120
+	if req.Label != "" {
+		tags["label"] = req.Label
+	}
+	if req.SessionID != "" {
+		tags["session_id"] = req.SessionID
+	}
+	if req.CreatedBy != "" {
+		tags["created_by"] = req.CreatedBy
 	}
 
-	ptmx, err := creackpty.StartWithSize(cmd, &creackpty.Winsize{
-		Rows: rows,
-		Cols: cols,
+	// Also inject Grove-specific env vars alongside tuimux's TUIMUX_PTY=1
+	env := append(req.Env, "GROVE_PTY=1", "GROVE_TERMINAL=1")
+
+	inner, err := m.inner.Create(tuimuxpty.CreateRequest{
+		CWD:     req.CWD,
+		Env:     env,
+		Tags:    tags,
+		Rows:    req.Rows,
+		Cols:    req.Cols,
+		Name:    name,
+		Command: req.Command,
+		Args:    req.Args,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("pty start: %w", err)
+		return nil, err
 	}
 
 	sess := &Session{
-		ID:        id,
+		Session:   inner,
 		Workspace: name,
-		CWD:       req.CWD,
-		Labels:    req.Labels,
 		Origin:    req.Origin,
 		PanelID:   req.PanelID,
 		Label:     req.Label,
 		SessionID: req.SessionID,
 		CreatedBy: req.CreatedBy,
-		cmd:       cmd,
-		ptmx:      ptmx,
-		clients:   make(map[*websocket.Conn]bool),
-		exitCh:    make(chan struct{}),
-		ulog:      logging.NewUnifiedLogger("groved.pty.session"),
-		onExit:    m.remove,
 	}
-	sess.StartedAt = time.Now()
 
 	m.mu.Lock()
-	m.sessions[id] = sess
+	m.grove[inner.ID] = sess
 	m.mu.Unlock()
 
-	go sess.readLoop()
+	// Clean up wrapper when session exits
+	go func() {
+		<-inner.ExitCh()
+		m.mu.Lock()
+		delete(m.grove, inner.ID)
+		m.mu.Unlock()
+	}()
 
-	m.ulog.Info("PTY session created").
-		Field("session", id).
-		Field("cwd", req.CWD).
-		Log(context.Background())
 	return sess, nil
 }
 
-// Get returns a session by ID.
+// Get returns a Grove-wrapped session by ID.
 func (m *Manager) Get(id string) (*Session, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	s, ok := m.sessions[id]
+	s, ok := m.grove[id]
 	return s, ok
 }
 
-// List returns metadata for all active sessions, including live foreground
-// process resolution via TIOCGPGRP.
+// List returns Grove-enriched metadata for all active sessions.
 func (m *Manager) List() []SessionMetadata {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	result := make([]SessionMetadata, 0, len(m.sessions))
-	for _, s := range m.sessions {
+	result := make([]SessionMetadata, 0, len(m.grove))
+	for _, s := range m.grove {
 		md := s.Metadata()
 		md.ForegroundProcess = s.ForegroundProcess()
 		result = append(result, md)
@@ -150,7 +137,7 @@ func (m *Manager) List() []SessionMetadata {
 // Kill terminates a session by ID.
 func (m *Manager) Kill(id string) error {
 	m.mu.RLock()
-	s, ok := m.sessions[id]
+	s, ok := m.grove[id]
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("session %s not found", id)
@@ -158,30 +145,7 @@ func (m *Manager) Kill(id string) error {
 	return s.Kill()
 }
 
-// Shutdown kills all active PTY sessions. Called during daemon graceful shutdown.
+// Shutdown kills all active PTY sessions.
 func (m *Manager) Shutdown() {
-	m.mu.RLock()
-	ids := make([]string, 0, len(m.sessions))
-	for id := range m.sessions {
-		ids = append(ids, id)
-	}
-	m.mu.RUnlock()
-
-	ctx := context.Background()
-	for _, id := range ids {
-		if err := m.Kill(id); err != nil {
-			m.ulog.Warn("Failed to kill PTY session during shutdown").
-				Err(err).
-				Field("session", id).
-				Log(ctx)
-		}
-	}
-}
-
-// remove is the onExit callback invoked by a Session when its process exits.
-func (m *Manager) remove(id string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.sessions, id)
-	m.ulog.Debug("PTY session removed from registry").Field("session", id).Log(context.Background())
+	m.inner.Shutdown()
 }
