@@ -293,7 +293,7 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 	}
 	m.mu.Unlock()
 
-	if isProxy {
+	if isProxy && !m.isSandboxScope() {
 		if err := m.addInboundRoute(jobID); err != nil {
 			m.ulog.Warn("Failed to write inbound route").Err(err).Field("job_id", jobID).Log(m.ctx)
 		}
@@ -762,6 +762,16 @@ func hasSignalChannel(channels []string) bool {
 		}
 	}
 	return false
+}
+
+// isSandboxScope returns true if this daemon's scope looks like a test
+// sandbox temp directory. Test-spawned daemons must not write to the
+// host's routing.json or they hijack inbound message delivery.
+func (m *Manager) isSandboxScope() bool {
+	return strings.Contains(m.scope, "/grove-tend-") ||
+		strings.HasPrefix(m.scope, os.TempDir()) ||
+		strings.HasPrefix(m.scope, "/private/var/folders/") ||
+		strings.HasPrefix(m.scope, "/tmp/")
 }
 
 func (m *Manager) isActive(jobID string) bool {
