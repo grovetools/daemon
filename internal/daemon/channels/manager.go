@@ -355,7 +355,7 @@ func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*mod
 		} else {
 			// Broadcast to all allowlisted contacts
 			for _, contact := range m.signalCfg.Allowlist {
-				taggedMsg := m.tagMessage(req.JobID, req.Message)
+				taggedMsg := m.tagMessage(req.JobID, req.JobTitle, req.Message)
 				result, err := ch.Send(ctx, channels.OutboundMessage{
 					Recipient: contact,
 					Message:   taggedMsg,
@@ -372,7 +372,7 @@ func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*mod
 		}
 	}
 
-	taggedMsg := m.tagMessage(req.JobID, req.Message)
+	taggedMsg := m.tagMessage(req.JobID, req.JobTitle, req.Message)
 	result, err := ch.Send(ctx, channels.OutboundMessage{
 		Recipient: recipient,
 		Message:   taggedMsg,
@@ -449,12 +449,34 @@ func (m *Manager) Status() *models.ChannelStatusResponse {
 	return resp
 }
 
+// getActiveSessionIDs returns the union of in-memory activeSessions and
+// routing.json inbound routes. This gives the global daemon a complete
+// view of all channel-enabled sessions, including those on scoped daemons.
+func (m *Manager) getActiveSessionIDs() map[string]bool {
+	active := make(map[string]bool)
+	m.mu.Lock()
+	for id := range m.activeSessions {
+		active[id] = true
+	}
+	m.mu.Unlock()
+
+	if state, err := loadChannelState(); err == nil {
+		for id := range state.InboundRoutes {
+			active[id] = true
+		}
+	}
+	return active
+}
+
 // handleInbound routes an inbound message to the correct agent session.
 func (m *Manager) handleInbound(msg channels.InboundMessage) {
 	ctx := context.Background()
 	text := msg.Message
 	var targetJobID string
 	var resolvedVia string
+
+	// Build unified active set (local activeSessions + routing.json)
+	activeIDs := m.getActiveSessionIDs()
 
 	m.mu.Lock()
 
@@ -466,7 +488,7 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 		Field("source", msg.Source).
 		Field("text_len", len(text)).
 		Field("quote_id", quoteID).
-		Field("active_sessions", len(m.activeSessions)).
+		Field("active_sessions", len(activeIDs)).
 		Field("route_table_size", len(m.routeTable)).
 		Log(ctx)
 
@@ -477,7 +499,7 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 			resolvedVia = "quote"
 		} else {
 			// Stale route — try extracting tag from quoted text
-			targetJobID = m.extractTagFromText(msg.Quote.Text)
+			targetJobID = m.extractTagFromText(msg.Quote.Text, activeIDs)
 			if targetJobID != "" {
 				resolvedVia = "quote_tag_fallback"
 			}
@@ -491,18 +513,18 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 	// 2. Fresh Message — Check for @tag
 	if targetJobID == "" && strings.HasPrefix(text, "@") {
 		tag, rest := parseTag(text)
-		targetJobID = m.resolveTag(tag)
+		targetJobID = m.resolveTagFrom(tag, activeIDs)
 		if targetJobID != "" {
 			text = rest
 			resolvedVia = "tag"
 		}
 	}
 
-	// 3. Fallback routing
+	// 3. Fallback routing — use unified active set
 	if targetJobID == "" {
-		count := len(m.activeSessions)
+		count := len(activeIDs)
 		if count == 1 {
-			for id := range m.activeSessions {
+			for id := range activeIDs {
 				targetJobID = id
 			}
 			resolvedVia = "single_active_fallback"
@@ -632,7 +654,12 @@ func (m *Manager) startSignalChannel(ctx context.Context) {
 }
 
 // tagMessage prepends a session tag to outbound messages.
-func (m *Manager) tagMessage(jobID, message string) string {
+// jobTitle is an explicit title passed across the daemon boundary;
+// falls back to the store lookup if empty.
+func (m *Manager) tagMessage(jobID, jobTitle, message string) string {
+	if jobTitle != "" {
+		return fmt.Sprintf("[%s] %s", jobTitle, message)
+	}
 	session := m.store.GetSession(jobID)
 	if session != nil && session.JobTitle != "" {
 		return fmt.Sprintf("[%s] %s", session.JobTitle, message)
@@ -648,15 +675,22 @@ func (m *Manager) recordRoute(timestamp int64, jobID string) {
 	m.saveRoutes()
 }
 
-// resolveTag matches a tag against active session titles/IDs.
-func (m *Manager) resolveTag(tag string) string {
+// resolveTagFrom matches a tag against session titles/IDs in the given set.
+// When the store has no entry (scoped sessions on the global daemon), it
+// falls back to matching the tag against the job ID string itself.
+func (m *Manager) resolveTagFrom(tag string, activeIDs map[string]bool) string {
 	tag = strings.ToLower(tag)
-	for id := range m.activeSessions {
+	for id := range activeIDs {
 		session := m.store.GetSession(id)
-		if session == nil {
+		if session != nil {
+			if strings.EqualFold(session.JobTitle, tag) || strings.EqualFold(session.ID, tag) {
+				return id
+			}
 			continue
 		}
-		if strings.EqualFold(session.JobTitle, tag) || strings.EqualFold(session.ID, tag) {
+		// Fallback for scoped sessions missing from the global store
+		idLower := strings.ToLower(id)
+		if idLower == tag || strings.HasPrefix(idLower, tag+"-") || strings.Contains(idLower, "-"+tag+"-") {
 			return id
 		}
 	}
@@ -664,11 +698,11 @@ func (m *Manager) resolveTag(tag string) string {
 }
 
 // extractTagFromText tries to find a [tag] in quoted text.
-func (m *Manager) extractTagFromText(text string) string {
+func (m *Manager) extractTagFromText(text string, activeIDs map[string]bool) string {
 	if idx := strings.Index(text, "["); idx >= 0 {
 		if end := strings.Index(text[idx:], "]"); end > 0 {
 			tag := text[idx+1 : idx+end]
-			return m.resolveTag(tag)
+			return m.resolveTagFrom(tag, activeIDs)
 		}
 	}
 	return ""
@@ -893,9 +927,9 @@ type SessionDeliveryInfo struct {
 
 // ChannelState is the on-disk representation of all channel routing state.
 type ChannelState struct {
-	InboundRoutes   map[string]string              `json:"inbound_routes"`            // jobID → socketPath
-	QuoteRoutes     map[int64]string               `json:"quote_routes"`              // timestamp → jobID
-	SessionDelivery map[string]SessionDeliveryInfo  `json:"session_delivery,omitempty"` // jobID → delivery info
+	InboundRoutes   map[string]string              `json:"inbound_routes"`             // jobID → socketPath
+	QuoteRoutes     map[int64]string               `json:"quote_routes"`               // timestamp → jobID
+	SessionDelivery map[string]SessionDeliveryInfo `json:"session_delivery,omitempty"` // jobID → delivery info
 }
 
 func stateFilePath() string {
