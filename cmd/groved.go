@@ -761,7 +761,9 @@ Exits 0 if at least one running daemon is found; exits 1 if none.`,
 						e.PID, displayScope(e.Scope), e.Age, filepath.Base(e.SockPath))
 				}
 
-				client := daemon.NewGlobalClient()
+				// Connect-only: don't auto-start the global daemon just to
+				// display status. NewGlobalClient() would spawn one if absent.
+				client := daemon.New()
 				defer func() { _ = client.Close() }()
 				if client.IsRunning() {
 					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

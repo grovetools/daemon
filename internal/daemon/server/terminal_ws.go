@@ -17,6 +17,14 @@ import (
 // --auto-shutdown is enabled.
 const autoShutdownIdleTimeout = 2 * time.Minute
 
+// autoShutdownInitialTimeout is the grace period for a freshly spawned
+// daemon to receive its first client (WebSocket or RPC). This is longer
+// than the normal idle timeout to avoid killing daemons while treemux is
+// still performing its WS handshake, but short enough to reap daemons
+// spawned by non-TUI tools (flow plan run, cx, hooks) that never open a
+// WebSocket and would otherwise persist indefinitely.
+const autoShutdownInitialTimeout = 5 * time.Minute
+
 // WsMessage is the JSON envelope for all WebSocket communication
 // between Primary/Follower groveterm instances and the daemon hub.
 type WsMessage struct {
@@ -46,23 +54,24 @@ type TerminalHub struct {
 
 // NewTerminalHub creates a ready-to-use TerminalHub.
 //
-// When autoShutdown is true the hub will arm a 2-minute idle timer every
-// time the last terminal client disconnects. It intentionally does NOT
-// arm a timer at construction: a freshly auto-spawned daemon must wait
-// indefinitely for its first client (treemux's WS handshake can take
-// several seconds, and racing that against a 2-minute clock caused
-// daemons to exit mid-connect). If no client ever arrives, the daemon
-// stays up until SIGTERM — a leaked idle daemon is a much smaller
-// problem than a daemon that disappears while treemux is still
-// attaching.
+// When autoShutdown is true the hub arms an initial 5-minute timer. This
+// gives treemux plenty of time to complete its WS handshake (typically
+// seconds) while ensuring daemons spawned by non-TUI tools (flow plan
+// run, cx, hooks) that never open a WebSocket are reaped rather than
+// persisting indefinitely. Once a client connects and later disconnects,
+// the normal 2-minute idle timer takes over.
 func NewTerminalHub(autoShutdown bool) *TerminalHub {
-	return &TerminalHub{
+	hub := &TerminalHub{
 		followers:      make(map[*websocket.Conn]bool),
 		sseSubscribers: make(map[chan string]bool),
 		ulog:           logging.NewUnifiedLogger("groved.server.treemux"),
 		autoShutdown:   autoShutdown,
 		shutdownReq:    make(chan struct{}),
 	}
+	if autoShutdown {
+		hub.idleTimer = time.AfterFunc(autoShutdownInitialTimeout, hub.fireAutoShutdown)
+	}
+	return hub
 }
 
 // ShutdownReq exposes the auto-shutdown request channel. The channel is
