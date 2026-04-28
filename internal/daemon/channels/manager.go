@@ -759,6 +759,16 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 				}
 			case store.UpdateSessionTmuxTarget:
 				m.saveDeliveryState()
+			case store.UpdateSessions, store.UpdateSessionConfirmation, store.UpdateSessionIntent:
+				// When sessions appear in the store, try restoring delivery
+				// info for any active channel sessions that lack mux info.
+				m.mu.Lock()
+				for jobID := range m.activeSessions {
+					m.mu.Unlock()
+					m.restoreDeliveryInfo(jobID)
+					m.mu.Lock()
+				}
+				m.mu.Unlock()
 			}
 		}
 	}
