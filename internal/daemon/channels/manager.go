@@ -314,6 +314,9 @@ func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
 			m.ulog.Warn("Failed to remove inbound route").Err(err).Field("job_id", jobID).Log(ctx)
 		}
 	}
+
+	// Clean up persisted delivery info
+	m.removeSessionDelivery(jobID)
 }
 
 // Send sends a message via the signal channel and records the route.
@@ -918,6 +921,20 @@ func (m *Manager) saveSessionDelivery(jobID string) {
 		PtyID:      session.PtyID,
 	}
 	_ = saveStateAtomic(state)
+}
+
+// removeSessionDelivery removes persisted delivery info for a job ID.
+func (m *Manager) removeSessionDelivery(jobID string) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	state, err := loadChannelState()
+	if err != nil {
+		return
+	}
+	if _, ok := state.SessionDelivery[jobID]; ok {
+		delete(state.SessionDelivery, jobID)
+		_ = saveStateAtomic(state)
+	}
 }
 
 // GetSessionDelivery returns persisted delivery info for a job ID.
