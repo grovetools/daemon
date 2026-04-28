@@ -21,8 +21,8 @@ import (
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
-	"github.com/grovetools/core/pkg/repo"
 	"github.com/grovetools/core/pkg/sessions"
+	"github.com/grovetools/core/pkg/repo"
 	"github.com/grovetools/core/pkg/tmux"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/channels"
@@ -854,25 +854,10 @@ func (s *Server) resolveInputMode(workDir string) string {
 	return "vim"
 }
 
-// sessionFromRegistry constructs a minimal Session from the filesystem
-// registry or channel state file. Used as a fallback when the in-memory
+// sessionFromDeliveryState constructs a minimal Session from the persisted
+// channel delivery state (state.json). Used as a fallback when the in-memory
 // store hasn't been populated yet (e.g., immediately after daemon restart).
-func (s *Server) sessionFromRegistry(jobID string) *models.Session {
-	// Try filesystem session registry first
-	registry, err := sessions.NewFileSystemRegistry()
-	if err == nil {
-		if meta, err := registry.Find(jobID); err == nil {
-			return &models.Session{
-				ID:               meta.SessionID,
-				Mux:              meta.Mux,
-				TmuxTarget:       meta.TmuxTarget,
-				PtyID:            meta.PtyID,
-				WorkingDirectory: meta.WorkingDirectory,
-			}
-		}
-	}
-
-	// Fall back to channel state file (has delivery info persisted by claw)
+func (s *Server) sessionFromDeliveryState(jobID string) *models.Session {
 	if info := channels.GetSessionDelivery(jobID); info != nil {
 		return &models.Session{
 			ID:         jobID,
@@ -881,7 +866,6 @@ func (s *Server) sessionFromRegistry(jobID string) *models.Session {
 			PtyID:      info.PtyID,
 		}
 	}
-
 	return nil
 }
 
@@ -914,19 +898,10 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 	}
 	session := s.engine.Store().GetSession(jobID)
 	if session == nil {
-		session = s.sessionFromRegistry(jobID)
+		session = s.sessionFromDeliveryState(jobID)
 	}
 	if session == nil {
 		return fmt.Errorf("session not found: %s", jobID)
-	}
-
-	// Enrich session with persisted delivery info if mux is missing
-	if effectiveMux(session) == models.MuxNone {
-		if info := channels.GetSessionDelivery(jobID); info != nil {
-			session.Mux = info.Mux
-			session.TmuxTarget = info.TmuxTarget
-			session.PtyID = info.PtyID
-		}
 	}
 
 	inputMode := s.resolveInputMode(session.WorkingDirectory)
@@ -1011,7 +986,7 @@ func (s *Server) SendSessionInterrupt(ctx context.Context, jobID string) error {
 	}
 	session := s.engine.Store().GetSession(jobID)
 	if session == nil {
-		session = s.sessionFromRegistry(jobID)
+		session = s.sessionFromDeliveryState(jobID)
 	}
 	if session == nil {
 		return fmt.Errorf("session not found: %s", jobID)
