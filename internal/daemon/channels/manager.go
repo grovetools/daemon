@@ -868,12 +868,18 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 					continue
 				}
 				for _, job := range jobs {
-					if hasSignalChannel(job.Channels) && !m.isActive(job.ID) {
-						if err := m.EnableChannel(ctx, job.ID); err == nil {
-							m.ulog.Info("Rehydrated channel from discovered job").
-								Field("job_id", job.ID).
-								Log(ctx)
-						}
+					if !hasSignalChannel(job.Channels) || m.isActive(job.ID) {
+						continue
+					}
+					// Only rehydrate channels for jobs that are actually running
+					if job.Status != "running" && job.Status != "idle" && job.Status != "pending_user" {
+						continue
+					}
+					if err := m.EnableChannel(ctx, job.ID); err == nil {
+						m.ulog.Info("Rehydrated channel from discovered job").
+							Field("job_id", job.ID).
+							Field("status", job.Status).
+							Log(ctx)
 					}
 				}
 			}
