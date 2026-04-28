@@ -708,7 +708,7 @@ func (m *Manager) handleCommand(ctx context.Context, sender, text string, active
 				status = fmt.Sprintf("dead (restarts: %d)", st.RestartCount)
 			}
 		}
-		reply = fmt.Sprintf("Signal: %s\nClaws: %d\nRoutes: %d", status, len(activeIDs), len(m.routeTable))
+		reply = fmt.Sprintf("Signal: %s\nClaws: %d\nQuote routes: %d", status, len(activeIDs), len(m.routeTable))
 	default:
 		reply = "Commands: !claws, !health"
 	}
