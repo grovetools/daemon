@@ -888,8 +888,14 @@ func (m *Manager) loadDeliveryState() map[string]deliveryInfo {
 }
 
 func (m *Manager) saveDeliveryState() {
+	// Load existing state to merge with — don't clobber entries for
+	// sessions that haven't had their mux set yet this lifecycle.
+	state := m.loadDeliveryState()
+	if state == nil {
+		state = make(map[string]deliveryInfo)
+	}
+
 	m.mu.Lock()
-	state := make(map[string]deliveryInfo)
 	for jobID := range m.activeSessions {
 		session := m.store.GetSession(jobID)
 		if session == nil {
