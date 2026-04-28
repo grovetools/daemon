@@ -152,6 +152,10 @@ func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 				SubmittedAt: submittedAt,
 			}
 
+			if len(meta.Channels) > 0 {
+				job.Channels = meta.Channels
+			}
+
 			// Look up workspace from watched paths
 			h.pathsMutex.RLock()
 			for watchedPath, wsNode := range h.watchedPaths {

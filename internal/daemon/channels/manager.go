@@ -117,12 +117,9 @@ func (m *Manager) Start(ctx context.Context) {
 			m.activeSessions[jobID] = true
 		}
 		m.mu.Unlock()
-	} else {
-		// Scoped / proxy daemon: activeSessions tracks local sessions.
-		// The store is authoritative — prune any activeSessions entry
-		// whose session has gone missing.
-		m.pruneStaleSessions(m.ctx)
 	}
+	// Scoped daemons no longer prune synchronously at boot — the store
+	// may still be empty. Pruning runs on a background ticker instead.
 
 	// Global daemon: signal-cli is infrastructure, not per-session. Spawn
 	// it unconditionally at startup so outbound sends from scoped daemons
@@ -141,11 +138,14 @@ func (m *Manager) Start(ctx context.Context) {
 		m.mu.Unlock()
 	}
 
-	// Subscribe to session end events for route cleanup
-	go m.watchSessionEnds(m.ctx)
+	// Subscribe to store events for route cleanup and channel rehydration
+	go m.watchStoreUpdates(m.ctx)
 
 	// Periodic route cleanup (TTL)
 	go m.routeCleanup(m.ctx)
+
+	// Background prune — replaces the former synchronous boot-time prune
+	go m.backgroundPrune(m.ctx)
 
 	m.ulog.Info("Channel manager started").
 		Field("scope", m.scope).
@@ -659,8 +659,8 @@ func parseTag(text string) (tag, rest string) {
 	})
 }
 
-// watchSessionEnds listens for session end events and cleans up routes.
-func (m *Manager) watchSessionEnds(ctx context.Context) {
+// watchStoreUpdates listens for session lifecycle and job discovery events.
+func (m *Manager) watchStoreUpdates(ctx context.Context) {
 	ch := m.store.Subscribe()
 	defer m.store.Unsubscribe(ch)
 
@@ -669,12 +669,57 @@ func (m *Manager) watchSessionEnds(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case u := <-ch:
-			if u.Type == store.UpdateSessionEnd {
+			switch u.Type {
+			case store.UpdateSessionEnd:
 				if payload, ok := u.Payload.(*store.SessionEndPayload); ok {
 					m.DisableChannel(ctx, payload.JobID)
 					m.cleanupRoutesForJob(payload.JobID)
 				}
+			case store.UpdateJobsDiscovered:
+				jobs, ok := u.Payload.([]*models.JobInfo)
+				if !ok {
+					continue
+				}
+				for _, job := range jobs {
+					if hasSignalChannel(job.Channels) && !m.isActive(job.ID) {
+						if err := m.EnableChannel(ctx, job.ID); err == nil {
+							m.ulog.Info("Rehydrated channel from discovered job").
+								Field("job_id", job.ID).
+								Log(ctx)
+						}
+					}
+				}
 			}
+		}
+	}
+}
+
+func hasSignalChannel(channels []string) bool {
+	for _, ch := range channels {
+		if ch == "signal" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) isActive(jobID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeSessions[jobID]
+}
+
+// backgroundPrune periodically prunes stale sessions instead of at boot.
+func (m *Manager) backgroundPrune(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.pruneStaleSessions(ctx)
 		}
 	}
 }

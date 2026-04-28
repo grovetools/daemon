@@ -185,6 +185,7 @@ func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger
 					WorkDir:     jobWorkDir,
 					Repo:        jobRepo,
 					Branch:      jobBranch,
+					Channels:    meta.Channels,
 					SubmittedAt: submittedAt,
 				}
 				discoveredJobs = append(discoveredJobs, job)
