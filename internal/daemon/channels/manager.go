@@ -300,6 +300,7 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 	}
 
 	m.ulog.Info("Channel enabled for session").Field("job_id", jobID).Log(m.ctx)
+	m.saveDeliveryState()
 	return nil
 }
 
@@ -740,12 +741,15 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 				for _, job := range jobs {
 					if hasSignalChannel(job.Channels) && !m.isActive(job.ID) {
 						if err := m.EnableChannel(ctx, job.ID); err == nil {
+							m.restoreDeliveryInfo(job.ID)
 							m.ulog.Info("Rehydrated channel from discovered job").
 								Field("job_id", job.ID).
 								Log(ctx)
 						}
 					}
 				}
+			case store.UpdateSessionTmuxTarget:
+				m.saveDeliveryState()
 			}
 		}
 	}
@@ -826,6 +830,86 @@ func (m *Manager) routeCleanup(ctx context.Context) {
 
 func (m *Manager) routeFilePath() string {
 	return filepath.Join(paths.StateDir(), "channels", "signal_routes.json")
+}
+
+// --- Session delivery state persistence ---
+//
+// session-delivery.json maps jobID → {mux, tmux_target, pty_id} for
+// channel-enabled sessions. This survives daemon restarts so inbound
+// messages can still be delivered to running agents.
+
+type deliveryInfo struct {
+	Mux         string `json:"mux"`
+	TmuxTarget  string `json:"tmux_target,omitempty"`
+	PtyID       string `json:"pty_id,omitempty"`
+}
+
+func deliveryFilePath() string {
+	return filepath.Join(paths.StateDir(), "channels", "session-delivery.json")
+}
+
+func (m *Manager) loadDeliveryState() map[string]deliveryInfo {
+	data, err := os.ReadFile(deliveryFilePath())
+	if err != nil {
+		return nil
+	}
+	var state map[string]deliveryInfo
+	_ = json.Unmarshal(data, &state)
+	return state
+}
+
+func (m *Manager) saveDeliveryState() {
+	m.mu.Lock()
+	state := make(map[string]deliveryInfo)
+	for jobID := range m.activeSessions {
+		session := m.store.GetSession(jobID)
+		if session == nil {
+			continue
+		}
+		if session.Mux != "" || session.TmuxTarget != "" || session.PtyID != "" {
+			state[jobID] = deliveryInfo{
+				Mux:        session.Mux,
+				TmuxTarget: session.TmuxTarget,
+				PtyID:      session.PtyID,
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	data, err := json.Marshal(state)
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(deliveryFilePath())
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(deliveryFilePath(), data, 0o644)
+}
+
+// restoreDeliveryInfo patches sessions in the store with persisted mux/target
+// info so inbound messages can be delivered after a daemon restart.
+func (m *Manager) restoreDeliveryInfo(jobID string) {
+	state := m.loadDeliveryState()
+	if state == nil {
+		return
+	}
+	info, ok := state[jobID]
+	if !ok {
+		return
+	}
+	session := m.store.GetSession(jobID)
+	if session == nil {
+		return
+	}
+	if session.Mux == "" && info.Mux != "" {
+		session.Mux = info.Mux
+		session.TmuxTarget = info.TmuxTarget
+		session.PtyID = info.PtyID
+		m.ulog.Info("Restored delivery info for session").
+			Field("job_id", jobID).
+			Field("mux", info.Mux).
+			Field("tmux_target", info.TmuxTarget).
+			Log(m.ctx)
+	}
 }
 
 func (m *Manager) loadRoutes() {
