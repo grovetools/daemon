@@ -920,6 +920,15 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 		return fmt.Errorf("session not found: %s", jobID)
 	}
 
+	// Enrich session with persisted delivery info if mux is missing
+	if effectiveMux(session) == models.MuxNone {
+		if info := channels.GetSessionDelivery(jobID); info != nil {
+			session.Mux = info.Mux
+			session.TmuxTarget = info.TmuxTarget
+			session.PtyID = info.PtyID
+		}
+	}
+
 	inputMode := s.resolveInputMode(session.WorkingDirectory)
 	payload := rawInput + "\r"
 	if inputMode == "vim" {
