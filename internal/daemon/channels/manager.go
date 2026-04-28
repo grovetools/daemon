@@ -719,6 +719,9 @@ func (m *Manager) handleCommand(ctx context.Context, sender, text string, active
 	ch := m.signalChannel
 	m.mu.Unlock()
 	if ch != nil && reply != "" {
+		// Brief delay — signal-cli is single-threaded and may still be
+		// processing the inbound message that triggered this command.
+		time.Sleep(500 * time.Millisecond)
 		sendCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_, err := ch.Send(sendCtx, channels.OutboundMessage{Recipient: sender, Message: reply})
