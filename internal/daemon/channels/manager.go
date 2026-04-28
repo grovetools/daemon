@@ -709,8 +709,27 @@ func (m *Manager) handleCommand(ctx context.Context, sender, text string, active
 			}
 		}
 		reply = fmt.Sprintf("Signal: %s\nClaws: %d\nQuote routes: %d", status, len(activeIDs), len(m.routeTable))
+	case "unclaw":
+		parts := strings.SplitN(cmd+" "+strings.SplitN(text, " ", 2)[1], " ", 2)
+		tag := strings.TrimSpace(parts[1])
+		if tag == "" {
+			reply = "Usage: !unclaw <agent>"
+		} else {
+			targetID := m.resolveTagFrom(strings.TrimPrefix(tag, "@"), activeIDs)
+			if targetID == "" {
+				reply = fmt.Sprintf("No active claw matching '%s'", tag)
+			} else {
+				m.DisableChannel(ctx, targetID)
+				m.cleanupRoutesForJob(targetID)
+				title := targetID
+				if idx := strings.LastIndex(targetID, "-"); idx > 0 {
+					title = targetID[:idx]
+				}
+				reply = fmt.Sprintf("Unclawed @%s", title)
+			}
+		}
 	default:
-		reply = "Commands: !claws, !health"
+		reply = "Commands: !claws, !health, !unclaw <agent>"
 	}
 
 	m.ulog.Info("handling !command").
