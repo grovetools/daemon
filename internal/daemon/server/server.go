@@ -38,6 +38,7 @@ import (
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/memory/pkg/memory"
 	navbindings "github.com/grovetools/nav/pkg/bindings"
+	"github.com/grovetools/tuimux/hub"
 	tuimuxserver "github.com/grovetools/tuimux/server"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -94,7 +95,7 @@ type Server struct {
 
 	// terminalHub routes WebSocket messages for multi-attach
 	// (Primary/Follower groveterm instances).
-	terminalHub *TerminalHub
+	terminalHub *hub.Hub
 
 	// repoGroup deduplicates concurrent /api/repos/ensure requests for the same URL+version.
 	repoGroup singleflight.Group
@@ -116,16 +117,18 @@ type Server struct {
 // handler can initiate graceful shutdown through the same cleanup path
 // used for SIGTERM.
 func New(autoShutdown bool) *Server {
+	hubCfg := hub.Config{
+		AutoShutdown:   autoShutdown,
+		InitialTimeout: 5 * time.Minute,
+		IdleTimeout:    2 * time.Minute,
+	}
 	return &Server{
 		ulog:           logging.NewUnifiedLogger("groved.server"),
 		captureWaiters: make(map[string]chan string),
-		terminalHub:    NewTerminalHub(autoShutdown),
+		terminalHub:    hub.NewHub(hubCfg),
 	}
 }
 
-// TerminalHubShutdownReq returns the TerminalHub's auto-shutdown channel,
-// or nil if auto-shutdown is disabled. The channel is closed when the
-// idle timer fires.
 func (s *Server) TerminalHubShutdownReq() <-chan struct{} {
 	if s.terminalHub == nil {
 		return nil
@@ -175,7 +178,7 @@ func (s *Server) SetPtyManager(m *daemonpty.Manager) {
 	s.ptyManager = m
 	s.tuimuxServer = tuimuxserver.New(tuimuxserver.Config{
 		PtyManager:  m.Inner(),
-		TerminalHub: s.terminalHub.inner,
+		TerminalHub: s.terminalHub,
 	})
 }
 
@@ -272,17 +275,14 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/memory/analysis/duplicates", s.handleMemoryAnalysisDuplicates)
 	mux.HandleFunc("/api/memory/analysis/notebooks", s.handleMemoryAnalysisNotebooks)
 	mux.HandleFunc("/api/memory/analysis/context", s.handleMemoryAnalysisContext)
-	// Treemux multi-attach WebSocket endpoint
-	mux.HandleFunc("/api/treemux/ws", s.HandleTerminalWS)
-	// Treemux SSE stream for web viewers
-	mux.HandleFunc("/api/treemux/stream", s.handleTerminalStream)
 	// Static web viewer files
 	mux.Handle("/web/treemux/", http.StripPrefix("/web/treemux/", daemonweb.TreemuxFileServer()))
 
-	// PTY session management endpoints — delegated to tuimux/server
+	// PTY + hub endpoints — delegated to tuimux/server
 	if s.tuimuxServer != nil {
 		tmuxHandler := s.tuimuxServer.Handler()
 		mux.Handle("/api/pty/", tmuxHandler)
+		mux.Handle("/api/hub/", tmuxHandler)
 	}
 
 	// Nav bindings endpoints
