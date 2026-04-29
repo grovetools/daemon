@@ -6,13 +6,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/grovetools/tuimux/hub"
 )
-
-var wsUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
 
 type TerminalHub struct {
 	inner *hub.Hub

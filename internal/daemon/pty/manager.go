@@ -145,6 +145,11 @@ func (m *Manager) Kill(id string) error {
 	return s.Kill()
 }
 
+// Inner returns the underlying tuimux PTY manager.
+func (m *Manager) Inner() *tuimuxpty.Manager {
+	return m.inner
+}
+
 // Shutdown kills all active PTY sessions.
 func (m *Manager) Shutdown() {
 	m.inner.Shutdown()

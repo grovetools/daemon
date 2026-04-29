@@ -38,6 +38,7 @@ import (
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/memory/pkg/memory"
 	navbindings "github.com/grovetools/nav/pkg/bindings"
+	tuimuxserver "github.com/grovetools/tuimux/server"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sync/singleflight"
@@ -74,6 +75,10 @@ type Server struct {
 
 	// PTY session manager for daemon-owned PTY sessions.
 	ptyManager *daemonpty.Manager
+
+	// tuimuxServer is the reusable tuimux HTTP server that handles
+	// PTY and hub endpoints.
+	tuimuxServer *tuimuxserver.Server
 
 	// Memory store + embedder are wired via SetMemoryStore so /api/memory/*
 	// handlers can serve the same instance the MemoryHandler watcher uses.
@@ -168,6 +173,10 @@ func (s *Server) SetScope(scope string) {
 // SetPtyManager sets the PTY session manager for the server.
 func (s *Server) SetPtyManager(m *daemonpty.Manager) {
 	s.ptyManager = m
+	s.tuimuxServer = tuimuxserver.New(tuimuxserver.Config{
+		PtyManager:  m.Inner(),
+		TerminalHub: s.terminalHub.inner,
+	})
 }
 
 // ListenAndServe starts the daemon on the given unix socket path.
@@ -270,11 +279,11 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	// Static web viewer files
 	mux.Handle("/web/treemux/", http.StripPrefix("/web/treemux/", daemonweb.TreemuxFileServer()))
 
-	// PTY session management endpoints
-	mux.HandleFunc("/api/pty/create", s.handlePtyCreate)
-	mux.HandleFunc("/api/pty/list", s.handlePtyList)
-	mux.HandleFunc("/api/pty/kill/", s.handlePtyKill)
-	mux.HandleFunc("/api/pty/attach/", s.handlePtyAttach)
+	// PTY session management endpoints — delegated to tuimux/server
+	if s.tuimuxServer != nil {
+		tmuxHandler := s.tuimuxServer.Handler()
+		mux.Handle("/api/pty/", tmuxHandler)
+	}
 
 	// Nav bindings endpoints
 	mux.HandleFunc("/api/nav/bindings", s.handleNavBindings)
