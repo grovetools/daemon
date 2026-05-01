@@ -306,13 +306,13 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
 	m.mu.Lock()
 	delete(m.activeSessions, jobID)
-	isProxy := m.globalClient != nil
 	m.mu.Unlock()
 
-	if isProxy {
-		if err := m.removeInboundRoute(jobID); err != nil {
-			m.ulog.Warn("Failed to remove inbound route").Err(err).Field("job_id", jobID).Log(ctx)
-		}
+	// Remove inbound route unconditionally — on scoped daemons this clears
+	// the route we registered; on the global daemon this clears stale routes
+	// left by scoped daemons that have since stopped.
+	if err := m.removeInboundRoute(jobID); err != nil {
+		m.ulog.Warn("Failed to remove inbound route").Err(err).Field("job_id", jobID).Log(ctx)
 	}
 
 	// Clean up persisted delivery info
@@ -721,6 +721,9 @@ func (m *Manager) handleCommand(ctx context.Context, sender, text string, active
 			} else {
 				m.DisableChannel(ctx, targetID)
 				m.cleanupRoutesForJob(targetID)
+				if session := m.store.GetSession(targetID); session != nil && session.JobFilePath != "" {
+					stripClawFrontmatter(session.JobFilePath)
+				}
 				title := targetID
 				if idx := strings.LastIndex(targetID, "-"); idx > 0 {
 					title = targetID[:idx]
@@ -859,17 +862,20 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 			switch u.Type {
 			case store.UpdateSessionEnd:
 				if payload, ok := u.Payload.(*store.SessionEndPayload); ok {
-					// Don't disable channels for sessions that have channels
-					// in their frontmatter — the frontmatter is the source of
-					// truth for claw state. The session collector may emit
-					// spurious ends (e.g., PID=0 after daemon restart) but the
-					// agent is still running.
 					session := m.store.GetSession(payload.JobID)
-					if session != nil && hasSignalChannel(session.Channels) {
+					isTerminal := payload.Outcome == "completed" || payload.Outcome == "failed" ||
+						payload.Outcome == "interrupted" || payload.Outcome == "abandoned"
+
+					if session != nil && hasSignalChannel(session.Channels) && !isTerminal {
+						// Spurious end (e.g., PID=0 after daemon restart) —
+						// frontmatter says channels are enabled, keep the claw alive.
 						continue
 					}
 					m.DisableChannel(ctx, payload.JobID)
 					m.cleanupRoutesForJob(payload.JobID)
+					if isTerminal && session != nil && session.JobFilePath != "" {
+						stripClawFrontmatter(session.JobFilePath)
+					}
 				}
 			case store.UpdateSessionTmuxTarget:
 				// Persist delivery info to state.json for restart resilience.
@@ -1235,4 +1241,57 @@ func (m *Manager) forwardSessionInput(ctx context.Context, socketPath, jobID, in
 		return fmt.Errorf("scoped daemon returned %s", resp.Status)
 	}
 	return nil
+}
+
+// stripClawFrontmatter removes channels and autonomous blocks from a job
+// file's YAML frontmatter so the claw is not rehydrated on daemon restart.
+func stripClawFrontmatter(filePath string) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return
+	}
+	s := string(content)
+
+	// Remove channels line (e.g. "channels: [signal]" or "channels:\n- signal")
+	if idx := strings.Index(s, "\nchannels:"); idx >= 0 {
+		end := idx + 1
+		line := s[end:]
+		lineEnd := strings.Index(line, "\n")
+		if lineEnd >= 0 {
+			end += lineEnd + 1
+			remaining := s[end:]
+			for strings.HasPrefix(remaining, "- ") {
+				nextLine := strings.Index(remaining, "\n")
+				if nextLine >= 0 {
+					end += nextLine + 1
+					remaining = s[end:]
+				} else {
+					end += len(remaining)
+					break
+				}
+			}
+		} else {
+			end += len(line)
+		}
+		s = s[:idx+1] + s[end:]
+	}
+
+	// Remove autonomous block
+	if idx := strings.Index(s, "autonomous:\n"); idx >= 0 {
+		end := idx
+		lines := strings.Split(s[idx:], "\n")
+		end += len(lines[0]) + 1
+		for i := 1; i < len(lines); i++ {
+			if strings.HasPrefix(lines[i], "  ") {
+				end += len(lines[i]) + 1
+			} else {
+				break
+			}
+		}
+		s = s[:idx] + s[end:]
+	}
+
+	if s != string(content) {
+		_ = os.WriteFile(filePath, []byte(s), 0o600) //nolint:gosec // G306: job file permissions
+	}
 }
