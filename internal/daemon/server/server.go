@@ -23,7 +23,7 @@ import (
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/repo"
 	"github.com/grovetools/core/pkg/sessions"
-	"github.com/grovetools/core/pkg/tmux"
+	muxpkg "github.com/grovetools/core/pkg/mux"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/engine"
@@ -1056,11 +1056,11 @@ func (s *Server) SendSessionInterrupt(ctx context.Context, jobID string) error {
 		if session.TmuxTarget == "" {
 			return fmt.Errorf("tmux target missing for session %s", jobID)
 		}
-		tmuxClient, err := tmux.NewClient()
+		engine, err := muxpkg.NewTmuxEngine()
 		if err != nil {
 			return fmt.Errorf("tmux not available: %w", err)
 		}
-		if err := tmuxClient.SendKeys(ctx, session.TmuxTarget, "C-c"); err != nil {
+		if err := engine.SendKeys(ctx, session.TmuxTarget, "C-c"); err != nil {
 			return err
 		}
 		s.ulog.Debug("Sent interrupt to agent").
