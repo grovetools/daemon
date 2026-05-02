@@ -390,7 +390,7 @@ func newGrovedStartCmd() *cobra.Command {
 			// daemon rather than maintaining their own (conflicting) bind.
 			if scope == "" {
 				go func() {
-					if err := envManager.Proxy.ListenAndServe(":8443"); err != nil {
+					if err := envManager.Proxy.ListenAndServe("127.0.0.1:8443"); err != nil {
 						ulog.Warn("Proxy server stopped").Err(err).Log(context.Background())
 					}
 				}()

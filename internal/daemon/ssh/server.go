@@ -73,7 +73,11 @@ func New(cfg *config.DaemonSSHConfig) (*Server, error) {
 		return nil, fmt.Errorf("expanding authorized_keys path: %w", err)
 	}
 
-	addr := fmt.Sprintf(":%d", port)
+	host := cfg.BindAddress
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	addr := fmt.Sprintf("%s:%d", host, port)
 
 	ulog := logging.NewUnifiedLogger("groved.ssh")
 	s := &Server{
@@ -87,12 +91,10 @@ func New(cfg *config.DaemonSSHConfig) (*Server, error) {
 		wish.WithMiddleware(groveHandler(s)),
 	}
 
-	// Only add authorized_keys auth if the file exists
-	if _, err := os.Stat(authorizedKeysPath); err == nil {
-		opts = append(opts, wish.WithAuthorizedKeys(authorizedKeysPath))
-	} else {
-		ulog.Warn("~/.ssh/authorized_keys not found, SSH server will accept all connections").Log(context.Background())
+	if _, err := os.Stat(authorizedKeysPath); err != nil {
+		return nil, fmt.Errorf("SSH server requires ~/.ssh/authorized_keys but file not found: %w", err)
 	}
+	opts = append(opts, wish.WithAuthorizedKeys(authorizedKeysPath))
 
 	srv, err := wish.NewServer(opts...)
 	if err != nil {
