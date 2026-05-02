@@ -30,7 +30,6 @@ import (
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
-	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/daemon/internal/enrichment"
@@ -39,6 +38,7 @@ import (
 	"github.com/grovetools/memory/pkg/memory"
 	navbindings "github.com/grovetools/nav/pkg/bindings"
 	"github.com/grovetools/tuimux/hub"
+	tuimuxpty "github.com/grovetools/tuimux/pty"
 	tuimuxserver "github.com/grovetools/tuimux/server"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -75,7 +75,7 @@ type Server struct {
 	scope string
 
 	// PTY session manager for daemon-owned PTY sessions.
-	ptyManager *daemonpty.Manager
+	ptyManager *tuimuxpty.Manager
 
 	// tuimuxServer is the reusable tuimux HTTP server that handles
 	// PTY and hub endpoints.
@@ -174,10 +174,10 @@ func (s *Server) SetScope(scope string) {
 }
 
 // SetPtyManager sets the PTY session manager for the server.
-func (s *Server) SetPtyManager(m *daemonpty.Manager) {
+func (s *Server) SetPtyManager(m *tuimuxpty.Manager) {
 	s.ptyManager = m
 	s.tuimuxServer = tuimuxserver.New(tuimuxserver.Config{
-		PtyManager:  m.Inner(),
+		PtyManager:  m,
 		TerminalHub: s.terminalHub,
 	})
 }
@@ -1340,17 +1340,19 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 			script.WriteString(fmt.Sprintf(" '%s'", escapedArg))
 		}
 
-		sess, err := s.ptyManager.Create(daemonpty.CreateRequest{
-			CWD:       payload.WorkDir,
-			Command:   shell,
-			Args:      []string{"-i", "-c", script.String()},
-			Origin:    "agent:" + payload.JobID,
-			Label:     payload.JobTitle,
-			CreatedBy: "flow",
-			Labels: map[string]string{
-				"job_id":    payload.JobID,
-				"plan_name": payload.PlanName,
-				"type":      "agent",
+		sess, err := s.ptyManager.Create(tuimuxpty.CreateRequest{
+			CWD:     payload.WorkDir,
+			Command: shell,
+			Args:    []string{"-i", "-c", script.String()},
+			Name:    filepath.Base(payload.WorkDir),
+			Env:     []string{"GROVE_PTY=1", "GROVE_TERMINAL=1"},
+			Tags: map[string]string{
+				"job_id":     payload.JobID,
+				"plan_name":  payload.PlanName,
+				"type":       "agent",
+				"origin":     "agent:" + payload.JobID,
+				"label":      payload.JobTitle,
+				"created_by": "flow",
 			},
 		})
 		if err != nil {
@@ -1359,7 +1361,7 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		ptyID := sess.Metadata().ID
+		ptyID := sess.ID
 
 		// Update the session registry with the PTY ID so re-attachment works.
 		if st := s.engine.Store(); st != nil {

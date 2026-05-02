@@ -31,13 +31,13 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/pairwatch"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
-	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
 	"github.com/grovetools/daemon/internal/daemon/server"
 	daemonssh "github.com/grovetools/daemon/internal/daemon/ssh"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/grove-gemini/pkg/gemini"
+	tuimuxpty "github.com/grovetools/tuimux/pty"
 	"github.com/grovetools/memory/pkg/memory"
 	notifyconfig "github.com/grovetools/notify/pkg/config"
 	"github.com/spf13/cobra"
@@ -421,7 +421,7 @@ func newGrovedStartCmd() *cobra.Command {
 			}
 
 			// PTY session manager for daemon-owned PTY sessions
-			ptyManager := daemonpty.NewManager()
+			ptyManager := tuimuxpty.NewManager(nil)
 			srv.SetPtyManager(ptyManager)
 
 			// sendInputToSession delegates to Server.SendSessionInput so the

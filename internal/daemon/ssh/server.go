@@ -18,8 +18,8 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/util/pathutil"
-	daemonpty "github.com/grovetools/daemon/internal/daemon/pty"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	tuimuxpty "github.com/grovetools/tuimux/pty"
 )
 
 // Server wraps a wish SSH server with grove-specific configuration.
@@ -28,7 +28,7 @@ type Server struct {
 	ulog       *logging.UnifiedLogger
 	port       int
 	store      *store.Store
-	ptyManager *daemonpty.Manager
+	ptyManager *tuimuxpty.Manager
 }
 
 // SetStore injects the daemon state store for workspace listing.
@@ -37,7 +37,7 @@ func (s *Server) SetStore(st *store.Store) {
 }
 
 // SetPtyManager injects the PTY session manager for listing daemon-owned PTYs.
-func (s *Server) SetPtyManager(pm *daemonpty.Manager) {
+func (s *Server) SetPtyManager(pm *tuimuxpty.Manager) {
 	s.ptyManager = pm
 }
 

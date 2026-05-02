@@ -136,7 +136,7 @@ func (s *Server) buildPickerItems() []list.Item {
 		for _, meta := range s.ptyManager.List() {
 			desc := fmt.Sprintf("Daemon PTY · %s", meta.CWD)
 			items = append(items, pickerItem{
-				title:       fmt.Sprintf("pty:%s", meta.Workspace),
+				title:       fmt.Sprintf("pty:%s", meta.Name),
 				description: desc,
 				args:        []string{"--attach", meta.ID},
 			})
