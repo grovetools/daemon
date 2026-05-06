@@ -63,7 +63,8 @@ type Server struct {
 	engine         *engine.Engine
 	runningConfig  *RunningConfig
 	jobRunner      *jobrunner.JobRunner
-	logStreamer    *logstreamer.LogStreamer
+	logStreamer         *logstreamer.LogStreamer
+	workspaceStreamer   *logstreamer.WorkspaceStreamer
 	envManager     *daemonenv.Manager
 	channelManager *channels.Manager
 
@@ -156,6 +157,11 @@ func (s *Server) SetLogStreamer(ls *logstreamer.LogStreamer) {
 	s.logStreamer = ls
 }
 
+// SetWorkspaceStreamer sets the workspace log streamer for the server.
+func (s *Server) SetWorkspaceStreamer(ws *logstreamer.WorkspaceStreamer) {
+	s.workspaceStreamer = ws
+}
+
 // SetEnvManager sets the environment manager for the server.
 func (s *Server) SetEnvManager(m *daemonenv.Manager) {
 	s.envManager = m
@@ -243,6 +249,8 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
 	mux.HandleFunc("/api/notes/index", s.handleNoteIndex)
 	mux.HandleFunc("/api/notes/event", s.handleNoteEvent)
+	// Aggregated workspace log streaming
+	mux.HandleFunc("/api/logs/stream", s.handleStreamWorkspaceLogs)
 	// Environment management endpoints
 	mux.HandleFunc("/api/env/up", s.handleEnvUp)
 	mux.HandleFunc("/api/env/down", s.handleEnvDown)
@@ -2032,6 +2040,84 @@ func (s *Server) handleStreamJobLogs(w http.ResponseWriter, r *http.Request, job
 				}
 				_, _ = fmt.Fprintf(w, "event: status\ndata: %s\n\n", data)
 			}
+			flusher.Flush()
+		}
+	}
+}
+
+// handleStreamWorkspaceLogs provides SSE streaming of aggregated workspace logs.
+func (s *Server) handleStreamWorkspaceLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.workspaceStreamer == nil {
+		http.Error(w, "workspace streamer not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	q := r.URL.Query()
+	replay := 100
+	if v := q.Get("replay"); v != "" {
+		if n, err := fmt.Sscanf(v, "%d", &replay); n != 1 || err != nil {
+			replay = 100
+		}
+	}
+
+	opts := models.LogStreamOptions{
+		Scope:     q.Get("scope"),
+		Workspace: q.Get("workspace"),
+		Level:     q.Get("level"),
+		System:    q.Get("system") == "true",
+		Replay:    replay,
+	}
+
+	history, ch := s.workspaceStreamer.Subscribe(opts)
+	defer s.workspaceStreamer.Unsubscribe(ch)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	_, _ = fmt.Fprintf(w, ": connected\n\n")
+	flusher.Flush()
+
+	for _, line := range history {
+		data, err := json.Marshal(models.LogStreamLine{
+			Workspace:     line.Workspace,
+			WorkspacePath: line.WorkspacePath,
+			Line:          line.Line,
+		})
+		if err != nil {
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+	}
+	flusher.Flush()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case line, ok := <-ch:
+			if !ok {
+				return
+			}
+			data, err := json.Marshal(models.LogStreamLine{
+				Workspace:     line.Workspace,
+				WorkspacePath: line.WorkspacePath,
+				Line:          line.Line,
+			})
+			if err != nil {
+				continue
+			}
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		}
 	}
