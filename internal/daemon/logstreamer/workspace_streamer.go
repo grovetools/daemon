@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/logging/logutil"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
@@ -23,8 +22,7 @@ type WorkspaceStreamer struct {
 	subscribers   map[chan logutil.TailedLine]models.LogStreamOptions
 	activeTailers map[string]context.CancelFunc // workspace path -> cancel
 	logChan       chan logutil.TailedLine
-	mu            sync.RWMutex
-	ulog          *logging.UnifiedLogger
+	mu sync.RWMutex
 }
 
 // NewWorkspaceStreamer creates a new aggregated workspace log streamer.
@@ -38,8 +36,7 @@ func NewWorkspaceStreamer(st *store.Store, capacity int) *WorkspaceStreamer {
 		capacity:      capacity,
 		subscribers:   make(map[chan logutil.TailedLine]models.LogStreamOptions),
 		activeTailers: make(map[string]context.CancelFunc),
-		logChan:       make(chan logutil.TailedLine, 256),
-		ulog:          logging.NewUnifiedLogger("groved.workspace_streamer"),
+		logChan: make(chan logutil.TailedLine, 256),
 	}
 }
 
@@ -173,10 +170,6 @@ func (ws *WorkspaceStreamer) syncTailers(ctx context.Context) {
 			wg.Wait()
 		}()
 
-		ws.ulog.Debug("Started tailing workspace logs").
-			Field("workspace", ews.Name).
-			Field("path", logsDir).
-			Log(ctx)
 	}
 
 	// Start system log tailer if not running.

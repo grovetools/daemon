@@ -43,6 +43,11 @@ type SkillHandler struct {
 	cachedConfigs map[string]*skills.SkillsConfig
 	configsMutex  sync.RWMutex
 
+	// Tracks workspaces that have been seen by handleWorkspacesDiscovered,
+	// independent of whether they have a valid skills config. Prevents
+	// infinite re-discovery of workspaces without grove.toml skills blocks.
+	seenWorkspaces map[string]bool
+
 	// Cached global skills config for change detection on config reloads
 	globalSkillsCfg *skills.SkillsConfig
 }
@@ -68,6 +73,7 @@ func NewSkillHandler(st *store.Store, cfg *config.Config, debounceMs int) (*Skil
 		watchedPaths:    make(map[string]*workspace.WorkspaceNode),
 		timers:          make(map[string]*time.Timer),
 		cachedConfigs:   make(map[string]*skills.SkillsConfig),
+		seenWorkspaces:  make(map[string]bool),
 		globalSkillsCfg: skills.LoadGlobalSkillsConfig(cfg),
 	}, nil
 }
@@ -245,10 +251,10 @@ func (h *SkillHandler) handleWorkspacesDiscovered() {
 	workspaces := h.store.GetWorkspaces()
 
 	h.configsMutex.RLock()
-	cachedCount := len(h.cachedConfigs)
+	seenCount := len(h.seenWorkspaces)
 	h.configsMutex.RUnlock()
 
-	if cachedCount == 0 {
+	if seenCount == 0 {
 		h.ulog.Info("Workspaces discovered, performing initial skill sync").
 			Field("count", len(workspaces)).
 			Log(ctx)
@@ -263,7 +269,7 @@ func (h *SkillHandler) handleWorkspacesDiscovered() {
 		}
 
 		h.configsMutex.RLock()
-		_, seen := h.cachedConfigs[node.Path]
+		seen := h.seenWorkspaces[node.Path]
 		h.configsMutex.RUnlock()
 
 		if !seen {
@@ -420,9 +426,13 @@ func (h *SkillHandler) syncWorkspace(node *workspace.WorkspaceNode) {
 		}
 
 		ctx := context.Background()
-		h.ulog.Info("Executing skill sync").Field("target", debounceKey).Log(ctx)
+		h.ulog.Debug("Executing skill sync").Field("target", debounceKey).Log(ctx)
 
-		// Cache the current skills config for change detection on future grove.toml saves
+		// Mark workspace as seen and cache skills config for change detection
+		h.configsMutex.Lock()
+		h.seenWorkspaces[targetNode.Path] = true
+		h.configsMutex.Unlock()
+
 		if cfg, loadErr := skills.LoadSkillsConfig(h.cfg, targetNode); loadErr == nil {
 			h.configsMutex.Lock()
 			h.cachedConfigs[targetNode.Path] = cfg

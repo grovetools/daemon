@@ -666,12 +666,6 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 			Field("path", job.Path).
 			Log(ctx)
 	} else {
-		h.ulog.Debug("Successfully indexed document into memory").
-			Field("path", job.Path).
-			Field("type", docType).
-			Field("new_embeddings", len(textsToEmbed)).
-			Field("reused_embeddings", len(chunks)-len(textsToEmbed)).
-			Log(ctx)
 		_ = h.memStore.LogAudit(ctx, "upsert", job.Path, map[string]any{
 			"doc_type":       docType,
 			"chunks":         len(chunks),

@@ -1196,8 +1196,6 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
-	s.ulog.Debug("SSE client connected").StructuredOnly().Log(r.Context())
-
 	// Send current state immediately so client has data right away
 	state := s.engine.Store().Get()
 	if len(state.Workspaces) > 0 {
@@ -1218,7 +1216,6 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
-			s.ulog.Debug("SSE client disconnected").Log(r.Context())
 			return
 		case update := <-ch:
 			// Convert internal store.Update to public API format
@@ -1272,12 +1269,9 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 	_, _ = fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
-	s.ulog.Debug("HUD SSE client connected").Field("path", path).StructuredOnly().Log(r.Context())
-
 	for {
 		select {
 		case <-r.Context().Done():
-			s.ulog.Debug("HUD SSE client disconnected").Field("path", path).StructuredOnly().Log(r.Context())
 			return
 		case hud, ok := <-out:
 			if !ok {
