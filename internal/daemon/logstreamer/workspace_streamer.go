@@ -22,7 +22,7 @@ type WorkspaceStreamer struct {
 	subscribers   map[chan logutil.TailedLine]models.LogStreamOptions
 	activeTailers map[string]context.CancelFunc // workspace path -> cancel
 	logChan       chan logutil.TailedLine
-	mu sync.RWMutex
+	mu            sync.RWMutex
 }
 
 // NewWorkspaceStreamer creates a new aggregated workspace log streamer.
@@ -36,7 +36,7 @@ func NewWorkspaceStreamer(st *store.Store, capacity int) *WorkspaceStreamer {
 		capacity:      capacity,
 		subscribers:   make(map[chan logutil.TailedLine]models.LogStreamOptions),
 		activeTailers: make(map[string]context.CancelFunc),
-		logChan: make(chan logutil.TailedLine, 256),
+		logChan:       make(chan logutil.TailedLine, 256),
 	}
 }
 
@@ -244,12 +244,12 @@ func (ws *WorkspaceStreamer) buildEcoMap() map[string]string {
 
 // levelSeverity maps log level strings to numeric severity for >= comparison.
 var levelSeverity = map[string]int{
-	"debug": 0,
-	"info":  1,
-	"warn":  2,
+	"debug":   0,
+	"info":    1,
+	"warn":    2,
 	"warning": 2,
-	"error": 3,
-	"fatal": 4,
+	"error":   3,
+	"fatal":   4,
 }
 
 // matchesFilter evaluates whether a log line matches the client's filter options.

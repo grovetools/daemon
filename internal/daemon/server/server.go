@@ -20,10 +20,10 @@ import (
 	"github.com/grovetools/core/logging"
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/models"
+	muxpkg "github.com/grovetools/core/pkg/mux"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/repo"
 	"github.com/grovetools/core/pkg/sessions"
-	muxpkg "github.com/grovetools/core/pkg/mux"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/engine"
@@ -58,15 +58,15 @@ type RunningConfig struct {
 
 // Server manages the daemon's HTTP server over a Unix socket.
 type Server struct {
-	ulog           *logging.UnifiedLogger
-	server         *http.Server
-	engine         *engine.Engine
-	runningConfig  *RunningConfig
-	jobRunner      *jobrunner.JobRunner
-	logStreamer         *logstreamer.LogStreamer
-	workspaceStreamer   *logstreamer.WorkspaceStreamer
-	envManager     *daemonenv.Manager
-	channelManager *channels.Manager
+	ulog              *logging.UnifiedLogger
+	server            *http.Server
+	engine            *engine.Engine
+	runningConfig     *RunningConfig
+	jobRunner         *jobrunner.JobRunner
+	logStreamer       *logstreamer.LogStreamer
+	workspaceStreamer *logstreamer.WorkspaceStreamer
+	envManager        *daemonenv.Manager
+	channelManager    *channels.Manager
 
 	// scope is the daemon's configured ecosystem scope — empty for the
 	// global/unscoped daemon, non-empty for scoped daemons. Proxy
@@ -602,13 +602,14 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 					})
 				}
 			}
-			if req.LastSender != "" {
+			if req.LastSender != "" || req.LastSenderGroup != "" {
 				s.engine.Store().ApplyUpdate(store.Update{
 					Type:   store.UpdateSessionLastSender,
 					Source: "api",
 					Payload: &store.SessionLastSenderPayload{
-						JobID:      sessionID,
-						LastSender: req.LastSender,
+						JobID:           sessionID,
+						LastSender:      req.LastSender,
+						LastSenderGroup: req.LastSenderGroup,
 					},
 				})
 			}

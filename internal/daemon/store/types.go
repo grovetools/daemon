@@ -161,8 +161,9 @@ type SessionTmuxTargetPayload struct {
 
 // SessionLastSenderPayload tracks the last Signal sender for a session.
 type SessionLastSenderPayload struct {
-	JobID      string `json:"job_id"`
-	LastSender string `json:"last_sender"`
+	JobID           string `json:"job_id"`
+	LastSender      string `json:"last_sender"`
+	LastSenderGroup string `json:"last_sender_group"`
 }
 
 // SessionConfirmationPayload contains data for confirming a session after agent startup.

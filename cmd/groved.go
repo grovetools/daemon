@@ -37,9 +37,9 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/grove-gemini/pkg/gemini"
-	tuimuxpty "github.com/grovetools/tuimux/pty"
 	"github.com/grovetools/memory/pkg/memory"
 	notifyconfig "github.com/grovetools/notify/pkg/config"
+	tuimuxpty "github.com/grovetools/tuimux/pty"
 	"github.com/spf13/cobra"
 )
 
@@ -447,6 +447,7 @@ func newGrovedStartCmd() *cobra.Command {
 					CLIPath:   notifyCfg.Signal.CLIPath,
 					Account:   notifyCfg.Signal.Account,
 					Allowlist: notifyCfg.Signal.Allowlist,
+					Groups:    notifyCfg.Signal.Groups,
 				}, scope, sockPath)
 				chMgr.SendInput = sendInputToSession
 				// Scoped daemons proxy outbound sends to the global daemon
@@ -507,10 +508,10 @@ func newGrovedStartCmd() *cobra.Command {
 				case <-shutdownReq:
 					ulog.Info("Auto-shutdown fired (idle TerminalHub)").Log(bgCtx)
 				}
-				ptyManager.Shutdown() // Kill all daemon-owned PTY sessions
-				envManager.Shutdown() // Teardown all running environments and proxy routes
+				ptyManager.Shutdown()    // Kill all daemon-owned PTY sessions
+				envManager.Shutdown()    // Teardown all running environments and proxy routes
 				streamer.Stop()          // Stop all job log tailing goroutines
-			workspaceStreamer.Stop() // Stop workspace log aggregation
+				workspaceStreamer.Stop() // Stop workspace log aggregation
 				if chMgr != nil {
 					// Stop signal-cli daemon subprocess so it doesn't orphan.
 					// A fresh signal-cli is spawned on the next groved boot,

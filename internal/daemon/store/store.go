@@ -281,6 +281,7 @@ func (s *Store) ApplyUpdate(u Update) {
 		if payload, ok := u.Payload.(*SessionLastSenderPayload); ok {
 			if session, exists := s.state.Sessions[payload.JobID]; exists {
 				session.LastSender = payload.LastSender
+				session.LastSenderGroup = payload.LastSenderGroup
 			}
 		}
 

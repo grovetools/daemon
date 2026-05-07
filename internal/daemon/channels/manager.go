@@ -31,6 +31,7 @@ type SignalConfig struct {
 	CLIPath   string
 	Account   string
 	Allowlist []string
+	Groups    []string
 }
 
 // Manager manages external messaging channels and routes messages to/from agent sessions.
@@ -348,13 +349,18 @@ func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*mod
 		}
 	}
 
-	// Resolve recipient
+	// Resolve recipient / group
 	recipient := req.Recipient
-	if recipient == "" {
-		// Check LastSender for this session
+	groupID := req.GroupID
+	if recipient == "" && groupID == "" {
 		session := m.store.GetSession(req.JobID)
-		if session != nil && session.LastSender != "" {
+		if session != nil && session.LastSenderGroup != "" {
+			groupID = session.LastSenderGroup
+		} else if session != nil && session.LastSender != "" {
 			recipient = session.LastSender
+		} else if len(m.signalCfg.Groups) > 0 {
+			// Broadcast to first configured group
+			groupID = m.signalCfg.Groups[0]
 		} else {
 			// Broadcast to all allowlisted contacts
 			for _, contact := range m.signalCfg.Allowlist {
@@ -378,6 +384,7 @@ func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*mod
 	taggedMsg := m.tagMessage(req.JobID, req.JobTitle, req.Message)
 	result, err := ch.Send(ctx, channels.OutboundMessage{
 		Recipient: recipient,
+		GroupID:   groupID,
 		Message:   taggedMsg,
 	})
 	if err != nil {
@@ -498,7 +505,7 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 	// 0. Handle !commands (meta-commands from user)
 	if strings.HasPrefix(text, "!") {
 		m.mu.Unlock()
-		go m.handleCommand(ctx, msg.Source, text, activeIDs)
+		go m.handleCommand(ctx, msg.Source, msg.GroupID, text, activeIDs)
 		return
 	}
 
@@ -544,7 +551,7 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 				Field("active_sessions", count).
 				Log(ctx)
 			m.recordInbound(msg.Source, "dropped", "", "multiple active agents", false)
-			m.replyWithAgentList(msg.Source, activeIDs)
+			m.replyWithAgentList(msg.Source, msg.GroupID, activeIDs)
 			return
 		} else {
 			m.mu.Unlock()
@@ -561,21 +568,29 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 		Field("resolved_via", resolvedVia).
 		Log(ctx)
 
-	// Update LastSender
+	// Update LastSender (and LastSenderGroup if from a group)
 	m.store.ApplyUpdate(store.Update{
 		Type:   store.UpdateSessionLastSender,
 		Source: "channels",
 		Payload: &store.SessionLastSenderPayload{
-			JobID:      targetJobID,
-			LastSender: msg.Source,
+			JobID:           targetJobID,
+			LastSender:      msg.Source,
+			LastSenderGroup: msg.GroupID,
 		},
 	})
 
 	// Cross-daemon routing: if routing.json maps this jobID to another
 	// daemon's socket, forward the input there instead of looking it up
 	// in our local store.
+	// Format context tag: include sender in group chats so the agent knows who spoke
+	var taggedText string
+	if msg.GroupID != "" {
+		taggedText = fmt.Sprintf("[via Signal from %s] %s", msg.Source, text)
+	} else {
+		taggedText = fmt.Sprintf("[via Signal] %s", text)
+	}
+
 	if sockPath, ok := m.lookupInboundRoute(targetJobID); ok && sockPath != "" && sockPath != m.socketPath {
-		taggedText := fmt.Sprintf("[via Signal] %s", text)
 		if err := m.forwardSessionInput(ctx, sockPath, targetJobID, taggedText); err != nil {
 			m.ulog.Warn("Cross-daemon inbound forward failed — purging route").
 				Err(err).
@@ -613,7 +628,6 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 	}
 
 	session := m.store.GetSession(targetJobID)
-	taggedText := fmt.Sprintf("[via Signal] %s", text)
 	injectLog := m.ulog.Info("Injecting signal message into agent").
 		Field("job_id", targetJobID).
 		Field("input_len", len(taggedText))
@@ -645,6 +659,7 @@ func (m *Manager) startSignalChannel(ctx context.Context) {
 		CLIPath:   m.signalCfg.CLIPath,
 		Account:   m.signalCfg.Account,
 		Allowlist: m.signalCfg.Allowlist,
+		Groups:    m.signalCfg.Groups,
 	})
 
 	if err := ch.Start(ctx, m.handleInbound); err != nil {
@@ -678,7 +693,7 @@ func (m *Manager) tagMessage(jobID, jobTitle, message string) string {
 }
 
 // handleCommand processes !commands sent via Signal.
-func (m *Manager) handleCommand(ctx context.Context, sender, text string, activeIDs map[string]bool) {
+func (m *Manager) handleCommand(ctx context.Context, sender, groupID, text string, activeIDs map[string]bool) {
 	cmd := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(text)), "!")
 	cmd = strings.SplitN(cmd, " ", 2)[0]
 
@@ -747,7 +762,7 @@ func (m *Manager) handleCommand(ctx context.Context, sender, text string, active
 	if ch != nil && reply != "" {
 		sendCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, err := ch.Send(sendCtx, channels.OutboundMessage{Recipient: sender, Message: reply})
+		_, err := ch.Send(sendCtx, channels.OutboundMessage{Recipient: sender, GroupID: groupID, Message: reply})
 		if err != nil {
 			m.ulog.Error("!command reply failed").Err(err).Field("cmd", cmd).StructuredOnly().Log(ctx)
 		} else {
@@ -810,7 +825,7 @@ func (m *Manager) extractTagFromText(text string, activeIDs map[string]bool) str
 }
 
 // replyWithAgentList sends a Signal message listing active agents.
-func (m *Manager) replyWithAgentList(recipient string, activeIDs map[string]bool) {
+func (m *Manager) replyWithAgentList(recipient, groupID string, activeIDs map[string]bool) {
 	m.mu.Lock()
 	ch := m.signalChannel
 	m.mu.Unlock()
@@ -830,6 +845,7 @@ func (m *Manager) replyWithAgentList(recipient string, activeIDs map[string]bool
 		msg := "Multiple agents active. Reply to a specific message or use @tag:\n" + strings.Join(agents, "\n")
 		_, _ = ch.Send(context.Background(), channels.OutboundMessage{
 			Recipient: recipient,
+			GroupID:   groupID,
 			Message:   msg,
 		})
 	}
