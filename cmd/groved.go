@@ -443,11 +443,13 @@ func newGrovedStartCmd() *cobra.Command {
 			notifyCfg := notifyconfig.Load()
 			if notifyCfg.Signal.Enabled {
 				chMgr = daemonchannels.NewManager(st, daemonchannels.SignalConfig{
-					Enabled:   notifyCfg.Signal.Enabled,
-					CLIPath:   notifyCfg.Signal.CLIPath,
-					Account:   notifyCfg.Signal.Account,
-					Allowlist: notifyCfg.Signal.Allowlist,
-					Groups:    notifyCfg.Signal.Groups,
+					Enabled:     notifyCfg.Signal.Enabled,
+					CLIPath:     notifyCfg.Signal.CLIPath,
+					Account:     notifyCfg.Signal.Account,
+					Allowlist:   notifyCfg.Signal.Allowlist,
+					Groups:      notifyCfg.Signal.Groups,
+					Contacts:    notifyCfg.Signal.ContactsFlat(),
+					NamedGroups: notifyCfg.Signal.NamedGroupsFlat(),
 				}, scope, sockPath)
 				chMgr.SendInput = sendInputToSession
 				// Scoped daemons proxy outbound sends to the global daemon

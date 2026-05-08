@@ -128,9 +128,10 @@ type SessionIntentPayload struct {
 	WorkDir     string `json:"work_dir"`
 
 	// Channel & Autonomous support
-	Channels   []string                 `json:"channels,omitempty"`
-	Autonomous *models.AutonomousConfig `json:"autonomous,omitempty"`
-	TmuxTarget string                   `json:"tmux_target,omitempty"`
+	Channels     []string                 `json:"channels,omitempty"`
+	Autonomous   *models.AutonomousConfig `json:"autonomous,omitempty"`
+	TmuxTarget   string                   `json:"tmux_target,omitempty"`
+	SignalTarget string                   `json:"signal_target,omitempty"`
 
 	// Mux identifies the multiplexer backing the session's PTY.
 	Mux string `json:"mux,omitempty"`
@@ -138,8 +139,9 @@ type SessionIntentPayload struct {
 
 // SessionChannelsPayload contains data for updating session channels.
 type SessionChannelsPayload struct {
-	JobID    string   `json:"job_id"`
-	Channels []string `json:"channels"`
+	JobID        string   `json:"job_id"`
+	Channels     []string `json:"channels"`
+	SignalTarget string   `json:"signal_target,omitempty"`
 }
 
 // SessionAutonomousPayload contains data for updating session autonomous config.

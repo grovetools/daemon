@@ -256,6 +256,7 @@ func (s *Store) ApplyUpdate(u Update) {
 		if payload, ok := u.Payload.(*SessionChannelsPayload); ok {
 			if session, exists := s.state.Sessions[payload.JobID]; exists {
 				session.Channels = payload.Channels
+				session.SignalTarget = payload.SignalTarget
 			}
 		}
 	case UpdateSessionAutonomous:
@@ -337,6 +338,7 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload) {
 		Channels:         payload.Channels,
 		Autonomous:       payload.Autonomous,
 		TmuxTarget:       payload.TmuxTarget,
+		SignalTarget:     payload.SignalTarget,
 		Mux:              payload.Mux,
 	}
 	s.state.Sessions[payload.JobID] = session

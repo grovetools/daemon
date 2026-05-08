@@ -27,11 +27,23 @@ import (
 
 // SignalConfig holds the configuration needed to create a Signal channel.
 type SignalConfig struct {
-	Enabled   bool
-	CLIPath   string
-	Account   string
-	Allowlist []string
-	Groups    []string
+	Enabled     bool
+	CLIPath     string
+	Account     string
+	Allowlist   []string
+	Groups      []string
+	Contacts    map[string]string
+	NamedGroups map[string]string
+}
+
+func (cfg *SignalConfig) ResolveTarget(name string) (id string, isGroup bool) {
+	if val, ok := cfg.NamedGroups[name]; ok {
+		return val, true
+	}
+	if val, ok := cfg.Contacts[name]; ok {
+		return val, false
+	}
+	return "", false
 }
 
 // Manager manages external messaging channels and routes messages to/from agent sessions.
@@ -354,12 +366,26 @@ func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*mod
 	groupID := req.GroupID
 	if recipient == "" && groupID == "" {
 		session := m.store.GetSession(req.JobID)
-		if session != nil && session.LastSenderGroup != "" {
+		logging.NewUnifiedLogger("groved.channels.send").Info("resolving target").
+			Field("job_id", req.JobID).
+			Field("session_found", session != nil).
+			Field("signal_target", func() string { if session != nil { return session.SignalTarget }; return "" }()).
+			Field("last_sender", func() string { if session != nil { return session.LastSender }; return "" }()).
+			Field("last_sender_group", func() string { if session != nil { return session.LastSenderGroup }; return "" }()).
+			Field("configured_groups", len(m.signalCfg.Groups)).
+			StructuredOnly().Log(ctx)
+		if session != nil && session.SignalTarget != "" {
+			id, isGroup := m.signalCfg.ResolveTarget(session.SignalTarget)
+			if isGroup {
+				groupID = id
+			} else if id != "" {
+				recipient = id
+			}
+		} else if session != nil && session.LastSenderGroup != "" {
 			groupID = session.LastSenderGroup
 		} else if session != nil && session.LastSender != "" {
 			recipient = session.LastSender
 		} else if len(m.signalCfg.Groups) > 0 {
-			// Broadcast to first configured group
 			groupID = m.signalCfg.Groups[0]
 		} else {
 			// Broadcast to all allowlisted contacts
@@ -380,6 +406,12 @@ func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*mod
 			return &models.ChannelSendResponse{Status: "broadcast"}, nil
 		}
 	}
+
+	logging.NewUnifiedLogger("groved.channels.send").Info("resolved target").
+		Field("job_id", req.JobID).
+		Field("recipient", recipient).
+		Field("group_id", groupID).
+		StructuredOnly().Log(ctx)
 
 	taggedMsg := m.tagMessage(req.JobID, req.JobTitle, req.Message)
 	result, err := ch.Send(ctx, channels.OutboundMessage{
@@ -582,12 +614,19 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 	// Cross-daemon routing: if routing.json maps this jobID to another
 	// daemon's socket, forward the input there instead of looking it up
 	// in our local store.
-	// Format context tag: include sender in group chats so the agent knows who spoke
+	// Format context tag: resolve phone to name if possible
+	senderLabel := msg.Source
+	for name, phone := range m.signalCfg.Contacts {
+		if phone == msg.Source {
+			senderLabel = name
+			break
+		}
+	}
 	var taggedText string
 	if msg.GroupID != "" {
-		taggedText = fmt.Sprintf("[via Signal from %s] %s", msg.Source, text)
+		taggedText = fmt.Sprintf("[via Signal from %s] %s", senderLabel, text)
 	} else {
-		taggedText = fmt.Sprintf("[via Signal] %s", text)
+		taggedText = fmt.Sprintf("[via Signal from %s] %s", senderLabel, text)
 	}
 
 	if sockPath, ok := m.lookupInboundRoute(targetJobID); ok && sockPath != "" && sockPath != m.socketPath {
@@ -1286,6 +1325,19 @@ func stripClawFrontmatter(filePath string) {
 					break
 				}
 			}
+		} else {
+			end += len(line)
+		}
+		s = s[:idx+1] + s[end:]
+	}
+
+	// Remove signal_target line
+	if idx := strings.Index(s, "\nsignal_target:"); idx >= 0 {
+		end := idx + 1
+		line := s[end:]
+		lineEnd := strings.Index(line, "\n")
+		if lineEnd >= 0 {
+			end += lineEnd + 1
 		} else {
 			end += len(line)
 		}

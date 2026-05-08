@@ -706,8 +706,9 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			Type:   store.UpdateSessionChannels,
 			Source: "api",
 			Payload: &store.SessionChannelsPayload{
-				JobID:    sessionID,
-				Channels: req.Channels,
+				JobID:        sessionID,
+				Channels:     req.Channels,
+				SignalTarget: req.SignalTarget,
 			},
 		})
 		// If channel manager is set, enable/disable channels
