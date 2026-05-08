@@ -87,21 +87,15 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 						continue
 					}
 
-					// PID 0 with a recent start means the intent was registered but
-					// the agent hasn't confirmed yet — give it 2 minutes to survive
-					// daemon restarts between RegisterSessionIntent and ConfirmSession.
-					if session.PID == 0 && time.Since(session.StartedAt) < 2*time.Minute {
+					// PID 0 means the intent was registered but never confirmed
+					// with a real PID. This happens for cross-daemon sessions
+					// (the real process lives on a scoped daemon) or stale intents.
+					// Either way, we can't do PID liveness — skip entirely.
+					if session.PID == 0 {
 						continue
 					}
 
-					// PID 0 with active channels means this session lives on a
-					// scoped daemon — this daemon only has the intent, not the
-					// real process. Don't reap it; the owning daemon handles lifecycle.
-					if session.PID == 0 && len(session.Channels) > 0 {
-						continue
-					}
-
-					if session.PID == 0 || !process.IsProcessAlive(session.PID) {
+					if !process.IsProcessAlive(session.PID) {
 						c.ulog.Warn("Session process died unexpectedly").
 							Field("job_id", session.ID).
 							Field("pid", session.PID).
