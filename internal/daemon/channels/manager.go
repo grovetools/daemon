@@ -169,11 +169,26 @@ func (m *Manager) Start(ctx context.Context) {
 // session is missing, along with any routeTable entries pointing at pruned
 // jobIDs. Persists the updated route file if anything changed.
 func (m *Manager) pruneStaleSessions(ctx context.Context) {
+	m.ulog.Debug("pruneStaleSessions starting").
+		Field("scope", m.scope).
+		Field("active_sessions_count", len(m.activeSessions)).
+		StructuredOnly().Log(ctx)
+
 	m.mu.Lock()
 	stale := make([]string, 0, len(m.activeSessions))
 	for jobID := range m.activeSessions {
-		if m.store.GetSession(jobID) == nil {
+		sess := m.store.GetSession(jobID)
+		if sess == nil {
+			m.ulog.Warn("pruneStaleSessions: session missing from store, marking stale").
+				Field("job_id", jobID).
+				Field("scope", m.scope).
+				Log(ctx)
 			stale = append(stale, jobID)
+		} else {
+			m.ulog.Debug("pruneStaleSessions: session found").
+				Field("job_id", jobID).
+				Field("status", sess.Status).
+				StructuredOnly().Log(ctx)
 		}
 	}
 	for _, jobID := range stale {
@@ -293,6 +308,12 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 	m.activeSessions[jobID] = true
 	isProxy := m.globalClient != nil
 
+	m.ulog.Info("EnableChannel invoked").
+		Field("job_id", jobID).
+		Field("scope", m.scope).
+		Field("is_proxy", isProxy).
+		Log(m.ctx)
+
 	if !isProxy && !m.isRunning {
 		m.isRunning = true
 		m.ready = make(chan struct{})
@@ -317,6 +338,11 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 // cross-daemon because scoped claws live in routing.json, not in the
 // global daemon's activeSessions.
 func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
+	m.ulog.Info("DisableChannel invoked").
+		Field("job_id", jobID).
+		Field("scope", m.scope).
+		Log(ctx)
+
 	m.mu.Lock()
 	delete(m.activeSessions, jobID)
 	m.mu.Unlock()
@@ -921,11 +947,24 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 					isTerminal := payload.Outcome == "completed" || payload.Outcome == "failed" ||
 						payload.Outcome == "interrupted" || payload.Outcome == "abandoned"
 
+					m.ulog.Info("watchStoreUpdates: received UpdateSessionEnd").
+						Field("job_id", payload.JobID).
+						Field("outcome", payload.Outcome).
+						Field("is_terminal", isTerminal).
+						Field("has_session", session != nil).
+						Field("has_channels", session != nil && hasSignalChannel(session.Channels)).
+						Log(ctx)
+
 					if session != nil && hasSignalChannel(session.Channels) && !isTerminal {
-						// Spurious end (e.g., PID=0 after daemon restart) —
-						// frontmatter says channels are enabled, keep the claw alive.
+						m.ulog.Info("watchStoreUpdates: ignoring spurious session end").
+							Field("job_id", payload.JobID).
+							Log(ctx)
 						continue
 					}
+
+					m.ulog.Info("watchStoreUpdates: disabling channel due to session end").
+						Field("job_id", payload.JobID).
+						Log(ctx)
 					m.DisableChannel(ctx, payload.JobID)
 					m.cleanupRoutesForJob(payload.JobID)
 					if isTerminal && session != nil && session.JobFilePath != "" {
@@ -1075,6 +1114,9 @@ func (m *Manager) backgroundPrune(ctx context.Context) {
 
 // cleanupRoutesForJob removes all route entries for a specific job.
 func (m *Manager) cleanupRoutesForJob(jobID string) {
+	m.ulog.Info("cleanupRoutesForJob executing").
+		Field("job_id", jobID).
+		Log(m.ctx)
 	m.mu.Lock()
 	for ts, id := range m.routeTable {
 		if id == jobID {
@@ -1222,6 +1264,11 @@ func (m *Manager) saveRoutes() {
 }
 
 func (m *Manager) addInboundRoute(jobID string) error {
+	m.ulog.Info("addInboundRoute executing").
+		Field("job_id", jobID).
+		Field("socket", m.socketPath).
+		Field("is_sandbox", m.isSandboxScope()).
+		Log(m.ctx)
 	if m.socketPath == "" {
 		return fmt.Errorf("manager has no socketPath; cannot register inbound route")
 	}
@@ -1242,6 +1289,9 @@ func (m *Manager) addInboundRoute(jobID string) error {
 }
 
 func (m *Manager) removeInboundRoute(jobID string) error {
+	m.ulog.Info("removeInboundRoute executing").
+		Field("job_id", jobID).
+		Log(m.ctx)
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	state, err := loadChannelState()
@@ -1307,7 +1357,7 @@ func stripClawFrontmatter(filePath string) {
 	}
 	s := string(content)
 
-	// Remove channels line (e.g. "channels: [signal]" or "channels:\n- signal")
+	// Remove channels line (e.g. "channels: [signal]" or "channels:\n  - signal")
 	if idx := strings.Index(s, "\nchannels:"); idx >= 0 {
 		end := idx + 1
 		line := s[end:]
@@ -1315,7 +1365,7 @@ func stripClawFrontmatter(filePath string) {
 		if lineEnd >= 0 {
 			end += lineEnd + 1
 			remaining := s[end:]
-			for strings.HasPrefix(remaining, "- ") {
+			for strings.HasPrefix(remaining, "- ") || strings.HasPrefix(remaining, "  - ") {
 				nextLine := strings.Index(remaining, "\n")
 				if nextLine >= 0 {
 					end += nextLine + 1

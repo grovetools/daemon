@@ -94,6 +94,13 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 						continue
 					}
 
+					// PID 0 with active channels means this session lives on a
+					// scoped daemon — this daemon only has the intent, not the
+					// real process. Don't reap it; the owning daemon handles lifecycle.
+					if session.PID == 0 && len(session.Channels) > 0 {
+						continue
+					}
+
 					if session.PID == 0 || !process.IsProcessAlive(session.PID) {
 						c.ulog.Warn("Session process died unexpectedly").
 							Field("job_id", session.ID).
