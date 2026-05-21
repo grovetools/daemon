@@ -441,7 +441,7 @@ func newGrovedStartCmd() *cobra.Command {
 			// Declared at outer scope so the shutdown goroutine can call Stop().
 			var chMgr *daemonchannels.Manager
 			notifyCfg := notifyconfig.Load()
-			if notifyCfg.Signal.Enabled {
+			if notifyCfg.Signal.Enabled || notifyCfg.HomeAssistant.Enabled {
 				chMgr = daemonchannels.NewManager(st, daemonchannels.SignalConfig{
 					Enabled:     notifyCfg.Signal.Enabled,
 					CLIPath:     notifyCfg.Signal.CLIPath,
@@ -450,6 +450,13 @@ func newGrovedStartCmd() *cobra.Command {
 					Groups:      notifyCfg.Signal.Groups,
 					Contacts:    notifyCfg.Signal.ContactsFlat(),
 					NamedGroups: notifyCfg.Signal.NamedGroupsFlat(),
+				}, daemonchannels.HAConfig{
+					Enabled:          notifyCfg.HomeAssistant.Enabled,
+					WebhookPort:      notifyCfg.HomeAssistant.WebhookPort,
+					WebhookSecret:    notifyCfg.HomeAssistant.WebhookSecret,
+					URL:              notifyCfg.HomeAssistant.URL,
+					Token:            notifyCfg.HomeAssistant.Token,
+					DefaultSatellite: notifyCfg.HomeAssistant.DefaultSatellite,
 				}, scope, sockPath)
 				chMgr.SendInput = sendInputToSession
 				// Scoped daemons proxy outbound sends to the global daemon
@@ -460,7 +467,9 @@ func newGrovedStartCmd() *cobra.Command {
 				}
 				chMgr.Start(ctx)
 				srv.SetChannelManager(chMgr)
-				ulog.Info("Channel manager initialized (signal enabled)").
+				ulog.Info("Channel manager initialized").
+					Field("signal", notifyCfg.Signal.Enabled).
+					Field("ha", notifyCfg.HomeAssistant.Enabled).
 					Field("scope", scope).
 					Field("proxy_mode", scope != "").
 					Log(ctx)

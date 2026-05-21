@@ -22,6 +22,7 @@ import (
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/notify/pkg/channels"
+	"github.com/grovetools/notify/pkg/channels/ha"
 	"github.com/grovetools/notify/pkg/channels/signal"
 )
 
@@ -34,6 +35,16 @@ type SignalConfig struct {
 	Groups      []string
 	Contacts    map[string]string
 	NamedGroups map[string]string
+}
+
+// HAConfig holds the configuration needed to create a Home Assistant channel.
+type HAConfig struct {
+	Enabled          bool
+	WebhookPort      int
+	WebhookSecret    string
+	URL              string
+	Token            string
+	DefaultSatellite string
 }
 
 func (cfg *SignalConfig) ResolveTarget(name string) (id string, isGroup bool) {
@@ -52,7 +63,10 @@ type Manager struct {
 	store          *store.Store
 	signalCfg      SignalConfig
 	signalChannel  channels.Channel
+	haCfg          HAConfig
+	haChannel      *ha.Channel
 	activeSessions map[string]bool  // jobID → true for sessions with signal enabled
+	haActiveSess   map[string]bool  // jobID → true for sessions with ha enabled
 	routeTable     map[int64]string // signal timestamp → jobID
 	ready          chan struct{}    // closed when signal-cli is ready
 	isRunning      bool
@@ -85,13 +99,15 @@ type Manager struct {
 // NewManager creates a new ChannelManager. scope is the daemon's scope
 // ("" for the global daemon); socketPath is this daemon's own socket path
 // (used by scoped daemons to register inbound routes in routing.json).
-func NewManager(st *store.Store, cfg SignalConfig, scope, socketPath string) *Manager {
+func NewManager(st *store.Store, cfg SignalConfig, haCfg HAConfig, scope, socketPath string) *Manager {
 	return &Manager{
 		store:          st,
 		signalCfg:      cfg,
+		haCfg:          haCfg,
 		scope:          scope,
 		socketPath:     socketPath,
 		activeSessions: make(map[string]bool),
+		haActiveSess:   make(map[string]bool),
 		routeTable:     make(map[int64]string),
 		ulog:           logging.NewUnifiedLogger("groved.channels"),
 	}
@@ -145,6 +161,27 @@ func (m *Manager) Start(ctx context.Context) {
 			m.isRunning = true
 			m.ready = make(chan struct{})
 			go m.startSignalChannel(m.ctx)
+		}
+		m.mu.Unlock()
+	}
+
+	// Start HA channel if enabled (HA is always local, no proxy mode)
+	if m.haCfg.Enabled {
+		m.mu.Lock()
+		haCh := ha.NewChannel(ha.Config{
+			WebhookPort:      m.haCfg.WebhookPort,
+			WebhookSecret:    m.haCfg.WebhookSecret,
+			HAURL:            m.haCfg.URL,
+			HAToken:          m.haCfg.Token,
+			DefaultSatellite: m.haCfg.DefaultSatellite,
+		})
+		if err := haCh.Start(m.ctx, m.handleHAInbound); err != nil {
+			m.ulog.Error("Failed to start HA channel").Err(err).Log(m.ctx)
+		} else {
+			m.haChannel = haCh
+			m.ulog.Info("HA channel started").
+				Field("webhook_port", m.haCfg.WebhookPort).
+				Log(m.ctx)
 		}
 		m.mu.Unlock()
 	}
@@ -290,14 +327,41 @@ func (m *Manager) Stop(ctx context.Context) {
 		m.isRunning = false
 	}
 
+	if m.haChannel != nil {
+		_ = m.haChannel.Stop(ctx)
+		m.haChannel = nil
+	}
+
 	m.saveRoutes()
 	m.ulog.Info("Channel manager stopped").Log(ctx)
 }
 
-// EnableChannel enables a channel for a session. Starts signal-cli if needed.
-// On a scoped daemon (globalClient != nil) it registers this daemon's socket
-// in routing.json instead of spawning signal-cli locally.
-func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
+// EnableChannel enables channels for a session. channelNames selects which
+// channels to activate (e.g. ["signal"], ["ha"], ["signal","ha"]). An empty
+// or nil list defaults to ["signal"] for backwards compatibility.
+func (m *Manager) EnableChannel(_ context.Context, jobID string, channelNames ...string) error {
+	if len(channelNames) == 0 {
+		channelNames = []string{"signal"}
+	}
+
+	for _, ch := range channelNames {
+		switch ch {
+		case "signal":
+			if err := m.enableSignal(jobID); err != nil {
+				return err
+			}
+		case "ha":
+			if err := m.enableHA(jobID); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unknown channel %q", ch)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) enableSignal(jobID string) error {
 	m.mu.Lock()
 
 	if !m.signalCfg.Enabled {
@@ -309,6 +373,7 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 	isProxy := m.globalClient != nil
 
 	m.ulog.Info("EnableChannel invoked").
+		Field("channel", "signal").
 		Field("job_id", jobID).
 		Field("scope", m.scope).
 		Field("is_proxy", isProxy).
@@ -317,7 +382,7 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 	if !isProxy && !m.isRunning {
 		m.isRunning = true
 		m.ready = make(chan struct{})
-		go m.startSignalChannel(m.ctx) // Use manager's long-lived context, not request context
+		go m.startSignalChannel(m.ctx)
 	}
 	m.mu.Unlock()
 
@@ -327,7 +392,21 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string) error {
 		}
 	}
 
-	m.ulog.Info("Channel enabled for session").Field("job_id", jobID).Log(m.ctx)
+	m.ulog.Info("Channel enabled for session").Field("channel", "signal").Field("job_id", jobID).Log(m.ctx)
+	return nil
+}
+
+func (m *Manager) enableHA(jobID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.haCfg.Enabled {
+		return fmt.Errorf("home_assistant is not enabled in configuration")
+	}
+
+	m.haActiveSess[jobID] = true
+
+	m.ulog.Info("HA channel enabled for session").Field("job_id", jobID).Log(m.ctx)
 	return nil
 }
 
@@ -345,6 +424,7 @@ func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
 
 	m.mu.Lock()
 	delete(m.activeSessions, jobID)
+	delete(m.haActiveSess, jobID)
 	m.mu.Unlock()
 
 	// Remove inbound route unconditionally — on scoped daemons this clears
@@ -358,10 +438,14 @@ func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
 	m.removeSessionDelivery(jobID)
 }
 
-// Send sends a message via the signal channel and records the route.
-// On scoped daemons (globalClient != nil), this is forwarded to the global
-// daemon which owns signal-cli.
+// Send sends a message via the appropriate channel and records the route.
+// On scoped daemons (globalClient != nil), signal sends are forwarded to the
+// global daemon which owns signal-cli. HA sends are always local.
 func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*models.ChannelSendResponse, error) {
+	if req.Channel == "ha" {
+		return m.sendHA(ctx, req)
+	}
+
 	m.mu.Lock()
 	gc := m.globalClient
 	ch := m.signalChannel
@@ -395,9 +479,24 @@ func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*mod
 		logging.NewUnifiedLogger("groved.channels.send").Info("resolving target").
 			Field("job_id", req.JobID).
 			Field("session_found", session != nil).
-			Field("signal_target", func() string { if session != nil { return session.SignalTarget }; return "" }()).
-			Field("last_sender", func() string { if session != nil { return session.LastSender }; return "" }()).
-			Field("last_sender_group", func() string { if session != nil { return session.LastSenderGroup }; return "" }()).
+			Field("signal_target", func() string {
+				if session != nil {
+					return session.SignalTarget
+				}
+				return ""
+			}()).
+			Field("last_sender", func() string {
+				if session != nil {
+					return session.LastSender
+				}
+				return ""
+			}()).
+			Field("last_sender_group", func() string {
+				if session != nil {
+					return session.LastSenderGroup
+				}
+				return ""
+			}()).
 			Field("configured_groups", len(m.signalCfg.Groups)).
 			StructuredOnly().Log(ctx)
 		if session != nil && session.SignalTarget != "" {
@@ -457,6 +556,70 @@ func (m *Manager) Send(ctx context.Context, req models.ChannelSendRequest) (*mod
 		Timestamp: result.Timestamp,
 		Status:    "sent",
 	}, nil
+}
+
+func (m *Manager) sendHA(ctx context.Context, req models.ChannelSendRequest) (*models.ChannelSendResponse, error) {
+	m.mu.Lock()
+	ch := m.haChannel
+	m.mu.Unlock()
+
+	if ch == nil {
+		return nil, fmt.Errorf("ha channel is not running")
+	}
+
+	result, err := ch.Send(ctx, channels.OutboundMessage{
+		Recipient: req.Recipient,
+		Message:   req.Message,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("ha send failed: %w", err)
+	}
+
+	return &models.ChannelSendResponse{
+		Timestamp: result.Timestamp,
+		Status:    "sent",
+	}, nil
+}
+
+// handleHAInbound routes an inbound HA webhook message to the right session.
+func (m *Manager) handleHAInbound(msg channels.InboundMessage) {
+	ctx := context.Background()
+
+	m.mu.Lock()
+	count := len(m.haActiveSess)
+
+	if count == 0 {
+		m.mu.Unlock()
+		m.ulog.Warn("HA inbound dropped — no active HA sessions").Log(ctx)
+		return
+	}
+
+	var targetJobID string
+	if count == 1 {
+		for id := range m.haActiveSess {
+			targetJobID = id
+		}
+	}
+	m.mu.Unlock()
+
+	if targetJobID == "" {
+		m.ulog.Warn("HA inbound dropped — multiple active HA sessions").
+			Field("count", count).Log(ctx)
+		return
+	}
+
+	formatted := fmt.Sprintf("[via HA Voice from %s] %s", msg.Source, msg.Message)
+	m.ulog.Info("HA inbound routed").
+		Field("job_id", targetJobID).
+		Field("source", msg.Source).
+		Log(ctx)
+
+	if m.SendInput != nil {
+		if err := m.SendInput(ctx, targetJobID, formatted); err != nil {
+			m.ulog.Error("Failed to deliver HA inbound").Err(err).
+				Field("job_id", targetJobID).Log(ctx)
+		}
+	}
 }
 
 // recordInbound appends an inbound routing decision to the circular buffer.
@@ -952,10 +1115,10 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 						Field("outcome", payload.Outcome).
 						Field("is_terminal", isTerminal).
 						Field("has_session", session != nil).
-						Field("has_channels", session != nil && hasSignalChannel(session.Channels)).
+						Field("has_channels", session != nil && hasChannel(session.Channels)).
 						Log(ctx)
 
-					if session != nil && hasSignalChannel(session.Channels) && !isTerminal {
+					if session != nil && hasChannel(session.Channels) && !isTerminal {
 						m.ulog.Info("watchStoreUpdates: ignoring spurious session end").
 							Field("job_id", payload.JobID).
 							Log(ctx)
@@ -986,14 +1149,14 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 					continue
 				}
 				for _, job := range jobs {
-					if !hasSignalChannel(job.Channels) || m.isActive(job.ID) {
+					if !hasChannel(job.Channels) || m.isActive(job.ID) {
 						continue
 					}
 					// Only rehydrate channels for jobs that are actually running
 					if job.Status != "running" && job.Status != "idle" && job.Status != "pending_user" {
 						continue
 					}
-					if err := m.EnableChannel(ctx, job.ID); err == nil {
+					if err := m.EnableChannel(ctx, job.ID, job.Channels...); err == nil {
 						m.ulog.Info("Rehydrated channel from discovered job").
 							Field("job_id", job.ID).
 							Field("status", job.Status).
@@ -1005,9 +1168,9 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 	}
 }
 
-func hasSignalChannel(channels []string) bool {
-	for _, ch := range channels {
-		if ch == "signal" {
+func hasChannel(chList []string) bool {
+	for _, ch := range chList {
+		if ch == "signal" || ch == "ha" {
 			return true
 		}
 	}
@@ -1094,7 +1257,7 @@ func GetSessionDelivery(jobID string) *SessionDeliveryInfo {
 func (m *Manager) isActive(jobID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.activeSessions[jobID]
+	return m.activeSessions[jobID] || m.haActiveSess[jobID]
 }
 
 // backgroundPrune periodically prunes stale sessions instead of at boot.

@@ -714,7 +714,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 		// If channel manager is set, enable/disable channels
 		if s.channelManager != nil {
 			if len(req.Channels) > 0 {
-				if err := s.channelManager.EnableChannel(r.Context(), sessionID); err != nil {
+				if err := s.channelManager.EnableChannel(r.Context(), sessionID, req.Channels...); err != nil {
 					s.ulog.Error("Failed to enable channel").Err(err).Log(r.Context())
 				}
 			} else {
@@ -1112,13 +1112,11 @@ func (s *Server) handleSessionIntent(w http.ResponseWriter, r *http.Request) {
 
 	// If the intent includes channels, enable them in the channel manager
 	if s.channelManager != nil && len(intent.Channels) > 0 {
-		for range intent.Channels {
-			if err := s.channelManager.EnableChannel(r.Context(), intent.JobID); err != nil {
-				s.ulog.Warn("Failed to enable channel from intent").
-					Err(err).
-					Field("job_id", intent.JobID).
-					Log(r.Context())
-			}
+		if err := s.channelManager.EnableChannel(r.Context(), intent.JobID, intent.Channels...); err != nil {
+			s.ulog.Warn("Failed to enable channel from intent").
+				Err(err).
+				Field("job_id", intent.JobID).
+				Log(r.Context())
 		}
 	}
 
