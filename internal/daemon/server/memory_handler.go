@@ -172,19 +172,22 @@ func (s *Server) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 	}
 	searchCfg = memCfg.BuildSearchConfig(searchCfg, req.Scope, req.WorkspacePath)
 
-	// Embed the query if vector search is enabled.
+	// Embed the query if vector search is enabled. Without an embedder
+	// (e.g. no Gemini API key) semantic search is unavailable, so degrade
+	// to FTS-only instead of erroring.
 	var queryEmb []float32
 	if searchCfg.UseVector {
 		if s.memEmbedder == nil {
-			http.Error(w, "embedder not initialized", http.StatusServiceUnavailable)
-			return
+			searchCfg.UseVector = false
+			searchCfg.UseFTS = true
+		} else {
+			emb, err := s.memEmbedder.EmbedQuery(r.Context(), req.Query)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("failed to embed query: %v", err), http.StatusInternalServerError)
+				return
+			}
+			queryEmb = emb
 		}
-		emb, err := s.memEmbedder.EmbedQuery(r.Context(), req.Query)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to embed query: %v", err), http.StatusInternalServerError)
-			return
-		}
-		queryEmb = emb
 	}
 
 	results, err := s.memStore.Search(r.Context(), req.Query, queryEmb, searchCfg)
