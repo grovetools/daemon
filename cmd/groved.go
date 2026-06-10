@@ -629,22 +629,29 @@ func newGrovedStartCmd() *cobra.Command {
 						if err != nil {
 							ulog.Warn("Failed to initialize memory store, indexing disabled").Err(err).Log(ctx)
 						} else {
+							// The embedder is optional: without a Gemini client the
+							// memory store still indexes and serves FTS (keyword)
+							// search; only semantic (vector) search is unavailable.
 							// Use grove-gemini's config resolver (secrets.toml, env var, api_key_command)
+							var embedder *memory.Embedder
 							geminiClient, err := gemini.NewClient(ctx, "")
 							if err != nil {
-								ulog.Warn("Failed to initialize Gemini client, memory indexing disabled").Err(err).Log(ctx)
+								ulog.Warn("Failed to initialize Gemini client, memory will run without semantic search").Err(err).Log(ctx)
 							} else {
-								embedder := memory.NewEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
-
-								memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
-								unifiedWatcher.Register(memoryHandler)
-								ulog.Info("Memory handler registered with unified watcher").Log(ctx)
-
-								// Share the same store + embedder with the HTTP server so
-								// /api/memory/* handlers can serve TUI clients without
-								// opening a second SQLite connection.
-								srv.SetMemoryStore(memStore, embedder, dbPath)
+								embedder = memory.NewEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
 							}
+
+							memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
+							unifiedWatcher.Register(memoryHandler)
+							ulog.Info("Memory handler registered with unified watcher").
+								Field("fts_enabled", true).
+								Field("semantic_available", embedder != nil).
+								Log(ctx)
+
+							// Share the same store + embedder (possibly nil) with the
+							// HTTP server so /api/memory/* handlers can serve TUI
+							// clients without opening a second SQLite connection.
+							srv.SetMemoryStore(memStore, embedder, dbPath)
 						}
 					}
 				}

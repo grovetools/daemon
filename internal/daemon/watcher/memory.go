@@ -606,8 +606,11 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 		}
 	}
 
+	// Without an embedder (e.g. no Gemini API key), index chunks with empty
+	// embeddings: they remain FTS-searchable and vectors can be backfilled
+	// once an embedder is configured.
 	var newEmbeddings [][]float32
-	if len(textsToEmbed) > 0 {
+	if len(textsToEmbed) > 0 && h.embedder != nil {
 		if err := h.limiter.Wait(ctx); err != nil {
 			h.ulog.Debug("Rate limiter cancelled").Err(err).Field("path", job.Path).Log(ctx)
 			return
@@ -638,7 +641,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 		var emb []float32
 		if existing, ok := existingEmbeddings[hash]; ok {
 			emb = existing
-		} else {
+		} else if newEmbIdx < len(newEmbeddings) {
 			emb = newEmbeddings[newEmbIdx]
 			newEmbIdx++
 		}
@@ -669,7 +672,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 		_ = h.memStore.LogAudit(ctx, "upsert", job.Path, map[string]any{
 			"doc_type":       docType,
 			"chunks":         len(chunks),
-			"new_embeddings": len(textsToEmbed),
+			"new_embeddings": len(newEmbeddings),
 			"reused":         len(chunks) - len(textsToEmbed),
 		})
 		h.broadcastMemoryEvent("upsert", job.Path)
