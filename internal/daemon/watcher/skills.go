@@ -369,7 +369,7 @@ func (h *SkillHandler) triggerSync(changedSkills map[string]struct{}) {
 
 		// Use the resolver to check if any of the changed skills are anywhere
 		// in the transitive graph. A single resolve covers the whole batch.
-		resolved, err := skills.ResolveConfiguredSkills(h.svc, node, skillsCfg)
+		resolved, _, err := skills.ResolveConfiguredSkills(h.svc, node, skillsCfg)
 		if err != nil {
 			h.ulog.Debug("Best effort resolving skills failed").Err(err).Log(ctx)
 		}
