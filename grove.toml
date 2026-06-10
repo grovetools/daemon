@@ -1,4 +1,5 @@
 name = "daemon"
+managed = true
 description = "Grove ecosystem background daemon"
 
 [binary]
