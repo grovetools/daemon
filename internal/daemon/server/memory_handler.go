@@ -306,8 +306,9 @@ func (s *Server) handleMemoryStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out := models.MemoryStatusResponse{
-		DBPath:   s.memDBPath,
-		DocTypes: map[string]int{},
+		DBPath:                  s.memDBPath,
+		DocTypes:                map[string]int{},
+		SemanticSearchAvailable: s.memEmbedder != nil,
 	}
 	if docs, ok := stats["documents"].(int); ok {
 		out.Documents = docs
