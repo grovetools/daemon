@@ -70,7 +70,7 @@ func (h *WorkspaceHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorksp
 		}
 	}
 
-	// 2. Watch every project's root and .grove-worktrees directory
+	// 2. Watch every project's root and its existing worktree bases
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
 		if node == nil {
@@ -78,9 +78,10 @@ func (h *WorkspaceHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorksp
 		}
 
 		newWatches[node.Path] = true
-		wtDir := filepath.Join(node.Path, ".grove-worktrees")
-		if _, err := os.Stat(wtDir); err == nil {
-			newWatches[wtDir] = true
+		for _, wtDir := range workspace.WorktreeBases(node.Path) {
+			if _, err := os.Stat(wtDir); err == nil {
+				newWatches[wtDir] = true
+			}
 		}
 	}
 

@@ -322,9 +322,15 @@ func endpointName(url string) string {
 
 func detectOrphans(ecosystemRoot string, worktrees []*workspace.WorkspaceNode) []Orphan {
 	orphans := []Orphan{}
-	pattern := filepath.Join(ecosystemRoot, ".grove-worktrees", "*", ".grove", "env", "state.json")
-	matches, err := filepath.Glob(pattern)
-	if err != nil || len(matches) == 0 {
+	var matches []string
+	for _, base := range workspace.WorktreeBases(ecosystemRoot) {
+		ms, err := filepath.Glob(filepath.Join(base, "*", ".grove", "env", "state.json"))
+		if err != nil {
+			continue
+		}
+		matches = append(matches, ms...)
+	}
+	if len(matches) == 0 {
 		return orphans
 	}
 	known := map[string]struct{}{}
