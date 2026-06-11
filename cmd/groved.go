@@ -360,6 +360,9 @@ func newGrovedStartCmd() *cobra.Command {
 				persister := jobrunner.NewPersistenceWithDir(persistDir)
 
 				jr = jobrunner.New(st, localRuntime, workers, persister)
+
+			// PHASE 2: Adopt running agents from previous daemon instance
+			jr.AdoptRunningAgents(ctx)
 				go jr.Start(ctx)
 				ulog.Info("JobRunner started").Field("workers", workers).Log(ctx)
 			}
@@ -496,6 +499,9 @@ func newGrovedStartCmd() *cobra.Command {
 			// 5. Handle Signals + auto-shutdown
 			stop := make(chan os.Signal, 1)
 			signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+			drain := make(chan os.Signal, 1)
+			// PHASE 2: Listen for SIGUSR1 to trigger drain mode (zero-downtime upgrade)
+			signal.Notify(drain, syscall.SIGUSR1)
 
 			// 5.1 If paired to a parent PID, watch for its death and trigger
 			// the same graceful shutdown pathway as a SIGTERM. This pipes
@@ -548,6 +554,14 @@ func newGrovedStartCmd() *cobra.Command {
 				// Explicitly release pidfile before exit in signal handler
 				_ = pidfile.Release(pidPath)
 				os.Exit(0)
+			}()
+
+			// PHASE 2: Handle SIGUSR1 for graceful drain (zero-downtime upgrade)
+			go func() {
+				bgCtx := context.Background()
+				<-drain
+				ulog.Info("Received SIGUSR1 - entering drain mode").Log(bgCtx)
+				srv.EnterDrainMode(bgCtx)
 			}()
 
 			// 5.5. Start inline monitor early so it captures all events from boot

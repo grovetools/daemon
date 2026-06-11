@@ -302,6 +302,22 @@ func (ls *LogStreamer) NotifyJobDetached(jobID string) {
 	ls.closeSubscribers(stream)
 }
 
+// NotifyDraining closes all SSE subscriber channels for all active streams.
+// PHASE 2: Called when entering drain mode so SSE clients reconnect to the new daemon.
+func (ls *LogStreamer) NotifyDraining() {
+	ls.mu.Lock()
+	streams := make([]*JobStream, 0, len(ls.streams))
+	for _, stream := range ls.streams {
+		streams = append(streams, stream)
+	}
+	ls.mu.Unlock()
+
+	for _, stream := range streams {
+		ls.closeSubscribers(stream)
+	}
+	ls.ulog.Info("NotifyDraining: closed all SSE subscribers").Log(context.Background())
+}
+
 // broadcastStatus sends a status event to all subscribers.
 func (ls *LogStreamer) broadcastStatus(stream *JobStream, status, errMsg string) {
 	stream.mu.Lock()
