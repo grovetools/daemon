@@ -27,6 +27,10 @@ func main() {
 
 		// Interactive Agent Transcript Tests
 		DaemonInteractiveTranscriptScenario(),
+
+		// Notebook Sync Phase 2 Tests
+		SyncMergeScenario(),
+		SyncEditWinsOverDeleteScenario(),
 	}
 
 	// Execute the custom tend application with our scenarios

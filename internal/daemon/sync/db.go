@@ -468,3 +468,99 @@ func (d *DB) RemoveQuarantineOverride(workspace, path string) error {
 	}
 	return nil
 }
+
+// GetWorkspaceCursor retrieves the current pull cursor for a workspace.
+func (d *DB) GetWorkspaceCursor(workspace string) (int64, error) {
+	state, err := d.GetState(workspace)
+	if err != nil {
+		return 0, err
+	}
+	if state == nil {
+		return 0, nil
+	}
+	return state.Cursor, nil
+}
+
+// UpdateWorkspaceCursor updates the pull cursor for a workspace.
+func (d *DB) UpdateWorkspaceCursor(workspace string, cursor int64) error {
+	return d.SetCursor(workspace, cursor)
+}
+
+// InsertDocument inserts a new document into sync_documents.
+func (d *DB) InsertDocument(doc *Document) error {
+	_, err := d.db.Exec(
+		`INSERT INTO sync_documents (document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		doc.DocumentID, doc.Workspace, doc.Path, doc.ContentHash, doc.LastSyncedHash, doc.LastSyncedVersion, doc.BaseContent)
+	if err != nil {
+		return fmt.Errorf("failed to insert sync document %s: %w", doc.DocumentID, err)
+	}
+	return nil
+}
+
+// UpdateDocument updates an existing document in sync_documents.
+func (d *DB) UpdateDocument(doc *Document) error {
+	_, err := d.db.Exec(
+		`UPDATE sync_documents SET content_hash = ?, last_synced_hash = ?, last_synced_version = ?, base_content = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE document_id = ?`,
+		doc.ContentHash, doc.LastSyncedHash, doc.LastSyncedVersion, doc.BaseContent, doc.DocumentID)
+	if err != nil {
+		return fmt.Errorf("failed to update sync document %s: %w", doc.DocumentID, err)
+	}
+	return nil
+}
+
+// AdoptDocument records a server document in the local database, marking it as synced.
+// Used during snapshot reconciliation when local and remote hashes match.
+func (d *DB) AdoptDocument(workspace, path, documentID string, version int64, hash string) error {
+	_, err := d.db.Exec(
+		`UPDATE sync_documents SET document_id = ?, last_synced_version = ?, last_synced_hash = ?, content_hash = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE workspace = ? AND path = ?`,
+		documentID, version, hash, hash, workspace, path)
+	if err != nil {
+		return fmt.Errorf("failed to adopt document %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// InsertOutboxEntry inserts an outbox entry (alias for EnqueueOutbox).
+func (d *DB) InsertOutboxEntry(e *OutboxEntry) error {
+	_, err := d.EnqueueOutbox(e)
+	return err
+}
+
+// MovePrefix updates all documents under a prefix, renaming the directory.
+// For example, moving "plans/" to "archived/plans/" updates all docs under the prefix.
+func (d *DB) MovePrefix(workspace, oldPrefix, newPrefix string) error {
+	// Normalize prefixes to end with /
+	if len(oldPrefix) > 0 && oldPrefix[len(oldPrefix)-1] != '/' {
+		oldPrefix += "/"
+	}
+	if len(newPrefix) > 0 && newPrefix[len(newPrefix)-1] != '/' {
+		newPrefix += "/"
+	}
+
+	_, err := d.db.Exec(
+		`UPDATE sync_documents SET path = ? || SUBSTR(path, ?) WHERE workspace = ? AND path LIKE ?`,
+		newPrefix, len(oldPrefix)+1, workspace, oldPrefix+"%")
+	if err != nil {
+		return fmt.Errorf("failed to move prefix %s to %s: %w", oldPrefix, newPrefix, err)
+	}
+	return nil
+}
+
+// DeletePrefix removes all documents under a path prefix.
+func (d *DB) DeletePrefix(workspace, prefix string) error {
+	// Normalize prefix to end with /
+	if len(prefix) > 0 && prefix[len(prefix)-1] != '/' {
+		prefix += "/"
+	}
+
+	_, err := d.db.Exec(
+		`DELETE FROM sync_documents WHERE workspace = ? AND (path = ? OR path LIKE ?)`,
+		workspace, prefix[:len(prefix)-1], prefix+"%")
+	if err != nil {
+		return fmt.Errorf("failed to delete prefix %s: %w", prefix, err)
+	}
+	return nil
+}
