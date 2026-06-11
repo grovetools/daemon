@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	coreenv "github.com/grovetools/core/pkg/env"
+	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/workspace"
 )
 
@@ -379,6 +380,62 @@ func TestRestore_FindsDeeplyNestedStateFiles(t *testing.T) {
 	}
 	if re.Ports["api"] != 51234 {
 		t.Errorf("Ports[api] = %d, want 51234", re.Ports["api"])
+	}
+	if re.StateDir != stateDir {
+		t.Errorf("StateDir = %q, want %q", re.StateDir, stateDir)
+	}
+}
+
+// TestRestore_FindsXDGShapedStateFile verifies that Restore discovers the
+// env state.json of an XDG-located worktree when handed the XDG worktree
+// base (paths.WorktreesDir()) — exactly what envBasePathsFromConfig appends
+// to the boot base-path list in Phase 4. Without that base, port
+// reservations and proxy routes for XDG envs would be lost across daemon
+// restarts. The layout mirrors what flow creates:
+// WorktreesDir()/<DirIdentifier(ecoRoot)>/<name>/.grove/env/state.json.
+func TestRestore_FindsXDGShapedStateFile(t *testing.T) {
+	// Sandbox XDG so WorktreesDir() resolves inside the test tmp dir, not the
+	// real ~/.local/share/grove. GROVE_HOME must be cleared — it beats
+	// XDG_DATA_HOME in paths.getDataHome().
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	t.Setenv("GROVE_HOME", "")
+
+	ecoRoot := filepath.Join(t.TempDir(), "kitchen-env")
+	xdgBase := paths.WorktreesDir()
+	if xdgBase == "" {
+		t.Fatal("WorktreesDir() empty; XDG sandbox not applied")
+	}
+	wtPath := filepath.Join(xdgBase, workspace.DirIdentifier(ecoRoot), "tier1-x")
+	stateDir := filepath.Join(wtPath, ".grove", "env")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil { //nolint:gosec // G301: test dir
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	stateFile := coreenv.EnvStateFile{
+		Provider:      "docker",
+		WorkspaceName: "tier1-x",
+		WorkspacePath: wtPath,
+		Ports:         map[string]int{"api": 53400},
+		ProxyRoutes:   map[string]int{"tier1-x.grove.local": 53400},
+	}
+	data, _ := json.MarshalIndent(&stateFile, "", "  ")
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0o644); err != nil { //nolint:gosec // G306: test file
+		t.Fatalf("write: %v", err)
+	}
+
+	m := NewManager()
+	// Pass the XDG base, exactly as envBasePathsFromConfig would on boot.
+	m.Restore([]string{xdgBase})
+
+	re, ok := m.envs["tier1-x"]
+	if !ok {
+		t.Fatalf("expected tier1-x to be restored from XDG-shaped base %s", xdgBase)
+	}
+	if re.Provider != "docker" {
+		t.Errorf("provider = %q, want docker", re.Provider)
+	}
+	if re.Ports["api"] != 53400 {
+		t.Errorf("Ports[api] = %d, want 53400", re.Ports["api"])
 	}
 	if re.StateDir != stateDir {
 		t.Errorf("StateDir = %q, want %q", re.StateDir, stateDir)
