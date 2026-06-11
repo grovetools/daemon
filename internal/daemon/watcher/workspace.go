@@ -12,6 +12,7 @@ import (
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/sirupsen/logrus"
@@ -85,15 +86,25 @@ func (h *WorkspaceHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorksp
 		}
 	}
 
+	// 3. Watch the XDG worktree base itself. fsnotify is non-recursive, so
+	// this catches NEW identifier dirs appearing; per-identifier dirs come
+	// via WorktreeBases above once they exist (attached by the periodic
+	// refreshWatches tick).
+	if wtd := paths.WorktreesDir(); wtd != "" {
+		if _, err := os.Stat(wtd); err == nil {
+			newWatches[wtd] = true
+		}
+	}
+
 	h.pathsMutex.Lock()
 	h.watchedPaths = newWatches
 	h.pathsMutex.Unlock()
 
-	paths := make([]string, 0, len(newWatches))
+	watchList := make([]string, 0, len(newWatches))
 	for p := range newWatches {
-		paths = append(paths, p)
+		watchList = append(watchList, p)
 	}
-	return paths
+	return watchList
 }
 
 func (h *WorkspaceHandler) MatchesEvent(event fsnotify.Event) bool {

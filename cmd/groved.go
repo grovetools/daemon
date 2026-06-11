@@ -64,13 +64,15 @@ func configDebounceMs(cfg *config.Config) int {
 // manager should walk when restoring state on boot. Pulled from the
 // configured grove sources (cfg.Groves), with `~` / env-var expansion
 // applied so the daemon's WalkDir doesn't try to descend a literal "~"
-// directory. Disabled groves are skipped; duplicates are de-duplicated.
+// directory, plus the XDG worktree base so Manager.Restore finds the
+// state.json of XDG-located worktrees. Disabled groves are skipped;
+// duplicates are de-duplicated.
 func envBasePathsFromConfig(cfg *config.Config) []string {
 	if cfg == nil {
 		return nil
 	}
 	seen := make(map[string]bool)
-	paths := make([]string, 0, len(cfg.Groves))
+	roots := make([]string, 0, len(cfg.Groves)+1)
 	for _, src := range cfg.Groves {
 		if src.Enabled != nil && !*src.Enabled {
 			continue
@@ -86,9 +88,13 @@ func envBasePathsFromConfig(cfg *config.Config) []string {
 			continue
 		}
 		seen[abs] = true
-		paths = append(paths, abs)
+		roots = append(roots, abs)
 	}
-	return paths
+	if wtd := paths.WorktreesDir(); wtd != "" && !seen[wtd] {
+		seen[wtd] = true
+		roots = append(roots, wtd)
+	}
+	return roots
 }
 
 // NewGrovedCmd returns the groved daemon command with subcommands.
