@@ -81,6 +81,93 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// handleSyncAllow handles POST /api/sync/allow, which adds a workspace/path
+// to the quarantine override list, allowing it to sync despite secret pattern
+// matches. Request body: {"workspace": "...", "path": "..."}.
+func (s *Server) handleSyncAllow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Scoped daemons forward to global daemon
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		Workspace string `json:"workspace"`
+		Path      string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if req.Workspace == "" || req.Path == "" {
+		http.Error(w, "workspace and path are required", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.syncDB.SetQuarantineOverride(req.Workspace, req.Path); err != nil {
+		http.Error(w, fmt.Sprintf("failed to set quarantine override: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleSyncDisallowQuarantine handles DELETE /api/sync/allow, which removes
+// a workspace/path from the quarantine override list.
+func (s *Server) handleSyncDisallowQuarantine(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Scoped daemons forward to global daemon
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		Workspace string `json:"workspace"`
+		Path      string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if req.Workspace == "" || req.Path == "" {
+		http.Error(w, "workspace and path are required", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.syncDB.RemoveQuarantineOverride(req.Workspace, req.Path); err != nil {
+		http.Error(w, fmt.Sprintf("failed to remove quarantine override: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
 // forwardSyncToGlobal replays an /api/sync/* request against the global
 // daemon's unix socket. Unlike the memory proxy (typed core client methods),
 // sync forwarding is a raw HTTP relay so Phase 0 needs no core client
