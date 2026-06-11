@@ -124,10 +124,13 @@ func (jr *JobRunner) Start(ctx context.Context) {
 // yet satisfied, it is placed in the blocked queue and will be automatically
 // promoted when its dependencies reach a terminal state.
 func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*models.JobInfo, error) {
-	timeout := 30 * time.Minute
+	// Jobs run with no deadline unless the submitter sets an explicit,
+	// parseable timeout. Hung jobs are handled by cancellation, not a
+	// wall clock.
+	timeoutStr := ""
 	if req.Timeout != "" {
 		if d, err := time.ParseDuration(req.Timeout); err == nil {
-			timeout = d
+			timeoutStr = d.String()
 		}
 	}
 
@@ -139,7 +142,7 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 		PlanDir:     req.PlanDir,
 		JobFile:     req.JobFile,
 		Priority:    req.Priority,
-		TimeoutStr:  timeout.String(),
+		TimeoutStr:  timeoutStr,
 		Env:         req.Env,
 		AgentTarget: req.AgentTarget,
 		Status:      "queued",
@@ -326,14 +329,17 @@ func (jr *JobRunner) executeJob(ctx context.Context, info *models.JobInfo) {
 		}
 	}()
 
-	timeout := 30 * time.Minute
+	// No deadline by default — only an explicit per-job timeout creates one.
+	var jobCtx context.Context
+	var cancel context.CancelFunc
 	if info.TimeoutStr != "" {
-		if d, err := time.ParseDuration(info.TimeoutStr); err == nil {
-			timeout = d
+		if d, err := time.ParseDuration(info.TimeoutStr); err == nil && d > 0 {
+			jobCtx, cancel = context.WithTimeout(ctx, d)
 		}
 	}
-
-	jobCtx, cancel := context.WithTimeout(ctx, timeout)
+	if jobCtx == nil {
+		jobCtx, cancel = context.WithCancel(ctx)
+	}
 	defer cancel()
 
 	jr.mu.Lock()
