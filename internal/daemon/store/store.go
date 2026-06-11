@@ -489,7 +489,13 @@ func (s *Store) applyNoteEvent(event *models.NoteEvent) {
 			s.state.NoteIndex[event.Path] = event.IndexEntry
 		}
 	case models.NoteEventDeleted, models.NoteEventArchived:
+		// Typed archive events carry Path = new .archive location and
+		// PrevPath = original location; evict both so the source entry
+		// doesn't go stale. Legacy events (PrevPath empty) keep working.
 		delete(s.state.NoteIndex, event.Path)
+		if event.PrevPath != "" {
+			delete(s.state.NoteIndex, event.PrevPath)
+		}
 	case models.NoteEventMoved:
 		if event.PrevPath != "" {
 			delete(s.state.NoteIndex, event.PrevPath)
