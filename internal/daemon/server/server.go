@@ -25,6 +25,7 @@ import (
 	"github.com/grovetools/core/pkg/repo"
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/version"
 	"github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
@@ -306,6 +307,7 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/nav/locked-keys", s.handleNavLockedKeys)
 	mux.HandleFunc("/api/nav/last-accessed", s.handleNavLastAccessedGroup)
 	// System endpoints
+	mux.HandleFunc("/api/system/info", s.handleSystemInfo)
 	mux.HandleFunc("/api/system/treemux-status", s.handleTerminalStatus)
 	// Native agent pane relay endpoints
 	mux.HandleFunc("/api/agents/spawn", s.handleAgentSpawn)
@@ -1294,6 +1296,53 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 	}
 }
 
+// handleSystemInfo returns the daemon's version, commit, and build date.
+func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	info := models.SystemInfo{
+		Version:   version.Version,
+		Commit:    version.Commit,
+		BuildDate: version.BuildDate,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(info)
+}
+
+// checkJobSubmitWarnings detects unknown fields in a job submission request.
+// It returns a list of warnings about fields that will be ignored.
+func (s *Server) checkJobSubmitWarnings(bodyBytes []byte) []string {
+	var warnings []string
+
+	// Parse the raw JSON to get field names
+	var rawReq map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &rawReq); err != nil {
+		// If we can't parse raw JSON, skip warning generation
+		return warnings
+	}
+
+	// Known fields in JobSubmitRequest struct
+	knownFields := map[string]bool{
+		"plan_dir":     true,
+		"job_file":     true,
+		"priority":     true,
+		"timeout":      true,
+		"env":          true,
+		"agent_target": true,
+	}
+
+	// Check for unknown fields
+	for fieldName := range rawReq {
+		if !knownFields[fieldName] {
+			warnings = append(warnings, fmt.Sprintf("unknown field: %s (will be ignored)", fieldName))
+		}
+	}
+
+	return warnings
+}
+
 // handleTerminalStatus returns whether a groveterm instance is connected via WebSocket.
 func (s *Server) handleTerminalStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -1858,19 +1907,41 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
+		// Parse request and detect unknown fields for capability warnings
+		body := r.Body
+		var bodyBytes []byte
 		var req models.JobSubmitRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+
+		// Read body into a buffer so we can decode it twice
+		if data, err := io.ReadAll(body); err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		} else {
+			bodyBytes = data
+		}
+
+		if err := json.Unmarshal(bodyBytes, &req); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
+
+		// Check for unknown fields in the JSON
+		warnings := s.checkJobSubmitWarnings(bodyBytes)
+
 		info, err := s.jobRunner.Submit(r.Context(), req)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+
+		response := models.JobSubmitResponse{
+			JobInfo:  info,
+			Warnings: warnings,
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(info)
+		_ = json.NewEncoder(w).Encode(response)
 
 	case http.MethodGet:
 		statusFilter := r.URL.Query().Get("status")
