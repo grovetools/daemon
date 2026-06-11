@@ -275,3 +275,69 @@ func NewClientFromConfig(ctx context.Context, cfg *config.SyncConfig, deviceID, 
 
 	return client, nil
 }
+
+// PullEvents fetches a batch of events from the workspace event log, starting from the given cursor.
+// It uses long-polling if wait is set to > 0 seconds.
+func (c *Client) PullEvents(ctx context.Context, workspace string, cursor int64, limit int, wait time.Duration) (*syncproto.PullResponse, error) {
+	req := &syncproto.PullRequest{
+		Workspace: workspace,
+		Cursor:    cursor,
+		Limit:     limit,
+	}
+	if wait > 0 {
+		req.Wait = wait.String()
+	}
+
+	waitStr := ""
+	if wait > 0 {
+		waitStr = wait.String()
+	}
+	httpReq, err := c.newRequest(ctx, "GET", fmt.Sprintf("/sync/pull?workspace=%s&cursor=%d&limit=%d&wait=%s", workspace, cursor, limit, waitStr), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pull request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("pull request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("pull request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var pullResp syncproto.PullResponse
+	if err := json.NewDecoder(resp.Body).Decode(&pullResp); err != nil {
+		return nil, fmt.Errorf("failed to decode pull response: %w", err)
+	}
+
+	return &pullResp, nil
+}
+
+// FetchBlob fetches a blob by its SHA-256 hash.
+func (c *Client) FetchBlob(ctx context.Context, hash string) ([]byte, error) {
+	httpReq, err := c.newRequest(ctx, "GET", fmt.Sprintf("/sync/blob/%s", hash), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create blob fetch request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("blob fetch failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("blob fetch failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read blob content: %w", err)
+	}
+
+	return content, nil
+}

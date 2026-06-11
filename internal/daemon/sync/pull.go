@@ -5,8 +5,13 @@ package sync
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/syncproto"
 )
 
@@ -14,15 +19,15 @@ import (
 // and applying them to the local workspace. Pulling is gated by per-workspace
 // Pull configuration; workspaces with Pull=false get no pull pipeline.
 type PullPipeline struct {
-	ws       *SyncWorkspace
+	ws       *config.SyncWorkspace
 	client   *Client
 	db       *DB
-	log      Logger
+	log      *logging.UnifiedLogger
 	pollWait time.Duration
 }
 
 // NewPullPipeline creates a pull pipeline for a workspace.
-func NewPullPipeline(ws *SyncWorkspace, client *Client, db *DB, log Logger) *PullPipeline {
+func NewPullPipeline(ws *config.SyncWorkspace, client *Client, db *DB, log *logging.UnifiedLogger) *PullPipeline {
 	return &PullPipeline{
 		ws:       ws,
 		client:   client,
@@ -36,8 +41,8 @@ func NewPullPipeline(ws *SyncWorkspace, client *Client, db *DB, log Logger) *Pul
 // It uses long-polling to avoid busy-waiting. The loop respects workspace configuration
 // and stops when the context is cancelled.
 func (p *PullPipeline) RunPullLoop(ctx context.Context, workspaceRoot string) error {
-	p.log.Debug("pull loop starting", "workspace", p.ws.Name)
-	defer p.log.Debug("pull loop stopped", "workspace", p.ws.Name)
+	p.log.Debug("pull loop starting").Field("workspace", p.ws.Name).Log(ctx)
+	defer p.log.Debug("pull loop stopped").Field("workspace", p.ws.Name).Log(ctx)
 
 	// Get the current cursor for this workspace
 	cursor, err := p.db.GetWorkspaceCursor(p.ws.Name)
@@ -56,7 +61,7 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, workspaceRoot string) er
 		// Poll for new events from the server with long-polling
 		resp, err := p.client.PullEvents(ctx, p.ws.Name, cursor, 100, p.pollWait)
 		if err != nil {
-			p.log.Error("pull failed", "workspace", p.ws.Name, "error", err.Error())
+			p.log.Error("pull failed").Field("workspace", p.ws.Name).Err(err).Log(ctx)
 			// Back off and retry
 			select {
 			case <-time.After(5 * time.Second):
@@ -68,9 +73,9 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, workspaceRoot string) er
 
 		// Handle snapshot requirement (cursor too old, need resync)
 		if resp.SnapshotRequired {
-			p.log.Info("snapshot required, resyncing", "workspace", p.ws.Name)
+			p.log.Info("snapshot required, resyncing").Field("workspace", p.ws.Name).Log(ctx)
 			if err := p.snaphotResync(ctx, workspaceRoot); err != nil {
-				p.log.Error("snapshot resync failed", "workspace", p.ws.Name, "error", err.Error())
+				p.log.Error("snapshot resync failed").Field("workspace", p.ws.Name).Err(err).Log(ctx)
 				select {
 				case <-time.After(10 * time.Second):
 					continue
@@ -87,11 +92,12 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, workspaceRoot string) er
 		if len(resp.Events) > 0 {
 			for _, ev := range resp.Events {
 				if err := p.applyEvent(ctx, workspaceRoot, &ev); err != nil {
-					p.log.Error("failed to apply event",
-						"workspace", p.ws.Name,
-						"path", ev.Path,
-						"type", ev.Type,
-						"error", err.Error())
+					p.log.Error("failed to apply event").
+						Field("workspace", p.ws.Name).
+						Field("path", ev.Path).
+						Field("type", ev.Type).
+						Err(err).
+						Log(ctx)
 					// On apply error, we don't stop the loop — store the conflict
 					// and continue. The user will be notified via UpdateSyncConflict.
 				}
@@ -99,7 +105,7 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, workspaceRoot string) er
 			// Advance cursor
 			cursor = resp.Cursor
 			if err := p.db.UpdateWorkspaceCursor(p.ws.Name, cursor); err != nil {
-				p.log.Error("failed to update cursor", "workspace", p.ws.Name, "error", err.Error())
+				p.log.Error("failed to update cursor").Field("workspace", p.ws.Name).Err(err).Log(ctx)
 			}
 		}
 	}
@@ -108,14 +114,14 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, workspaceRoot string) er
 // snaphotResync fetches the manifest snapshot and reconciles it with local state.
 // Hash-equal files are adopted in place; divergent files are re-fetched.
 func (p *PullPipeline) snaphotResync(ctx context.Context, workspaceRoot string) error {
-	p.log.Debug("fetching snapshot manifest", "workspace", p.ws.Name)
+	p.log.Debug("fetching snapshot manifest").Field("workspace", p.ws.Name).Log(ctx)
 
 	manifest, err := p.client.Snapshot(ctx, p.ws.Name)
 	if err != nil {
 		return fmt.Errorf("snapshot fetch failed: %w", err)
 	}
 
-	p.log.Debug("snapshot received", "workspace", p.ws.Name, "documents", len(manifest.Documents))
+	p.log.Debug("snapshot received").Field("workspace", p.ws.Name).Field("documents", len(manifest.Documents)).Log(ctx)
 
 	// Reconcile: for each document in the manifest, check if we have a hash match
 	for _, doc := range manifest.Documents {
@@ -123,13 +129,13 @@ func (p *PullPipeline) snaphotResync(ctx context.Context, workspaceRoot string) 
 
 		if localDoc != nil && localDoc.ContentHash == doc.Hash {
 			// Hash match: adopt the server UUID and version in place
-			p.log.Debug("adopting hash-equal document", "path", doc.Path)
+			p.log.Debug("adopting hash-equal document").Field("path", doc.Path).Log(ctx)
 			if err := p.db.AdoptDocument(p.ws.Name, doc.Path, doc.ID, doc.Version, doc.Hash); err != nil {
-				p.log.Error("failed to adopt document", "path", doc.Path, "error", err.Error())
+				p.log.Error("failed to adopt document").Field("path", doc.Path).Err(err).Log(ctx)
 			}
 		} else {
 			// Hash mismatch or new document: will be fetched on the next pull via events
-			p.log.Debug("document differs from manifest, will pull separately", "path", doc.Path)
+			p.log.Debug("document differs from manifest, will pull separately").Field("path", doc.Path).Log(ctx)
 		}
 	}
 
@@ -182,11 +188,10 @@ func (p *PullPipeline) applyCreate(ctx context.Context, workspaceRoot string, ev
 
 	// Record in sync DB
 	doc := &Document{
-		DocumentID:    ev.DocumentID,
-		WorkspaceName: p.ws.Name,
-		Path:          ev.Path,
-		Version:       ev.Version,
-		ContentHash:   ev.ContentHash,
+		DocumentID:        ev.DocumentID,
+		Workspace:         p.ws.Name,
+		Path:              ev.Path,
+		ContentHash:       ev.ContentHash,
 		LastSyncedVersion: ev.Version,
 		LastSyncedHash:    ev.ContentHash,
 		BaseContent:       content,
@@ -195,7 +200,7 @@ func (p *PullPipeline) applyCreate(ctx context.Context, workspaceRoot string, ev
 		return fmt.Errorf("failed to record document: %w", err)
 	}
 
-	p.log.Debug("created document", "path", ev.Path, "id", ev.DocumentID)
+	p.log.Debug("created document").Field("path", ev.Path).Field("id", ev.DocumentID).Log(ctx)
 	return nil
 }
 
@@ -233,7 +238,6 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, workspaceRoot string, ev
 			return fmt.Errorf("failed to write file: %w", err)
 		}
 		doc.ContentHash = ev.ContentHash
-		doc.Version = ev.Version
 		doc.LastSyncedVersion = ev.Version
 		doc.LastSyncedHash = ev.ContentHash
 		doc.BaseContent = content
@@ -255,8 +259,8 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, workspaceRoot string, ev
 
 	if !bytesEqual(baseBody, remoteBody) && !bytesEqual(baseBody, localBody) && !bytesEqual(localBody, remoteBody) {
 		// Both local and remote changed the body: CONFLICT
-		p.log.Info("merge conflict detected", "path", ev.Path)
-		if err := p.recordConflict(workspaceRoot, ev.Path, ev.DocumentID, localContent); err != nil {
+		p.log.Info("merge conflict detected").Field("path", ev.Path).Log(ctx)
+		if err := p.recordConflict(ctx, workspaceRoot, ev.Path, ev.DocumentID, localContent); err != nil {
 			return fmt.Errorf("failed to record conflict: %w", err)
 		}
 		// TODO: emit UpdateSyncConflict SSE
@@ -270,7 +274,6 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, workspaceRoot string, ev
 	}
 
 	doc.ContentHash = ev.ContentHash
-	doc.Version = ev.Version
 	doc.LastSyncedVersion = ev.Version
 	doc.LastSyncedHash = ev.ContentHash
 	doc.BaseContent = content
@@ -295,9 +298,8 @@ func (p *PullPipeline) applyMove(ctx context.Context, workspaceRoot string, ev *
 	}
 
 	doc.Path = ev.Path
-	doc.Version = ev.Version
 	doc.LastSyncedVersion = ev.Version
-	return p.db.MoveDocument(p.ws.Name, ev.PrevPath, ev.Path, doc.Version)
+	return p.db.MoveDocument(doc.DocumentID, ev.Path)
 }
 
 // applyDelete removes a document, or marks it for revival if there are local unpushed edits.
@@ -316,24 +318,25 @@ func (p *PullPipeline) applyDelete(ctx context.Context, workspaceRoot string, ev
 	localContent, err := readFile(filePath)
 	if err != nil {
 		// File already deleted locally
-		return p.db.DeleteDocument(p.ws.Name, ev.Path)
+		return p.db.DeleteDocument(doc.DocumentID)
 	}
 
 	// Check for local edits: if local hash != base, this is edit-wins-over-delete
-	if hashContent(localContent) != doc.ContentHash {
-		p.log.Info("edit-wins-over-delete: local edits preserved",
-			"path", ev.Path, "id", doc.DocumentID)
+	if hashContent(localContent) != doc.LastSyncedHash {
+		p.log.Info("edit-wins-over-delete: local edits preserved").
+			Field("path", ev.Path).
+			Field("id", doc.DocumentID).
+			Log(ctx)
 
 		// Synthesize a document_updated event to push the local content back
 		hash := hashContent(localContent)
-		outboxEv := &SyncOutboxEntry{
+		outboxEv := &OutboxEntry{
 			DocumentID:  doc.DocumentID,
-			WorkspaceName: p.ws.Name,
+			Workspace:   p.ws.Name,
 			EventType:   syncproto.EventDocumentUpdated,
 			Path:        ev.Path,
 			ContentHash: hash,
-			BaseVersion: doc.LastSyncedVersion, // OCC guard: the version we're updating from
-			Payload:     localContent,
+			Payload:     string(localContent),
 		}
 		return p.db.InsertOutboxEntry(outboxEv)
 	}
@@ -344,7 +347,7 @@ func (p *PullPipeline) applyDelete(ctx context.Context, workspaceRoot string, ev
 		return fmt.Errorf("failed to delete file: %w", err)
 	}
 
-	return p.db.DeleteDocument(p.ws.Name, ev.Path)
+	return p.db.DeleteDocument(doc.DocumentID)
 }
 
 // applyPrefixMove moves a directory and updates all documents under it.
@@ -372,13 +375,27 @@ func (p *PullPipeline) applyPrefixDelete(ctx context.Context, workspaceRoot stri
 	return p.db.DeletePrefix(p.ws.Name, ev.Path)
 }
 
-// recordConflict writes a conflict artifact to disk.
-func (p *PullPipeline) recordConflict(workspaceRoot, path, docID string, localContent []byte) error {
-	// TODO: Write to ~/.local/state/grove/sync/conflicts/{workspace}/{path}.{uuid}.conflict.md
+// recordConflict writes a conflict artifact to disk at ~/.local/state/grove/sync/conflicts/.
+// Emits an UpdateSyncConflict SSE event for TUI display.
+func (p *PullPipeline) recordConflict(ctx context.Context, workspaceRoot, path, docID string, localContent []byte) error {
+	// Create conflicts directory: ~/.local/state/grove/sync/conflicts/{workspace}/
+	conflictDir := filepath.Join(paths.StateDir(), "sync", "conflicts", p.ws.Name)
+	if err := os.MkdirAll(conflictDir, 0o700); err != nil {
+		return fmt.Errorf("failed to create conflict directory: %w", err)
+	}
+
+	// Write conflict artifact: {path}.{uuid}.conflict.md
+	conflictFile := filepath.Join(conflictDir, fmt.Sprintf("%s.%s.conflict.md", path, docID))
+	if err := writeFile(conflictFile, localContent); err != nil {
+		return fmt.Errorf("failed to write conflict artifact: %w", err)
+	}
+
+	p.log.Info("conflict recorded").Field("workspace", p.ws.Name).Field("path", path).Field("artifact", conflictFile).Log(ctx)
+	// TODO: Emit store.UpdateSyncConflict SSE event
 	return nil
 }
 
 func (p *PullPipeline) joinPath(root, path string) string {
-	// TODO: Proper path joining with workspace normalization
-	return root + "/" + path
+	// Use filepath.Join for proper path handling across OS
+	return filepath.Join(root, filepath.FromSlash(path))
 }
