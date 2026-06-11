@@ -27,6 +27,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/grovetools/core/pkg/paths"
+	"github.com/grovetools/core/pkg/syncproto"
 	_ "github.com/mattn/go-sqlite3" // sqlite driver (same driver memory.db uses)
 )
 
@@ -68,6 +69,12 @@ CREATE TABLE IF NOT EXISTS sync_state (
 	cursor         INTEGER NOT NULL DEFAULT 0,
 	origin_id      TEXT NOT NULL DEFAULT '',
 	last_synced_at DATETIME
+);
+
+CREATE TABLE IF NOT EXISTS sync_quarantine_override (
+	workspace TEXT NOT NULL,
+	path      TEXT NOT NULL,
+	PRIMARY KEY (workspace, path)
 );
 `
 
@@ -392,6 +399,72 @@ func (d *DB) SetCursor(workspace string, cursor int64) error {
 		workspace, cursor, d.originID)
 	if err != nil {
 		return fmt.Errorf("failed to set sync cursor for %s: %w", workspace, err)
+	}
+	return nil
+}
+
+// SetDocumentVersion updates the version and last-synced hash for a document
+// after successful push. Used by the push pipeline to record server confirmations.
+func (d *DB) SetDocumentVersion(documentID string, version int64) error {
+	res, err := d.db.Exec(
+		`UPDATE sync_documents SET last_synced_version = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE document_id = ?`,
+		version, documentID)
+	if err != nil {
+		return fmt.Errorf("failed to set document version for %s: %w", documentID, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sync document %s not found", documentID)
+	}
+	return nil
+}
+
+// ToSyncEvent converts an OutboxEntry to a syncproto.SyncEvent for push,
+// reading the document content and populating the event fields.
+func (e *OutboxEntry) ToSyncEvent() syncproto.SyncEvent {
+	return syncproto.SyncEvent{
+		Type:        e.EventType,
+		Workspace:   e.Workspace,
+		DocumentID:  e.DocumentID,
+		Path:        e.Path,
+		PrevPath:    e.PrevPath,
+		ContentHash: e.ContentHash,
+		// Content, BaseVersion, and Size are populated by the caller
+	}
+}
+
+// IsQuarantineOverridden reports whether a workspace/path pair has been
+// explicitly overridden to allow syncing despite secret quarantine matches.
+func (d *DB) IsQuarantineOverridden(workspace, path string) (bool, error) {
+	var count int
+	err := d.db.QueryRow(
+		`SELECT COUNT(*) FROM sync_quarantine_override WHERE workspace = ? AND path = ?`,
+		workspace, path).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("failed to check quarantine override for %s/%s: %w", workspace, path, err)
+	}
+	return count > 0, nil
+}
+
+// SetQuarantineOverride adds a workspace/path to the quarantine override list,
+// allowing it to sync despite secret pattern matches.
+func (d *DB) SetQuarantineOverride(workspace, path string) error {
+	_, err := d.db.Exec(
+		`INSERT OR REPLACE INTO sync_quarantine_override (workspace, path) VALUES (?, ?)`,
+		workspace, path)
+	if err != nil {
+		return fmt.Errorf("failed to set quarantine override for %s/%s: %w", workspace, path, err)
+	}
+	return nil
+}
+
+// RemoveQuarantineOverride removes a workspace/path from the override list.
+func (d *DB) RemoveQuarantineOverride(workspace, path string) error {
+	_, err := d.db.Exec(
+		`DELETE FROM sync_quarantine_override WHERE workspace = ? AND path = ?`,
+		workspace, path)
+	if err != nil {
+		return fmt.Errorf("failed to remove quarantine override for %s/%s: %w", workspace, path, err)
 	}
 	return nil
 }

@@ -313,6 +313,8 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	// metadata; never expose it on the unauthenticated TCP listener).
 	// Scoped daemons proxy these to the global daemon, which owns sync.db.
 	mux.HandleFunc("/api/sync/status", unixOnly(s.handleSyncStatus))
+	mux.HandleFunc("/api/sync/allow", unixOnly(s.handleSyncAllow))
+	mux.HandleFunc("/api/sync/allow", unixOnly(s.handleSyncDisallowQuarantine)) // DELETE for removal
 	// Static web viewer files
 	mux.Handle("/web/treemux/", http.StripPrefix("/web/treemux/", daemonweb.TreemuxFileServer()))
 
