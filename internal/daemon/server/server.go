@@ -249,6 +249,12 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
 	mux.HandleFunc("/api/notes/index", s.handleNoteIndex)
 	mux.HandleFunc("/api/notes/event", s.handleNoteEvent)
+	// Workflow/subagent aggregation endpoints. Served on the 0600 unix
+	// socket only (defensive: workflow payloads carry transcript-derived
+	// content — prompts, last assistant messages — that must not be
+	// reachable via the unauthenticated localhost TCP listener).
+	mux.HandleFunc("/api/workflows/event", unixOnly(s.handleWorkflowEvent))
+	mux.HandleFunc("/api/workflows", unixOnly(s.handleGetWorkflows))
 	// Aggregated workspace log streaming
 	mux.HandleFunc("/api/logs/stream", s.handleStreamWorkspaceLogs)
 	// Environment management endpoints
@@ -1675,6 +1681,19 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 
 	// Native agent pane relay — pass-through to groveterm via SSE.
 	case store.UpdateSpawnAgentPane, store.UpdateAttachAgentPane, store.UpdateAgentInput, store.UpdateCaptureRequest:
+		return &apiStateUpdate{
+			UpdateType: string(u.Type),
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
+
+	// Workflow/subagent lifecycle updates — each keeps its DISTINCT
+	// update_type string (the job_* pattern, NOT the collapsed "session"
+	// pattern). Dropping a case here silently hides events from SSE
+	// consumers; the broadcast is lossy-by-design, so consumers treat
+	// these as triggers and reconcile via GET /api/workflows.
+	case store.UpdateWorkflowRunDiscovered, store.UpdateWorkflowAgentStarted,
+		store.UpdateWorkflowAgentCompleted, store.UpdateWorkflowRunStale:
 		return &apiStateUpdate{
 			UpdateType: string(u.Type),
 			Source:     u.Source,

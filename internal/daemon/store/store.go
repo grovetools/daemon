@@ -12,29 +12,35 @@ import (
 // Store is the in-memory state store for the daemon.
 // It is thread-safe and supports pub/sub for real-time updates.
 type Store struct {
-	mu             sync.RWMutex
-	state          *State
-	subscribers    map[chan Update]struct{}
-	focus          map[string]struct{} // Focused workspace paths for priority scanning
-	persister      *Persister
-	pendingRestore persistedState // Loaded from disk, applied when workspaces arrive
+	mu                sync.RWMutex
+	state             *State
+	subscribers       map[chan Update]struct{}
+	focus             map[string]struct{} // Focused workspace paths for priority scanning
+	persister         *Persister
+	workflowPersister *workflowPersister
+	pendingRestore    persistedState // Loaded from disk, applied when workspaces arrive
 }
 
-// New creates a new Store instance, loading any persisted task results from disk.
+// New creates a new Store instance, loading any persisted task results and
+// workflow events from disk.
 func New() *Store {
 	s := &Store{
 		state: &State{
-			Workspaces: make(map[string]*models.EnrichedWorkspace),
-			Sessions:   make(map[string]*models.Session),
-			Jobs:       make(map[string]*models.JobInfo),
-			NoteIndex:  make(map[string]*models.NoteIndexEntry),
-			Plans:      make(map[string][]*orchestration.Plan),
+			Workspaces:     make(map[string]*models.EnrichedWorkspace),
+			Sessions:       make(map[string]*models.Session),
+			Jobs:           make(map[string]*models.JobInfo),
+			NoteIndex:      make(map[string]*models.NoteIndexEntry),
+			Plans:          make(map[string][]*orchestration.Plan),
+			WorkflowRuns:   make(map[string]*models.WorkflowRunState),
+			AdhocSubagents: make(map[string]map[string]*models.Subagent),
 		},
-		subscribers: make(map[chan Update]struct{}),
-		focus:       make(map[string]struct{}),
-		persister:   newPersister(),
+		subscribers:       make(map[chan Update]struct{}),
+		focus:             make(map[string]struct{}),
+		persister:         newPersister(),
+		workflowPersister: newWorkflowPersister(),
 	}
 	s.loadPersistedResults()
+	s.loadPersistedWorkflowEvents()
 	return s
 }
 
@@ -309,6 +315,13 @@ func (s *Store) ApplyUpdate(u Update) {
 				s.state.Plans[dir] = plans
 			}
 		}
+
+	// Workflow/subagent lifecycle events (hooks + journal watcher).
+	case UpdateWorkflowRunDiscovered, UpdateWorkflowAgentStarted,
+		UpdateWorkflowAgentCompleted, UpdateWorkflowRunStale:
+		if payload, ok := u.Payload.(*WorkflowEventPayload); ok {
+			s.applyWorkflowEvent(payload, true)
+		}
 	}
 
 	// Broadcast to subscribers
@@ -362,7 +375,9 @@ func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload) {
 	session.PID = payload.PID
 	session.Status = "running"
 	session.LastActivity = time.Now()
-	// Note: TranscriptPath is not currently in models.Session but could be added
+	if payload.TranscriptPath != "" {
+		session.TranscriptPath = payload.TranscriptPath
+	}
 }
 
 // applySessionStatus updates the status of an active session.

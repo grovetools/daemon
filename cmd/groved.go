@@ -313,6 +313,9 @@ func newGrovedStartCmd() *cobra.Command {
 			if isEnabled("note") {
 				eng.Register(collector.NewNoteCollector(noteInterval))
 			}
+			if isEnabled("workflow") {
+				eng.Register(collector.NewWorkflowCollector(0))
+			}
 
 			// 3.5 Setup context early (needed by JobRunner and Engine)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -703,7 +706,7 @@ func newGrovedStartCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringSlice("collectors", []string{"all"}, "Comma-separated list of collectors to enable (git, session, workspace, plan, note)")
+	cmd.Flags().StringSlice("collectors", []string{"all"}, "Comma-separated list of collectors to enable (git, session, workspace, plan, note, workflow)")
 	cmd.Flags().Int("pprof-port", 0, "Port to start pprof server on (0 to disable)")
 	cmd.Flags().Int("http-port", 0, "Port to start HTTP server on for browser access (web terminal viewer, 0 to disable)")
 	cmd.Flags().Bool("monitor", false, "Stream daemon activity to stdout")
