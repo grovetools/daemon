@@ -18,6 +18,20 @@ type State struct {
 	// plan lists over the socket instead of hammering the filesystem
 	// every tick.
 	Plans map[string][]*orchestration.Plan `json:"plans,omitempty"`
+
+	// WorkflowRuns aggregates subagent/workflow lifecycle events into
+	// per-run snapshots, keyed by workflow run ID (the wf_* directory
+	// name). Fed by hook-forwarded events (POST /api/workflows/event) and
+	// the daemon's journal watcher; deduped by (RunID, AgentID).
+	WorkflowRuns map[string]*models.WorkflowRunState `json:"workflow_runs,omitempty"`
+
+	// AdhocSubagents holds run-less subagent records: ad-hoc Agent-tool
+	// spawns (which never get a workflow run) and workflow agents whose
+	// run attribution hasn't arrived yet (SubagentStart carries no run
+	// id; the journal supplies it later, at which point the record
+	// migrates into WorkflowRuns). Keyed by session key (job ID, falling
+	// back to claude session ID), then agent ID.
+	AdhocSubagents map[string]map[string]*models.Subagent `json:"adhoc_subagents,omitempty"`
 }
 
 // UpdateType defines what kind of data changed.
@@ -96,6 +110,16 @@ const (
 	UpdateAttachAgentPane UpdateType = "attach_agent_pane" // Payload: *AttachAgentPayload
 	UpdateAgentInput      UpdateType = "agent_input"       // Payload: *AgentInputPayload
 	UpdateCaptureRequest  UpdateType = "capture_request"   // Payload: *CaptureRequestPayload
+
+	// Workflow/subagent lifecycle update types. Each maps to a DISTINCT
+	// SSE update_type string in convertToAPIUpdate (mirroring the job_*
+	// lifecycle pattern, never the collapsed "session" pattern) — a
+	// missed wire layer makes events silently invisible to consumers.
+	// Payload: *WorkflowEventPayload.
+	UpdateWorkflowRunDiscovered  UpdateType = "workflow_run_discovered"
+	UpdateWorkflowAgentStarted   UpdateType = "workflow_agent_started"
+	UpdateWorkflowAgentCompleted UpdateType = "workflow_agent_completed"
+	UpdateWorkflowRunStale       UpdateType = "workflow_run_stale"
 )
 
 // MemoryIndexPayload describes a single memory store mutation for SSE subscribers.
