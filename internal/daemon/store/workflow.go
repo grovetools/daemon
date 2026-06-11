@@ -163,6 +163,11 @@ func (s *Store) ensureWorkflowRun(ev models.WorkflowEvent) *models.WorkflowRunSt
 	if run.ClaudeSessionID == "" {
 		run.ClaudeSessionID = ev.ClaudeSessionID
 	}
+	// Hook-supplied workflow name backfills; journal RunName still wins
+	// (run_discovered overwrites unconditionally above).
+	if run.Name == "" && ev.WorkflowName != "" {
+		run.Name = ev.WorkflowName
+	}
 	return run
 }
 
