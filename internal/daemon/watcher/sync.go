@@ -156,6 +156,14 @@ type SyncHandler struct {
 	timers    map[string]*time.Timer
 	firstSeen map[string]time.Time
 	timersMu  sync.Mutex
+
+	// Transport state: a shared server client plus per-workspace pipeline
+	// cancel funcs, spawned lazily once workspaces are discovered.
+	client      *syncdb.Client
+	clientMu    sync.RWMutex
+	pipelines   map[string]context.CancelFunc
+	pipelinesMu sync.Mutex
+	baseCtx     context.Context
 }
 
 // NewSyncHandler creates a SyncHandler. Callers gate construction on sync
@@ -181,6 +189,7 @@ func NewSyncHandler(st *store.Store, cfg *config.Config, syncCfg *config.SyncCon
 		maxWaitMs:    maxWaitMs,
 		timers:       make(map[string]*time.Timer),
 		firstSeen:    make(map[string]time.Time),
+		pipelines:    make(map[string]context.CancelFunc),
 	}
 }
 
@@ -255,6 +264,7 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 	h.pathsMutex.Lock()
 	h.watchedPaths = newWatches
 	h.pathsMutex.Unlock()
+	h.ensurePipelines()
 
 	paths := make([]string, 0, len(newWatches))
 	for p := range newWatches {
@@ -534,9 +544,101 @@ func (h *SyncHandler) handleNoteEvent(ctx context.Context, event *models.NoteEve
 }
 
 func (h *SyncHandler) OnStart(ctx context.Context) {
-	// Phase 0 captures live changes only; full-tree reconciliation is the
-	// Phase 1 snapshot/anti-entropy pass. No initial scan here keeps boot
-	// cheap and the handler behavior-neutral.
+	h.baseCtx = ctx
+	go h.transportLoop(ctx)
+}
+
+// transportLoop connects to the sync server (retrying quietly — sync stays
+// passive and the outbox accumulates until the server is reachable), then
+// keeps per-workspace pipelines in step with discovered workspaces.
+func (h *SyncHandler) transportLoop(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		h.clientMu.RLock()
+		ready := h.client != nil
+		h.clientMu.RUnlock()
+
+		if !ready {
+			h.syncCfgMu.RLock()
+			cfg := h.syncCfg
+			h.syncCfgMu.RUnlock()
+			if cfg != nil {
+				client, err := syncdb.NewClientFromConfig(ctx, cfg, "", h.db.OriginID(), "", h.ulog)
+				if err != nil {
+					h.ulog.Debug("sync server not reachable yet").Err(err).StructuredOnly().Log(ctx)
+				} else {
+					h.clientMu.Lock()
+					h.client = client
+					h.clientMu.Unlock()
+					h.ulog.Info("sync server connected").Field("server", cfg.Server).StructuredOnly().Log(ctx)
+				}
+			}
+		} else {
+			h.ensurePipelines()
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// ensurePipelines spawns push/pull/anti-entropy loops for any subscribed
+// workspace that has been discovered but has no running transport yet.
+// Idempotent; called on each transport tick and after watch-path updates.
+func (h *SyncHandler) ensurePipelines() {
+	h.clientMu.RLock()
+	client := h.client
+	h.clientMu.RUnlock()
+	if client == nil || h.baseCtx == nil {
+		return
+	}
+
+	// Unique workspace -> root from the current watch set.
+	roots := make(map[string]string)
+	h.pathsMutex.RLock()
+	for _, w := range h.watchedPaths {
+		roots[w.workspace] = w.root
+	}
+	h.pathsMutex.RUnlock()
+
+	for name, root := range roots {
+		h.pipelinesMu.Lock()
+		_, running := h.pipelines[name]
+		if running {
+			h.pipelinesMu.Unlock()
+			continue
+		}
+		pctx, cancel := context.WithCancel(h.baseCtx)
+		h.pipelines[name] = cancel
+		h.pipelinesMu.Unlock()
+
+		sub := h.subscription(name)
+
+		push := syncdb.NewPushPipeline(h.db, client, name, h.ulog, syncdb.PushConfig{})
+		go func(root string) { _ = push.RunPushLoop(pctx, root) }(root)
+
+		if sub != nil && sub.Pull {
+			pull := syncdb.NewPullPipeline(sub, client, h.db, h.ulog)
+			go func(root string) { _ = pull.RunPullLoop(pctx, root) }(root)
+		}
+
+		ae := syncdb.NewAntiEntropyPass(h.db, client, name, root, h.ulog, syncdb.AntiEntropyConfig{})
+		go func() {
+			// One immediate pass (initial reconciliation), then the loop.
+			_ = ae.Run(pctx)
+			_ = ae.RunAntiEntropyLoop(pctx)
+		}()
+
+		h.ulog.Info("sync transport started").
+			Field("workspace", name).
+			Field("pull", sub != nil && sub.Pull).
+			StructuredOnly().Log(pctx)
+	}
 }
 
 // broadcastConflict publishes an UpdateSyncConflict store update so SSE
