@@ -15,6 +15,9 @@ import (
 	"net/http"
 	"time"
 
+	"strconv"
+
+	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/paths"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
 )
@@ -205,4 +208,108 @@ func (s *Server) forwardSyncToGlobal(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// historyClient builds a sync client from the configured sync settings for
+// user-initiated history/restore proxying. Constructed per request — these
+// are rare, human-driven calls and the handshake doubles as a liveness check.
+func (s *Server) historyClient(ctx context.Context) (*syncdb.Client, error) {
+	cfg, err := config.LoadSyncConfig()
+	if err != nil || cfg == nil {
+		return nil, fmt.Errorf("sync is not configured")
+	}
+	return syncdb.NewClientFromConfig(ctx, cfg, "", s.syncDB.OriginID(), "", nil)
+}
+
+// handleSyncHistory handles GET /api/sync/history?workspace=W&path=P by
+// proxying to grove-syncd's /sync/history with the daemon-held token.
+func (s *Server) handleSyncHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	q := r.URL.Query()
+	workspace, path := q.Get("workspace"), q.Get("path")
+	if workspace == "" || path == "" {
+		http.Error(w, "workspace and path are required", http.StatusBadRequest)
+		return
+	}
+
+	client, err := s.historyClient(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	entries, err := client.History(r.Context(), workspace, path)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("history fetch failed: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(entries)
+}
+
+// handleSyncRestore handles GET /api/sync/restore?workspace=W&path=P&version=V.
+// The daemon resolves the document id from sync.db and returns the raw
+// historical content; the caller (nb) writes the file as a user-initiated
+// edit, which re-enters sync as a normal new head version.
+func (s *Server) handleSyncRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	q := r.URL.Query()
+	workspace, path, versionStr := q.Get("workspace"), q.Get("path"), q.Get("version")
+	if workspace == "" || path == "" || versionStr == "" {
+		http.Error(w, "workspace, path and version are required", http.StatusBadRequest)
+		return
+	}
+	version, err := strconv.ParseInt(versionStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid version", http.StatusBadRequest)
+		return
+	}
+
+	doc, err := s.syncDB.GetDocumentByPath(workspace, path)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("document lookup failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if doc == nil {
+		http.Error(w, "document is not tracked by sync", http.StatusNotFound)
+		return
+	}
+
+	client, err := s.historyClient(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	content, err := client.HistoryBlob(r.Context(), workspace, doc.DocumentID, version)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("restore fetch failed: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	_, _ = w.Write(content)
 }

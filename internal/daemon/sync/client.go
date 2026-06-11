@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"time"
 
 	"github.com/grovetools/core/config"
@@ -340,4 +341,69 @@ func (c *Client) FetchBlob(ctx context.Context, hash string) ([]byte, error) {
 	}
 
 	return content, nil
+}
+
+// HistoryEntry is one version row from the server's /sync/history endpoint.
+type HistoryEntry struct {
+	Seq        int64  `json:"seq"`
+	Version    int64  `json:"version"`
+	Actor      string `json:"actor"`
+	ReceivedAt string `json:"received_at"`
+}
+
+// History returns the descending version history for a document path.
+func (c *Client) History(ctx context.Context, workspace, path string) ([]HistoryEntry, error) {
+	u := fmt.Sprintf("%s/sync/history?workspace=%s&path=%s",
+		c.serverURL, neturl.QueryEscape(workspace), neturl.QueryEscape(path))
+
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create history request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("history request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("history request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var entries []HistoryEntry
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+		return nil, fmt.Errorf("failed to decode history response: %w", err)
+	}
+	return entries, nil
+}
+
+// HistoryBlob returns the raw content of a document at a specific version.
+func (c *Client) HistoryBlob(ctx context.Context, workspace, documentID string, version int64) ([]byte, error) {
+	u := fmt.Sprintf("%s/sync/history/blob?workspace=%s&document_id=%s&version=%d",
+		c.serverURL, neturl.QueryEscape(workspace), neturl.QueryEscape(documentID), version)
+
+	httpReq, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create history blob request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("history blob request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("version %d not found for document %s", version, documentID)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("history blob request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return io.ReadAll(resp.Body)
 }
