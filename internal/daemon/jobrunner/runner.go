@@ -596,11 +596,24 @@ func (jr *JobRunner) appendTranscriptAsync(info *models.JobInfo) {
 			return
 		}
 
-		// AppendAgentTranscript is idempotent and handles locking internally
+		// AppendAgentTranscript is idempotent; it splices the transcript
+		// section under the job-file lock via StatePersister.UpdateJobTranscript,
+		// so it is safe to call concurrently with flow-side writers.
 		if err := orchestration.AppendAgentTranscript(job, plan); err != nil {
 			jr.ulog.Warn("Failed to auto-append agent transcript").Err(err).Log(ctx)
 		} else {
 			jr.ulog.Debug("Auto-appended agent transcript").Field("job_id", job.ID).Log(ctx)
+		}
+
+		// Archive workflow run artifacts alongside the transcript:
+		// daemon-observed completions never pass through flow's CompleteJob
+		// or the headless executor, so without this call workflow runs from
+		// daemon-run jobs were silently lost. Idempotent overwrite;
+		// warn-and-continue like the transcript above.
+		if err := orchestration.ArchiveWorkflowRuns(job, plan); err != nil {
+			jr.ulog.Warn("Failed to archive workflow runs").Err(err).Log(ctx)
+		} else {
+			jr.ulog.Debug("Archived workflow runs").Field("job_id", job.ID).Log(ctx)
 		}
 	}()
 }

@@ -5,6 +5,7 @@ go 1.24.4
 require (
 	github.com/charmbracelet/wish v1.4.7
 	github.com/google/uuid v1.6.0
+	github.com/grovetools/agentlogs v0.0.1
 	github.com/grovetools/core v0.6.3
 	github.com/grovetools/flow v0.6.3
 	github.com/grovetools/tuimux v0.0.1
