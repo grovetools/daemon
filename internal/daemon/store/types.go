@@ -111,6 +111,12 @@ const (
 	UpdateAgentInput      UpdateType = "agent_input"       // Payload: *AgentInputPayload
 	UpdateCaptureRequest  UpdateType = "capture_request"   // Payload: *CaptureRequestPayload
 
+	// Sync lifecycle update — emitted by the SyncHandler watcher when a
+	// local document is quarantined (secret heuristics) or, in Phase 1+,
+	// when a pulled change conflicts with local edits.
+	// Payload: *SyncConflictPayload.
+	UpdateSyncConflict UpdateType = "sync_conflict"
+
 	// Workflow/subagent lifecycle update types. Each maps to a DISTINCT
 	// SSE update_type string in convertToAPIUpdate (mirroring the job_*
 	// lifecycle pattern, never the collapsed "session" pattern) — a
@@ -132,6 +138,17 @@ type MemoryIndexPayload struct {
 type MemoryReindexPayload struct {
 	Mode   string `json:"mode"`             // "stale", "all", "path"
 	Target string `json:"target,omitempty"` // File path (only for mode "path")
+}
+
+// SyncConflictPayload describes a sync conflict or quarantine event for SSE
+// subscribers. In Phase 0 only secret quarantine fires; pull conflicts
+// arrive with the Phase 1 sync server.
+type SyncConflictPayload struct {
+	Kind       string `json:"kind"` // "secret_quarantine" | "conflict"
+	Workspace  string `json:"workspace"`
+	Path       string `json:"path"` // slash-normalized workspace-relative path
+	DocumentID string `json:"document_id,omitempty"`
+	Detail     string `json:"detail,omitempty"`
 }
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation

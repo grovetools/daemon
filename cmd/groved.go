@@ -34,6 +34,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/server"
 	daemonssh "github.com/grovetools/daemon/internal/daemon/ssh"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/grove-gemini/pkg/gemini"
@@ -657,12 +658,12 @@ func newGrovedStartCmd() *cobra.Command {
 							// memory store still indexes and serves FTS (keyword)
 							// search; only semantic (vector) search is unavailable.
 							// Use grove-gemini's config resolver (secrets.toml, env var, api_key_command)
-							var embedder *memory.Embedder
+							var embedder memory.Embedder
 							geminiClient, err := gemini.NewClient(ctx, "")
 							if err != nil {
 								ulog.Warn("Failed to initialize Gemini client, memory will run without semantic search").Err(err).Log(ctx)
 							} else {
-								embedder = memory.NewEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
+								embedder = memory.NewGeminiEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
 							}
 
 							memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
@@ -676,6 +677,32 @@ func newGrovedStartCmd() *cobra.Command {
 							// HTTP server so /api/memory/* handlers can serve TUI
 							// clients without opening a second SQLite connection.
 							srv.SetMemoryStore(memStore, embedder, dbPath)
+						}
+					}
+				}
+
+				// Register SyncHandler for notebook sync change capture.
+				// DARK BY DEFAULT: it registers only when a sync config with
+				// workspace subscriptions exists (~/.config/grove/sync.toml),
+				// which Phase 0 ships no enable-path for — without it, no
+				// watcher, no sync.db, zero behavior change. Like memory.db,
+				// sync.db is owned by the global daemon only; scoped daemons
+				// proxy /api/sync/* to global.
+				if scope == "" {
+					if syncCfg, err := config.LoadSyncConfig(); err != nil {
+						ulog.Warn("Failed to load sync config, sync disabled").Err(err).Log(ctx)
+					} else if syncCfg != nil && len(syncCfg.Workspaces) > 0 {
+						syncDB, err := syncdb.Open(syncdb.DefaultDBPath())
+						if err != nil {
+							ulog.Warn("Failed to open sync database, sync disabled").Err(err).Log(ctx)
+						} else {
+							syncHandler := watcher.NewSyncHandler(st, cfg, syncCfg, syncDB, 0, 0)
+							unifiedWatcher.Register(syncHandler)
+							srv.SetSyncDB(syncDB)
+							ulog.Info("Sync handler registered with unified watcher").
+								Field("workspaces", len(syncCfg.Workspaces)).
+								Field("origin_id", syncDB.OriginID()).
+								Log(ctx)
 						}
 					}
 				}

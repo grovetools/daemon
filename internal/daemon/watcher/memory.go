@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/google/uuid"
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
@@ -30,6 +29,11 @@ import (
 type IndexJob struct {
 	Path      string
 	Workspace string
+	// Bulk marks the job as part of a bulk ingest (e.g. a Phase 1 sync
+	// snapshot pull). Bulk jobs are rate-limited by the high-capacity bulk
+	// limiter instead of the 2/sec steady-state limiter, so ingesting a
+	// large workspace doesn't backlog embedding for hours.
+	Bulk bool
 }
 
 // MemoryHandler implements DomainHandler for auto-indexing content into the memory store.
@@ -38,7 +42,7 @@ type MemoryHandler struct {
 	cfg      *config.Config
 	locator  *workspace.NotebookLocator
 	memStore memory.DocumentStore
-	embedder *memory.Embedder
+	embedder memory.Embedder
 	ulog     *logging.UnifiedLogger
 
 	watchedPaths map[string]*workspace.WorkspaceNode
@@ -51,6 +55,7 @@ type MemoryHandler struct {
 
 	jobQueue    chan IndexJob
 	limiter     *rate.Limiter
+	bulkLimiter *rate.Limiter
 	initialSync sync.Once
 
 	jobsQueued   atomic.Int32
@@ -58,7 +63,7 @@ type MemoryHandler struct {
 }
 
 // NewMemoryHandler creates a new MemoryHandler for auto-indexing content.
-func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.DocumentStore, embedder *memory.Embedder, debounceMs int) *MemoryHandler {
+func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.DocumentStore, embedder memory.Embedder, debounceMs int) *MemoryHandler {
 	if debounceMs <= 0 {
 		debounceMs = 5000
 	}
@@ -75,7 +80,11 @@ func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.Docum
 		timers:       make(map[string]*time.Timer),
 		debounceMs:   debounceMs,
 		jobQueue:     make(chan IndexJob, 1000),
-		limiter:      rate.NewLimiter(rate.Limit(2), 1), // 2 embeddings/sec
+		limiter:      rate.NewLimiter(rate.Limit(2), 1), // 2 embeddings/sec steady-state
+		// Bulk-ingest limiter: an order of magnitude above steady-state so
+		// snapshot pulls finish in minutes, but still bounded so a bulk
+		// ingest can't hammer the embedding API without limit.
+		bulkLimiter: rate.NewLimiter(rate.Limit(20), 4),
 	}
 
 	// Start a worker pool (2 workers) to handle embedding generation asynchronously
@@ -318,6 +327,18 @@ func (h *MemoryHandler) queueDirect(path string) {
 	h.jobsQueued.Add(1)
 	go func() {
 		h.jobQueue <- IndexJob{Path: path, Workspace: wsName}
+	}()
+}
+
+// QueueBulkIndex enqueues a file for indexing in bulk-ingest mode: the job
+// is rate-limited by the high-capacity bulk limiter instead of the 2/sec
+// steady-state limiter. Used for high-throughput ingestion such as sync
+// snapshot pulls; not used by the steady-state fsnotify path.
+func (h *MemoryHandler) QueueBulkIndex(path string) {
+	wsName := resolveWorkspaceName(path)
+	h.jobsQueued.Add(1)
+	go func() {
+		h.jobQueue <- IndexJob{Path: path, Workspace: wsName, Bulk: true}
 	}()
 }
 
@@ -611,7 +632,14 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	// once an embedder is configured.
 	var newEmbeddings [][]float32
 	if len(textsToEmbed) > 0 && h.embedder != nil {
-		if err := h.limiter.Wait(ctx); err != nil {
+		// Bulk-ingest jobs (sync snapshot pulls) bypass the 2/sec
+		// steady-state limiter and go through the high-capacity bulk
+		// limiter instead.
+		limiter := h.limiter
+		if job.Bulk {
+			limiter = h.bulkLimiter
+		}
+		if err := limiter.Wait(ctx); err != nil {
 			h.ulog.Debug("Rate limiter cancelled").Err(err).Field("path", job.Path).Log(ctx)
 			return
 		}
@@ -654,7 +682,8 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	}
 
 	doc := &memory.Document{
-		ID:        uuid.New().String(),
+		// ID left empty: the store keeps the existing stable id for this
+		// path (or derives one), instead of churning identity per upsert.
 		Path:      job.Path,
 		DocType:   docType,
 		Workspace: job.Workspace,

@@ -27,7 +27,7 @@ func (s *Server) forwardToGlobal() daemon.Client {
 // SetMemoryStore wires the memory store + embedder into the server so HTTP
 // handlers can serve /api/memory/* requests. Called from cmd/groved.go after
 // the MemoryHandler watcher has been constructed with the same instances.
-func (s *Server) SetMemoryStore(store memory.DocumentStore, embedder *memory.Embedder, dbPath string) {
+func (s *Server) SetMemoryStore(store memory.DocumentStore, embedder memory.Embedder, dbPath string) {
 	s.memStore = store
 	s.memEmbedder = embedder
 	s.memDBPath = dbPath

@@ -32,6 +32,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/daemon/internal/enrichment"
 	daemonweb "github.com/grovetools/daemon/web"
@@ -86,8 +87,13 @@ type Server struct {
 	// Memory store + embedder are wired via SetMemoryStore so /api/memory/*
 	// handlers can serve the same instance the MemoryHandler watcher uses.
 	memStore    memory.DocumentStore
-	memEmbedder *memory.Embedder
+	memEmbedder memory.Embedder
 	memDBPath   string
+
+	// syncDB is wired via SetSyncDB on the global daemon when sync is
+	// configured (dark by default — no sync config, no DB). Scoped daemons
+	// leave it nil and proxy /api/sync/* to the global daemon.
+	syncDB *syncdb.DB
 
 	// captureWaiters holds pending GET /api/agents/{id}/capture requests.
 	// The HTTP handler blocks on the channel until groveterm sends the
@@ -303,6 +309,10 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/memory/analysis/duplicates", s.handleMemoryAnalysisDuplicates)
 	mux.HandleFunc("/api/memory/analysis/notebooks", s.handleMemoryAnalysisNotebooks)
 	mux.HandleFunc("/api/memory/analysis/context", s.handleMemoryAnalysisContext)
+	// Sync endpoints — unix socket only (sync state is content-adjacent
+	// metadata; never expose it on the unauthenticated TCP listener).
+	// Scoped daemons proxy these to the global daemon, which owns sync.db.
+	mux.HandleFunc("/api/sync/status", unixOnly(s.handleSyncStatus))
 	// Static web viewer files
 	mux.Handle("/web/treemux/", http.StripPrefix("/web/treemux/", daemonweb.TreemuxFileServer()))
 
@@ -1808,6 +1818,15 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 	case store.UpdateSpawnAgentPane, store.UpdateAttachAgentPane, store.UpdateAgentInput, store.UpdateCaptureRequest:
 		return &apiStateUpdate{
 			UpdateType: string(u.Type),
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
+
+	// Sync conflict/quarantine notifications — broadcast so TUIs and
+	// notify consumers can surface them.
+	case store.UpdateSyncConflict:
+		return &apiStateUpdate{
+			UpdateType: "sync_conflict",
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
