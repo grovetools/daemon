@@ -35,6 +35,10 @@ type Client struct {
 	originID   string
 	log        *logging.UnifiedLogger
 	httpClient *http.Client
+	// pollClient serves long-poll pulls: its timeout must exceed the
+	// server-side wait or every quiet poll dies awaiting headers exactly
+	// when the server would respond (the general client's 30s == wait).
+	pollClient *http.Client
 	caps       *syncproto.CapabilitiesResponse // Cached from handshake
 }
 
@@ -45,6 +49,7 @@ func NewClient(cfg ClientConfig) *Client {
 			Timeout: 30 * time.Second,
 		}
 	}
+	pollClient := &http.Client{Timeout: 90 * time.Second}
 	return &Client{
 		serverURL:  cfg.ServerURL,
 		token:      cfg.Token,
@@ -52,6 +57,7 @@ func NewClient(cfg ClientConfig) *Client {
 		originID:   cfg.OriginID,
 		log:        cfg.Logger,
 		httpClient: cfg.HTTPClient,
+		pollClient: pollClient,
 	}
 }
 
@@ -299,7 +305,7 @@ func (c *Client) PullEvents(ctx context.Context, workspace string, cursor int64,
 		return nil, fmt.Errorf("failed to create pull request: %w", err)
 	}
 
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.pollClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("pull request failed: %w", err)
 	}
