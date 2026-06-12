@@ -419,6 +419,25 @@ func (d *DB) SetDocumentVersion(documentID string, version int64) error {
 	return nil
 }
 
+// MarkDocumentSynced records a server-confirmed push of an existing document:
+// the pushed content is now the server head, so it becomes the last-synced
+// state AND the 3-way merge base. Leaving last_synced_hash/base_content stale
+// here makes the pull pipeline misjudge local dirtiness on the next remote
+// update.
+func (d *DB) MarkDocumentSynced(documentID string, version int64, hash string, content []byte) error {
+	res, err := d.db.Exec(
+		`UPDATE sync_documents SET last_synced_version = ?, last_synced_hash = ?, base_content = ?, content_hash = ?, updated_at = CURRENT_TIMESTAMP
+		 WHERE document_id = ?`,
+		version, hash, content, hash, documentID)
+	if err != nil {
+		return fmt.Errorf("failed to mark document synced for %s: %w", documentID, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sync document %s not found", documentID)
+	}
+	return nil
+}
+
 // ToSyncEvent converts an OutboxEntry to a syncproto.SyncEvent for push,
 // reading the document content and populating the event fields.
 func (e *OutboxEntry) ToSyncEvent() syncproto.SyncEvent {

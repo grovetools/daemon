@@ -214,9 +214,14 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 							Err(err).Log(ctx)
 					}
 				} else if result.DocumentID != "" {
-					// Update version for existing document
-					if err := p.db.SetDocumentVersion(result.DocumentID, result.Version); err != nil {
-						p.log.Warn("failed to update document version").
+					// Existing document: the accepted content is the new
+					// server head — record it as the last-synced state and
+					// merge base, not just the version. (Version-only updates
+					// left last_synced_hash stale, which broke the pull
+					// pipeline's local-dirtiness check.)
+					if err := p.db.MarkDocumentSynced(result.DocumentID, result.Version,
+						events[i].ContentHash, events[i].Content); err != nil {
+						p.log.Warn("failed to update document after push").
 							Field("path", events[i].Path).
 							Err(err).Log(ctx)
 					}

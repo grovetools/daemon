@@ -192,4 +192,21 @@ func TestDrainOutboxPopulatesBaseVersion(t *testing.T) {
 	if gotDocID.Load() != "doc-1" {
 		t.Fatalf("expected document_id backfilled from sync record, got %v", gotDocID.Load())
 	}
+
+	// Accepted push of an existing doc must roll the last-synced state and
+	// merge base forward to the pushed content — leaving them stale breaks
+	// the pull pipeline's local-dirtiness check on the next remote update.
+	doc, err := db.GetDocumentByPath("default", "inbox/note.md")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocumentByPath: %v", err)
+	}
+	if doc.LastSyncedVersion != 7 {
+		t.Fatalf("expected LastSyncedVersion 7 after accepted push, got %d", doc.LastSyncedVersion)
+	}
+	if doc.LastSyncedHash != "deadbeef" {
+		t.Fatalf("expected LastSyncedHash to advance to pushed hash, got %q", doc.LastSyncedHash)
+	}
+	if string(doc.BaseContent) != "v2 content" {
+		t.Fatalf("expected BaseContent to become pushed content, got %q", doc.BaseContent)
+	}
 }
