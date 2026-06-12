@@ -12,6 +12,8 @@ import (
 	neturl "net/url"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/syncproto"
@@ -325,6 +327,8 @@ func (c *Client) PullEvents(ctx context.Context, workspace string, cursor int64,
 }
 
 // FetchBlob fetches a blob by its SHA-256 hash.
+// FetchBlob retrieves and decompresses a document blob. Blob contract v1:
+// payload is zstd(full raw content), addressed by sha256 of the raw content.
 func (c *Client) FetchBlob(ctx context.Context, hash string) ([]byte, error) {
 	httpReq, err := c.newRequest(ctx, "GET", fmt.Sprintf("/sync/blob/%s", hash), nil)
 	if err != nil {
@@ -342,11 +346,20 @@ func (c *Client) FetchBlob(ctx context.Context, hash string) ([]byte, error) {
 		return nil, fmt.Errorf("blob fetch failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	content, err := io.ReadAll(resp.Body)
+	compressed, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read blob content: %w", err)
 	}
 
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
+	}
+	defer dec.Close()
+	content, err := dec.DecodeAll(compressed, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decompress blob: %w", err)
+	}
 	return content, nil
 }
 
