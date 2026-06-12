@@ -262,33 +262,22 @@ func (p *PushPipeline) uploadFileBlobs(ctx context.Context, path string, content
 	}
 	defer encoder.Close()
 
-	// Upload fixed 4MB chunks
-	chunkSize := p.cfg.BlobChunkSize
-	for offset := int64(0); offset < int64(len(content)); offset += chunkSize {
-		end := offset + chunkSize
-		if end > int64(len(content)) {
-			end = int64(len(content))
-		}
-
-		chunk := content[offset:end]
-		compressed := encoder.EncodeAll(chunk, nil)
-
-		// Compute chunk hash for dedup
-		chunkHash := sha256.Sum256(compressed)
-		chunkHashHex := hex.EncodeToString(chunkHash[:])
-
-		if err := p.client.PushBlob(ctx, chunkHashHex, compressed); err != nil {
-			return fmt.Errorf("failed to upload blob chunk for %s at offset %d: %w", path, offset, err)
-		}
-
-		p.log.Debug("uploaded blob chunk").
-			Field("path", path).
-			Field("chunk_hash", chunkHashHex).
-			Field("original_size", len(chunk)).
-			Field("compressed_size", len(compressed)).Log(ctx)
-
-		encoder.Reset(nil) // Reset for next chunk
+	// Blob contract v1: ONE blob per document version, addressed by the
+	// document content_hash (sha256 of the RAW content — the same hash the
+	// event carries and the pull side fetches by), containing the zstd-
+	// compressed full content. The earlier chunk scheme keyed blobs by
+	// sha256(zstd(chunk)) with no manifest, orphaning every chunk: the pull
+	// side could never derive those keys. Multi-chunk manifests for >4MB
+	// content are protocol vNext; until then large files ship as one blob.
+	compressed := encoder.EncodeAll(content, nil)
+	if err := p.client.PushBlob(ctx, hashHex, compressed); err != nil {
+		return fmt.Errorf("failed to upload blob for %s: %w", path, err)
 	}
+	p.log.Debug("uploaded blob").
+		Field("path", path).
+		Field("blob_hash", hashHex).
+		Field("original_size", len(content)).
+		Field("compressed_size", len(compressed)).Log(ctx)
 
 	p.log.Debug("uploaded all blob chunks").
 		Field("path", path).
