@@ -21,12 +21,12 @@ type AntiEntropyConfig struct {
 // AntiEntropyPass reconciles the local filesystem against the server manifest,
 // updating sync state for hash-equal files and enqueueing divergent ones for push.
 type AntiEntropyPass struct {
-	db              *DB
-	client          *Client
-	workspace       string
-	workspaceRoot   string // Absolute path to the workspace root
-	log             *logging.UnifiedLogger
-	cfg             AntiEntropyConfig
+	db            *DB
+	client        *Client
+	workspace     string
+	workspaceRoot string // Absolute path to the workspace root
+	log           *logging.UnifiedLogger
+	cfg           AntiEntropyConfig
 }
 
 // NewAntiEntropyPass constructs an anti-entropy reconciler.
@@ -74,12 +74,11 @@ func (a *AntiEntropyPass) Run(ctx context.Context) error {
 		}
 	}
 
-	// Update the workspace cursor
-	if err := a.db.SetCursor(a.workspace, manifest.Cursor); err != nil {
-		a.log.Warn("failed to update cursor after anti-entropy").
-			Err(err).Log(ctx)
-	}
-
+	// NOTE: anti-entropy must NOT touch the pull cursor — it is push-side
+	// reconciliation. Writing manifest.Cursor here both masked a dead pull
+	// loop (cursor advanced with zero events applied) and skipped any event
+	// between the manifest fetch and the write. Cursor ownership belongs to
+	// the pull loop and its snapshot resync only.
 	return nil
 }
 

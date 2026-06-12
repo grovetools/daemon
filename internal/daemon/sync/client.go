@@ -293,7 +293,8 @@ func (c *Client) PullEvents(ctx context.Context, workspace string, cursor int64,
 	if wait > 0 {
 		waitStr = wait.String()
 	}
-	httpReq, err := c.newRequest(ctx, "GET", fmt.Sprintf("/sync/pull?workspace=%s&cursor=%d&limit=%d&wait=%s", workspace, cursor, limit, waitStr), nil)
+	httpReq, err := c.newRequest(ctx, "GET", fmt.Sprintf("/sync/events?workspace=%s&cursor=%d&limit=%d&wait=%s&origin_id=%s&exclude_origin=%s",
+		neturl.QueryEscape(workspace), cursor, limit, waitStr, neturl.QueryEscape(c.originID), neturl.QueryEscape(c.originID)), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pull request: %w", err)
 	}
