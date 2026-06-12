@@ -641,6 +641,13 @@ func (h *SyncHandler) ensurePipelines() {
 			return ae.RunAntiEntropyLoop(pctx)
 		})
 
+		// Materialize the sync_state row immediately so /api/sync/status
+		// reflects the subscription as soon as transport starts (readiness
+		// probes key on this; rows otherwise appear only on first activity).
+		if cur, err := h.db.GetWorkspaceCursor(name); err == nil {
+			_ = h.db.UpdateWorkspaceCursor(name, cur)
+		}
+
 		h.ulog.Info("sync transport started").
 			Field("workspace", name).
 			Field("pull", sub != nil && sub.Pull).
