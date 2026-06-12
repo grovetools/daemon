@@ -324,6 +324,10 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	}))
 	mux.HandleFunc("/api/sync/history", unixOnly(s.handleSyncHistory))
 	mux.HandleFunc("/api/sync/restore", unixOnly(s.handleSyncRestore))
+	// Read-only introspection for the dev UI / playground god-view.
+	mux.HandleFunc("/api/sync/documents", unixOnly(s.handleSyncDocuments))
+	mux.HandleFunc("/api/sync/outbox", unixOnly(s.handleSyncOutbox))
+	mux.HandleFunc("/api/sync/conflicts", unixOnly(s.handleSyncConflicts))
 	// Static web viewer files
 	mux.Handle("/web/treemux/", http.StripPrefix("/web/treemux/", daemonweb.TreemuxFileServer()))
 

@@ -257,6 +257,37 @@ func (d *DB) DeleteDocument(documentID string) error {
 	return nil
 }
 
+// ListDocuments returns tracked documents ordered by workspace then path. An
+// empty workspace lists every workspace; a non-empty one filters to it. Used
+// by the read-only /api/sync/documents introspection endpoint (dev UI).
+func (d *DB) ListDocuments(workspace string) ([]*Document, error) {
+	query := `SELECT document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, updated_at
+		 FROM sync_documents`
+	var args []interface{}
+	if workspace != "" {
+		query += ` WHERE workspace = ?`
+		args = append(args, workspace)
+	}
+	query += ` ORDER BY workspace ASC, path ASC`
+
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list sync documents: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var docs []*Document
+	for rows.Next() {
+		var doc Document
+		if err := rows.Scan(&doc.DocumentID, &doc.Workspace, &doc.Path, &doc.ContentHash,
+			&doc.LastSyncedHash, &doc.LastSyncedVersion, &doc.BaseContent, &doc.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan sync document: %w", err)
+		}
+		docs = append(docs, &doc)
+	}
+	return docs, rows.Err()
+}
+
 // CountDocuments returns the number of tracked documents.
 func (d *DB) CountDocuments() (int, error) {
 	var n int
