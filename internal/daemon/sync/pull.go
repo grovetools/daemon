@@ -127,13 +127,24 @@ func (p *PullPipeline) snaphotResync(ctx context.Context, workspaceRoot string) 
 	for _, doc := range manifest.Documents {
 		localDoc, _ := p.db.GetDocumentByPath(p.ws.Name, doc.Path)
 
+		adopted := false
 		if localDoc != nil && localDoc.ContentHash == doc.Hash {
-			// Hash match: adopt the server UUID and version in place
-			p.log.Debug("adopting hash-equal document").Field("path", doc.Path).Log(ctx)
-			if err := p.db.AdoptDocument(p.ws.Name, doc.Path, doc.ID, doc.Version, doc.Hash); err != nil {
-				p.log.Error("failed to adopt document").Field("path", doc.Path).Err(err).Log(ctx)
+			// Hash match: adopt the server UUID and version in place. The
+			// hash-verified on-disk content becomes the merge base — version,
+			// last_synced_hash, and base_content roll together (rolling the
+			// version alone leaves a stale merge base → phantom conflicts).
+			// If disk no longer matches the tracked hash, fall through and
+			// re-fetch the server head like any divergent document.
+			content, rerr := readFile(p.joinPath(workspaceRoot, doc.Path))
+			if rerr == nil && hashContent(content) == doc.Hash {
+				p.log.Debug("adopting hash-equal document").Field("path", doc.Path).Log(ctx)
+				if err := p.db.AdoptDocument(p.ws.Name, doc.Path, doc.ID, doc.Version, doc.Hash, content); err != nil {
+					p.log.Error("failed to adopt document").Field("path", doc.Path).Err(err).Log(ctx)
+				}
+				adopted = true
 			}
-		} else {
+		}
+		if !adopted {
 			// Missing or divergent document: fetch the head content and
 			// materialize it NOW. The cursor jump below skips these
 			// documents' historical events, so anything not fetched here

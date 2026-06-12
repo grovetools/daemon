@@ -22,7 +22,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -101,33 +100,6 @@ func syncExcluded(relPath string, extra []string) bool {
 		}
 	}
 	return false
-}
-
-// secretPatterns are the quarantine heuristics: a document matching any of
-// these is never queued to the outbox. Conservative, high-signal patterns
-// only — quarantine is the backstop behind nb's Phase 1 frontmatter token
-// cleanup, not a general secret scanner.
-var secretPatterns = []struct {
-	name string
-	re   *regexp.Regexp
-}{
-	{"github fine-grained token", regexp.MustCompile(`github_pat_[A-Za-z0-9_]{20,}`)},
-	{"github token", regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{30,}`)},
-	{"private key block", regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----`)},
-	{"aws access key id", regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)},
-	{"slack token", regexp.MustCompile(`xox[baprs]-[0-9A-Za-z-]{10,}`)},
-	{"openai project key", regexp.MustCompile(`sk-proj-[A-Za-z0-9_-]{20,}`)},
-	{"anthropic key", regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`)},
-}
-
-// scanForSecrets returns the name of the first matching secret heuristic.
-func scanForSecrets(content []byte) (string, bool) {
-	for _, p := range secretPatterns {
-		if p.re.Match(content) {
-			return p.name, true
-		}
-	}
-	return "", false
 }
 
 // syncWatch maps a watched directory to its sync workspace subscription.
@@ -406,7 +378,8 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 	}
 
 	// Secret quarantine: drop the event before anything reaches the outbox.
-	if reason, found := scanForSecrets(content); found {
+	// The heuristic gate is shared with the anti-entropy push sweep.
+	if reason, found := syncdb.ScanForSecrets(content); found {
 		h.ulog.Warn("Sync quarantine: document matches secret heuristic, not queued").
 			Field("workspace", watch.workspace).
 			Field("path", rel).
