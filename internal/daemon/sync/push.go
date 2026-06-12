@@ -119,18 +119,26 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 		// Handle blob uploads for large files
 		if p.client.SupportsBlobs() {
 			maxInlineSize := p.client.MaxInlineSize()
+			blobErrors := make(map[int]error)
 			for i := range events {
 				if events[i].Size > maxInlineSize {
 					// Large file: upload chunks and clear inline content
 					if err := p.uploadFileBlobs(ctx, events[i].Path, events[i].Content); err != nil {
-						// Log the error but don't fail the push; retry the outbox entry later
+						// Mark blob upload failure; will skip this event from push
 						p.log.Warn("failed to upload blob").
 							Field("path", events[i].Path).
 							Err(err).Log(ctx)
+						blobErrors[i] = err
 						continue
 					}
 					events[i].Content = nil // Don't send inline content for large files
 				}
+			}
+
+			// If any blob uploads failed, return early to retry the entire batch
+			// (don't push events with missing blobs)
+			if len(blobErrors) > 0 {
+				return successCount, fmt.Errorf("blob upload failures: %v", blobErrors)
 			}
 		}
 

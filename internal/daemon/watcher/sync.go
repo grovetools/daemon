@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -620,24 +621,53 @@ func (h *SyncHandler) ensurePipelines() {
 		sub := h.subscription(name)
 
 		push := syncdb.NewPushPipeline(h.db, client, name, h.ulog, syncdb.PushConfig{})
-		go func(root string) { _ = push.RunPushLoop(pctx, root) }(root)
+		go h.runWithRecovery(pctx, name, "push", func() error {
+			return push.RunPushLoop(pctx, root)
+		})
 
 		if sub != nil && sub.Pull {
 			pull := syncdb.NewPullPipeline(sub, client, h.db, h.ulog)
-			go func(root string) { _ = pull.RunPullLoop(pctx, root) }(root)
+			go h.runWithRecovery(pctx, name, "pull", func() error {
+				return pull.RunPullLoop(pctx, root)
+			})
 		}
 
 		ae := syncdb.NewAntiEntropyPass(h.db, client, name, root, h.ulog, syncdb.AntiEntropyConfig{})
-		go func() {
+		go h.runWithRecovery(pctx, name, "anti-entropy", func() error {
 			// One immediate pass (initial reconciliation), then the loop.
-			_ = ae.Run(pctx)
-			_ = ae.RunAntiEntropyLoop(pctx)
-		}()
+			if err := ae.Run(pctx); err != nil {
+				return err
+			}
+			return ae.RunAntiEntropyLoop(pctx)
+		})
 
 		h.ulog.Info("sync transport started").
 			Field("workspace", name).
 			Field("pull", sub != nil && sub.Pull).
 			StructuredOnly().Log(pctx)
+	}
+}
+
+// runWithRecovery wraps a sync pipeline goroutine with panic recovery.
+// If the goroutine panics, it logs the panic and exits gracefully rather than
+// crashing the daemon. This ensures server restarts or protocol edge cases
+// don't kill the entire sync handler.
+func (h *SyncHandler) runWithRecovery(ctx context.Context, workspace, pipelineType string, fn func() error) {
+	defer func() {
+		if r := recover(); r != nil {
+			h.ulog.Error("sync pipeline panic (recovered)").
+				Field("workspace", workspace).
+				Field("pipeline", pipelineType).
+				Field("panic", fmt.Sprint(r)).
+				Log(ctx)
+		}
+	}()
+	if err := fn(); err != nil {
+		// Normal error exit (context cancelled, etc)
+		h.ulog.Debug("sync pipeline stopped").
+			Field("workspace", workspace).
+			Field("pipeline", pipelineType).
+			Err(err).Log(ctx)
 	}
 }
 
