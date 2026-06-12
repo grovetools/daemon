@@ -107,6 +107,7 @@ func NewGrovedCmd() *cobra.Command {
 
 	cmd.AddCommand(newGrovedStartCmd())
 	cmd.AddCommand(newGrovedStopCmd())
+	cmd.AddCommand(newGrovedUpgradeCmd())
 	cmd.AddCommand(newGrovedStatusCmd())
 	cmd.AddCommand(newGrovedConfigCmd())
 	cmd.AddCommand(newGrovedMonitorCmd())
@@ -739,6 +740,23 @@ func newGrovedStartCmd() *cobra.Command {
 	cmd.Flags().Int("pair-with-pid", 0, "Shut down when this parent PID exits (0 disables pairing)")
 	cmd.Flags().Int("ready-fd", 0, "Close this inherited file descriptor once the socket is bound (0 disables readiness signaling)")
 
+	return cmd
+}
+
+func newGrovedUpgradeCmd() *cobra.Command {
+	var scope string
+	cmd := &cobra.Command{
+		Use:   "upgrade",
+		Short: "Gracefully replace the running daemon with the current binary",
+		Long: `Zero-downtime upgrade: signals the running daemon with SIGUSR1 to enter
+drain mode (unlink the socket, finish in-flight requests), then starts this
+groved binary on the freed socket. The new daemon adopts running detached
+agents by PID, so live agent panes and headless jobs survive the swap.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return daemon.UpgradeRunning(cmd.Context(), scope)
+		},
+	}
+	cmd.Flags().StringVar(&scope, "scope", "", "scope name of the daemon to upgrade (default: the global daemon)")
 	return cmd
 }
 

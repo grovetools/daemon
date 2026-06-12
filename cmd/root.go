@@ -23,6 +23,7 @@ func init() {
 	// Mount relocated daemon commands
 	rootCmd.AddCommand(newGrovedStartCmd())
 	rootCmd.AddCommand(newGrovedStopCmd())
+	rootCmd.AddCommand(newGrovedUpgradeCmd())
 	rootCmd.AddCommand(newGrovedStatusCmd())
 	rootCmd.AddCommand(newGrovedKillCmd())
 	rootCmd.AddCommand(newGrovedClawsCmd())
