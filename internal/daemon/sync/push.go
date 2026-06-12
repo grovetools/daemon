@@ -17,11 +17,11 @@ import (
 
 // PushConfig holds the configuration for the push pipeline.
 type PushConfig struct {
-	BatchSize      int           // Events per push (default 50)
-	RetryBackoff   time.Duration // Initial backoff for retries (default 1s)
-	MaxRetries     int           // Max push retries (default 3)
-	BlobChunkSize  int64         // Fixed blob chunk size; default 4MB
-	CheckInterval  time.Duration // How often to check for outbox items (default 5s)
+	BatchSize     int           // Events per push (default 50)
+	RetryBackoff  time.Duration // Initial backoff for retries (default 1s)
+	MaxRetries    int           // Max push retries (default 3)
+	BlobChunkSize int64         // Fixed blob chunk size; default 4MB
+	CheckInterval time.Duration // How often to check for outbox items (default 5s)
 }
 
 // PushPipeline manages draining the outbox to the server with batching,
@@ -96,7 +96,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 
 			// Read file content for document_created and document_updated events
 			if entry.EventType == syncproto.EventDocumentCreated ||
-			   entry.EventType == syncproto.EventDocumentUpdated {
+				entry.EventType == syncproto.EventDocumentUpdated {
 				localPath := filepath.Join(workspaceRoot, syncproto.LocalizePath(entry.Path))
 				content, err := os.ReadFile(localPath)
 				if err != nil {
