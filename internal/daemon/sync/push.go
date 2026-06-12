@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
-
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/syncproto"
 )
@@ -256,28 +254,20 @@ func (p *PushPipeline) uploadFileBlobs(ctx context.Context, path string, content
 	hash := sha256.Sum256(content)
 	hashHex := hex.EncodeToString(hash[:])
 
-	encoder, err := zstd.NewWriter(nil)
-	if err != nil {
-		return fmt.Errorf("failed to create zstd encoder: %w", err)
-	}
-	defer encoder.Close()
-
-	// Blob contract v1: ONE blob per document version, addressed by the
-	// document content_hash (sha256 of the RAW content — the same hash the
-	// event carries and the pull side fetches by), containing the zstd-
-	// compressed full content. The earlier chunk scheme keyed blobs by
-	// sha256(zstd(chunk)) with no manifest, orphaning every chunk: the pull
-	// side could never derive those keys. Multi-chunk manifests for >4MB
-	// content are protocol vNext; until then large files ship as one blob.
-	compressed := encoder.EncodeAll(content, nil)
-	if err := p.client.PushBlob(ctx, hashHex, compressed); err != nil {
+	// Blob contract v1: ONE blob per document version, payload = the RAW
+	// content, addressed by sha256(payload) == the event content_hash. The
+	// server verifies hash(bytes)==key on upload (422 otherwise) and every
+	// party can verify end-to-end. Compression and multi-chunk manifests
+	// are protocol vNext — earlier schemes (zstd chunks keyed by compressed
+	// hash, then zstd-whole keyed by raw hash) either orphaned blobs or
+	// failed server-side integrity verification.
+	if err := p.client.PushBlob(ctx, hashHex, content); err != nil {
 		return fmt.Errorf("failed to upload blob for %s: %w", path, err)
 	}
 	p.log.Debug("uploaded blob").
 		Field("path", path).
 		Field("blob_hash", hashHex).
-		Field("original_size", len(content)).
-		Field("compressed_size", len(compressed)).Log(ctx)
+		Field("size", len(content)).Log(ctx)
 
 	p.log.Debug("uploaded all blob chunks").
 		Field("path", path).
