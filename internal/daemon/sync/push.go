@@ -111,6 +111,20 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				}
 			}
 
+			// OCC guard: the server compares base_version against the
+			// document head and conflicts on mismatch. Populate it from the
+			// local sync record (the version we last saw from the server) —
+			// without it every non-hash-equal update is a manufactured
+			// conflict (base_version defaults to 0).
+			if event.Type == syncproto.EventDocumentUpdated {
+				if doc, derr := p.db.GetDocumentByPath(p.workspace, entry.Path); derr == nil && doc != nil {
+					event.BaseVersion = doc.LastSyncedVersion
+					if event.DocumentID == "" {
+						event.DocumentID = doc.DocumentID
+					}
+				}
+			}
+
 			events[i] = event
 		}
 
@@ -210,10 +224,14 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				successCount++
 
 			case syncproto.PushStatusConflict:
-				p.log.Info("push conflict: base_version was stale").
-					Field("path", events[i].Path).Log(ctx)
-				// Leave the entry in the outbox for manual resolution or retry
-				// The conflict will be broadcast via UpdateSyncConflict in watcher
+				p.log.Warn("push conflict: base_version was stale").
+					Field("path", events[i].Path).
+					Field("base_version", events[i].BaseVersion).
+					Field("server_version", result.Version).Log(ctx)
+				// Leave the entry in the outbox: the contract says the client
+				// must merge and re-push, and merging is the pull pipeline's
+				// job. The no-progress guard below keeps a conflicted entry
+				// from hot-looping within this drain call.
 
 			case syncproto.PushStatusRejected:
 				p.log.Warn("push rejected").
@@ -230,6 +248,15 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				p.log.Warn("failed to delete outbox entries").
 					Err(err).Log(ctx)
 			}
+		} else {
+			// No-progress guard: every entry in this batch stayed in the
+			// outbox (conflicts awaiting merge). Another pass would refetch
+			// the same rows and spin hot for the rest of the process's life
+			// — yield until the next CheckInterval tick instead so the pull
+			// pipeline gets a chance to advance the merge base. Conflicted
+			// entries at the head of the queue block later entries until
+			// they resolve (ordering is preserved deliberately).
+			break
 		}
 
 		// Update workspace cursor after successful push
