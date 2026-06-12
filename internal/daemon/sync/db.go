@@ -560,13 +560,17 @@ func (d *DB) UpdateDocument(doc *Document) error {
 	return nil
 }
 
-// AdoptDocument records a server document in the local database, marking it as synced.
-// Used during snapshot reconciliation when local and remote hashes match.
-func (d *DB) AdoptDocument(workspace, path, documentID string, version int64, hash string) error {
+// AdoptDocument records a server document in the local database, marking it as
+// synced. Used during snapshot/anti-entropy reconciliation when local and
+// remote hashes match. The hash-verified local content becomes the 3-way merge
+// base: version, last_synced_hash, and base_content roll together (mirroring
+// MarkDocumentSynced) — rolling the version alone leaves a stale merge base,
+// the phantom-conflict trap.
+func (d *DB) AdoptDocument(workspace, path, documentID string, version int64, hash string, content []byte) error {
 	_, err := d.db.Exec(
-		`UPDATE sync_documents SET document_id = ?, last_synced_version = ?, last_synced_hash = ?, content_hash = ?, updated_at = CURRENT_TIMESTAMP
+		`UPDATE sync_documents SET document_id = ?, last_synced_version = ?, last_synced_hash = ?, content_hash = ?, base_content = ?, updated_at = CURRENT_TIMESTAMP
 		 WHERE workspace = ? AND path = ?`,
-		documentID, version, hash, hash, workspace, path)
+		documentID, version, hash, hash, content, workspace, path)
 	if err != nil {
 		return fmt.Errorf("failed to adopt document %s: %w", documentID, err)
 	}
