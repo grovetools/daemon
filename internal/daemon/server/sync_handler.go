@@ -9,10 +9,15 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"strconv"
@@ -77,6 +82,222 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 					LastSyncedAt: st.LastSyncedAt,
 				})
 			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// syncDocumentResponse is one entry of the GET /api/sync/documents payload:
+// per-document sync state for the dev-UI document matrix. IsDirty is the
+// LastSyncedHash comparison the pull pipeline relies on (a clean cell that
+// should read dirty was the visible symptom of the fast-forward clobber bug).
+type syncDocumentResponse struct {
+	DocumentID     string `json:"document_id"`
+	Workspace      string `json:"workspace"`
+	Path           string `json:"path"`
+	Version        int64  `json:"version"`
+	ContentHash    string `json:"content_hash"`
+	LastSyncedHash string `json:"last_synced_hash"`
+	IsDirty        bool   `json:"is_dirty"`
+}
+
+// handleSyncDocuments handles GET /api/sync/documents[?workspace=W], returning
+// per-document sync state with a computed is_dirty flag. Read-only.
+func (s *Server) handleSyncDocuments(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Scoped daemons never open sync.db — forward to the global daemon.
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	docs, err := s.syncDB.ListDocuments(r.URL.Query().Get("workspace"))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to list documents: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	out := make([]syncDocumentResponse, 0, len(docs))
+	for _, doc := range docs {
+		out = append(out, syncDocumentResponse{
+			DocumentID:     doc.DocumentID,
+			Workspace:      doc.Workspace,
+			Path:           doc.Path,
+			Version:        doc.LastSyncedVersion,
+			ContentHash:    doc.ContentHash,
+			LastSyncedHash: doc.LastSyncedHash,
+			IsDirty:        doc.ContentHash != doc.LastSyncedHash,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// syncOutboxResponse is one entry of the GET /api/sync/outbox payload: a
+// change parked in the local push queue. Payload is omitted (it can carry the
+// full document body) — this view drives the "parked" matrix indicator, not a
+// content diff.
+type syncOutboxResponse struct {
+	ID          int64     `json:"id"`
+	DocumentID  string    `json:"document_id"`
+	Workspace   string    `json:"workspace"`
+	EventType   string    `json:"event_type"`
+	Path        string    `json:"path"`
+	PrevPath    string    `json:"prev_path,omitempty"`
+	ContentHash string    `json:"content_hash"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// handleSyncOutbox handles GET /api/sync/outbox[?workspace=W], returning the
+// pending push queue in insertion order. Read-only.
+func (s *Server) handleSyncOutbox(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	entries, err := s.syncDB.ListOutbox(r.URL.Query().Get("workspace"), 0)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to list outbox: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	out := make([]syncOutboxResponse, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, syncOutboxResponse{
+			ID:          e.ID,
+			DocumentID:  e.DocumentID,
+			Workspace:   e.Workspace,
+			EventType:   e.EventType,
+			Path:        e.Path,
+			PrevPath:    e.PrevPath,
+			ContentHash: e.ContentHash,
+			CreatedAt:   e.CreatedAt,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// syncConflictResponse is one entry of the GET /api/sync/conflicts payload: a
+// conflict artifact on disk plus the 3-way-merge base recovered from sync.db.
+// BaseContent is the "base" leg of the conflict inspector's diff; the "local"
+// leg is ArtifactContent and the "server head" leg is fetched separately.
+type syncConflictResponse struct {
+	Workspace       string `json:"workspace"`
+	Path            string `json:"path"`        // original wire path of the conflicted document
+	DocumentID      string `json:"document_id"` // parsed from the artifact filename
+	Artifact        string `json:"artifact"`    // artifact filename, workspace-relative (slash form)
+	ArtifactContent string `json:"artifact_content"`
+	BaseContent     string `json:"base_content,omitempty"` // 3-way base from sync_documents, when resolvable
+}
+
+// handleSyncConflicts handles GET /api/sync/conflicts[?workspace=W]. It scans
+// the on-disk conflict store (StateDir/sync/conflicts/<workspace>/) written by
+// the pull pipeline (pull.go recordConflict: <path>.<document_id>.conflict.md)
+// and, for each artifact, recovers the base content from the matching
+// sync_documents row. Read-only.
+func (s *Server) handleSyncConflicts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	filter := r.URL.Query().Get("workspace")
+	root := filepath.Join(paths.StateDir(), "sync", "conflicts")
+	out := make([]syncConflictResponse, 0)
+
+	wsEntries, err := os.ReadDir(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		// No conflicts have ever been recorded — empty list, not an error.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+		return
+	}
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to read conflicts dir: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	for _, wsEntry := range wsEntries {
+		if !wsEntry.IsDir() {
+			continue
+		}
+		workspace := wsEntry.Name()
+		if filter != "" && workspace != filter {
+			continue
+		}
+		wsDir := filepath.Join(root, workspace)
+		walkErr := filepath.WalkDir(wsDir, func(p string, de fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if de.IsDir() || !strings.HasSuffix(de.Name(), ".conflict.md") {
+				return nil
+			}
+			rel, err := filepath.Rel(wsDir, p)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+
+			// Artifact name is "<path>.<document_id>.conflict.md"; the
+			// document id is the segment after the final dot of the stem.
+			stem := strings.TrimSuffix(rel, ".conflict.md")
+			idx := strings.LastIndex(stem, ".")
+			if idx < 0 {
+				return nil // unparseable name — skip rather than guess
+			}
+			origPath, docID := stem[:idx], stem[idx+1:]
+
+			content, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+
+			resp := syncConflictResponse{
+				Workspace:       workspace,
+				Path:            origPath,
+				DocumentID:      docID,
+				Artifact:        rel,
+				ArtifactContent: string(content),
+			}
+			if doc, derr := s.syncDB.GetDocument(docID); derr == nil && doc != nil {
+				resp.BaseContent = string(doc.BaseContent)
+			}
+			out = append(out, resp)
+			return nil
+		})
+		if walkErr != nil {
+			http.Error(w, fmt.Sprintf("failed to scan conflicts: %v", walkErr), http.StatusInternalServerError)
+			return
 		}
 	}
 

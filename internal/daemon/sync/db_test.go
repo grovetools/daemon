@@ -94,6 +94,59 @@ func TestDocumentLifecycle(t *testing.T) {
 	}
 }
 
+func TestListDocuments(t *testing.T) {
+	db := openTestDB(t)
+
+	docs := []*Document{
+		{DocumentID: "d1", Workspace: "ws", Path: "plans/b.md", ContentHash: "h1", LastSyncedHash: "h1"},
+		{DocumentID: "d2", Workspace: "ws", Path: "plans/a.md", ContentHash: "dirty", LastSyncedHash: "clean"},
+		{DocumentID: "d3", Workspace: "other", Path: "notes/x.md", ContentHash: "h3", LastSyncedHash: "h3"},
+	}
+	for _, d := range docs {
+		if err := db.UpsertDocument(d); err != nil {
+			t.Fatalf("UpsertDocument %s: %v", d.DocumentID, err)
+		}
+	}
+
+	// All workspaces, ordered by workspace then path.
+	all, err := db.ListDocuments("")
+	if err != nil {
+		t.Fatalf("ListDocuments(all): %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("expected 3 documents, got %d", len(all))
+	}
+	wantOrder := []string{"d3", "d2", "d1"} // other/notes/x.md, ws/plans/a.md, ws/plans/b.md
+	for i, want := range wantOrder {
+		if all[i].DocumentID != want {
+			t.Fatalf("order mismatch at %d: got %s want %s", i, all[i].DocumentID, want)
+		}
+	}
+
+	// Workspace filter.
+	wsDocs, err := db.ListDocuments("ws")
+	if err != nil {
+		t.Fatalf("ListDocuments(ws): %v", err)
+	}
+	if len(wsDocs) != 2 {
+		t.Fatalf("expected 2 documents in ws, got %d", len(wsDocs))
+	}
+	for _, d := range wsDocs {
+		if d.Workspace != "ws" {
+			t.Fatalf("filter leaked workspace %q", d.Workspace)
+		}
+	}
+
+	// Empty workspace match returns nothing, not an error.
+	none, err := db.ListDocuments("missing")
+	if err != nil {
+		t.Fatalf("ListDocuments(missing): %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("expected no documents, got %d", len(none))
+	}
+}
+
 func TestUniqueWorkspacePathConstraint(t *testing.T) {
 	db := openTestDB(t)
 
