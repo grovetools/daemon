@@ -134,8 +134,30 @@ func (p *PullPipeline) snaphotResync(ctx context.Context, workspaceRoot string) 
 				p.log.Error("failed to adopt document").Field("path", doc.Path).Err(err).Log(ctx)
 			}
 		} else {
-			// Hash mismatch or new document: will be fetched on the next pull via events
-			p.log.Debug("document differs from manifest, will pull separately").Field("path", doc.Path).Log(ctx)
+			// Missing or divergent document: fetch the head content and
+			// materialize it NOW. The cursor jump below skips these
+			// documents' historical events, so anything not fetched here
+			// would never arrive (documents pushed before a client's first
+			// sync were silently lost when this branch only logged).
+			content, err := p.client.HistoryBlob(ctx, p.ws.Name, doc.ID, doc.Version)
+			if err != nil {
+				p.log.Error("snapshot content fetch failed").Field("path", doc.Path).Err(err).Log(ctx)
+				continue
+			}
+			ev := &syncproto.SyncEvent{
+				Type:        syncproto.EventDocumentCreated,
+				DocumentID:  doc.ID,
+				Path:        doc.Path,
+				Version:     doc.Version,
+				ContentHash: doc.Hash,
+				Content:     content,
+			}
+			if localDoc != nil {
+				ev.Type = syncproto.EventDocumentUpdated
+			}
+			if err := p.applyEvent(ctx, workspaceRoot, ev); err != nil {
+				p.log.Error("snapshot apply failed").Field("path", doc.Path).Err(err).Log(ctx)
+			}
 		}
 	}
 
