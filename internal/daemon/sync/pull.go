@@ -254,8 +254,14 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, workspaceRoot string, ev
 		return fmt.Errorf("failed to read local file: %w", err)
 	}
 
-	// Fast-forward: if local is unchanged, just apply remote
-	if doc.ContentHash == hashContent(localContent) {
+	// Fast-forward only when the local file matches the last SERVER-confirmed
+	// content (no unpushed local edit to preserve), or already equals the
+	// incoming remote content. Comparing against doc.ContentHash here is the
+	// silent-data-loss bug: the watcher updates ContentHash on every local
+	// save, so a dirty-but-tracked file looks "clean" and the unpushed edit
+	// gets overwritten by the remote version.
+	localHash := hashContent(localContent)
+	if localHash == doc.LastSyncedHash || localHash == ev.ContentHash {
 		if err := writeFile(filePath, content); err != nil {
 			return fmt.Errorf("failed to write file: %w", err)
 		}
