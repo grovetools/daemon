@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 )
 
 // Frontmatter represents parsed YAML frontmatter as key-value pairs.
@@ -44,6 +46,27 @@ func parseFrontmatter(content []byte) Frontmatter {
 	return fm
 }
 
+// frontmatterKeys returns the frontmatter keys of content in file order.
+// Used as the ordering hint for reconstructDocument so merges preserve the
+// local file's layout instead of leaking map iteration order into bytes.
+func frontmatterKeys(content []byte) []string {
+	lines := strings.Split(string(content), "\n")
+	if len(lines) < 2 || lines[0] != "---" {
+		return nil
+	}
+	var keys []string
+	for i := 1; i < len(lines); i++ {
+		if lines[i] == "---" {
+			return keys
+		}
+		parts := strings.SplitN(lines[i], ":", 2)
+		if len(parts) == 2 {
+			keys = append(keys, strings.TrimSpace(parts[0]))
+		}
+	}
+	return nil // no closing marker: parseFrontmatter treats this as no frontmatter
+}
+
 // extractBody returns the content after the closing --- marker.
 func extractBody(content []byte) []byte {
 	lines := strings.Split(string(content), "\n")
@@ -59,25 +82,82 @@ func extractBody(content []byte) []byte {
 	return content
 }
 
-// reconstructDocument builds a new document from merged frontmatter and remote body.
-func reconstructDocument(frontmatter Frontmatter, body []byte) []byte {
+// reconstructDocument builds a document from merged frontmatter and body.
+// Keys are emitted following the order hint first (typically
+// frontmatterKeys(localContent), preserving the on-disk layout), then any
+// remaining keys sorted — output must be deterministic, otherwise repeated
+// merges of identical inputs churn content hashes.
+func reconstructDocument(frontmatter Frontmatter, order []string, body []byte) []byte {
 	if len(frontmatter) == 0 {
 		return body
 	}
 
 	var result strings.Builder
 	result.WriteString("---\n")
-	for key, val := range frontmatter {
-		result.WriteString(fmt.Sprintf("%s: %v\n", key, val))
+	seen := make(map[string]bool, len(frontmatter))
+	for _, key := range order {
+		if val, ok := frontmatter[key]; ok && !seen[key] {
+			result.WriteString(fmt.Sprintf("%s: %v\n", key, val))
+			seen[key] = true
+		}
+	}
+	var rest []string
+	for key := range frontmatter {
+		if !seen[key] {
+			rest = append(rest, key)
+		}
+	}
+	sort.Strings(rest)
+	for _, key := range rest {
+		result.WriteString(fmt.Sprintf("%s: %v\n", key, frontmatter[key]))
 	}
 	result.WriteString("---\n")
 	result.Write(body)
 	return []byte(result.String())
 }
 
-// mergeValues performs field-level merge of frontmatter.
-// If both local and remote changed a field differently, remote wins.
-// If only one side changed it, that change is taken.
+// modifiedLayouts are the timestamp shapes accepted for the frontmatter
+// `modified:` field (nb writes "2006-01-02 15:04:05"; the rest are tolerant
+// fallbacks).
+var modifiedLayouts = []string{
+	"2006-01-02 15:04:05",
+	time.RFC3339,
+	"2006-01-02T15:04:05",
+	"2006-01-02 15:04",
+	"2006-01-02",
+}
+
+// parseModifiedTime parses a frontmatter `modified:` value, tolerating
+// surrounding quotes. Returns false when missing or unparseable.
+func parseModifiedTime(v interface{}) (time.Time, bool) {
+	s, ok := v.(string)
+	if !ok {
+		return time.Time{}, false
+	}
+	s = strings.Trim(strings.TrimSpace(s), `"'`)
+	if s == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range modifiedLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// mergeValues performs a per-key 3-way merge of frontmatter. Frontmatter has
+// LWW-map semantics by design: a both-changed key NEVER parks the document —
+// every key resolves deterministically (most practical "conflicts" here are
+// `modified:` timestamp collisions that deserve auto-resolution).
+//
+// Rules per key:
+//   - only one side changed it → that change is taken (including deletion);
+//   - both sides changed it identically → taken once;
+//   - both sides changed it differently → the side whose document-level
+//     `modified:` timestamp parses LATER wins; if either side's `modified:`
+//     is missing/unparseable, or they are equal, LOCAL wins (local is the
+//     content on disk and the content we are about to push).
 func mergeValues(base, local, remote Frontmatter) Frontmatter {
 	merged := Frontmatter{}
 
@@ -93,6 +173,21 @@ func mergeValues(base, local, remote Frontmatter) Frontmatter {
 		allKeys[k] = true
 	}
 
+	// Both-changed tiebreak: decided once at document level from `modified:`.
+	remoteWins := false
+	if lt, lok := parseModifiedTime(local["modified"]); lok {
+		if rt, rok := parseModifiedTime(remote["modified"]); rok && rt.After(lt) {
+			remoteWins = true
+		}
+	}
+
+	set := func(key string, val interface{}) {
+		// A nil value means the winning side deleted the key: drop it.
+		if val != nil {
+			merged[key] = val
+		}
+	}
+
 	for key := range allKeys {
 		baseVal := base[key]
 		localVal := local[key]
@@ -100,18 +195,22 @@ func mergeValues(base, local, remote Frontmatter) Frontmatter {
 
 		// If remote didn't change, keep local (or base if local didn't change)
 		if equal(remoteVal, baseVal) {
-			merged[key] = localVal
+			set(key, localVal)
 			continue
 		}
 
 		// If local didn't change, take remote
 		if equal(localVal, baseVal) {
-			merged[key] = remoteVal
+			set(key, remoteVal)
 			continue
 		}
 
-		// Both changed: remote wins (server-arrival order is canonical)
-		merged[key] = remoteVal
+		// Both changed differently: LWW via `modified:`, local on ties/doubt.
+		if remoteWins {
+			set(key, remoteVal)
+		} else {
+			set(key, localVal)
+		}
 	}
 
 	return merged
@@ -151,16 +250,16 @@ func readFile(path string) ([]byte, error) {
 // writeFile writes content to a file, creating directories as needed.
 func writeFile(path string, content []byte) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, content, 0644)
+	return os.WriteFile(path, content, 0o644)
 }
 
 // moveFile renames a file from src to dst.
 func moveFile(src, dst string) error {
 	dir := filepath.Dir(dst)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	return os.Rename(src, dst)

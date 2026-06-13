@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -208,5 +209,328 @@ func TestDrainOutboxPopulatesBaseVersion(t *testing.T) {
 	}
 	if string(doc.BaseContent) != "v2 content" {
 		t.Fatalf("expected BaseContent to become pushed content, got %q", doc.BaseContent)
+	}
+}
+
+// serveRebaseStub builds a test server for the push-side rebase flow: it
+// answers the capabilities handshake, delegates /sync/push to push, and
+// serves /sync/history/blob from blob (called with the requested version).
+// blob may have side effects (mid-rebase edit injection).
+func serveRebaseStub(t *testing.T, push func(req *syncproto.PushRequest) *syncproto.PushResponse, blob func(version int64) ([]byte, error)) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sync/capabilities":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
+				Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}},
+			})
+		case "/sync/push":
+			w.Header().Set("Content-Type", "application/json")
+			var req syncproto.PushRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode push request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(push(&req))
+		case "/sync/history/blob":
+			var version int64
+			if _, err := fmt.Sscanf(r.URL.Query().Get("version"), "%d", &version); err != nil {
+				t.Errorf("parse blob version: %v", err)
+			}
+			content, err := blob(version)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write(content)
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+		}
+	}))
+}
+
+// seedRebaseScenario sets up the standard rebase fixture: a synced doc at
+// version 1 with the given base content, a local on-disk edit, and a parked
+// outbox update for it. Returns the workspace root.
+func seedRebaseScenario(t *testing.T, db *DB, base, local []byte) string {
+	t.Helper()
+	root := t.TempDir()
+	seedSyncedDoc(t, db, root, "inbox/note.md", base)
+	if err := os.WriteFile(filepath.Join(root, "inbox", "note.md"), local, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateDocument(&Document{
+		DocumentID: "doc-1", ContentHash: sha(local),
+		LastSyncedHash: sha(base), LastSyncedVersion: 1, BaseContent: base,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID:  "doc-1",
+		Workspace:   "default",
+		EventType:   syncproto.EventDocumentUpdated,
+		Path:        "inbox/note.md",
+		ContentHash: sha(local),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// TestDrainOutboxRebasesCleanConflict: a Conflict whose server head touched a
+// different body region than the local edit is rebased — the merged content
+// (both edits) lands on disk, the entry unparks, and the next drain pushes it
+// with the server head as base_version.
+func TestDrainOutboxRebasesCleanConflict(t *testing.T) {
+	// Conflict artifacts land under paths.StateDir(); keep them hermetic
+	// (GROVE_HOME would shadow the XDG override).
+	t.Setenv("GROVE_HOME", "")
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	db := openTestDB(t)
+
+	base := []byte("---\ntitle: note\n---\nline one\nline two\nline three\n")
+	local := []byte("---\ntitle: note\n---\nLOCAL one\nline two\nline three\n")
+	serverHead := []byte("---\ntitle: note\n---\nline one\nline two\nREMOTE three\n")
+	root := seedRebaseScenario(t, db, base, local)
+
+	var pushCount atomic.Int64
+	var acceptedContent atomic.Value
+	var acceptedBase atomic.Int64
+	srv := serveRebaseStub(t,
+		func(req *syncproto.PushRequest) *syncproto.PushResponse {
+			pushCount.Add(1)
+			resp := &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
+			for i, ev := range req.Events {
+				if ev.BaseVersion < 7 {
+					resp.Results[i] = syncproto.PushResult{
+						Status: syncproto.PushStatusConflict, DocumentID: "doc-1", Version: 7,
+					}
+					continue
+				}
+				acceptedContent.Store(string(ev.Content))
+				acceptedBase.Store(ev.BaseVersion)
+				resp.Results[i] = syncproto.PushResult{
+					Status: syncproto.PushStatusAccepted, DocumentID: "doc-1", Version: 8,
+				}
+			}
+			return resp
+		},
+		func(version int64) ([]byte, error) {
+			if version != 7 {
+				t.Errorf("expected blob fetch for server head v7, got v%d", version)
+			}
+			return serverHead, nil
+		})
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// First drain: conflict → rebase, entry stays queued for the re-push.
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox (rebase pass): %v", err)
+	}
+
+	wantMerged := "---\ntitle: note\n---\nLOCAL one\nline two\nREMOTE three\n"
+	got, err := os.ReadFile(filepath.Join(root, "inbox", "note.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != wantMerged {
+		t.Fatalf("disk after rebase = %q, want %q (both edits present)", got, wantMerged)
+	}
+
+	doc, err := db.GetDocumentByPath("default", "inbox/note.md")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocumentByPath: %v", err)
+	}
+	if doc.LastSyncedVersion != 7 || doc.LastSyncedHash != sha(serverHead) || string(doc.BaseContent) != string(serverHead) {
+		t.Fatalf("rebase must roll the merge base to the server head: v%d hash=%q", doc.LastSyncedVersion, doc.LastSyncedHash)
+	}
+	if doc.ContentHash != sha([]byte(wantMerged)) {
+		t.Fatalf("content_hash must track merged bytes (watcher echo gate), got %q", doc.ContentHash)
+	}
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected 1 rebased entry still queued, got %d (err=%v)", len(entries), err)
+	}
+	if entries[0].ContentHash != sha([]byte(wantMerged)) {
+		t.Fatalf("outbox entry not retargeted at merged content: %q", entries[0].ContentHash)
+	}
+
+	// Second drain: the rebased entry pushes cleanly with base_version 7.
+	n, err := pipeline.DrainOutbox(ctx, root)
+	if err != nil {
+		t.Fatalf("DrainOutbox (re-push pass): %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 ack on re-push, got %d", n)
+	}
+	if acceptedBase.Load() != 7 {
+		t.Fatalf("re-push must carry the server head as base_version, got %d", acceptedBase.Load())
+	}
+	if acceptedContent.Load() != wantMerged {
+		t.Fatalf("pushed content = %q, want merged %q", acceptedContent.Load(), wantMerged)
+	}
+	if remaining, _ := db.CountOutbox(); remaining != 0 {
+		t.Fatalf("expected empty outbox after rebased push, got %d", remaining)
+	}
+	// No artifact for a clean rebase.
+	conflictDir := filepath.Join(os.Getenv("XDG_STATE_HOME"), "grove", "sync", "conflicts", "default")
+	if _, err := os.Stat(filepath.Join(conflictDir, "inbox/note.md.doc-1.conflict.md")); !os.IsNotExist(err) {
+		t.Fatalf("clean rebase must not write a conflict artifact (stat err=%v)", err)
+	}
+}
+
+// TestDrainOutboxRebaseOverlapParksWithArtifact: overlapping hunks park the
+// entry exactly as before and write the conflict artifact once per
+// divergence (the entry retries every tick; the artifact must not churn).
+func TestDrainOutboxRebaseOverlapParksWithArtifact(t *testing.T) {
+	stateHome := t.TempDir()
+	t.Setenv("GROVE_HOME", "")
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	db := openTestDB(t)
+
+	base := []byte("---\ntitle: note\n---\nline one\nline two\n")
+	local := []byte("---\ntitle: note\n---\nLOCAL one\nline two\n")
+	serverHead := []byte("---\ntitle: note\n---\nREMOTE one\nline two\n")
+	root := seedRebaseScenario(t, db, base, local)
+
+	srv := serveRebaseStub(t,
+		func(req *syncproto.PushRequest) *syncproto.PushResponse {
+			resp := &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
+			for i := range resp.Results {
+				resp.Results[i] = syncproto.PushResult{
+					Status: syncproto.PushStatusConflict, DocumentID: "doc-1", Version: 7,
+				}
+			}
+			return resp
+		},
+		func(version int64) ([]byte, error) { return serverHead, nil })
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+
+	// Parked exactly as today: entry queued, disk untouched.
+	if remaining, _ := db.CountOutbox(); remaining != 1 {
+		t.Fatalf("overlap conflict must stay parked, got %d entries", remaining)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "inbox", "note.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(local) {
+		t.Fatalf("local content must be untouched on overlap, got %q", got)
+	}
+
+	artifact := filepath.Join(stateHome, "grove", "sync", "conflicts", "default", "inbox/note.md.doc-1.conflict.md")
+	fi1, err := os.Stat(artifact)
+	if err != nil {
+		t.Fatalf("expected conflict artifact at %s: %v", artifact, err)
+	}
+	artifactContent, err := os.ReadFile(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(artifactContent) != string(local) {
+		t.Fatalf("artifact must hold the local content, got %q", artifactContent)
+	}
+
+	// Second tick: still parked, artifact written once (not rewritten).
+	time.Sleep(10 * time.Millisecond)
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox (second tick): %v", err)
+	}
+	if remaining, _ := db.CountOutbox(); remaining != 1 {
+		t.Fatalf("entry must remain parked on second tick, got %d", remaining)
+	}
+	fi2, err := os.Stat(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi2.ModTime().Equal(fi1.ModTime()) {
+		t.Fatal("conflict artifact rewritten on retry; must be written once per divergence")
+	}
+}
+
+// TestDrainOutboxRebaseAbortsOnMidRebaseEdit: a local edit landing while the
+// rebase is in flight (between the local read and the merge write) aborts the
+// attempt — nothing is written, the doc record stays put, and the next tick
+// retries against the new local state.
+func TestDrainOutboxRebaseAbortsOnMidRebaseEdit(t *testing.T) {
+	t.Setenv("GROVE_HOME", "")
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	db := openTestDB(t)
+
+	base := []byte("---\ntitle: note\n---\nline one\nline two\nline three\n")
+	local := []byte("---\ntitle: note\n---\nLOCAL one\nline two\nline three\n")
+	serverHead := []byte("---\ntitle: note\n---\nline one\nline two\nREMOTE three\n")
+	midEdit := []byte("---\ntitle: note\n---\nLOCAL one\nMID EDIT two\nline three\n")
+	root := seedRebaseScenario(t, db, base, local)
+
+	srv := serveRebaseStub(t,
+		func(req *syncproto.PushRequest) *syncproto.PushResponse {
+			resp := &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
+			for i := range resp.Results {
+				resp.Results[i] = syncproto.PushResult{
+					Status: syncproto.PushStatusConflict, DocumentID: "doc-1", Version: 7,
+				}
+			}
+			return resp
+		},
+		func(version int64) ([]byte, error) {
+			// The blob fetch happens after the rebase snapshots the local
+			// file; mutating the file here is a mid-rebase local edit.
+			if err := os.WriteFile(filepath.Join(root, "inbox", "note.md"), midEdit, 0o644); err != nil {
+				return nil, err
+			}
+			return serverHead, nil
+		})
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+
+	// Aborted cleanly: the mid-rebase edit is intact on disk, the doc record
+	// and outbox entry are untouched, no artifact.
+	got, err := os.ReadFile(filepath.Join(root, "inbox", "note.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(midEdit) {
+		t.Fatalf("mid-rebase edit clobbered: disk = %q", got)
+	}
+	doc, err := db.GetDocumentByPath("default", "inbox/note.md")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocumentByPath: %v", err)
+	}
+	if doc.LastSyncedVersion != 1 || string(doc.BaseContent) != string(base) {
+		t.Fatalf("aborted rebase must not roll the merge base: v%d", doc.LastSyncedVersion)
+	}
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected the entry to stay parked, got %d (err=%v)", len(entries), err)
+	}
+	if entries[0].ContentHash != sha(local) {
+		t.Fatalf("aborted rebase must not retarget the outbox entry: %q", entries[0].ContentHash)
 	}
 }

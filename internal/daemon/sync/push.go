@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/syncproto"
 )
 
@@ -233,10 +234,16 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 					Field("path", events[i].Path).
 					Field("base_version", events[i].BaseVersion).
 					Field("server_version", result.Version).Log(ctx)
-				// Leave the entry in the outbox: the contract says the client
-				// must merge and re-push, and merging is the pull pipeline's
-				// job. The no-progress guard below keeps a conflicted entry
-				// from hot-looping within this drain call.
+				// Push-side diff3 rebase: 3-way merge base_content / local
+				// disk / server head. A clean merge rewrites the file and
+				// retargets the entry at the new server head so the next
+				// drain tick re-pushes it; overlapping hunks (or a transient
+				// fetch failure) leave the entry parked exactly as before —
+				// one retry per tick, head-of-line blocking, no-progress
+				// guard below.
+				if events[i].Type == syncproto.EventDocumentUpdated {
+					p.rebaseConflictedEntry(ctx, workspaceRoot, entries[i], &result)
+				}
 
 			case syncproto.PushStatusRejected:
 				p.log.Warn("push rejected").
@@ -275,6 +282,130 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 	}
 
 	return successCount, nil
+}
+
+// rebaseConflictedEntry implements the push-side diff3 rebase for a parked
+// Conflict entry: fetch the server head (HistoryBlob), 3-way merge it with
+// the local disk content over the stored merge base (frontmatter per-key LWW,
+// body line-based diff3), and on a clean merge rewrite the file and roll the
+// doc's merge base + the outbox hash forward so the next drain re-pushes the
+// merged content with the server head as base_version.
+//
+// Returns true only when a clean rebase landed. Every failure mode leaves the
+// entry parked untouched: transient errors (head fetch, file read) get no
+// artifact; an overlapping merge writes a conflict artifact once per
+// divergence (same format/location as the pull side's).
+func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot string, entry *OutboxEntry, result *syncproto.PushResult) bool {
+	docID := result.DocumentID
+	if docID == "" {
+		docID = entry.DocumentID
+	}
+	if docID == "" || result.Version == 0 {
+		// Server didn't identify the head; nothing to rebase onto. Transient.
+		return false
+	}
+
+	doc, err := p.db.GetDocumentByPath(p.workspace, entry.Path)
+	if err != nil || doc == nil {
+		return false
+	}
+
+	// Read the local disk content BEFORE the network fetch: the post-merge
+	// re-verify below compares against this snapshot, so any local edit that
+	// lands mid-rebase aborts this attempt (next tick retries).
+	localPath := filepath.Join(workspaceRoot, syncproto.LocalizePath(entry.Path))
+	localContent, err := os.ReadFile(localPath)
+	if err != nil {
+		return false
+	}
+	localHash := hashContent(localContent)
+
+	serverContent, err := p.client.HistoryBlob(ctx, p.workspace, docID, result.Version)
+	if err != nil {
+		// Transient: stay parked, no artifact, retry next tick.
+		p.log.Debug("rebase: failed to fetch server head").
+			Field("path", entry.Path).
+			Field("server_version", result.Version).
+			Err(err).Log(ctx)
+		return false
+	}
+
+	// Frontmatter merges per-key (LWW-map semantics — never conflicts);
+	// only overlapping body hunks park the document.
+	mergedVals := mergeValues(
+		parseFrontmatter(doc.BaseContent),
+		parseFrontmatter(localContent),
+		parseFrontmatter(serverContent))
+	mergedBody, clean := diff3Merge(
+		extractBody(doc.BaseContent),
+		extractBody(localContent),
+		extractBody(serverContent))
+	if !clean {
+		p.recordConflictArtifact(ctx, entry.Path, docID, localContent)
+		return false
+	}
+	merged := reconstructDocument(mergedVals, frontmatterKeys(localContent), mergedBody)
+
+	// A newer local edit mid-rebase invalidates the merge inputs: abort this
+	// attempt without touching anything; the next tick rebases the new state.
+	current, err := os.ReadFile(localPath)
+	if err != nil || hashContent(current) != localHash {
+		p.log.Debug("rebase: local file changed mid-rebase, aborting").
+			Field("path", entry.Path).Log(ctx)
+		return false
+	}
+
+	if err := writeFile(localPath, merged); err != nil {
+		p.log.Warn("rebase: failed to write merged content").
+			Field("path", entry.Path).Err(err).Log(ctx)
+		return false
+	}
+
+	// The server head becomes the merge base (and base_version for the
+	// re-push — DrainOutbox reads it from LastSyncedVersion); the merged
+	// content is the new local state. ContentHash must track the merged
+	// bytes so the watcher's hash gate suppresses the echo of our write.
+	mergedHash := hashContent(merged)
+	doc.ContentHash = mergedHash
+	doc.LastSyncedHash = hashContent(serverContent)
+	doc.LastSyncedVersion = result.Version
+	doc.BaseContent = serverContent
+	if err := p.db.UpdateDocument(doc); err != nil {
+		p.log.Warn("rebase: failed to update document record").
+			Field("path", entry.Path).Err(err).Log(ctx)
+		return false
+	}
+	if err := p.db.UpdateOutboxContentHashForPath(p.workspace, entry.Path, mergedHash); err != nil {
+		p.log.Warn("rebase: failed to update outbox entry").
+			Field("path", entry.Path).Err(err).Log(ctx)
+		return false
+	}
+
+	p.log.Info("rebased conflicted push onto server head").
+		Field("path", entry.Path).
+		Field("base_version", result.Version).Log(ctx)
+	return true
+}
+
+// recordConflictArtifact writes a conflict artifact for an unmergeable
+// push-side divergence — same format and location as the pull pipeline's
+// recordConflict — unless one already exists for this document (the entry is
+// retried every tick; the artifact is written once per divergence).
+func (p *PushPipeline) recordConflictArtifact(ctx context.Context, path, docID string, localContent []byte) {
+	conflictDir := filepath.Join(paths.StateDir(), "sync", "conflicts", p.workspace)
+	conflictFile := filepath.Join(conflictDir, fmt.Sprintf("%s.%s.conflict.md", path, docID))
+	if _, err := os.Stat(conflictFile); err == nil {
+		return // already recorded for this divergence
+	}
+	if err := writeFile(conflictFile, localContent); err != nil {
+		p.log.Warn("failed to write conflict artifact").
+			Field("path", path).Err(err).Log(ctx)
+		return
+	}
+	p.log.Info("conflict recorded").
+		Field("workspace", p.workspace).
+		Field("path", path).
+		Field("artifact", conflictFile).Log(ctx)
 }
 
 // uploadFileBlobs chunks and compresses a large file, uploading each chunk

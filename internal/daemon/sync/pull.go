@@ -283,21 +283,23 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, workspaceRoot string, ev
 		return p.db.UpdateDocument(doc)
 	}
 
-	// 3-way merge: parse frontmatter from base, local, and remote
-	// For now, this is a simplified implementation. Full 3-way merge is in the spec.
+	// 3-way merge of remote onto the dirty local file: frontmatter merges
+	// per-key (LWW-map semantics — frontmatter never conflicts, by design;
+	// see mergeValues), the body goes through line-based diff3. Disjoint
+	// edits from both sides compose; only overlapping body hunks conflict.
 	baseVals := parseFrontmatter(doc.BaseContent)
 	localVals := parseFrontmatter(localContent)
 	remoteVals := parseFrontmatter(content)
 
 	merged := mergeValues(baseVals, localVals, remoteVals)
 
-	// Check for body conflict
 	baseBody := extractBody(doc.BaseContent)
 	localBody := extractBody(localContent)
 	remoteBody := extractBody(content)
 
-	if !bytesEqual(baseBody, remoteBody) && !bytesEqual(baseBody, localBody) && !bytesEqual(localBody, remoteBody) {
-		// Both local and remote changed the body: CONFLICT
+	mergedBody, clean := diff3Merge(baseBody, localBody, remoteBody)
+	if !clean {
+		// Overlapping body hunks: CONFLICT — keep local, record an artifact.
 		p.log.Info("merge conflict detected").Field("path", ev.Path).Log(ctx)
 		if err := p.recordConflict(ctx, workspaceRoot, ev.Path, ev.DocumentID, localContent); err != nil {
 			return fmt.Errorf("failed to record conflict: %w", err)
@@ -306,16 +308,28 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, workspaceRoot string, ev
 		return nil
 	}
 
-	// No body conflict: merge the content
-	mergedContent := reconstructDocument(merged, remoteBody)
+	// Clean merge: both sides' edits land on disk. The remote head becomes
+	// the merge base / last-synced state; ContentHash tracks the merged bytes
+	// (disk truth — the local edit inside them is still unpushed).
+	mergedContent := reconstructDocument(merged, frontmatterKeys(localContent), mergedBody)
 	if err := writeFile(filePath, mergedContent); err != nil {
 		return fmt.Errorf("failed to write merged file: %w", err)
 	}
 
-	doc.ContentHash = ev.ContentHash
+	mergedHash := hashContent(mergedContent)
+	doc.ContentHash = mergedHash
 	doc.LastSyncedVersion = ev.Version
 	doc.LastSyncedHash = ev.ContentHash
 	doc.BaseContent = content
+
+	// Retarget any parked push of the pre-merge local edit at the merged
+	// content: the push pipeline reads disk content at push time, so a stale
+	// entry hash would fail the server's hash-integrity check and be dropped
+	// — silently losing the local half of the merge. (base_version comes from
+	// LastSyncedVersion above, so the re-push carries the new head.)
+	if err := p.db.UpdateOutboxContentHashForPath(p.ws.Name, ev.Path, mergedHash); err != nil {
+		p.log.Warn("failed to retarget outbox after merge").Field("path", ev.Path).Err(err).Log(ctx)
+	}
 	return p.db.UpdateDocument(doc)
 }
 

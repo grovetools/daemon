@@ -365,6 +365,22 @@ func (d *DB) DeleteOutbox(ids []int64) error {
 	return tx.Commit()
 }
 
+// UpdateOutboxContentHashForPath repoints every pending document_updated
+// outbox entry for a path at rebased/merged content. Used after a 3-way merge
+// rewrites the on-disk file (push-side rebase, pull-side merge onto a dirty
+// file): the push pipeline reads content from disk at push time, so a parked
+// entry carrying the pre-merge hash would fail the server's hash-integrity
+// check and be dropped — silently losing the merged edit.
+func (d *DB) UpdateOutboxContentHashForPath(workspace, path, hash string) error {
+	_, err := d.db.Exec(
+		`UPDATE sync_outbox SET content_hash = ? WHERE workspace = ? AND path = ? AND event_type = ?`,
+		hash, workspace, path, syncproto.EventDocumentUpdated)
+	if err != nil {
+		return fmt.Errorf("failed to update outbox content hash for %s/%s: %w", workspace, path, err)
+	}
+	return nil
+}
+
 // CountOutbox returns the number of pending outbox entries.
 func (d *DB) CountOutbox() (int, error) {
 	var n int
