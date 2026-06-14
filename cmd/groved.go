@@ -20,6 +20,7 @@ import (
 	"github.com/grovetools/core/pkg/logging/logutil"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
+	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/daemon/internal/daemon/autonomous"
@@ -40,7 +41,7 @@ import (
 	"github.com/grovetools/grove-gemini/pkg/gemini"
 	"github.com/grovetools/memory/pkg/memory"
 	notifyconfig "github.com/grovetools/notify/pkg/config"
-	tuimuxpty "github.com/grovetools/tuimux/pty"
+	tuimux "github.com/grovetools/tuimux/api/client"
 	"github.com/spf13/cobra"
 )
 
@@ -354,6 +355,18 @@ func newGrovedStartCmd() *cobra.Command {
 				jobsEnabled = *cfg.Daemon.Jobs.Enabled
 			}
 
+			// Stand up the standalone tuimux daemon BEFORE the JobRunner so
+			// adoption can query it. PTY ownership now lives out-of-process in
+			// this daemon, so it survives a `groved upgrade` (the successor
+			// re-discovers the same live socket). On failure we log and
+			// continue with a nil client — adoption must fail-open, never block.
+			tuimuxClient, tuimuxErr := tuimux.EnsureDaemon(tuimux.DefaultSocketPath())
+			if tuimuxErr != nil {
+				ulog.Warn("Failed to ensure tuimux daemon; agent PTYs will be unavailable").
+					Err(tuimuxErr).Log(ctx)
+				tuimuxClient = nil
+			}
+
 			var jr *jobrunner.JobRunner
 			if jobsEnabled {
 				workers := 4
@@ -387,7 +400,23 @@ func newGrovedStartCmd() *cobra.Command {
 				}
 				persister := jobrunner.NewPersistenceWithDir(persistDir)
 
-				jr = jobrunner.New(st, localRuntime, workers, persister)
+				jr = jobrunner.New(st, localRuntime, workers, persister, tuimuxClient)
+
+				// Synchronously recover persisted sessions into the store BEFORE
+				// adoption. The SessionCollector only populates the session map
+				// once the engine starts (~200 lines below), so without this
+				// adoption would see an empty map and could never read a job's
+				// PtyID to verify its out-of-process PTY survived the upgrade.
+				// Recovery failure must warn-and-continue, never block adoption.
+				if recovered, rerr := sessions.RecoverSessions(); rerr != nil {
+					ulog.Warn("Synchronous session recovery failed; continuing").Err(rerr).Log(ctx)
+				} else if len(recovered) > 0 {
+					st.ApplyUpdate(store.Update{
+						Type:    store.UpdateSessions,
+						Source:  "boot_recovery",
+						Payload: recovered,
+					})
+				}
 
 				// PHASE 2: Adopt running agents from previous daemon instance
 				jr.AdoptRunningAgents(ctx)
@@ -459,9 +488,11 @@ func newGrovedStartCmd() *cobra.Command {
 				}
 			}
 
-			// PTY session manager for daemon-owned PTY sessions
-			ptyManager := tuimuxpty.NewManager(nil)
-			srv.SetPtyManager(ptyManager)
+			// Wire the out-of-process tuimux client onto the server so PTY
+			// create / input / interrupt route to the standalone tuimux daemon
+			// instead of an embedded in-process manager. PTYs now survive a
+			// `groved upgrade` because the tuimux daemon outlives groved.
+			srv.SetTuimuxClient(tuimuxClient)
 
 			// sendInputToSession delegates to Server.SendSessionInput so the
 			// channels manager and autonomous pinger both benefit from the
@@ -556,7 +587,22 @@ func newGrovedStartCmd() *cobra.Command {
 				case <-shutdownReq:
 					ulog.Info("Auto-shutdown fired (idle TerminalHub)").Log(bgCtx)
 				}
-				ptyManager.Shutdown()    // Kill all daemon-owned PTY sessions
+				// Reap the agent PTYs this daemon owns. With PTYs out-of-process,
+				// a plain stop (this SIGTERM/auto-shutdown path — NOT the SIGUSR1
+				// drain path, which leaves PTYs untouched for upgrade survival)
+				// must explicitly kill them via the tuimux daemon, leaving the
+				// tuimux daemon process itself running (other tools may share it).
+				if tuimuxClient != nil {
+					for _, sess := range st.GetSessions() {
+						if sess.PtyID == "" {
+							continue
+						}
+						if err := tuimuxClient.KillPty(sess.PtyID); err != nil {
+							ulog.Warn("Failed to kill agent PTY on stop").
+								Err(err).Field("pty_id", sess.PtyID).Log(bgCtx)
+						}
+					}
+				}
 				envManager.Shutdown()    // Teardown all running environments and proxy routes
 				streamer.Stop()          // Stop all job log tailing goroutines
 				workspaceStreamer.Stop() // Stop workspace log aggregation
@@ -740,7 +786,9 @@ func newGrovedStartCmd() *cobra.Command {
 				ulog.Warn("Failed to start SSH server").Err(err).Log(ctx)
 			} else if s != nil {
 				s.SetStore(st)
-				s.SetPtyManager(ptyManager)
+				// PTYs are now owned out-of-process by the tuimux daemon; the
+				// SSH server's in-process ptyManager listing is left nil (its
+				// daemon-owned-PTY paths are nil-guarded and become no-ops).
 				sshServer = s
 				go func() {
 					if err := sshServer.Start(); err != nil {

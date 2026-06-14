@@ -15,6 +15,7 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/flow/pkg/orchestration"
+	tuimux "github.com/grovetools/tuimux/api/client"
 )
 
 // JobRunner manages the job queue, worker pool, and execution lifecycle.
@@ -30,6 +31,12 @@ type JobRunner struct {
 	store     *store.Store
 	ulog      *grovelogging.UnifiedLogger
 	persister *Persistence
+
+	// tuimuxClient talks to the standalone tuimux daemon that owns agent
+	// PTYs out-of-process. Used by AdoptRunningAgents to verify that an
+	// adopted job's PtyID still maps to a live PTY after a graceful upgrade.
+	// May be nil when the tuimux daemon could not be started.
+	tuimuxClient *tuimux.ApiClient
 
 	// blocked holds jobs whose dependencies are not yet satisfied.
 	// They are promoted to the run queue by evaluateBlockedJobs().
@@ -56,7 +63,9 @@ func (jr *JobRunner) SetOnJobDetached(fn func(jobID string)) {
 }
 
 // New creates a new JobRunner with the given store, runtime, and worker count.
-func New(st *store.Store, runtime orchestration.Runtime, workers int, persister *Persistence) *JobRunner {
+// tuimuxClient is the standalone tuimux daemon client used by adoption to
+// re-bind out-of-process agent PTYs across a graceful upgrade; it may be nil.
+func New(st *store.Store, runtime orchestration.Runtime, workers int, persister *Persistence, tuimuxClient *tuimux.ApiClient) *JobRunner {
 	if workers <= 0 {
 		workers = 4
 	}
@@ -68,6 +77,7 @@ func New(st *store.Store, runtime orchestration.Runtime, workers int, persister 
 		store:         st,
 		ulog:          grovelogging.NewUnifiedLogger("groved.jobrunner"),
 		persister:     persister,
+		tuimuxClient:  tuimuxClient,
 		blocked:       make(map[string]*models.JobInfo),
 		transcriptSem: make(chan struct{}, 4),
 	}

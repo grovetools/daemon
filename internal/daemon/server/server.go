@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,9 +41,8 @@ import (
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/memory/pkg/memory"
 	navbindings "github.com/grovetools/nav/pkg/bindings"
+	tuimux "github.com/grovetools/tuimux/api/client"
 	"github.com/grovetools/tuimux/hub"
-	tuimuxpty "github.com/grovetools/tuimux/pty"
-	tuimuxserver "github.com/grovetools/tuimux/server"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sync/singleflight"
@@ -78,12 +78,11 @@ type Server struct {
 	// accidentally grow a competing route table.
 	scope string
 
-	// PTY session manager for daemon-owned PTY sessions.
-	ptyManager *tuimuxpty.Manager
-
-	// tuimuxServer is the reusable tuimux HTTP server that handles
-	// PTY and hub endpoints.
-	tuimuxServer *tuimuxserver.Server
+	// tuimuxClient talks to the standalone tuimux daemon that owns agent
+	// PTYs out-of-process. Agent spawn, input, and interrupt route through
+	// it so PTY panes survive a `groved upgrade`. May be nil if the tuimux
+	// daemon could not be started.
+	tuimuxClient *tuimux.ApiClient
 
 	// Memory store + embedder are wired via SetMemoryStore so /api/memory/*
 	// handlers can serve the same instance the MemoryHandler watcher uses.
@@ -194,13 +193,11 @@ func (s *Server) SetScope(scope string) {
 	s.scope = scope
 }
 
-// SetPtyManager sets the PTY session manager for the server.
-func (s *Server) SetPtyManager(m *tuimuxpty.Manager) {
-	s.ptyManager = m
-	s.tuimuxServer = tuimuxserver.New(tuimuxserver.Config{
-		PtyManager:  m,
-		TerminalHub: s.terminalHub,
-	})
+// SetTuimuxClient wires the standalone tuimux daemon client used to create
+// and drive agent PTYs out-of-process. /api/pty/ and /api/hub/ are reverse
+// proxied to the same tuimux daemon socket (see ListenAndServe).
+func (s *Server) SetTuimuxClient(c *tuimux.ApiClient) {
+	s.tuimuxClient = c
 }
 
 // ListenAndServe starts the daemon on the given unix socket path.
@@ -332,12 +329,27 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	// Static web viewer files
 	mux.Handle("/web/treemux/", http.StripPrefix("/web/treemux/", daemonweb.TreemuxFileServer()))
 
-	// PTY + hub endpoints — delegated to tuimux/server
-	if s.tuimuxServer != nil {
-		tmuxHandler := s.tuimuxServer.Handler()
-		mux.Handle("/api/pty/", tmuxHandler)
-		mux.Handle("/api/hub/", tmuxHandler)
+	// PTY + hub endpoints — reverse proxied to the standalone tuimux daemon
+	// which owns the PTY master FDs out-of-process. Proxying (rather than
+	// embedding a manager) is what lets agent panes survive a `groved
+	// upgrade`: the tuimux daemon outlives groved, so the successor simply
+	// re-proxies to the same live socket and clients auto-reconnect. The
+	// proxy transparently handles WebSocket upgrades (/api/pty/attach,
+	// /api/pty/subscribe) and SSE (/api/pty/events).
+	tuimuxSock := tuimux.DefaultSocketPath()
+	ptyProxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = "unix"
+		},
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", tuimuxSock)
+			},
+		},
 	}
+	mux.Handle("/api/pty/", ptyProxy)
+	mux.Handle("/api/hub/", ptyProxy)
 
 	// Nav bindings endpoints
 	mux.HandleFunc("/api/nav/bindings", s.handleNavBindings)
@@ -1014,6 +1026,38 @@ func (s *Server) sessionFromDeliveryState(jobID string) *models.Session {
 	return nil
 }
 
+// writePtyWithRetry writes bytes to an out-of-process PTY via the tuimux
+// daemon. PTY ownership now lives in the standalone tuimux daemon, so this is
+// a unix-socket HTTP hop rather than the old zero-hop in-process write. A
+// single transient failure is retried once after a 50ms backoff; if it still
+// fails the tuimux daemon is unreachable and the SSE fallback (which also
+// depends on it) cannot save the session, so we mark the session interrupted
+// (not failed — the agent was alive; the route died) and return the error.
+func (s *Server) writePtyWithRetry(ctx context.Context, jobID, ptyID string, data []byte) error {
+	err := s.tuimuxClient.WritePty(ptyID, data)
+	if err != nil {
+		time.Sleep(50 * time.Millisecond)
+		err = s.tuimuxClient.WritePty(ptyID, data)
+	}
+	if err != nil {
+		s.ulog.Warn("PTY write to tuimux daemon failed after retry; marking session interrupted").
+			Err(err).
+			Field("job_id", jobID).
+			Field("pty_id", ptyID).
+			Log(ctx)
+		s.engine.Store().ApplyUpdate(store.Update{
+			Type:   store.UpdateSessionEnd,
+			Source: "api",
+			Payload: &store.SessionEndPayload{
+				JobID:   jobID,
+				Outcome: "interrupted",
+			},
+		})
+		return fmt.Errorf("tuimux daemon unreachable for session %s: %w", jobID, err)
+	}
+	return nil
+}
+
 // effectiveMux returns the mux to use for routing input/interrupt to a
 // session. An explicit session.Mux wins; otherwise we fall back to the
 // legacy implicit inference (PtyID→treemux, TmuxTarget→tmux) so pre-upgrade
@@ -1068,27 +1112,22 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 
 	switch mux {
 	case models.MuxTreemux:
-		// Tier 1: direct PTY write (zero-hop, works even when no client is attached)
-		if session.PtyID != "" && s.ptyManager != nil {
-			if ptySess, ok := s.ptyManager.Get(session.PtyID); ok {
-				if _, err := ptySess.Write([]byte(payload)); err != nil {
-					s.ulog.Warn("Direct PTY write failed, falling back").
-						Err(err).
-						Field("job_id", jobID).
-						Field("pty_id", session.PtyID).
-						Field("mux", mux).
-						Field("tier", "direct_pty").
-						Log(ctx)
-				} else {
-					s.ulog.Debug("Injected input into agent").
-						Field("job_id", jobID).
-						Field("mux", mux).
-						Field("tier", "direct_pty").
-						Field("input_len", len(payload)).
-						Log(ctx)
-					return nil
-				}
+		// Tier 1: write to the out-of-process PTY on the tuimux daemon. This is
+		// a unix-socket HTTP hop (was a zero-hop in-process write); on a single
+		// transient failure we retry once, then mark the session interrupted —
+		// because once the tuimux daemon is unreachable the SSE fallback (which
+		// also depends on it) cannot recover the session either.
+		if session.PtyID != "" && s.tuimuxClient != nil {
+			if err := s.writePtyWithRetry(ctx, jobID, session.PtyID, []byte(payload)); err != nil {
+				return err
 			}
+			s.ulog.Debug("Injected input into agent").
+				Field("job_id", jobID).
+				Field("mux", mux).
+				Field("tier", "direct_pty").
+				Field("input_len", len(payload)).
+				Log(ctx)
+			return nil
 		}
 		// Tier 2: SSE relay to groveterm
 		if s.terminalHub != nil && s.terminalHub.HasConnections() {
@@ -1150,25 +1189,16 @@ func (s *Server) SendSessionInterrupt(ctx context.Context, jobID string) error {
 
 	switch mux {
 	case models.MuxTreemux:
-		if session.PtyID != "" && s.ptyManager != nil {
-			if ptySess, ok := s.ptyManager.Get(session.PtyID); ok {
-				if _, err := ptySess.Write([]byte{0x03}); err != nil {
-					s.ulog.Warn("Direct PTY interrupt failed, falling back").
-						Err(err).
-						Field("job_id", jobID).
-						Field("pty_id", session.PtyID).
-						Field("mux", mux).
-						Field("tier", "direct_pty").
-						Log(ctx)
-				} else {
-					s.ulog.Debug("Sent interrupt to agent").
-						Field("job_id", jobID).
-						Field("mux", mux).
-						Field("tier", "direct_pty").
-						Log(ctx)
-					return nil
-				}
+		if session.PtyID != "" && s.tuimuxClient != nil {
+			if err := s.writePtyWithRetry(ctx, jobID, session.PtyID, []byte{0x03}); err != nil {
+				return err
 			}
+			s.ulog.Debug("Sent interrupt to agent").
+				Field("job_id", jobID).
+				Field("mux", mux).
+				Field("tier", "direct_pty").
+				Log(ctx)
+			return nil
 		}
 		if s.terminalHub != nil && s.terminalHub.HasConnections() {
 			s.engine.Store().ApplyUpdate(store.Update{
@@ -1472,6 +1502,39 @@ func (s *Server) handleTerminalStatus(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, `{"connected":%t}`, connected)
 }
 
+// writeAgentWrapper writes a one-shot wrapper script that re-execs the given
+// interactive shell with `-i -c <script>`. The tuimux ApiClient.CreatePty only
+// accepts a single command token (no Args), so this wrapper is how we preserve
+// the original `<shell> -i -c <script>` invocation (RC sourcing + env exports)
+// out-of-process. The wrapper removes itself before exec so it never lingers.
+// It returns the absolute path to the executable wrapper.
+func writeAgentWrapper(shell, script string) (string, error) {
+	f, err := os.CreateTemp("", "grove-agent-*.sh")
+	if err != nil {
+		return "", err
+	}
+	path := f.Name()
+	// rm the wrapper, then exec the interactive shell with the agent script.
+	// Single-quote the script and escape embedded single quotes so the outer
+	// `-c` argument is one literal token.
+	escapedScript := strings.ReplaceAll(script, "'", "'\\''")
+	content := fmt.Sprintf("#!/bin/sh\nrm -f '%s'\nexec '%s' -i -c '%s'\n", path, shell, escapedScript)
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
 // handleAgentSpawn handles POST /api/agents/spawn — creates a daemon-owned PTY
 // for the agent process and sends an attach event to groveterm via SSE.
 func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
@@ -1490,10 +1553,11 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If the PTY manager is available, create a daemon-owned PTY for the agent
-	// and send an attach event instead of a spawn event. This lets the agent
-	// process survive terminal restarts.
-	if s.ptyManager != nil && payload.Command != "" {
+	// If the tuimux client is available, create an out-of-process PTY for the
+	// agent on the standalone tuimux daemon and send an attach event instead
+	// of a spawn event. Owning the PTY out-of-process is what lets the agent
+	// process and its pane survive a `groved upgrade`.
+	if s.tuimuxClient != nil && payload.Command != "" {
 		// Wrap the agent command in an interactive shell so the user's RC
 		// files are sourced (PATH includes nvm, homebrew, etc.). Export
 		// env vars inside the script to ensure they survive shell init.
@@ -1515,13 +1579,25 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 			script.WriteString(fmt.Sprintf(" '%s'", escapedArg))
 		}
 
-		sess, err := s.ptyManager.Create(tuimuxpty.CreateRequest{
-			CWD:     payload.WorkDir,
-			Command: shell,
-			Args:    []string{"-i", "-c", script.String()},
-			Name:    filepath.Base(payload.WorkDir),
-			Env:     []string{"GROVE_PTY=1", "GROVE_TERMINAL=1"},
-			Tags: map[string]string{
+		// The tuimux ApiClient.CreatePty takes a single command token (no
+		// Args), so reproduce the original `<shell> -i -c <script>` invocation
+		// via a tiny self-deleting wrapper script that the tuimux daemon execs
+		// directly. The wrapper re-execs the interactive shell with the exact
+		// same args, preserving RC sourcing and env-export behavior. It removes
+		// itself before exec so no temp file lingers past spawn.
+		wrapper, werr := writeAgentWrapper(shell, script.String())
+		if werr != nil {
+			s.ulog.Error("Failed to write agent PTY wrapper").Err(werr).Log(r.Context())
+			http.Error(w, "failed to prepare agent PTY: "+werr.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		ptyID, err := s.tuimuxClient.CreatePty(
+			wrapper,
+			payload.WorkDir,
+			[]string{"GROVE_PTY=1", "GROVE_TERMINAL=1"},
+			40, 120,
+			map[string]string{
 				"job_id":     payload.JobID,
 				"plan_name":  payload.PlanName,
 				"type":       "agent",
@@ -1529,14 +1605,13 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 				"label":      payload.JobTitle,
 				"created_by": "flow",
 			},
-		})
+		)
 		if err != nil {
+			_ = os.Remove(wrapper)
 			s.ulog.Error("Failed to create agent PTY session").Err(err).Log(r.Context())
 			http.Error(w, "failed to create agent PTY: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		ptyID := sess.ID
 
 		// Update the session registry with the PTY ID so re-attachment works.
 		if st := s.engine.Store(); st != nil {
