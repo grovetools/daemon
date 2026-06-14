@@ -193,7 +193,13 @@ func newGrovedStartCmd() *cobra.Command {
 			// scope preserves the legacy global socket/pidfile, so existing dev
 			// and test workflows continue unchanged.
 			scope, _ := cmd.Flags().GetString("scope")
-			if scope != "" {
+			// `upgrade` passes the predecessor's already-resolved scope verbatim
+			// via --scope-verbatim so GROVE_SCOPE (and thus the socket its child
+			// clients reconnect to) is byte-identical across the swap. Re-resolving
+			// it here would re-derive a different string (case-normalization, cwd
+			// drift) and break that reconnection.
+			verbatimScope, _ := cmd.Flags().GetBool("scope-verbatim")
+			if scope != "" && !verbatimScope {
 				scope = workspace.ResolveScope(scope)
 			}
 			// Export GROVE_SCOPE so jobrunner and any PTYs spawned by this
@@ -245,6 +251,20 @@ func newGrovedStartCmd() *cobra.Command {
 					ulog.Error("Failed to release pidfile").Err(err).Log(context.Background())
 				}
 			}()
+
+			// Record the exact resolved scope in a sidecar next to the pidfile so
+			// `groved upgrade` can hand the successor the identical GROVE_SCOPE.
+			// Only scoped daemons need it (the unscoped scope is the empty string,
+			// known without a sidecar). We deliberately do NOT remove the sidecar
+			// on shutdown: during a graceful upgrade the successor writes it before
+			// this process tears down, and removing it on the drain path would race
+			// the successor's write. Stale sidecars are harmless and `status
+			// --prune` clears them.
+			if scope != "" {
+				if err := os.WriteFile(scopeSidecarPath(pidPath), []byte(scope), 0o644); err != nil { //nolint:gosec // G306: sibling of the world-readable pidfile
+					ulog.Warn("Failed to write scope sidecar").Err(err).Log(context.Background())
+				}
+			}
 
 			// 2. Load config for daemon settings
 			cfg, err := config.LoadDefault()
@@ -369,8 +389,8 @@ func newGrovedStartCmd() *cobra.Command {
 
 				jr = jobrunner.New(st, localRuntime, workers, persister)
 
-			// PHASE 2: Adopt running agents from previous daemon instance
-			jr.AdoptRunningAgents(ctx)
+				// PHASE 2: Adopt running agents from previous daemon instance
+				jr.AdoptRunningAgents(ctx)
 				go jr.Start(ctx)
 				ulog.Info("JobRunner started").Field("workers", workers).Log(ctx)
 			}
@@ -761,6 +781,8 @@ func newGrovedStartCmd() *cobra.Command {
 	cmd.Flags().String("monitor-format", "full", "Output format for --monitor: text, json, full, rich, pretty")
 	cmd.Flags().Bool("monitor-compact", true, "Disable spacing between monitor log entries")
 	cmd.Flags().String("scope", "", "Ecosystem scope path for this daemon (empty = global/unscoped)")
+	cmd.Flags().Bool("scope-verbatim", false, "Treat --scope as already resolved; skip ResolveScope (set by `groved upgrade` to preserve the predecessor's exact scope)")
+	_ = cmd.Flags().MarkHidden("scope-verbatim")
 	cmd.Flags().String("socket", "", "Override socket path (empty = derive from --scope)")
 	cmd.Flags().String("pidfile", "", "Override pidfile path (empty = derive from --scope)")
 	cmd.Flags().Bool("auto-shutdown", false, "Exit after 2m with no terminal WebSocket clients connected")
@@ -780,18 +802,58 @@ drain mode (unlink the socket, finish in-flight requests), then starts this
 groved binary on the freed socket. The new daemon adopts running detached
 agents by PID, so live agent panes and headless jobs survive the swap.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Resolve --scope the same way `start` does (groved.go ~:196), so the
-			// pidfile/socket hash we look up matches what the running daemon
-			// registered. Without this, `upgrade --scope <name>` hashes the raw
-			// string while the daemon was keyed on the resolved ecosystem path,
-			// producing "failed to read pidfile".
-			if scope != "" {
-				scope = workspace.ResolveScope(scope)
+			// Select the running daemon to upgrade from the live enumeration —
+			// the same source of truth `status` and `kill` use. An empty --scope
+			// targets the global/unscoped daemon; a non-empty --scope matches a
+			// scoped daemon by its label (the pidfile's middle segment), exactly
+			// like `groved kill <scope>`.
+			//
+			// We never derive the target by hashing --scope and never fall back to
+			// the unscoped daemon when a scope was requested but not found: an
+			// earlier version did, and `upgrade --scope <name>` silently drained
+			// and replaced the *unscoped* daemon when the name failed to resolve.
+			entries, err := enumerateDaemons()
+			if err != nil {
+				return fmt.Errorf("enumerate daemons: %w", err)
 			}
-			return daemon.UpgradeRunning(cmd.Context(), scope)
+
+			var match *daemonEntry
+			var runningLabels []string
+			for i := range entries {
+				e := entries[i]
+				if !e.Running {
+					continue
+				}
+				runningLabels = append(runningLabels, displayScope(e.Scope))
+				if e.Scope != scope {
+					continue
+				}
+				if match != nil {
+					return fmt.Errorf("scope %q matches multiple running daemons; `groved kill` the extras first", scope)
+				}
+				m := e
+				match = &m
+			}
+
+			if match == nil {
+				if scope == "" {
+					return fmt.Errorf("no running unscoped daemon to upgrade (running: %s)", strings.Join(runningLabels, ", "))
+				}
+				return fmt.Errorf("no running daemon for scope %q (running: %s)", scope, strings.Join(runningLabels, ", "))
+			}
+
+			// A scoped successor must inherit the predecessor's exact scope string
+			// (its GROVE_SCOPE), recorded in the .scope sidecar at start. Without it
+			// we cannot guarantee the successor's child clients reconnect to the same
+			// socket, so refuse rather than guess.
+			if match.Scope != "" && match.ExactScope == "" {
+				return fmt.Errorf("daemon for scope %q has no .scope sidecar (started by an older binary); restart it under the current binary, then upgrade", scope)
+			}
+
+			return daemon.UpgradeRunning(cmd.Context(), match.PidPath, match.SockPath, match.ExactScope)
 		},
 	}
-	cmd.Flags().StringVar(&scope, "scope", "", "scope name of the daemon to upgrade (default: the global daemon)")
+	cmd.Flags().StringVar(&scope, "scope", "", "label of the scoped daemon to upgrade (default: the global/unscoped daemon)")
 	return cmd
 }
 
@@ -893,15 +955,32 @@ Exits 0 if at least one running daemon is found; exits 1 if none.`,
 						} else {
 							fmt.Printf("  failed %s: %v\n", filepath.Base(e.PidPath), err)
 						}
-						// Also unlink the orphaned socket if it still exists.
+						// Also unlink the orphaned socket and .scope sidecar if present.
 						if _, err := os.Stat(e.SockPath); err == nil {
 							_ = os.Remove(e.SockPath)
 						}
+						_ = os.Remove(scopeSidecarPath(e.PidPath))
 					}
 				} else {
 					fmt.Printf("\nStale pidfiles (%d) — pass --prune to remove:\n", len(stale))
 					for _, e := range stale {
 						fmt.Printf("  %s (last PID %d — not running)\n", filepath.Base(e.PidPath), e.PID)
+					}
+				}
+			}
+
+			// Sweep orphaned .scope sidecars whose pidfile is gone (the daemon
+			// exited cleanly and released the pidfile, but a sidecar can linger if
+			// it was left by an upgrade or an unclean stop). These have no entry in
+			// the pidfile-keyed enumeration above, so handle them separately.
+			if prune {
+				sidecars, _ := filepath.Glob(filepath.Join(paths.StateDir(), "groved*.scope"))
+				for _, sc := range sidecars {
+					pidSibling := strings.TrimSuffix(sc, ".scope") + ".pid"
+					if _, err := os.Stat(pidSibling); os.IsNotExist(err) {
+						if os.Remove(sc) == nil {
+							fmt.Printf("  removed orphan sidecar %s\n", filepath.Base(sc))
+						}
 					}
 				}
 			}

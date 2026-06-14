@@ -15,12 +15,22 @@ import (
 
 // daemonEntry is a single entry in the enumerated daemon list.
 type daemonEntry struct {
-	Scope    string // "" for unscoped
-	PidPath  string
-	SockPath string
-	PID      int
-	Running  bool
-	Age      time.Duration
+	Scope      string // label only ("" for unscoped); the pidfile's middle segment
+	ExactScope string // the daemon's exact resolved scope string, from its .scope sidecar ("" if unscoped or no sidecar)
+	PidPath    string
+	SockPath   string
+	PID        int
+	Running    bool
+	Age        time.Duration
+}
+
+// scopeSidecarPath returns the path to the .scope sidecar that sits next to a
+// daemon's pidfile and records its exact resolved scope string. The pidfile
+// stores only the PID (every reader Atoi's the whole file), so the exact scope
+// — which the successor daemon needs as GROVE_SCOPE so its child clients
+// reconnect to the same socket — lives in this sibling file instead.
+func scopeSidecarPath(pidPath string) string {
+	return strings.TrimSuffix(pidPath, ".pid") + ".scope"
 }
 
 // enumerateDaemons scans StateDir() for groved*.pid files and returns a
@@ -36,11 +46,17 @@ func enumerateDaemons() ([]daemonEntry, error) {
 	entries := make([]daemonEntry, 0, len(matches))
 	for _, pidPath := range matches {
 		scope := scopeFromPidFilename(filepath.Base(pidPath))
-		var sockPath string
-		if scope == "" {
-			sockPath = paths.SocketPath()
-		} else {
-			sockPath = paths.SocketPath(scope)
+		// The socket sits next to the pidfile with the same stem. Derive it from
+		// the real filename rather than re-hashing the extracted label: the label
+		// is only filepath.Base(scope), so paths.SocketPath(label) re-hashes the
+		// short label and yields a DIFFERENT hash than the daemon's actual socket
+		// (which hashes the full scope path). That mismatch made `status` print a
+		// socket that didn't exist and would mis-target any path-based action.
+		sockPath := strings.TrimSuffix(pidPath, ".pid") + ".sock"
+
+		var exactScope string
+		if data, err := os.ReadFile(scopeSidecarPath(pidPath)); err == nil {
+			exactScope = strings.TrimSpace(string(data))
 		}
 
 		running, pid, _ := pidfile.IsRunning(pidPath)
@@ -51,12 +67,13 @@ func enumerateDaemons() ([]daemonEntry, error) {
 		}
 
 		entries = append(entries, daemonEntry{
-			Scope:    scope,
-			PidPath:  pidPath,
-			SockPath: sockPath,
-			PID:      pid,
-			Running:  running,
-			Age:      age,
+			Scope:      scope,
+			ExactScope: exactScope,
+			PidPath:    pidPath,
+			SockPath:   sockPath,
+			PID:        pid,
+			Running:    running,
+			Age:        age,
 		})
 	}
 
@@ -158,6 +175,11 @@ Stale pidfiles whose PIDs are already gone are removed.`,
 }
 
 func killOne(e daemonEntry, wait time.Duration) {
+	// A definitive stop has no successor, so the daemon won't unlink its own
+	// .scope sidecar (it leaves that to the upgrade path). Clean it up here once
+	// we've signaled; the daemon releases the pidfile on SIGTERM.
+	defer func() { _ = os.Remove(scopeSidecarPath(e.PidPath)) }()
+
 	proc, err := os.FindProcess(e.PID)
 	if err != nil {
 		fmt.Printf("  [%s] find process %d: %v\n", displayScope(e.Scope), e.PID, err)
