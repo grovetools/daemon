@@ -780,6 +780,14 @@ drain mode (unlink the socket, finish in-flight requests), then starts this
 groved binary on the freed socket. The new daemon adopts running detached
 agents by PID, so live agent panes and headless jobs survive the swap.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Resolve --scope the same way `start` does (groved.go ~:196), so the
+			// pidfile/socket hash we look up matches what the running daemon
+			// registered. Without this, `upgrade --scope <name>` hashes the raw
+			// string while the daemon was keyed on the resolved ecosystem path,
+			// producing "failed to read pidfile".
+			if scope != "" {
+				scope = workspace.ResolveScope(scope)
+			}
 			return daemon.UpgradeRunning(cmd.Context(), scope)
 		},
 	}
