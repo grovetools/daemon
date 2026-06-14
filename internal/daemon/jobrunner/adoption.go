@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -41,40 +42,42 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 			continue
 		}
 
-		if job.PID <= 0 {
-			// No PID recorded — mark as failed ungraceful
-			job.Status = "failed"
-			job.Error = "daemon restarted with no recorded PID"
-			now := time.Now()
-			job.CompletedAt = &now
-			jr.persister.Save(job)
-			jr.store.ApplyUpdate(store.Update{
-				Type:    store.UpdateJobFailed,
-				Source:  "adoption",
-				Payload: job,
-			})
-			failed++
-			jr.ulog.Warn("Marked orphaned job as failed (no PID)").
-				Field("job_id", job.ID).
-				Log(ctx)
-			continue
-		}
+		statusPath := jr.getStatusFilePath(job)
+		_, statErr := os.Stat(statusPath)
 
-		// Check if PID is still alive via kill(pid, 0)
-		alive := jr.isPIDAlive(job.PID)
+		// Diagnostic (permanent, Debug): logs the exact state adoption sees for
+		// each running job — including the persisted ID, the PID, the computed
+		// .status path, and whether that file exists. This both confirms the
+		// PID-propagation fix took effect and settles the job.ID identity
+		// question (does the persisted JobInfo.ID match the .status writer's
+		// key?). Observe via
+		// `core logs --component groved.jobrunner --level debug -f`.
+		jr.ulog.Debug("Adoption loop: evaluating running job").
+			Field("job_id", job.ID).
+			Field("job_status", job.Status).
+			Field("job_pid", job.PID).
+			Field("status_path", statusPath).
+			Field("status_file_exists", statErr == nil).
+			StructuredOnly().
+			Log(ctx)
+
+		// A job is adoptable only when it has a live PID. Missing or dead PIDs
+		// fall through to the .status reconcile below before we declare failure
+		// — this is the core fix: never mark a job "failed (no PID)" without
+		// first consulting the durable .status file the agent wrote on exit.
+		alive := job.PID > 0 && jr.isPIDAlive(job.PID)
 		if !alive {
-			// Process is dead — try to read .status file for exit code
-			statusPath := jr.getStatusFilePath(job)
+			// Process is missing or dead — try to read .status for exit code.
 			if statusContent, err := jr.readStatusFile(statusPath); err == nil {
-				// .status file exists — use its exit code
+				// .status file exists — reconcile to the true terminal state.
 				if statusContent.ExitCode == 0 {
 					job.Status = "completed"
 				} else {
 					job.Status = "failed"
-					job.Error = "agent exited with code: " + string(rune(statusContent.ExitCode))
+					job.Error = "agent exited with code: " + strconv.Itoa(statusContent.ExitCode)
 				}
 			} else {
-				// No .status file — assume ungraceful crash
+				// No .status file — agent vanished without recording an exit.
 				job.Status = "failed"
 				job.Error = "daemon restarted; agent process exited without status file"
 			}
@@ -82,13 +85,18 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 			now := time.Now()
 			job.CompletedAt = &now
 			jr.persister.Save(job)
+
+			updateType := store.UpdateJobCompleted
+			if job.Status == "failed" {
+				updateType = store.UpdateJobFailed
+			}
 			jr.store.ApplyUpdate(store.Update{
-				Type:    store.UpdateJobFailed,
+				Type:    updateType,
 				Source:  "adoption",
 				Payload: job,
 			})
 			failed++
-			jr.ulog.Info("Adoption: process dead, marked job complete").
+			jr.ulog.Info("Adoption: process not alive, reconciled from .status").
 				Field("job_id", job.ID).
 				Field("pid", job.PID).
 				Field("status", job.Status).
@@ -137,7 +145,7 @@ func (jr *JobRunner) adoptedPIDPoller(ctx context.Context, job *models.JobInfo) 
 					if statusContent.ExitCode == 0 {
 						jr.markDone(job, "completed", "")
 					} else {
-						jr.markDone(job, "failed", "agent exited with code: "+string(rune(statusContent.ExitCode)))
+						jr.markDone(job, "failed", "agent exited with code: "+strconv.Itoa(statusContent.ExitCode))
 					}
 				} else {
 					jr.markDone(job, "failed", "agent process exited without status file")

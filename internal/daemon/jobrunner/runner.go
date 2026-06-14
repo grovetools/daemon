@@ -573,6 +573,32 @@ func (jr *JobRunner) watchTransitions(ctx context.Context) {
 						}
 					}
 				}
+			case store.UpdateSessionConfirmation:
+				// The store's applySessionConfirmation already copied the
+				// confirmed PID onto JobInfo.PID before this broadcast. The
+				// confirmation arrives asynchronously, after the job was first
+				// marked "running" and saved, so re-persist the job to flush the
+				// PID to disk — otherwise jobs/<id>.json keeps pid:null and
+				// adoption can never re-attach the agent on a graceful upgrade.
+				if payload, ok := update.Payload.(*store.SessionConfirmationPayload); ok {
+					job := jr.store.GetJob(payload.JobID)
+					pid := 0
+					if job != nil {
+						pid = job.PID
+					}
+					// Diagnostic (permanent, Debug): proves the event reaches the
+					// jobrunner and shows the PID read back from the store just
+					// before the persist. Observe via
+					// `core logs --component groved.jobrunner --level debug -f`.
+					jr.ulog.Debug("Session confirmation: persisting JobInfo with PID").
+						Field("job_id", payload.JobID).
+						Field("job_pid", pid).
+						StructuredOnly().
+						Log(ctx)
+					if jr.persister != nil && job != nil {
+						jr.persister.Save(job)
+					}
+				}
 			}
 		}
 	}
