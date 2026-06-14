@@ -5,6 +5,8 @@ package jobrunner
 import (
 	"context"
 	"encoding/json"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +15,8 @@ import (
 
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	tuimux "github.com/grovetools/tuimux/api/client"
+	tuimuxpty "github.com/grovetools/tuimux/pty"
 )
 
 // statusFileContent represents the JSON structure written to .status files by agents.
@@ -37,9 +41,71 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 	adopted := 0
 	failed := 0
 
+	// Health-gate the out-of-process PTY list BEFORE any fail decision. PTYs
+	// now live in the standalone tuimux daemon; an adopted interactive job is
+	// only truly alive if its PtyID still maps to a live PTY there. But a
+	// transient/too-early query that returns an error must NOT cause us to
+	// fail live sessions, so we retry a few times and, if it still fails, set
+	// tuimuxAvailable=false and fall back to the PID-only path (fail-open).
+	livePtys := map[string]bool{}
+	tuimuxAvailable := false
+	if jr.tuimuxClient != nil {
+		for attempt := 0; attempt < 3; attempt++ {
+			metas, err := jr.listLivePtys()
+			if err == nil {
+				for _, m := range metas {
+					livePtys[m.ID] = true
+				}
+				tuimuxAvailable = true
+				break
+			}
+			jr.ulog.Warn("Adoption: tuimux PTY list query failed; retrying").
+				Err(err).Field("attempt", attempt+1).Log(ctx)
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if !tuimuxAvailable {
+		jr.ulog.Warn("Adoption: tuimux PTY list unavailable; falling back to PID-only adoption (no PTY split-brain check)").Log(ctx)
+	}
+
 	for _, job := range jobs {
 		if job.Status != "running" {
 			continue
+		}
+
+		// PTY split-brain check (only when the tuimux daemon answered and the
+		// job actually owns a PTY). Headless jobs (no session / empty PtyID)
+		// bypass this entirely and keep the existing PID-only path below, which
+		// already survives upgrades. If the job's PtyID is gone from the live
+		// list, its out-of-process PTY died during the drain window: the agent
+		// process is an unreachable orphan, so reap the process group and mark
+		// it failed. We only do this when tuimuxAvailable — never on a flaky
+		// query. The .status reconcile below is preserved for every other case.
+		if tuimuxAvailable {
+			session := jr.store.GetSession(job.ID)
+			if session != nil && session.PtyID != "" && !livePtys[session.PtyID] {
+				if job.PID > 0 {
+					// Negative PID targets the whole process group.
+					_ = syscall.Kill(-job.PID, syscall.SIGKILL)
+				}
+				job.Status = "failed"
+				job.Error = "PTY lost during daemon upgrade"
+				now := time.Now()
+				job.CompletedAt = &now
+				jr.persister.Save(job)
+				jr.store.ApplyUpdate(store.Update{
+					Type:    store.UpdateJobFailed,
+					Source:  "adoption",
+					Payload: job,
+				})
+				failed++
+				jr.ulog.Info("Adoption: PTY lost during upgrade; reaped orphan and marked failed").
+					Field("job_id", job.ID).
+					Field("pid", job.PID).
+					Field("pty_id", session.PtyID).
+					Log(ctx)
+				continue
+			}
 		}
 
 		statusPath := jr.getStatusFilePath(job)
@@ -125,6 +191,45 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 // Returns true if the process exists, false otherwise.
 func (jr *JobRunner) isPIDAlive(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
+}
+
+// listLivePtys queries the standalone tuimux daemon's GET /api/pty/list and
+// returns the live PTY session metadata. It dials the tuimux unix socket
+// directly (the ApiClient does not expose a PTY-list method) so adoption can
+// re-bind adopted jobs to their surviving out-of-process PTYs. A short timeout
+// keeps a slow/dead daemon from stalling boot; the caller treats any error as
+// "list unavailable" and falls open to PID-only adoption.
+func (jr *JobRunner) listLivePtys() ([]tuimuxpty.SessionMetadata, error) {
+	sock := tuimux.DefaultSocketPath()
+	httpClient := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sock)
+			},
+		},
+	}
+	resp, err := httpClient.Get("http://localhost/api/pty/list")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, &listError{status: resp.StatusCode}
+	}
+	var metas []tuimuxpty.SessionMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&metas); err != nil {
+		return nil, err
+	}
+	return metas, nil
+}
+
+// listError is returned when GET /api/pty/list responds with a non-200 status.
+type listError struct{ status int }
+
+func (e *listError) Error() string {
+	return "pty list returned status " + strconv.Itoa(e.status)
 }
 
 // adoptedPIDPoller polls for the completion of an adopted process and marks it done.
