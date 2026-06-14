@@ -1,9 +1,11 @@
 package store
 
 import (
+	"context"
 	"sync"
 	"time"
 
+	grovelogging "github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/flow/pkg/orchestration"
@@ -19,6 +21,7 @@ type Store struct {
 	persister         *Persister
 	workflowPersister *workflowPersister
 	pendingRestore    persistedState // Loaded from disk, applied when workspaces arrive
+	ulog              *grovelogging.UnifiedLogger
 }
 
 // New creates a new Store instance, loading any persisted task results and
@@ -38,6 +41,7 @@ func New() *Store {
 		focus:             make(map[string]struct{}),
 		persister:         newPersister(),
 		workflowPersister: newWorkflowPersister(),
+		ulog:              grovelogging.NewUnifiedLogger("groved.store"),
 	}
 	s.loadPersistedResults()
 	s.loadPersistedWorkflowEvents()
@@ -378,6 +382,27 @@ func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload) {
 	if payload.TranscriptPath != "" {
 		session.TranscriptPath = payload.TranscriptPath
 	}
+
+	// Propagate the confirmed PID onto the matching JobInfo record. Adoption
+	// (jobrunner/adoption.go) reads JobInfo.PID to re-attach detached agents
+	// across a daemon restart; without this copy the field stays 0 forever and
+	// every running job is marked "failed (no PID)" on a graceful upgrade.
+	// The jobrunner persists this to disk via its UpdateSessionConfirmation
+	// listener, which runs after this broadcast.
+	job, jobExists := s.state.Jobs[payload.JobID]
+	if jobExists {
+		job.PID = payload.PID
+	}
+
+	// Diagnostic (permanent, Debug): proves the PID arrived non-zero and
+	// whether the JobInfo was present in the store at confirm time. Observe via
+	// `core logs --component groved.store --level debug -f`.
+	s.ulog.Debug("Session confirmation: propagating PID to JobInfo").
+		Field("job_id", payload.JobID).
+		Field("pid", payload.PID).
+		Field("job_exists_in_store", jobExists).
+		StructuredOnly().
+		Log(context.Background())
 }
 
 // applySessionStatus updates the status of an active session.
