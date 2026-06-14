@@ -48,11 +48,13 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 	// fail live sessions, so we retry a few times and, if it still fails, set
 	// tuimuxAvailable=false and fall back to the PID-only path (fail-open).
 	livePtys := map[string]bool{}
+	var liveMetas []tuimuxpty.SessionMetadata
 	tuimuxAvailable := false
 	if jr.tuimuxClient != nil {
 		for attempt := 0; attempt < 3; attempt++ {
 			metas, err := jr.listLivePtys()
 			if err == nil {
+				liveMetas = metas
 				for _, m := range metas {
 					livePtys[m.ID] = true
 				}
@@ -66,6 +68,21 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 	}
 	if !tuimuxAvailable {
 		jr.ulog.Warn("Adoption: tuimux PTY list unavailable; falling back to PID-only adoption (no PTY split-brain check)").Log(ctx)
+	}
+
+	// Rebuild the agent-SESSION store from the live PTY list before anything
+	// consumes it. After a `groved upgrade` the agent PTYs survive in the
+	// standalone tuimux daemon (each tagged with job_id/plan_name/type/label)
+	// but the daemon's session store comes back empty: RecoverSessions only
+	// reads on-disk Claude-Code sessions, not the agent panes. Without this,
+	// sessions carry no PtyID, so the stop-path KillPty can't close panes,
+	// treemux restart falls back to a read-only log view instead of the live
+	// pane, and post-upgrade spawns fail to mount. The tuimux PTY list is the
+	// authoritative source of truth; reconstruct a models.Session per surviving
+	// agent PTY. Runs before the split-brain check below (which reads
+	// session.PtyID) and before treemux's first GetSessions.
+	if tuimuxAvailable {
+		jr.rebuildAgentSessions(ctx, liveMetas)
 	}
 
 	for _, job := range jobs {
@@ -185,6 +202,75 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 			Field("failed", failed).
 			Log(ctx)
 	}
+}
+
+// rebuildAgentSessions reconstructs the agent-session store from the live tuimux
+// PTY list. For each surviving PTY tagged type=="agent" it either updates the
+// PtyID of an already-recovered session (keyed by the job_id tag) or synthesizes
+// a fresh models.Session from the PTY's tags. It merges with the sessions
+// currently in the store (disk-recovered Claude-Code sessions from
+// RecoverSessions, which has already run) and applies the union exactly once via
+// UpdateSessions — never just the agent PTYs, because that update REPLACES the
+// whole session map and would otherwise clobber the recovered sessions. The
+// operation is idempotent: re-running it neither duplicates nor wipes sessions.
+func (jr *JobRunner) rebuildAgentSessions(ctx context.Context, metas []tuimuxpty.SessionMetadata) {
+	// Start from what's already in the store (disk-recovered sessions) so we
+	// don't clobber them when we re-apply the full set.
+	merged := map[string]*models.Session{}
+	for _, sess := range jr.store.GetSessions() {
+		merged[sess.ID] = sess
+	}
+
+	rebuilt := 0
+	updated := 0
+	for _, m := range metas {
+		if m.Tags["type"] != "agent" {
+			continue
+		}
+		jobID := m.Tags["job_id"]
+		if jobID == "" {
+			continue
+		}
+		if sess, ok := merged[jobID]; ok {
+			if sess.PtyID != m.ID {
+				sess.PtyID = m.ID
+				updated++
+			}
+			continue
+		}
+		merged[jobID] = &models.Session{
+			ID:           jobID,
+			Type:         "interactive_agent",
+			PtyID:        m.ID,
+			Mux:          models.MuxTreemux,
+			Status:       "running",
+			PlanName:     m.Tags["plan_name"],
+			JobTitle:     m.Tags["label"],
+			StartedAt:    m.StartedAt,
+			LastActivity: time.Now(),
+		}
+		rebuilt++
+	}
+
+	if rebuilt == 0 && updated == 0 {
+		return
+	}
+
+	sessions := make([]*models.Session, 0, len(merged))
+	for _, sess := range merged {
+		sessions = append(sessions, sess)
+	}
+	jr.store.ApplyUpdate(store.Update{
+		Type:    store.UpdateSessions,
+		Source:  "adoption_rebuild",
+		Payload: sessions,
+	})
+	jr.ulog.Info("Adoption: rebuilt agent session store from live PTY list").
+		Field("rebuilt", rebuilt).
+		Field("updated", updated).
+		Field("total_sessions", len(sessions)).
+		StructuredOnly().
+		Log(ctx)
 }
 
 // isPIDAlive checks if a process ID is still running via kill(pid, 0).
