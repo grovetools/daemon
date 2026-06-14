@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -379,7 +380,23 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	}
 
 	s.ulog.Info("Daemon listening").Field("socket", socketPath).Log(context.Background())
-	return s.server.Serve(listener)
+	err = s.server.Serve(listener)
+
+	// A graceful drain (SIGUSR1 → EnterDrainMode) closes the listener out from
+	// under Serve, which then returns a "use of closed network connection"
+	// accept error. During an upgrade that is the expected, successful end of
+	// this daemon's life — the successor has taken the socket — not a failure.
+	// Report it as a clean shutdown so `groved start` exits 0 instead of
+	// printing "Error: server error: …" on a working upgrade. ErrServerClosed
+	// (the SIGTERM/Shutdown path) is likewise not an error.
+	s.drainMu.Lock()
+	draining := s.isDraining
+	s.drainMu.Unlock()
+	if draining || errors.Is(err, http.ErrServerClosed) {
+		s.ulog.Info("Listener closed for shutdown; exiting cleanly").Log(context.Background())
+		return nil
+	}
+	return err
 }
 
 // Shutdown gracefully stops the server.
