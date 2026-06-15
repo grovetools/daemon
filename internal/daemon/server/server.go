@@ -1444,16 +1444,43 @@ func (s *Server) handleStreamWorkspaceHUD(w http.ResponseWriter, r *http.Request
 	}
 }
 
-// handleSystemInfo returns the daemon's version, commit, and build date.
+// startupExeSig is the size+modtime signature of this daemon's own executable,
+// captured at process start. A `groved upgrade` swaps the binary on disk; a
+// rebuild overwrites it. Comparing the current on-disk signature against this
+// baseline tells us whether the running daemon is stale (an upgrade is waiting)
+// WITHOUT comparing commit hashes against an unrelated client repo.
+var startupExeSig = currentExeSig()
+
+func currentExeSig() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	fi, err := os.Stat(exe)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%d-%d", fi.Size(), fi.ModTime().UnixNano())
+}
+
+// handleSystemInfo returns the daemon's version, commit, build date, and
+// whether its on-disk binary has changed since startup (upgrade available).
 func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	upgradeAvailable := false
+	if startupExeSig != "" {
+		if cur := currentExeSig(); cur != "" && cur != startupExeSig {
+			upgradeAvailable = true
+		}
+	}
 	info := models.SystemInfo{
-		Version:   version.Version,
-		Commit:    version.Commit,
-		BuildDate: version.BuildDate,
+		Version:          version.Version,
+		Commit:           version.Commit,
+		BuildDate:        version.BuildDate,
+		UpgradeAvailable: upgradeAvailable,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(info)
