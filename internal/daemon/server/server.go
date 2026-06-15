@@ -1465,6 +1465,7 @@ func currentExeSig() string {
 
 // handleSystemInfo returns the daemon's version, commit, build date, and
 // whether its on-disk binary has changed since startup (upgrade available).
+// Reports staleness so the treemux HUD can show daemon version + upgrade badge.
 func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
