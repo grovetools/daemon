@@ -239,15 +239,21 @@ func (jr *JobRunner) rebuildAgentSessions(ctx context.Context, metas []tuimuxpty
 			continue
 		}
 		merged[jobID] = &models.Session{
-			ID:           jobID,
-			Type:         "interactive_agent",
-			PtyID:        m.ID,
-			Mux:          models.MuxTreemux,
-			Status:       "running",
-			PlanName:     m.Tags["plan_name"],
-			JobTitle:     m.Tags["label"],
-			StartedAt:    m.StartedAt,
-			LastActivity: time.Now(),
+			ID:   jobID,
+			Type: "interactive_agent",
+			// WorkingDirectory must be set from the PTY's CWD: scoped surfaces
+			// (treemux's rail rehydrate and the agents drawer) filter sessions
+			// by workspace via IsSessionInWorkspace(WorkingDirectory, ...). An
+			// empty WD drops the synthesized session from those views after an
+			// upgrade even though its PTY is alive.
+			WorkingDirectory: m.CWD,
+			PtyID:            m.ID,
+			Mux:              models.MuxTreemux,
+			Status:           "running",
+			PlanName:         m.Tags["plan_name"],
+			JobTitle:         m.Tags["label"],
+			StartedAt:        m.StartedAt,
+			LastActivity:     time.Now(),
 		}
 		rebuilt++
 	}
