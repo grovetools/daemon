@@ -220,6 +220,7 @@ func indexFileEntry(filePath, wsName, contentDirPath, contentDirType string) *mo
 				entry.ID = meta.ID
 				entry.Tags = meta.Tags
 				entry.PlanRef = meta.PlanRef
+				entry.Priority = meta.Priority
 				if !meta.Created.IsZero() {
 					entry.Created = meta.Created
 				}
