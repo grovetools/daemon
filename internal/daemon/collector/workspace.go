@@ -6,7 +6,9 @@ import (
 
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/pkg/worktreeregistry"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/sirupsen/logrus"
 )
@@ -73,6 +75,10 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 				c.ulog.Debug("Slow workspace discovery detected").Field("duration", d).Log(ctx)
 			}
 		}()
+
+		// Reconcile the worktree registry before discovery so stale entries
+		// are pruned and newly-created XDG dirs are adopted in one pass.
+		worktreeregistry.Reconcile(paths.WorktreesDir()) //nolint:errcheck // best-effort
 
 		// Discover base nodes globally — a scoped daemon still serves the
 		// full workspace list so nav can show the whole worldview. Heavy
