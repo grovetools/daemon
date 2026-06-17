@@ -179,15 +179,15 @@ func TestWorkflowDedupeHookThenJournal(t *testing.T) {
 		Kind:            models.WorkflowAgentStarted,
 		JobID:           "job-1",
 		ClaudeSessionID: "sess-1",
-		AgentID:         "a1",
+		AgentID:         "a1234567890abcdef",
 		AgentType:       "workflow-subagent",
 		Timestamp:       hookStart,
 		Source:          models.WorkflowSourceHooks,
 	}))
 
 	adhoc := s.GetAdhocSubagents()
-	if adhoc["job-1"]["a1"] == nil {
-		t.Fatal("expected a1 in the ad-hoc bucket")
+	if adhoc["job-1"]["a1234567890abcdef"] == nil {
+		t.Fatal("expected a1234567890abcdef in the ad-hoc bucket")
 	}
 
 	// 2. Journal attribution arrives: agent migrates into the run, keeping
@@ -197,7 +197,7 @@ func TestWorkflowDedupeHookThenJournal(t *testing.T) {
 		JobID:           "job-1",
 		ClaudeSessionID: "sess-1",
 		RunID:           "wf_1",
-		AgentID:         "a1",
+		AgentID:         "a1234567890abcdef",
 		Prompt:          "journal prompt",
 		Timestamp:       hookStart.Add(3 * time.Second), // daemon receive time
 		Source:          models.WorkflowSourceJournal,
@@ -210,9 +210,9 @@ func TestWorkflowDedupeHookThenJournal(t *testing.T) {
 	if run == nil {
 		t.Fatal("run wf_1 not found")
 	}
-	agent := run.Agents["a1"]
+	agent := run.Agents["a1234567890abcdef"]
 	if agent == nil {
-		t.Fatal("agent a1 not migrated into run")
+		t.Fatal("agent a1234567890abcdef not migrated into run")
 	}
 	if !agent.StartedAt.Equal(hookStart) {
 		t.Errorf("StartedAt = %v, want hook timestamp %v (hooks win on timestamps)", agent.StartedAt, hookStart)
@@ -234,7 +234,7 @@ func TestWorkflowDedupeHookThenJournal(t *testing.T) {
 		JobID:           "job-1",
 		ClaudeSessionID: "sess-1",
 		RunID:           "wf_1",
-		AgentID:         "a1",
+		AgentID:         "a1234567890abcdef",
 		ResultSummary:   "journal result",
 		Timestamp:       hookStart.Add(8 * time.Second),
 		Source:          models.WorkflowSourceJournal,
@@ -244,16 +244,16 @@ func TestWorkflowDedupeHookThenJournal(t *testing.T) {
 		Kind:            models.WorkflowAgentCompleted,
 		JobID:           "job-1",
 		ClaudeSessionID: "sess-1",
-		AgentID:         "a1", // hooks may have no RunID; session lookup attributes it
+		AgentID:         "a1234567890abcdef", // hooks may have no RunID; session lookup attributes it
 		AgentType:       "workflow-subagent",
 		LastMessage:     "hook last message",
-		TranscriptPath:  "/tmp/agent-a1.jsonl",
+		TranscriptPath:  "/tmp/agent-a1234567890abcdef.jsonl",
 		Timestamp:       hookStop,
 		Source:          models.WorkflowSourceHooks,
 	}))
 
 	run = s.GetWorkflowRuns()["wf_1"]
-	agent = run.Agents["a1"]
+	agent = run.Agents["a1234567890abcdef"]
 	if !agent.CompletedAt.Equal(hookStop) {
 		t.Errorf("CompletedAt = %v, want hook timestamp %v", agent.CompletedAt, hookStop)
 	}
@@ -327,7 +327,7 @@ func TestAdhocAgentToolSubagent(t *testing.T) {
 		Kind:            models.WorkflowAgentStarted,
 		JobID:           "job-1",
 		ClaudeSessionID: "sess-1",
-		AgentID:         "explore-1",
+		AgentID:         "a4567890abcdef123",
 		AgentType:       "Explore",
 		Prompt:          "find the handler",
 		Timestamp:       ts,
@@ -337,7 +337,7 @@ func TestAdhocAgentToolSubagent(t *testing.T) {
 		Kind:            models.WorkflowAgentCompleted,
 		JobID:           "job-1",
 		ClaudeSessionID: "sess-1",
-		AgentID:         "explore-1",
+		AgentID:         "a4567890abcdef123",
 		AgentType:       "Explore",
 		LastMessage:     "found it",
 		Timestamp:       ts.Add(4 * time.Second),
@@ -345,7 +345,7 @@ func TestAdhocAgentToolSubagent(t *testing.T) {
 	}))
 
 	adhoc := s.GetAdhocSubagents()
-	agent := adhoc["job-1"]["explore-1"]
+	agent := adhoc["job-1"]["a4567890abcdef123"]
 	if agent == nil {
 		t.Fatal("ad-hoc agent not found")
 	}
@@ -361,7 +361,7 @@ func TestAdhocAgentToolSubagent(t *testing.T) {
 
 	// Session mirror covers ad-hoc agents too.
 	sess := s.GetSession("job-1")
-	if len(sess.Subagents) != 1 || sess.Subagents[0].ID != "explore-1" {
+	if len(sess.Subagents) != 1 || sess.Subagents[0].ID != "a4567890abcdef123" {
 		t.Errorf("session subagents = %+v", sess.Subagents)
 	}
 }
@@ -408,7 +408,7 @@ func TestWorkflowRestartRebuildFromPersistedEvents(t *testing.T) {
 		Kind:            models.WorkflowAgentStarted,
 		JobID:           "job-2",
 		ClaudeSessionID: "sess-2",
-		AgentID:         "x1",
+		AgentID:         "a234567890abcdef1",
 		AgentType:       "Explore",
 		Timestamp:       t0.Add(3 * time.Second),
 		Source:          models.WorkflowSourceHooks,
@@ -443,7 +443,7 @@ func TestWorkflowRestartRebuildFromPersistedEvents(t *testing.T) {
 	}
 
 	adhoc := s2.GetAdhocSubagents()
-	if adhoc["job-2"]["x1"] == nil {
+	if adhoc["job-2"]["a234567890abcdef1"] == nil {
 		t.Error("ad-hoc agent x1 not rebuilt after restart")
 	}
 
@@ -545,7 +545,7 @@ func TestWorkflowNameAdhocSubagent(t *testing.T) {
 		Kind:            models.WorkflowAgentStarted,
 		JobID:           "job-1",
 		ClaudeSessionID: "sess-1",
-		AgentID:         "adhoc-1",
+		AgentID:         "a34567890abcdef12",
 		AgentType:       "general-purpose",
 		Name:            "investigate auth flow",
 		Prompt:          "investigate the auth flow",
@@ -554,7 +554,7 @@ func TestWorkflowNameAdhocSubagent(t *testing.T) {
 	}))
 
 	adhoc := s.GetAdhocSubagents()
-	agent := adhoc["job-1"]["adhoc-1"]
+	agent := adhoc["job-1"]["a34567890abcdef12"]
 	if agent == nil {
 		t.Fatal("adhoc agent not found")
 	}
@@ -567,14 +567,14 @@ func TestWorkflowNameAdhocSubagent(t *testing.T) {
 		Kind:            models.WorkflowAgentCompleted,
 		JobID:           "job-1",
 		ClaudeSessionID: "sess-1",
-		AgentID:         "adhoc-1",
+		AgentID:         "a34567890abcdef12",
 		Name:            "investigate auth flow",
 		LastMessage:     "found the issue",
 		Timestamp:       ts.Add(5 * time.Second),
 		Source:          models.WorkflowSourceHooks,
 	}))
 
-	agent = s.GetAdhocSubagents()["job-1"]["adhoc-1"]
+	agent = s.GetAdhocSubagents()["job-1"]["a34567890abcdef12"]
 	if agent.Name != "investigate auth flow" {
 		t.Errorf("adhoc name after completion = %q", agent.Name)
 	}
@@ -586,7 +586,7 @@ func TestWorkflowNameAdhocSubagent(t *testing.T) {
 	sess := s.GetSession("job-1")
 	found := false
 	for _, sa := range sess.Subagents {
-		if sa.ID == "adhoc-1" {
+		if sa.ID == "a34567890abcdef12" {
 			found = true
 			if sa.Name != "investigate auth flow" {
 				t.Errorf("session adhoc subagent Name = %q", sa.Name)
@@ -663,5 +663,87 @@ func TestWorkflowUpdateBroadcast(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no broadcast received")
+	}
+}
+
+func TestIsSpawnAgentID(t *testing.T) {
+	tests := []struct {
+		id   string
+		want bool
+	}{
+		{"a62124203bfeb94f0", true}, // real spawn: a + 16 hex
+		{"a1234567890abcdef", true},
+		{"a03e225", false},          // phantom: a + 6 hex (Explore/Plan registration)
+		{"ac81b9b", false},          // phantom
+		{"", false},                 // empty
+		{"a62124203bfeb94f0a", false}, // 17 hex (too long)
+		{"a62124203bfeb94g0", false},  // non-hex digit
+		{"explore-1", false},          // synthetic / not spawn form
+		{"b62124203bfeb94f0", false},  // wrong prefix
+	}
+	for _, tt := range tests {
+		if got := isSpawnAgentID(tt.id); got != tt.want {
+			t.Errorf("isSpawnAgentID(%q) = %v, want %v", tt.id, got, tt.want)
+		}
+	}
+}
+
+// TestPhantomSubagentStartDropped verifies the daemon's belt-and-suspenders
+// guard: an agent_started event with no run attribution and a short, non-spawn
+// agent_id (the phantom Explore/Plan type-registration shape) never creates an
+// ad-hoc subagent, while a real full-spawn-id event still does.
+func TestPhantomSubagentStartDropped(t *testing.T) {
+	s := newTestStore(t)
+	seedSession(t, s, "job-1", "sess-1")
+
+	ts := time.Date(2026, 6, 17, 6, 30, 14, 0, time.UTC)
+
+	// Phantom: short id, empty RunID — must be dropped.
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentStarted,
+		JobID:           "job-1",
+		ClaudeSessionID: "sess-1",
+		AgentID:         "a03e225",
+		AgentType:       "Explore",
+		Timestamp:       ts,
+		Source:          models.WorkflowSourceHooks,
+	}))
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentStarted,
+		JobID:           "job-1",
+		ClaudeSessionID: "sess-1",
+		AgentID:         "ac81b9b",
+		AgentType:       "Plan",
+		Timestamp:       ts.Add(time.Millisecond),
+		Source:          models.WorkflowSourceHooks,
+	}))
+
+	if got := s.GetAdhocSubagents(); len(got) != 0 {
+		t.Errorf("phantom registration events must not create ad-hoc subagents, got %+v", got)
+	}
+	if got := s.GetWorkflowRuns(); len(got) != 0 {
+		t.Errorf("phantom events must not create runs, got %+v", got)
+	}
+	if sess := s.GetSession("job-1"); len(sess.Subagents) != 0 {
+		t.Errorf("phantom events must not mirror onto the session, got %+v", sess.Subagents)
+	}
+
+	// Real spawn: full id, empty RunID — must be kept in the ad-hoc bucket.
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentStarted,
+		JobID:           "job-1",
+		ClaudeSessionID: "sess-1",
+		AgentID:         "a62124203bfeb94f0",
+		AgentType:       "general-purpose",
+		Timestamp:       ts.Add(time.Second),
+		Source:          models.WorkflowSourceHooks,
+	}))
+
+	adhoc := s.GetAdhocSubagents()
+	if adhoc["job-1"]["a62124203bfeb94f0"] == nil {
+		t.Fatalf("real spawn must create an ad-hoc subagent, got %+v", adhoc)
+	}
+	if len(adhoc["job-1"]) != 1 {
+		t.Errorf("only the real spawn should be present, got %+v", adhoc["job-1"])
 	}
 }

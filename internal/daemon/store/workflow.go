@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -114,7 +115,9 @@ func (s *Store) applyWorkflowEvent(p *WorkflowEventPayload, persist bool) {
 		if ev.AgentID == "" {
 			return
 		}
-		s.applyWorkflowAgentEvent(ev)
+		if !s.applyWorkflowAgentEvent(ev) {
+			return // phantom registration dropped; do not persist it
+		}
 
 	case models.WorkflowRunStale:
 		if ev.RunID == "" {
@@ -178,7 +181,17 @@ func (s *Store) ensureWorkflowRun(ev models.WorkflowEvent) *models.WorkflowRunSt
 //   - RunID empty → an existing run-attributed record for the same session
 //     wins (the journal already attributed this agent); otherwise the
 //     event lands in the per-session ad-hoc bucket.
-func (s *Store) applyWorkflowAgentEvent(ev models.WorkflowEvent) {
+//
+// Returns false (applying nothing) when the event is a phantom
+// type-registration: a started event with no run attribution and a non-spawn
+// agent id that would otherwise create a brand-new ad-hoc record. The harness
+// fires SubagentStart once per registered agent definition (Explore, Plan) at
+// session init with a short, transcript-less agent_id; this is the daemon's
+// belt-and-suspenders guard so an older hooks binary that still forwards them
+// (or already-persisted phantoms replayed at startup) can't repopulate the
+// ad-hoc bucket. Events that match an existing record (run migration, the
+// real-spawn lifecycle) are never affected.
+func (s *Store) applyWorkflowAgentEvent(ev models.WorkflowEvent) bool {
 	var agent *models.Subagent
 	var run *models.WorkflowRunState
 
@@ -196,6 +209,9 @@ func (s *Store) applyWorkflowAgentEvent(ev models.WorkflowEvent) {
 	} else {
 		run, agent = s.findRunAgent(ev)
 		if agent == nil {
+			if ev.Kind == models.WorkflowAgentStarted && !isSpawnAgentID(ev.AgentID) {
+				return false
+			}
 			agent = s.ensureAdhocSubagent(ev)
 		}
 	}
@@ -210,6 +226,21 @@ func (s *Store) applyWorkflowAgentEvent(ev models.WorkflowEvent) {
 	}
 
 	s.upsertSessionSubagent(ev.JobID, agent)
+	return true
+}
+
+// spawnAgentIDRe matches a genuine subagent spawn id: the literal 'a'
+// followed by exactly 16 hex digits (17 chars total), e.g.
+// "a62124203bfeb94f0". Claude Code mints this id for every real Task/Agent
+// spawn and writes its transcript at <session>/subagents/agent-<id>.jsonl.
+// Phantom type-registration events (one per .claude/agents/*.md definition,
+// fired at session init) carry a short 'a' + ~6 hex id and no transcript.
+var spawnAgentIDRe = regexp.MustCompile(`^a[0-9a-f]{16}$`)
+
+// isSpawnAgentID reports whether agentID is a genuine spawn id rather than a
+// phantom type-registration id (see spawnAgentIDRe).
+func isSpawnAgentID(agentID string) bool {
+	return spawnAgentIDRe.MatchString(agentID)
 }
 
 // workflowSessionKey identifies the owning session for run-less bookkeeping:
