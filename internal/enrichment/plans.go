@@ -11,6 +11,7 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/plan"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/pkg/worktreeregistry"
 	"github.com/grovetools/core/util/frontmatter"
 	"github.com/sirupsen/logrus"
 )
@@ -169,6 +170,14 @@ func processPlanDir(planPath string, stats *models.PlanStats, node *workspace.Wo
 // It checks the notebook directory first (sibling of plans dir), then falls back
 // to the legacy .grove/state.yml location.
 func getActivePlanForPath(node *workspace.WorkspaceNode, locator *workspace.NotebookLocator) string {
+	// Registry-first: for a worktree node the notebook locator redirects to the
+	// main project's notebook, so reading flow.active_plan from the notebook-sibling
+	// state.yml would return the main checkout's plan. The XDG worktree registry
+	// holds the worktree's own plan keyed by its container path, so prefer it.
+	if activePlan, ok := worktreeregistry.PlanForPath(node.Path); ok {
+		return activePlan
+	}
+
 	stateFilePath := filepath.Join(node.Path, ".grove", "state.yml")
 
 	// Try notebook location first: state.yml lives alongside plans/ in the notebook dir
