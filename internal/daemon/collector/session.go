@@ -10,6 +10,12 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/store"
 )
 
+// PtyKiller is satisfied by any type that can terminate an out-of-process PTY
+// by ID. The tuimux ApiClient implements this interface.
+type PtyKiller interface {
+	KillPty(ptyID string) error
+}
+
 // SessionCollector monitors active sessions in the store for process liveness.
 // It also performs initial crash recovery on daemon startup.
 //
@@ -19,8 +25,9 @@ import (
 // 2. Periodically verifies that active sessions' PIDs are still alive
 // 3. Cleans up dead sessions (marks as interrupted, removes crash-recovery files)
 type SessionCollector struct {
-	interval time.Duration
-	ulog     *logging.UnifiedLogger
+	interval  time.Duration
+	ulog      *logging.UnifiedLogger
+	ptyKiller PtyKiller
 }
 
 // NewSessionCollector creates a new SessionCollector.
@@ -33,6 +40,14 @@ func NewSessionCollector(interval time.Duration) *SessionCollector {
 		interval: interval,
 		ulog:     logging.NewUnifiedLogger("groved.collector.session"),
 	}
+}
+
+// SetPtyKiller wires a PTY terminator into the collector. When set, the
+// collector kills the out-of-process PTY when it detects a dead session PID
+// so that treemux panes auto-close without requiring a daemon restart.
+// Must be called before the engine starts the collector's Run goroutine.
+func (c *SessionCollector) SetPtyKiller(killer PtyKiller) {
+	c.ptyKiller = killer
 }
 
 // Name returns the collector's name.
@@ -100,6 +115,18 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 							Field("job_id", session.ID).
 							Field("pid", session.PID).
 							Log(ctx)
+
+						// Kill the out-of-process PTY so treemux panes get EOF and
+						// auto-close. The process is already dead so this is best-effort.
+						if c.ptyKiller != nil && session.PtyID != "" {
+							if err := c.ptyKiller.KillPty(session.PtyID); err != nil {
+								c.ulog.Debug("Failed to kill PTY for dead session").
+									Err(err).
+									Field("job_id", session.ID).
+									Field("pty_id", session.PtyID).
+									Log(ctx)
+							}
+						}
 
 						// Update daemon state
 						updates <- store.Update{

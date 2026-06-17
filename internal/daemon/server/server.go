@@ -953,6 +953,19 @@ func (s *Server) killSession(sessionID string) error {
 		}
 	}
 
+	// Kill the out-of-process PTY so the treemux NativeAgentPanel gets EOF
+	// and auto-closes its pane. Without this the pane stays open even after
+	// the agent process exits, requiring a daemon restart to clear the row.
+	if session.PtyID != "" && s.tuimuxClient != nil {
+		if err := s.tuimuxClient.KillPty(session.PtyID); err != nil {
+			s.ulog.Warn("Failed to kill agent PTY on session kill").
+				Err(err).
+				Field("session_id", sessionID).
+				Field("pty_id", session.PtyID).
+				Log(context.Background())
+		}
+	}
+
 	// Remove the crash-recovery directory so a daemon restart won't
 	// re-resurrect this session as alive. The directory is named after
 	// the native session ID (Claude UUID), falling back to the job ID.

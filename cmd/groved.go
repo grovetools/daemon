@@ -332,8 +332,10 @@ func newGrovedStartCmd() *cobra.Command {
 			if isEnabled("git") {
 				eng.Register(collector.NewGitStatusCollector(gitInterval))
 			}
+			var sessionColl *collector.SessionCollector
 			if isEnabled("session") {
-				eng.Register(collector.NewSessionCollector(sessionInterval))
+				sessionColl = collector.NewSessionCollector(sessionInterval)
+				eng.Register(sessionColl)
 			}
 			if isEnabled("plan") {
 				eng.Register(collector.NewPlanCollector(planInterval))
@@ -365,6 +367,11 @@ func newGrovedStartCmd() *cobra.Command {
 				ulog.Warn("Failed to ensure tuimux daemon; agent PTYs will be unavailable").
 					Err(tuimuxErr).Log(ctx)
 				tuimuxClient = nil
+			}
+			// Wire tuimux into the session collector so it can kill out-of-process
+			// PTYs when it detects a dead session PID (daemon-side reaper).
+			if sessionColl != nil && tuimuxClient != nil {
+				sessionColl.SetPtyKiller(tuimuxClient)
 			}
 
 			var jr *jobrunner.JobRunner
