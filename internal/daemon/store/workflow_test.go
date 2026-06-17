@@ -455,6 +455,191 @@ func TestWorkflowRestartRebuildFromPersistedEvents(t *testing.T) {
 	}
 }
 
+func TestWorkflowNamePassthrough(t *testing.T) {
+	s := newTestStore(t)
+	seedSession(t, s, "job-1", "sess-1")
+
+	ts := time.Date(2026, 6, 17, 10, 0, 0, 0, time.UTC)
+
+	// 1. Hook event with Name arrives for a run-attributed agent.
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentStarted,
+		JobID:           "job-1",
+		ClaudeSessionID: "sess-1",
+		RunID:           "wf_name_test",
+		AgentID:         "a1",
+		AgentType:       "Explore",
+		Name:            "explore codebase",
+		Timestamp:       ts,
+		Source:          models.WorkflowSourceHooks,
+	}))
+
+	run := s.GetWorkflowRuns()["wf_name_test"]
+	if run == nil {
+		t.Fatal("run not found")
+	}
+	agent := run.Agents["a1"]
+	if agent == nil {
+		t.Fatal("agent a1 not found")
+	}
+	if agent.Name != "explore codebase" {
+		t.Errorf("agent.Name = %q, want 'explore codebase'", agent.Name)
+	}
+
+	// 2. Journal event arrives without a name — must not overwrite.
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentStarted,
+		JobID:           "job-1",
+		ClaudeSessionID: "sess-1",
+		RunID:           "wf_name_test",
+		AgentID:         "a1",
+		Prompt:          "find the handler",
+		Timestamp:       ts.Add(time.Second),
+		Source:          models.WorkflowSourceJournal,
+	}))
+
+	agent = s.GetWorkflowRuns()["wf_name_test"].Agents["a1"]
+	if agent.Name != "explore codebase" {
+		t.Errorf("journal must not overwrite hook name: got %q", agent.Name)
+	}
+	if agent.TaskDescription != "find the handler" {
+		t.Errorf("TaskDescription = %q, want journal prompt", agent.TaskDescription)
+	}
+
+	// 3. Hook completion with the same name: should survive.
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentCompleted,
+		JobID:           "job-1",
+		ClaudeSessionID: "sess-1",
+		RunID:           "wf_name_test",
+		AgentID:         "a1",
+		Name:            "explore codebase",
+		LastMessage:     "done",
+		Timestamp:       ts.Add(2 * time.Second),
+		Source:          models.WorkflowSourceHooks,
+	}))
+
+	agent = s.GetWorkflowRuns()["wf_name_test"].Agents["a1"]
+	if agent.Name != "explore codebase" {
+		t.Errorf("name must survive completion: got %q", agent.Name)
+	}
+
+	// 4. Name is mirrored in session.Subagents.
+	sess := s.GetSession("job-1")
+	if len(sess.Subagents) != 1 {
+		t.Fatalf("session.Subagents = %d, want 1", len(sess.Subagents))
+	}
+	if sess.Subagents[0].Name != "explore codebase" {
+		t.Errorf("session subagent Name = %q, want 'explore codebase'", sess.Subagents[0].Name)
+	}
+}
+
+func TestWorkflowNameAdhocSubagent(t *testing.T) {
+	s := newTestStore(t)
+	seedSession(t, s, "job-1", "sess-1")
+
+	ts := time.Date(2026, 6, 17, 10, 5, 0, 0, time.UTC)
+
+	// Ad-hoc Agent-tool spawn with a name (no RunID).
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentStarted,
+		JobID:           "job-1",
+		ClaudeSessionID: "sess-1",
+		AgentID:         "adhoc-1",
+		AgentType:       "general-purpose",
+		Name:            "investigate auth flow",
+		Prompt:          "investigate the auth flow",
+		Timestamp:       ts,
+		Source:          models.WorkflowSourceHooks,
+	}))
+
+	adhoc := s.GetAdhocSubagents()
+	agent := adhoc["job-1"]["adhoc-1"]
+	if agent == nil {
+		t.Fatal("adhoc agent not found")
+	}
+	if agent.Name != "investigate auth flow" {
+		t.Errorf("adhoc agent.Name = %q, want 'investigate auth flow'", agent.Name)
+	}
+
+	// Complete the ad-hoc agent.
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentCompleted,
+		JobID:           "job-1",
+		ClaudeSessionID: "sess-1",
+		AgentID:         "adhoc-1",
+		Name:            "investigate auth flow",
+		LastMessage:     "found the issue",
+		Timestamp:       ts.Add(5 * time.Second),
+		Source:          models.WorkflowSourceHooks,
+	}))
+
+	agent = s.GetAdhocSubagents()["job-1"]["adhoc-1"]
+	if agent.Name != "investigate auth flow" {
+		t.Errorf("adhoc name after completion = %q", agent.Name)
+	}
+	if agent.Status != "completed" {
+		t.Errorf("adhoc status = %q, want completed", agent.Status)
+	}
+
+	// Name is mirrored in session.Subagents.
+	sess := s.GetSession("job-1")
+	found := false
+	for _, sa := range sess.Subagents {
+		if sa.ID == "adhoc-1" {
+			found = true
+			if sa.Name != "investigate auth flow" {
+				t.Errorf("session adhoc subagent Name = %q", sa.Name)
+			}
+		}
+	}
+	if !found {
+		t.Error("adhoc agent not found in session.Subagents")
+	}
+}
+
+func TestWorkflowNameHookOverridesJournalName(t *testing.T) {
+	s := newTestStore(t)
+	seedSession(t, s, "job-1", "sess-1")
+
+	ts := time.Date(2026, 6, 17, 10, 10, 0, 0, time.UTC)
+
+	// Journal arrives first with a name (unusual but possible).
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentStarted,
+		JobID:           "job-1",
+		ClaudeSessionID: "sess-1",
+		RunID:           "wf_override",
+		AgentID:         "a2",
+		Name:            "journal-name",
+		Prompt:          "do something",
+		Timestamp:       ts,
+		Source:          models.WorkflowSourceJournal,
+	}))
+
+	agent := s.GetWorkflowRuns()["wf_override"].Agents["a2"]
+	if agent.Name != "journal-name" {
+		t.Errorf("initial Name = %q, want 'journal-name'", agent.Name)
+	}
+
+	// Hook arrives later with a different name — hooks win.
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentStarted,
+		JobID:           "job-1",
+		ClaudeSessionID: "sess-1",
+		RunID:           "wf_override",
+		AgentID:         "a2",
+		Name:            "hook-name",
+		Timestamp:       ts.Add(time.Second),
+		Source:          models.WorkflowSourceHooks,
+	}))
+
+	agent = s.GetWorkflowRuns()["wf_override"].Agents["a2"]
+	if agent.Name != "hook-name" {
+		t.Errorf("hook must override journal name: got %q, want 'hook-name'", agent.Name)
+	}
+}
+
 func TestWorkflowUpdateBroadcast(t *testing.T) {
 	s := newTestStore(t)
 	ch := s.Subscribe()
