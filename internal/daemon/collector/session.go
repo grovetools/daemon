@@ -16,6 +16,27 @@ type PtyKiller interface {
 	KillPty(ptyID string) error
 }
 
+const (
+	// sessionReapGracePeriod is how long after a session's start/last-activity
+	// the liveness reaper leaves it completely alone. Agent startup can register
+	// a short-lived intermediate PID (shell, grove meta-tool) before the real
+	// agent process exists; we never judge liveness inside this window.
+	sessionReapGracePeriod = 45 * time.Second
+
+	// reapDeadStrikes is the number of consecutive polls a PID must read as dead
+	// before the session is reaped, to absorb transient IsProcessAlive blips.
+	reapDeadStrikes = 2
+)
+
+// pidLiveness is per-session reaper bookkeeping carried across poll ticks.
+// A PID is only eligible for reaping once it has been positively observed alive
+// (seenAlive) — a never-confirmed-alive PID is more likely a slow/handoff
+// startup than a crashed agent, so reaping it would race the starting agent.
+type pidLiveness struct {
+	seenAlive   bool
+	deadStrikes int
+}
+
 // SessionCollector monitors active sessions in the store for process liveness.
 // It also performs initial crash recovery on daemon startup.
 //
@@ -28,6 +49,9 @@ type SessionCollector struct {
 	interval  time.Duration
 	ulog      *logging.UnifiedLogger
 	ptyKiller PtyKiller
+	// liveness tracks per-session reap bookkeeping (seen-alive + dead strikes)
+	// across ticks. Only accessed from the single Run goroutine.
+	liveness map[string]*pidLiveness
 }
 
 // NewSessionCollector creates a new SessionCollector.
@@ -39,6 +63,7 @@ func NewSessionCollector(interval time.Duration) *SessionCollector {
 	return &SessionCollector{
 		interval: interval,
 		ulog:     logging.NewUnifiedLogger("groved.collector.session"),
+		liveness: make(map[string]*pidLiveness),
 	}
 }
 
@@ -72,6 +97,14 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 		}
 	}
 
+	// Recovered sessions were alive when persisted, so a dead PID now means a
+	// genuine crash (not a slow startup) — seed them as seen-alive so the loop
+	// below reaps them. Runtime-registered sessions start seenAlive=false and
+	// must be observed alive before they become reap-eligible (startup guard).
+	for _, s := range recoveredSessions {
+		c.liveness[s.ID] = &pidLiveness{seenAlive: true}
+	}
+
 	// 2. PID Verification Loop
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
@@ -91,62 +124,101 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 			// Get all active sessions from the canonical store
 			activeSessions := st.GetSessions()
 
+			// Track which sessions are still active this tick so we can prune
+			// liveness bookkeeping for sessions that have since ended.
+			activeIDs := make(map[string]struct{}, len(activeSessions))
+
 			for _, session := range activeSessions {
-				// Only verify sessions we think are active
-				if session.Status == "running" || session.Status == "idle" || session.Status == "pending_user" {
+				// Only verify sessions we think are active.
+				if session.Status != "running" && session.Status != "idle" && session.Status != "pending_user" {
+					continue
+				}
+				activeIDs[session.ID] = struct{}{}
 
-					// Grace period: skip PID check for sessions confirmed within the last 30s.
-					// During agent startup, the initial PID may be a short-lived intermediate
-					// process (shell, grove meta-tool) that exits before the real agent starts.
-					if time.Since(session.LastActivity) < 30*time.Second && time.Since(session.StartedAt) < 30*time.Second {
-						continue
-					}
+				// Grace period: leave freshly-started sessions completely alone.
+				// During agent startup the registered PID may be a short-lived
+				// intermediate process (shell, grove meta-tool) that exits before
+				// the real agent starts.
+				if time.Since(session.LastActivity) < sessionReapGracePeriod && time.Since(session.StartedAt) < sessionReapGracePeriod {
+					continue
+				}
 
-					// PID 0 means the intent was registered but never confirmed
-					// with a real PID. This happens for cross-daemon sessions
-					// (the real process lives on a scoped daemon) or stale intents.
-					// Either way, we can't do PID liveness — skip entirely.
-					if session.PID == 0 {
-						continue
-					}
+				// PID 0 means the intent was registered but never confirmed with a
+				// real PID (cross-daemon sessions, or stale intents). Can't judge.
+				if session.PID == 0 {
+					continue
+				}
 
-					if !process.IsProcessAlive(session.PID) {
-						c.ulog.Warn("Session process died unexpectedly").
+				ls := c.liveness[session.ID]
+				if ls == nil {
+					ls = &pidLiveness{}
+					c.liveness[session.ID] = ls
+				}
+
+				if process.IsProcessAlive(session.PID) {
+					// Confirmed alive — eligible for reaping only if it later dies.
+					// Reset any transient dead strikes.
+					ls.seenAlive = true
+					ls.deadStrikes = 0
+					continue
+				}
+
+				// PID reads dead. Only reap a PID we have positively observed alive:
+				// a never-confirmed-alive PID is more likely a slow/handoff startup
+				// than a crashed agent, and reaping it would race the starting agent.
+				if !ls.seenAlive {
+					continue
+				}
+
+				// Debounce: require N consecutive dead reads before reaping.
+				ls.deadStrikes++
+				if ls.deadStrikes < reapDeadStrikes {
+					continue
+				}
+
+				c.ulog.Warn("Session process died unexpectedly").
+					Field("job_id", session.ID).
+					Field("pid", session.PID).
+					Log(ctx)
+
+				// Kill the out-of-process PTY so treemux panes get EOF and
+				// auto-close. The process is already dead so this is best-effort.
+				if c.ptyKiller != nil && session.PtyID != "" {
+					if err := c.ptyKiller.KillPty(session.PtyID); err != nil {
+						c.ulog.Debug("Failed to kill PTY for dead session").
+							Err(err).
 							Field("job_id", session.ID).
-							Field("pid", session.PID).
+							Field("pty_id", session.PtyID).
 							Log(ctx)
-
-						// Kill the out-of-process PTY so treemux panes get EOF and
-						// auto-close. The process is already dead so this is best-effort.
-						if c.ptyKiller != nil && session.PtyID != "" {
-							if err := c.ptyKiller.KillPty(session.PtyID); err != nil {
-								c.ulog.Debug("Failed to kill PTY for dead session").
-									Err(err).
-									Field("job_id", session.ID).
-									Field("pty_id", session.PtyID).
-									Log(ctx)
-							}
-						}
-
-						// Update daemon state
-						updates <- store.Update{
-							Type:   store.UpdateSessionEnd,
-							Source: "session_collector",
-							Payload: &store.SessionEndPayload{
-								JobID:   session.ID,
-								Outcome: "interrupted",
-							},
-						}
-
-						// Clean up the crash recovery files
-						if registry != nil {
-							nativeID := session.ClaudeSessionID
-							if nativeID == "" {
-								nativeID = session.ID
-							}
-							_ = registry.Unregister(nativeID)
-						}
 					}
+				}
+
+				// Update daemon state
+				updates <- store.Update{
+					Type:   store.UpdateSessionEnd,
+					Source: "session_collector",
+					Payload: &store.SessionEndPayload{
+						JobID:   session.ID,
+						Outcome: "interrupted",
+					},
+				}
+
+				// Clean up the crash recovery files
+				if registry != nil {
+					nativeID := session.ClaudeSessionID
+					if nativeID == "" {
+						nativeID = session.ID
+					}
+					_ = registry.Unregister(nativeID)
+				}
+
+				delete(c.liveness, session.ID)
+			}
+
+			// Prune liveness bookkeeping for sessions no longer active.
+			for id := range c.liveness {
+				if _, ok := activeIDs[id]; !ok {
+					delete(c.liveness, id)
 				}
 			}
 
