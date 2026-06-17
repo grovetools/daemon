@@ -278,7 +278,8 @@ func (s *Store) ensureAdhocSubagent(ev models.WorkflowEvent) *models.Subagent {
 // Field authority: hooks win on timestamps (the journal has none — its
 // timestamps are daemon receive times); the journal wins on prompts and
 // structured results (hooks can't see workflow spawn prompts, and its
-// last_assistant_message is only a fallback result).
+// last_assistant_message is only a fallback result). Hooks win on names
+// (the hooks forwarder reads agent-<id>.meta.json; the journal has no name).
 func mergeWorkflowAgentEvent(agent *models.Subagent, ev models.WorkflowEvent) {
 	fromHooks := ev.Source == models.WorkflowSourceHooks
 
@@ -290,6 +291,11 @@ func mergeWorkflowAgentEvent(agent *models.Subagent, ev models.WorkflowEvent) {
 	}
 	if ev.Prompt != "" && (agent.TaskDescription == "" || !fromHooks) {
 		agent.TaskDescription = ev.Prompt
+	}
+	// Hooks win on names: prefer non-empty hook-sourced values; do not
+	// overwrite an existing name with empty.
+	if ev.Name != "" && (agent.Name == "" || fromHooks) {
+		agent.Name = ev.Name
 	}
 
 	switch ev.Kind {
