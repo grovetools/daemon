@@ -7,6 +7,7 @@ import (
 	"net/http"
 	_ "net/http/pprof" //nolint:gosec // G108: intentional debug endpoint for daemon operator use
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -97,6 +98,22 @@ func envBasePathsFromConfig(cfg *config.Config) []string {
 		roots = append(roots, wtd)
 	}
 	return roots
+}
+
+// resolveTuimuxPath finds the tuimux binary, checking BinDir first then
+// falling back to PATH. groved spawns this real binary (which has a "daemon"
+// subcommand) to stand up the out-of-process PTY backplane; it must not
+// re-exec itself, as groved has no "daemon" subcommand.
+func resolveTuimuxPath() (string, error) {
+	binDirPath := filepath.Join(paths.BinDir(), "tuimux")
+	if _, err := os.Stat(binDirPath); err == nil {
+		return binDirPath, nil
+	}
+	p, err := exec.LookPath("tuimux")
+	if err != nil {
+		return "", fmt.Errorf("tuimux not found in %s or PATH", paths.BinDir())
+	}
+	return p, nil
 }
 
 // NewGrovedCmd returns the groved daemon command with subcommands.
@@ -362,11 +379,20 @@ func newGrovedStartCmd() *cobra.Command {
 			// this daemon, so it survives a `groved upgrade` (the successor
 			// re-discovers the same live socket). On failure we log and
 			// continue with a nil client — adoption must fail-open, never block.
-			tuimuxClient, tuimuxErr := tuimux.EnsureDaemon(tuimux.DefaultSocketPath())
-			if tuimuxErr != nil {
-				ulog.Warn("Failed to ensure tuimux daemon; agent PTYs will be unavailable").
-					Err(tuimuxErr).Log(ctx)
+			var tuimuxClient *tuimux.ApiClient
+			tuimuxBin, binErr := resolveTuimuxPath()
+			if binErr != nil {
+				ulog.Warn("tuimux binary not found; agent PTYs will be unavailable").
+					Err(binErr).Log(ctx)
 				tuimuxClient = nil
+			} else {
+				var tuimuxErr error
+				tuimuxClient, tuimuxErr = tuimux.EnsureDaemonWithBinary(tuimux.DefaultSocketPath(), tuimuxBin)
+				if tuimuxErr != nil {
+					ulog.Warn("Failed to ensure tuimux daemon; agent PTYs will be unavailable").
+						Err(tuimuxErr).Log(ctx)
+					tuimuxClient = nil
+				}
 			}
 			// Wire tuimux into the session collector so it can kill out-of-process
 			// PTYs when it detects a dead session PID (daemon-side reaper).
