@@ -743,6 +743,11 @@ func newGrovedStartCmd() *cobra.Command {
 					ulog.Info("Note handler registered with unified watcher").Log(ctx)
 				}
 
+				// Register NavHandler for nav keymap state (sessions.yml) watching
+				navHandler := watcher.NewNavHandler(st)
+				unifiedWatcher.Register(navHandler)
+				ulog.Info("Nav handler registered with unified watcher").Log(ctx)
+
 				// Register MemoryHandler for auto-indexing content.
 				// Only the global daemon owns the SQLite DB and embedder; scoped
 				// daemons proxy /api/memory/* to global via server-side forwarding.
