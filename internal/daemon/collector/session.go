@@ -143,19 +143,37 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 					continue
 				}
 
-				// PID 0 means the intent was registered but never confirmed with a
-				// real PID (cross-daemon sessions, or stale intents). Can't judge.
-				if session.PID == 0 {
-					continue
+				// PID 0 means this daemon's record was never confirmed with a real
+				// PID. That happens for genuinely unstarted intents AND for sessions
+				// confirmed against a different scoped daemon (the filesystem
+				// job-watcher synthesizes a PID-0 record here). For the latter the
+				// real PID is in the global crash-recovery registry; recover it so
+				// the session is reapable instead of lingering "running" forever.
+				// A registry entry only exists post-confirmation, so its presence is
+				// proof the session was alive — seed seenAlive=true so an
+				// already-dead orphan reaps without needing a fresh alive reading.
+				pid := session.PID
+				var recovered *sessions.SessionMetadata
+				if pid == 0 {
+					if registry != nil {
+						if md, err := registry.Find(session.ID); err == nil && md != nil && md.PID > 0 {
+							pid = md.PID
+							recovered = md
+						}
+					}
+					if pid == 0 {
+						// No confirmed PID anywhere — a true unstarted intent. Can't judge.
+						continue
+					}
 				}
 
 				ls := c.liveness[session.ID]
 				if ls == nil {
-					ls = &pidLiveness{}
+					ls = &pidLiveness{seenAlive: recovered != nil}
 					c.liveness[session.ID] = ls
 				}
 
-				if process.IsProcessAlive(session.PID) {
+				if process.IsProcessAlive(pid) {
 					// Confirmed alive — eligible for reaping only if it later dies.
 					// Reset any transient dead strikes.
 					ls.seenAlive = true
@@ -178,7 +196,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 
 				c.ulog.Warn("Session process died unexpectedly").
 					Field("job_id", session.ID).
-					Field("pid", session.PID).
+					Field("pid", pid).
 					Log(ctx)
 
 				// Kill the out-of-process PTY so treemux panes get EOF and
@@ -203,9 +221,13 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 					},
 				}
 
-				// Clean up the crash recovery files
+				// Clean up the crash recovery files. Prefer the native ID from the
+				// recovered registry metadata when this daemon's record lacks it.
 				if registry != nil {
 					nativeID := session.ClaudeSessionID
+					if nativeID == "" && recovered != nil && recovered.ClaudeSessionID != "" {
+						nativeID = recovered.ClaudeSessionID
+					}
 					if nativeID == "" {
 						nativeID = session.ID
 					}

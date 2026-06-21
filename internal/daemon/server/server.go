@@ -930,6 +930,23 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// lookupRegistryPID consults the global crash-recovery registry for a session's
+// confirmed metadata (chiefly its real PID and native session ID). It is the
+// bridge that lets a daemon act on a session it did not itself launch — the
+// registry is global while session stores are per-scope. Returns nil when no
+// entry exists or the registry is unavailable.
+func lookupRegistryPID(jobID string) *sessions.SessionMetadata {
+	registry, err := sessions.NewFileSystemRegistry()
+	if err != nil {
+		return nil
+	}
+	md, err := registry.Find(jobID)
+	if err != nil {
+		return nil
+	}
+	return md
+}
+
 // killSession terminates a tracked session by sending SIGTERM to its
 // recorded PID, removes the filesystem registry entry, and applies a
 // session-end update to the in-memory store so SSE subscribers learn
@@ -945,11 +962,24 @@ func (s *Server) killSession(sessionID string) error {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
 
-	if session.PID > 0 {
+	// Resolve the PID to signal. This daemon's record may carry PID 0 when the
+	// session was synthesized by the filesystem job-watcher and the agent was
+	// actually confirmed against a different scoped daemon. In that case the
+	// real PID lives in the global crash-recovery registry, written at confirm
+	// time. Without this fallback, killing such a session only closes the PTY
+	// and leaves the agent process orphaned.
+	pid := session.PID
+	if pid <= 0 {
+		if md := lookupRegistryPID(sessionID); md != nil {
+			pid = md.PID
+		}
+	}
+
+	if pid > 0 {
 		// SIGTERM only — let the process clean up. ESRCH (process
 		// already gone) is not an error from our perspective.
-		if err := syscall.Kill(session.PID, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
-			return fmt.Errorf("failed to signal pid %d: %w", session.PID, err)
+		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+			return fmt.Errorf("failed to signal pid %d: %w", pid, err)
 		}
 	}
 
@@ -969,9 +999,14 @@ func (s *Server) killSession(sessionID string) error {
 	// Remove the crash-recovery directory so a daemon restart won't
 	// re-resurrect this session as alive. The directory is named after
 	// the native session ID (Claude UUID), falling back to the job ID.
+	// When this daemon's record lacks the native ID (filesystem-watcher
+	// synthesized record), recover it from the registry so we delete the
+	// real directory rather than a non-existent job-ID-named one.
 	dirName := sessionID
 	if session.ClaudeSessionID != "" {
 		dirName = session.ClaudeSessionID
+	} else if md := lookupRegistryPID(sessionID); md != nil && md.ClaudeSessionID != "" {
+		dirName = md.ClaudeSessionID
 	}
 	if registry, err := sessions.NewFileSystemRegistry(); err == nil {
 		_ = registry.Unregister(dirName)
@@ -1329,12 +1364,71 @@ func (s *Server) handleSessionConfirm(w http.ResponseWriter, r *http.Request) {
 		Payload: &confirmation,
 	})
 
+	// Persist the confirmed PID to the GLOBAL filesystem registry
+	// (~/.grove/hooks/sessions). Grove runs one daemon per scope, but the
+	// daemon that later serves `flow agent list` / `flow plan finish` /
+	// `flow agent kill` is often a DIFFERENT (cwd/global-scoped) daemon whose
+	// session record was synthesized by the filesystem job-watcher and carries
+	// PID 0. Without a shared on-disk PID, that daemon can neither SIGTERM the
+	// agent at finish nor reap it when it dies — the orphaned-agent bug. The
+	// registry is global, so writing it here lets any scoped daemon recover the
+	// real PID via registry.Find(jobID). Best-effort: tracking degrades to the
+	// previous behavior on error.
+	s.persistConfirmedSessionToRegistry(&confirmation)
+
 	s.ulog.Debug("Session confirmed").
 		Field("job_id", confirmation.JobID).
 		Field("pid", confirmation.PID).
 		Log(r.Context())
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "confirmed"})
+}
+
+// persistConfirmedSessionToRegistry writes the confirmed session (with its real
+// PID) to the global crash-recovery registry so that ANY scoped daemon — not
+// just the one that ran the agent — can recover the PID to kill or reap it.
+// Best-effort: a registry write failure must not fail confirmation.
+func (s *Server) persistConfirmedSessionToRegistry(c *store.SessionConfirmationPayload) {
+	if c == nil || c.PID <= 0 {
+		return
+	}
+	registry, err := sessions.NewFileSystemRegistry()
+	if err != nil {
+		return
+	}
+
+	md := sessions.SessionMetadata{
+		SessionID:       c.JobID,
+		JobID:           c.JobID,
+		ClaudeSessionID: c.NativeID,
+		PID:             c.PID,
+		TranscriptPath:  c.TranscriptPath,
+		Provider:        "claude",
+		Status:          "running",
+		StartedAt:       time.Now(),
+		User:            os.Getenv("USER"),
+	}
+	// Enrich from the in-memory session record when available (plan, workdir,
+	// title, pty, mux) so a daemon restart's crash recovery restores full state.
+	if sess := s.engine.Store().GetSession(c.JobID); sess != nil {
+		md.PlanName = sess.PlanName
+		md.JobTitle = sess.JobTitle
+		md.WorkingDirectory = sess.WorkingDirectory
+		md.JobFilePath = sess.JobFilePath
+		md.PtyID = sess.PtyID
+		md.Mux = sess.Mux
+		md.Type = sess.Type
+		if sess.Provider != "" {
+			md.Provider = sess.Provider
+		}
+	}
+
+	if err := registry.Register(md); err != nil {
+		s.ulog.Debug("Failed to persist confirmed session to registry").
+			Err(err).
+			Field("job_id", c.JobID).
+			Log(context.Background())
+	}
 }
 
 // splitPath splits a URL path by "/" and removes empty parts.

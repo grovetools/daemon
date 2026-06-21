@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/daemon/internal/daemon/store"
 )
 
@@ -89,6 +90,100 @@ func TestSessionCollector_ReapsDeadPIDAfterSeenAlive(t *testing.T) {
 		case <-timeout:
 			t.Fatal("collector did not reap the dead PID after it was seen alive")
 		}
+	}
+}
+
+// TestSessionCollector_ReapsPIDZeroViaRegistry is the orphaned-agent regression:
+// a store session with PID 0 (synthesized by the filesystem job-watcher on a
+// daemon that did not launch the agent) must still be reaped when the agent has
+// died, by recovering its real — now dead — PID from the global crash-recovery
+// registry. Before the fix the collector skipped every PID-0 session, so such
+// orphans lingered "running" forever.
+func TestSessionCollector_ReapsPIDZeroViaRegistry(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir()) // isolate the global registry
+
+	// A real child gives a genuinely-alive PID that we later kill, mirroring an
+	// agent confirmed alive (registry written) that subsequently exits.
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start child process: %v", err)
+	}
+	pid := cmd.Process.Pid
+
+	reg, err := sessions.NewFileSystemRegistry()
+	if err != nil {
+		t.Fatalf("NewFileSystemRegistry: %v", err)
+	}
+	sessionID := "coordinate-orphan-zero-pid"
+	// The registry holds the confirmed identity + real PID (as written at confirm
+	// time by whichever scoped daemon launched the agent).
+	if err := reg.Register(sessions.SessionMetadata{
+		SessionID:       sessionID,
+		JobID:           sessionID,
+		ClaudeSessionID: "00000000-aaaa-bbbb-cccc-000000000000",
+		PID:             pid,
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	st := store.New()
+	oldTime := time.Now().Add(-5 * time.Minute) // past the grace period
+	st.ApplyUpdate(store.Update{
+		Type:   store.UpdateSessions,
+		Source: "test",
+		Payload: []*models.Session{
+			// PID 0 — the watcher-synthesized record with no native ID. The real
+			// PID is only discoverable via the registry.
+			{ID: sessionID, PID: 0, Status: "running", StartedAt: oldTime, LastActivity: oldTime},
+		},
+	})
+
+	c := NewSessionCollector(50 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	updates := make(chan store.Update, 100)
+	go func() { _ = c.Run(ctx, st, updates) }()
+
+	// Let the collector recover the PID and observe it alive, then kill it.
+	time.Sleep(300 * time.Millisecond)
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case u := <-updates:
+			if u.Type == store.UpdateSessionEnd {
+				if p, ok := u.Payload.(*store.SessionEndPayload); ok && p.JobID == sessionID {
+					return // reaped via registry-recovered PID, as intended
+				}
+			}
+		case <-timeout:
+			t.Fatal("collector did not reap a PID-0 session via its registry-recovered PID")
+		}
+	}
+}
+
+// TestSessionCollector_SkipsPIDZeroWithoutRegistry verifies the guard is not
+// over-broad: a PID-0 session with NO registry entry is a genuinely unstarted
+// intent and must be left alone (no PID to judge), not reaped.
+func TestSessionCollector_SkipsPIDZeroWithoutRegistry(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir()) // empty registry
+
+	st := store.New()
+	sessionID := "test-unstarted-intent"
+	oldTime := time.Now().Add(-5 * time.Minute)
+	st.ApplyUpdate(store.Update{
+		Type:   store.UpdateSessions,
+		Source: "test",
+		Payload: []*models.Session{
+			{ID: sessionID, PID: 0, Status: "running", StartedAt: oldTime, LastActivity: oldTime},
+		},
+	})
+
+	c := NewSessionCollector(50 * time.Millisecond)
+	if drainForSessionEnd(t, c, st, sessionID, 600*time.Millisecond) {
+		t.Fatal("collector reaped a PID-0 session with no confirmed PID (unstarted-intent regression)")
 	}
 }
 
