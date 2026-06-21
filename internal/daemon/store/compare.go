@@ -30,7 +30,10 @@ func GitStatusEqual(a, b *git.ExtendedGitStatus) bool {
 		sa.ModifiedCount == sb.ModifiedCount &&
 		sa.UntrackedCount == sb.UntrackedCount &&
 		sa.StagedCount == sb.StagedCount &&
-		sa.IsDirty == sb.IsDirty
+		sa.IsDirty == sb.IsDirty &&
+		sa.AheadMainCount == sb.AheadMainCount &&
+		sa.BehindMainCount == sb.BehindMainCount &&
+		sa.HasUpstream == sb.HasUpstream
 }
 
 // PlanStatsEqual returns true if two PlanStats values are equivalent.
