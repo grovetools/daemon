@@ -248,6 +248,11 @@ func (c *WorkflowCollector) convertEvent(jobID, claudeSessionID string, ev workf
 		base.Kind = models.WorkflowRunStale
 		base.RunID = e.RunID
 		return store.Update{Type: store.UpdateWorkflowRunStale, Source: c.Name(), Payload: &store.WorkflowEventPayload{Event: base}}, true
+
+	case workflowmon.RunCompleted:
+		base.Kind = models.WorkflowRunCompleted
+		base.RunID = e.RunID
+		return store.Update{Type: store.UpdateWorkflowRunCompleted, Source: c.Name(), Payload: &store.WorkflowEventPayload{Event: base}}, true
 	}
 
 	return store.Update{}, false
