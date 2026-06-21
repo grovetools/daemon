@@ -1985,7 +1985,8 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 	// consumers; the broadcast is lossy-by-design, so consumers treat
 	// these as triggers and reconcile via GET /api/workflows.
 	case store.UpdateWorkflowRunDiscovered, store.UpdateWorkflowAgentStarted,
-		store.UpdateWorkflowAgentCompleted, store.UpdateWorkflowRunStale:
+		store.UpdateWorkflowAgentCompleted, store.UpdateWorkflowRunStale,
+		store.UpdateWorkflowRunCompleted:
 		return &apiStateUpdate{
 			UpdateType: string(u.Type),
 			Source:     u.Source,

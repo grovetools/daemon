@@ -126,6 +126,7 @@ const (
 	UpdateWorkflowAgentStarted   UpdateType = "workflow_agent_started"
 	UpdateWorkflowAgentCompleted UpdateType = "workflow_agent_completed"
 	UpdateWorkflowRunStale       UpdateType = "workflow_run_stale"
+	UpdateWorkflowRunCompleted   UpdateType = "workflow_run_completed"
 )
 
 // MemoryIndexPayload describes a single memory store mutation for SSE subscribers.

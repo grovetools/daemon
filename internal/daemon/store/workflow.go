@@ -39,6 +39,8 @@ func UpdateTypeForWorkflowKind(k models.WorkflowKind) (UpdateType, bool) {
 		return UpdateWorkflowAgentCompleted, true
 	case models.WorkflowRunStale:
 		return UpdateWorkflowRunStale, true
+	case models.WorkflowRunCompleted:
+		return UpdateWorkflowRunCompleted, true
 	}
 	return "", false
 }
@@ -124,12 +126,27 @@ func (s *Store) applyWorkflowEvent(p *WorkflowEventPayload, persist bool) {
 			return
 		}
 		// Staleness comes from the journal-quiet + session-gone heuristic
-		// (workflowmon.FileSource) — never from the PID reaper.
+		// (workflowmon.FileSource) — never from the PID reaper. Reserved for
+		// session-ended-with-stragglers (RunCompleted handles the clean case).
 		run, ok := s.state.WorkflowRuns[ev.RunID]
 		if !ok {
 			return
 		}
 		run.Stale = true
+		run.UpdatedAt = ev.Timestamp
+
+	case models.WorkflowRunCompleted:
+		if ev.RunID == "" {
+			return
+		}
+		// Clean terminal state: the owning session ended with every started
+		// agent finished (workflowmon.FileSource's session-end gate, NOT live
+		// mid-run count equality).
+		run, ok := s.state.WorkflowRuns[ev.RunID]
+		if !ok {
+			return
+		}
+		run.Completed = true
 		run.UpdatedAt = ev.Timestamp
 
 	default:

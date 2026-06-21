@@ -322,7 +322,8 @@ func (s *Store) ApplyUpdate(u Update) {
 
 	// Workflow/subagent lifecycle events (hooks + journal watcher).
 	case UpdateWorkflowRunDiscovered, UpdateWorkflowAgentStarted,
-		UpdateWorkflowAgentCompleted, UpdateWorkflowRunStale:
+		UpdateWorkflowAgentCompleted, UpdateWorkflowRunStale,
+		UpdateWorkflowRunCompleted:
 		if payload, ok := u.Payload.(*WorkflowEventPayload); ok {
 			s.applyWorkflowEvent(payload, true)
 		}
