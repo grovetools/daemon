@@ -1769,6 +1769,7 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		// addressable tmux/server name, so address them by PtyID (mux-agnostic),
 		// symmetric with the direct-PTY input path. On error, fall through to the
 		// groveterm SSE round-trip below.
+		var nativeErr error
 		if session := s.resolveSessionForRouting(agentID); session != nil && session.PtyID != "" && s.tuimuxClient != nil {
 			screen, err := s.tuimuxClient.CapturePty(session.PtyID)
 			if err == nil {
@@ -1777,11 +1778,27 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 				_, _ = io.WriteString(w, screen)
 				return
 			}
+			nativeErr = err
 			s.ulog.Warn("Native CapturePty failed, falling back to groveterm SSE").
 				Err(err).
 				Field("job_id", agentID).
 				Field("pty_id", session.PtyID).
 				Log(r.Context())
+		}
+
+		// Tier 2: groveterm SSE round-trip. This only works when a groveterm
+		// terminal is actually connected to relay the capture; without one the
+		// waiter can only ever time out. Skip it (mirroring the input path's
+		// HasConnections gate) and surface the native error instead, so headless
+		// callers fail fast with the real cause rather than a misleading 5s
+		// "groveterm did not respond" timeout.
+		if s.terminalHub == nil || !s.terminalHub.HasConnections() {
+			if nativeErr != nil {
+				http.Error(w, "capture failed: "+nativeErr.Error(), http.StatusBadGateway)
+			} else {
+				http.Error(w, "capture unavailable: no PTY for native capture and no terminal connected", http.StatusServiceUnavailable)
+			}
+			return
 		}
 
 		ch := make(chan string, 1)
