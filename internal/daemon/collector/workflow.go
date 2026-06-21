@@ -232,6 +232,7 @@ func (c *WorkflowCollector) convertEvent(jobID, claudeSessionID string, ev workf
 		base.Kind = models.WorkflowAgentStarted
 		base.RunID = e.RunID
 		base.AgentID = e.AgentID
+		base.Name = e.Name
 		base.Prompt = e.Prompt
 		base.Phase = e.Phase
 		return store.Update{Type: store.UpdateWorkflowAgentStarted, Source: c.Name(), Payload: &store.WorkflowEventPayload{Event: base}}, true

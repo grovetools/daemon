@@ -117,7 +117,7 @@ func TestWorkflowCollectorConvertsJournalEvents(t *testing.T) {
 		Name:   "probe-flow",
 		Phases: []workflowmon.PhaseMeta{{Title: "Phase 1"}},
 	}}
-	src.ch <- workflowmon.AgentStarted{RunID: "wf_1", AgentID: "a1", Prompt: "do it"}
+	src.ch <- workflowmon.AgentStarted{RunID: "wf_1", AgentID: "a1", Name: "inspect:core", Prompt: "do it"}
 	src.ch <- workflowmon.AgentCompleted{RunID: "wf_1", AgentID: "a1", Result: "ok"}
 	src.ch <- workflowmon.RunStale{RunID: "wf_1"}
 
@@ -153,7 +153,10 @@ func TestWorkflowCollectorConvertsJournalEvents(t *testing.T) {
 					t.Errorf("run meta = %q/%v", payload.RunName, payload.Phases)
 				}
 			case store.UpdateWorkflowAgentStarted:
-				if ev.AgentID != "a1" || ev.Prompt != "do it" {
+				// The collector must propagate Name (the human label) along
+				// with AgentID/Prompt — without it the store fold is starved
+				// and rows lead with the raw agent id.
+				if ev.AgentID != "a1" || ev.Prompt != "do it" || ev.Name != "inspect:core" {
 					t.Errorf("started event = %+v", ev)
 				}
 			case store.UpdateWorkflowAgentCompleted:
