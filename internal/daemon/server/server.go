@@ -1088,6 +1088,29 @@ func effectiveMux(session *models.Session) string {
 	return models.MuxNone
 }
 
+// resolveSessionForRouting looks up a session by jobID and enriches it with
+// persisted delivery state (mux/tmux target/PtyID) when the in-memory store
+// session lacks muxing details. This is the shared lookup that input, interrupt
+// and capture routing all depend on to reach out-of-process agent PTYs. Returns
+// nil if no session can be resolved.
+func (s *Server) resolveSessionForRouting(jobID string) *models.Session {
+	session := s.engine.Store().GetSession(jobID)
+	if session == nil {
+		session = s.sessionFromDeliveryState(jobID)
+	}
+	if session == nil {
+		return nil
+	}
+	if effectiveMux(session) == models.MuxNone {
+		if info := channels.GetSessionDelivery(jobID); info != nil {
+			session.Mux = info.Mux
+			session.TmuxTarget = info.TmuxTarget
+			session.PtyID = info.PtyID
+		}
+	}
+	return session
+}
+
 // SendSessionInput routes raw input text to an interactive agent session.
 // The mux (treemux vs tmux) is read from session.Mux, with a fallback to
 // implicit inference for pre-existing sessions. For treemux, it prefers a
@@ -1098,21 +1121,9 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 	if s.engine == nil {
 		return fmt.Errorf("engine not initialized")
 	}
-	session := s.engine.Store().GetSession(jobID)
-	if session == nil {
-		session = s.sessionFromDeliveryState(jobID)
-	}
+	session := s.resolveSessionForRouting(jobID)
 	if session == nil {
 		return fmt.Errorf("session not found: %s", jobID)
-	}
-
-	// Enrich with persisted delivery info if store session lacks mux
-	if effectiveMux(session) == models.MuxNone {
-		if info := channels.GetSessionDelivery(jobID); info != nil {
-			session.Mux = info.Mux
-			session.TmuxTarget = info.TmuxTarget
-			session.PtyID = info.PtyID
-		}
 	}
 
 	inputMode := s.resolveInputMode(session.WorkingDirectory)
@@ -1752,6 +1763,25 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
+		}
+
+		// Tier 1: native PTY capture. Out-of-process agent PTYs have no
+		// addressable tmux/server name, so address them by PtyID (mux-agnostic),
+		// symmetric with the direct-PTY input path. On error, fall through to the
+		// groveterm SSE round-trip below.
+		if session := s.resolveSessionForRouting(agentID); session != nil && session.PtyID != "" && s.tuimuxClient != nil {
+			screen, err := s.tuimuxClient.CapturePty(session.PtyID)
+			if err == nil {
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, screen)
+				return
+			}
+			s.ulog.Warn("Native CapturePty failed, falling back to groveterm SSE").
+				Err(err).
+				Field("job_id", agentID).
+				Field("pty_id", session.PtyID).
+				Log(r.Context())
 		}
 
 		ch := make(chan string, 1)
