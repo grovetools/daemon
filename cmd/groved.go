@@ -742,6 +742,27 @@ func newGrovedStartCmd() *cobra.Command {
 					}
 				}
 
+				// Register SettingsHandler to reconcile .claude settings if enabled
+				autoSyncClaudeSettings := true
+				if cfg.Daemon != nil && cfg.Daemon.AutoSyncClaudeSettings != nil {
+					autoSyncClaudeSettings = *cfg.Daemon.AutoSyncClaudeSettings
+				}
+
+				if autoSyncClaudeSettings {
+					debounceMs := 1000
+					if cfg.Daemon != nil && cfg.Daemon.SkillSyncDebounceMs > 0 {
+						debounceMs = cfg.Daemon.SkillSyncDebounceMs
+					}
+
+					settingsHandler, err := watcher.NewSettingsHandler(st, cfg, debounceMs)
+					if err != nil {
+						ulog.Warn("Failed to initialize Claude settings handler").Err(err).Log(ctx)
+					} else {
+						unifiedWatcher.Register(settingsHandler)
+						ulog.Info("Claude settings handler registered with unified watcher").Log(ctx)
+					}
+				}
+
 				// Register WorkspaceHandler for instant discovery on fs changes
 				if isEnabled("workspace") {
 					workspaceHandler := watcher.NewWorkspaceHandler(st, cfg, 2000)
