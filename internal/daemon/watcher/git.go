@@ -83,6 +83,7 @@ func (h *GitHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) [
 		}
 	}
 
+	focusedCount := 0
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
 		if node == nil {
@@ -94,10 +95,13 @@ func (h *GitHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) [
 		if !h.store.IsFocused(node.Path) {
 			continue
 		}
+		focusedCount++
 
 		gitDir, commonDir, err := git.ResolveGitDirs(ctx, node.Path)
 		if err != nil {
-			h.ulog.Debug("Failed to resolve git dirs").Err(err).Field("path", node.Path).Log(ctx)
+			// Expected for non-repo container/ecosystem roots (no .git); keep at
+			// Debug so it doesn't flood the log on every refresh.
+			h.ulog.Debug("git watcher: ResolveGitDirs failed (non-repo?)").Err(err).Field("path", node.Path).Log(ctx)
 			continue
 		}
 
@@ -114,6 +118,18 @@ func (h *GitHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) [
 	paths := make([]string, 0, len(newWatches))
 	for p := range newWatches {
 		paths = append(paths, p)
+	}
+
+	// Debug: fires on every refresh (15s tick + each focus/workspace change), so
+	// keep it off the default level. Enable with GROVE_LOG_LEVEL=debug to confirm
+	// the watch set when freshness looks wrong.
+	h.ulog.Debug("git watcher: computed watch set").
+		Field("total_workspaces", len(workspaces)).
+		Field("focused", focusedCount).
+		Field("watch_paths", len(paths)).
+		Log(ctx)
+	for _, p := range paths {
+		h.ulog.Debug("git watcher: watching").Field("path", p).Log(ctx)
 	}
 	return paths
 }
@@ -155,6 +171,17 @@ func (h *GitHandler) HandleEvents(ctx context.Context, events []fsnotify.Event) 
 	}
 	h.pathsMutex.RUnlock()
 
+	if len(touched) > 0 {
+		paths := make([]string, 0, len(touched))
+		for p := range touched {
+			paths = append(paths, p)
+		}
+		h.ulog.Debug("git watcher: events received").
+			Field("raw_events", len(events)).
+			Field("touched_workspaces", paths).
+			Log(ctx)
+	}
+
 	for _, node := range touched {
 		h.scheduleScan(node)
 	}
@@ -182,7 +209,7 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 	ctx := context.Background()
 	status, err := git.GetExtendedStatus(node.Path)
 	if err != nil {
-		h.ulog.Debug("git status scan failed").Err(err).Field("path", node.Path).Log(ctx)
+		h.ulog.Warn("git watcher: scan failed").Err(err).Field("path", node.Path).Log(ctx)
 		return
 	}
 
@@ -190,9 +217,18 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 	state := h.store.Get()
 	if current, ok := state.Workspaces[node.Path]; ok {
 		if store.GitStatusEqual(current.GitStatus, status) {
+			h.ulog.Debug("git watcher: scan no-op (status unchanged)").Field("path", node.Path).Log(ctx)
 			return
 		}
 	}
+
+	h.ulog.Info("git watcher: emitting delta").
+		Field("path", node.Path).
+		Field("branch", status.Branch).
+		Field("dirty", status.IsDirty).
+		Field("ahead_main", status.AheadMainCount).
+		Field("behind_main", status.BehindMainCount).
+		Log(ctx)
 
 	h.store.ApplyUpdate(store.Update{
 		Type:    store.UpdateWorkspacesDelta,
@@ -226,6 +262,7 @@ func (h *GitHandler) HandleStoreUpdate(update store.Update) {
 		if h.store.IsFocused(path) {
 			// New, focused workspace: scan immediately in a goroutine so we never
 			// block the watcher's store-subscription loop.
+			h.ulog.Info("git watcher: new focused workspace, immediate scan").Field("path", path).Log(context.Background())
 			go h.scanAndEmit(node)
 		}
 	}
@@ -238,6 +275,8 @@ func (h *GitHandler) HandleStoreUpdate(update store.Update) {
 	h.knownPaths = known
 }
 
-// OnStart is a no-op: the initial watch set is established via ComputeWatchPaths
-// during the UnifiedWatcher's first refreshWatches.
-func (h *GitHandler) OnStart(ctx context.Context) {}
+// OnStart logs handler startup; the initial watch set is established via
+// ComputeWatchPaths during the UnifiedWatcher's first refreshWatches.
+func (h *GitHandler) OnStart(ctx context.Context) {
+	h.ulog.Info("git watcher: handler started").Field("debounce_ms", h.debounceMs).Log(ctx)
+}
