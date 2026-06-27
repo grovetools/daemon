@@ -292,7 +292,14 @@ func (jr *JobRunner) isPIDAlive(pid int) bool {
 // keeps a slow/dead daemon from stalling boot; the caller treats any error as
 // "list unavailable" and falls open to PID-only adoption.
 func (jr *JobRunner) listLivePtys() ([]tuimuxpty.SessionMetadata, error) {
+	// Prefer the socket of the wired tuimux client (this daemon's own
+	// scope-keyed socket). Fall back to DefaultSocketPath(), which reads the
+	// GROVE_SCOPE this daemon exported at start, so it still resolves to the
+	// same scoped socket.
 	sock := tuimux.DefaultSocketPath()
+	if jr.tuimuxClient != nil && jr.tuimuxClient.SocketPath != "" {
+		sock = jr.tuimuxClient.SocketPath
+	}
 	httpClient := &http.Client{
 		Timeout: 2 * time.Second,
 		Transport: &http.Transport{

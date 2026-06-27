@@ -336,7 +336,10 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	// re-proxies to the same live socket and clients auto-reconnect. The
 	// proxy transparently handles WebSocket upgrades (/api/pty/attach,
 	// /api/pty/subscribe) and SSE (/api/pty/events).
-	tuimuxSock := tuimux.DefaultSocketPath()
+	// Proxy this daemon's /api/pty/* to ITS OWN scope-keyed tuimux socket so a
+	// scoped daemon's inspector reads only its own PTY map. Empty scope resolves
+	// to the legacy machine-wide socket (backward compat).
+	tuimuxSock := tuimux.ScopedSocketPath(s.scope)
 	ptyProxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = "http"

@@ -380,6 +380,14 @@ func newGrovedStartCmd() *cobra.Command {
 			// re-discovers the same live socket). On failure we log and
 			// continue with a nil client — adoption must fail-open, never block.
 			var tuimuxClient *tuimux.ApiClient
+			// Each daemon stands up / connects to a tuimux multiplexer keyed to
+			// its own scope, so a scoped daemon's PTY inspector sees ONLY its own
+			// PTYs. Empty scope resolves to the legacy machine-wide socket
+			// (backward compat — currently-running shells aren't orphaned).
+			// groved already exported GROVE_SCOPE above, so the spawned tuimux's
+			// own DefaultSocketPath() default agrees; passing the resolved scope
+			// explicitly is belt-and-suspenders.
+			tuimuxSock := tuimux.ScopedSocketPath(scope)
 			tuimuxBin, binErr := resolveTuimuxPath()
 			if binErr != nil {
 				ulog.Warn("tuimux binary not found; agent PTYs will be unavailable").
@@ -387,7 +395,7 @@ func newGrovedStartCmd() *cobra.Command {
 				tuimuxClient = nil
 			} else {
 				var tuimuxErr error
-				tuimuxClient, tuimuxErr = tuimux.EnsureDaemonWithBinary(tuimux.DefaultSocketPath(), tuimuxBin)
+				tuimuxClient, tuimuxErr = tuimux.EnsureDaemonWithBinary(tuimuxSock, tuimuxBin)
 				if tuimuxErr != nil {
 					ulog.Warn("Failed to ensure tuimux daemon; agent PTYs will be unavailable").
 						Err(tuimuxErr).Log(ctx)
@@ -634,6 +642,18 @@ func newGrovedStartCmd() *cobra.Command {
 							ulog.Warn("Failed to kill agent PTY on stop").
 								Err(err).Field("pty_id", sess.PtyID).Log(bgCtx)
 						}
+					}
+				}
+				// A scoped tuimux is owned by this scoped daemon and has no other
+				// owner once it exits — reap it so it doesn't orphan. The global
+				// (scope == "") tuimux is shared and intended to persist, so we
+				// NEVER stop it. This runs only on the plain-stop path (above);
+				// the SIGUSR1 drain/upgrade path leaves the scoped tuimux running
+				// so the successor re-binds the same socket and live PTYs survive.
+				if scope != "" {
+					if err := tuimux.StopDaemon(tuimuxSock); err != nil {
+						ulog.Warn("Failed to stop scoped tuimux daemon on shutdown").
+							Err(err).Field("socket", tuimuxSock).Log(bgCtx)
 					}
 				}
 				envManager.Shutdown()    // Teardown all running environments and proxy routes
