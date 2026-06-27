@@ -133,7 +133,9 @@ func (w *UnifiedWatcher) Start(ctx context.Context) {
 		case <-refreshTicker.C:
 			w.refreshWatches()
 		case update := <-sub:
-			if update.Type == store.UpdateWorkspaces {
+			// Refresh on workspace changes (new/removed) and on focus changes so
+			// the git handler's watch set follows the user's nav scroll.
+			if update.Type == store.UpdateWorkspaces || update.Type == store.UpdateFocus {
 				w.refreshWatches()
 			}
 			// Broadcast store updates to all handlers
