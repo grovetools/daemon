@@ -729,6 +729,17 @@ func newGrovedStartCmd() *cobra.Command {
 					ulog.Info("Workspace handler registered with unified watcher").Log(ctx)
 				}
 
+				// Register GitHandler for subsecond-fresh git status on the
+				// focused workspace set. It watches .git internals (HEAD, index,
+				// refs/heads, refs/remotes) and emits a WorkspaceDelta on change;
+				// the timer-driven GitStatusCollector remains the background
+				// fallback for unfocused workspaces.
+				if isEnabled("git") {
+					gitHandler := watcher.NewGitHandler(st, 150)
+					unifiedWatcher.Register(gitHandler)
+					ulog.Info("Git handler registered with unified watcher").Log(ctx)
+				}
+
 				// Register FlowHandler for plan directory watching
 				if isEnabled("plan") {
 					flowHandler := watcher.NewFlowHandler(st, cfg, 2000)
