@@ -449,7 +449,13 @@ func newGrovedStartCmd() *cobra.Command {
 				// adoption would see an empty map and could never read a job's
 				// PtyID to verify its out-of-process PTY survived the upgrade.
 				// Recovery failure must warn-and-continue, never block adoption.
-				if recovered, rerr := sessions.RecoverSessions(); rerr != nil {
+				//
+				// Scope-filter to this daemon's own scope (same as the collector
+				// seed below): seeding the unfiltered global set here would let
+				// adoption reap another scope's agents as orphans (their PtyIDs
+				// live in a different scoped tuimux), reopening the cross-scope
+				// leak this feature closes.
+				if recovered, rerr := sessions.RecoverSessionsForScope(scope); rerr != nil {
 					ulog.Warn("Synchronous session recovery failed; continuing").Err(rerr).Log(ctx)
 				} else if len(recovered) > 0 {
 					st.ApplyUpdate(store.Update{
