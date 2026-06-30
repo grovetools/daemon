@@ -17,7 +17,7 @@ type Store struct {
 	mu                sync.RWMutex
 	state             *State
 	subscribers       map[chan Update]struct{}
-	focus             map[string]struct{} // Focused workspace paths for priority scanning
+	focus             map[string]map[string]struct{} // [source][path] focused workspace paths for priority scanning
 	persister         *Persister
 	workflowPersister *workflowPersister
 	pendingRestore    persistedState // Loaded from disk, applied when workspaces arrive
@@ -38,7 +38,7 @@ func New() *Store {
 			AdhocSubagents: make(map[string]map[string]*models.Subagent),
 		},
 		subscribers:       make(map[chan Update]struct{}),
-		focus:             make(map[string]struct{}),
+		focus:             make(map[string]map[string]struct{}),
 		persister:         newPersister(),
 		workflowPersister: newWorkflowPersister(),
 		ulog:              grovelogging.NewUnifiedLogger("groved.store"),
@@ -708,22 +708,42 @@ func (s *Store) Unsubscribe(ch chan Update) {
 	close(ch)
 }
 
-// SetFocus updates the set of focused workspace paths.
-// Focused workspaces get priority scanning by collectors.
-func (s *Store) SetFocus(paths []string) {
+// SetFocus replaces the set of focused workspace paths for a single source.
+// Each source (e.g. "nav", "treemux_git") owns its own path set; multiple
+// sources are aggregated across IsFocused/GetFocus so they don't clobber each
+// other. Focused workspaces get priority scanning by collectors.
+func (s *Store) SetFocus(source string, paths []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.focus = make(map[string]struct{}, len(paths))
-	for _, p := range paths {
-		s.focus[p] = struct{}{}
+	if len(paths) == 0 {
+		delete(s.focus, source)
+	} else {
+		set := make(map[string]struct{}, len(paths))
+		for _, p := range paths {
+			set[p] = struct{}{}
+		}
+		s.focus[source] = set
+	}
+
+	// Aggregate the full focus set across all sources for the broadcast payload.
+	seen := make(map[string]struct{})
+	agg := make([]string, 0)
+	for _, set := range s.focus {
+		for p := range set {
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			agg = append(agg, p)
+		}
 	}
 
 	// Broadcast focus change to subscribers
 	update := Update{
 		Type:    UpdateFocus,
 		Source:  "client",
-		Scanned: len(paths),
-		Payload: paths,
+		Scanned: len(agg),
+		Payload: agg,
 	}
 	for ch := range s.subscribers {
 		select {
@@ -733,24 +753,30 @@ func (s *Store) SetFocus(paths []string) {
 	}
 }
 
-// GetFocus returns the set of focused workspace paths.
+// GetFocus returns the aggregated set of focused workspace paths across all sources.
 func (s *Store) GetFocus() map[string]struct{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	// Return a copy
-	result := make(map[string]struct{}, len(s.focus))
-	for k := range s.focus {
-		result[k] = struct{}{}
+	// Return a copy aggregated across all sources.
+	result := make(map[string]struct{})
+	for _, set := range s.focus {
+		for p := range set {
+			result[p] = struct{}{}
+		}
 	}
 	return result
 }
 
-// IsFocused returns true if the given path is in the focus set.
+// IsFocused returns true if the given path is focused by any source.
 func (s *Store) IsFocused(path string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	_, ok := s.focus[path]
-	return ok
+	for _, set := range s.focus {
+		if _, ok := set[path]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // BroadcastConfigReload sends a config reload notification to all subscribers.

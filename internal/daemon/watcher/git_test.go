@@ -52,7 +52,7 @@ func seedWorkspace(t *testing.T, st *store.Store, path string) {
 			path: {WorkspaceNode: node},
 		},
 	})
-	st.SetFocus([]string{path})
+	st.SetFocus("test", []string{path})
 }
 
 func TestGitHandlerComputeWatchPaths(t *testing.T) {
@@ -176,7 +176,7 @@ func TestGitHandlerNewWorktreeImmediateScan(t *testing.T) {
 	_ = h.ComputeWatchPaths(st.GetWorkspaces())
 
 	// Focus the (not-yet-known) new workspace path before discovery arrives.
-	st.SetFocus([]string{repo})
+	st.SetFocus("test", []string{repo})
 
 	// Seed the store with the new workspace so Get() can find it during scan.
 	node := &workspace.WorkspaceNode{Name: filepath.Base(repo), Path: repo, Kind: workspace.KindStandaloneProject}

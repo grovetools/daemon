@@ -2248,14 +2248,18 @@ func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		var req struct {
-			Paths []string `json:"paths"`
+			Source string   `json:"source"`
+			Paths  []string `json:"paths"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
-		s.engine.Store().SetFocus(req.Paths)
-		s.ulog.Debug("Focus updated").Field("count", len(req.Paths)).Log(r.Context())
+		if req.Source == "" {
+			req.Source = "default"
+		}
+		s.engine.Store().SetFocus(req.Source, req.Paths)
+		s.ulog.Debug("Focus updated").Field("source", req.Source).Field("count", len(req.Paths)).Log(r.Context())
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]int{"focused": len(req.Paths)})
 
