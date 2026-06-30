@@ -424,8 +424,95 @@ func (s *Store) applySessionStatus(payload *SessionStatusPayload) {
 		return
 	}
 
+	prevStatus := session.Status
 	session.Status = payload.Status
 	session.LastActivity = time.Now()
+
+	// Interactive (tmux-detached) agents have no foreground runtime loop to
+	// persist a mid-session status change into their job markdown — unlike chat
+	// jobs, whose foreground DaemonRuntime stream already does this. Mirror the
+	// pending_user/running transition into the job front-matter here so the
+	// existing SSE "session" broadcast (fired by Apply's subscriber loop after
+	// this returns) → flow TUI refreshPlan chain surfaces the blocked state with
+	// zero flow-side changes.
+	s.syncSessionStatusToJobMarkdown(session, prevStatus, payload.Status)
+}
+
+// isTerminalJobStatus reports whether a job markdown status represents a
+// finished job that must never be downgraded to an in-flight status.
+func isTerminalJobStatus(status orchestration.JobStatus) bool {
+	switch status {
+	case orchestration.JobStatusCompleted,
+		orchestration.JobStatusFailed,
+		orchestration.JobStatusAbandoned:
+		return true
+	default:
+		return false
+	}
+}
+
+// syncSessionStatusToJobMarkdown mirrors a session's pending_user/running status
+// into its job markdown front-matter (reusing flow's atomic front-matter writer)
+// so detached interactive agents surface their blocked state in flow's TUI. Any
+// load/write failure is logged and swallowed: a markdown-write problem must never
+// break session-status application.
+func (s *Store) syncSessionStatusToJobMarkdown(session *models.Session, prevStatus, newStatus string) {
+	// Only flow jobs carry a JobFilePath; skip raw, non-flow Claude sessions.
+	if session.JobFilePath == "" {
+		return
+	}
+	// Only the blocked/resumed transitions are interesting here.
+	if newStatus != string(orchestration.JobStatusPendingUser) &&
+		newStatus != string(orchestration.JobStatusRunning) {
+		return
+	}
+	// Avoid markdown churn on repeated identical session notifications.
+	if newStatus == prevStatus {
+		return
+	}
+
+	job, err := orchestration.LoadJob(session.JobFilePath)
+	if err != nil {
+		s.ulog.Warn("Failed to load job markdown for session status sync").
+			Field("job_id", session.ID).
+			Field("job_file", session.JobFilePath).
+			Field("error", err.Error()).
+			StructuredOnly().
+			Log(context.Background())
+		return
+	}
+	// LoadJob leaves FilePath empty (its callers set it); UpdateJobStatus needs it.
+	job.FilePath = session.JobFilePath
+
+	// Never downgrade a terminal status (completed/failed/abandoned).
+	if isTerminalJobStatus(job.Status) {
+		return
+	}
+	// Already matches the desired status — nothing to write.
+	oldStatus := string(job.Status)
+	if oldStatus == newStatus {
+		return
+	}
+
+	sp := orchestration.NewStatePersister()
+	if err := sp.UpdateJobStatus(job, orchestration.JobStatus(newStatus)); err != nil {
+		s.ulog.Warn("Failed to write job markdown status for session").
+			Field("job_id", session.ID).
+			Field("job_file", session.JobFilePath).
+			Field("new_status", newStatus).
+			Field("error", err.Error()).
+			StructuredOnly().
+			Log(context.Background())
+		return
+	}
+
+	s.ulog.Debug("Synced session status to job markdown").
+		Field("job_id", session.ID).
+		Field("job_file", session.JobFilePath).
+		Field("old_status", oldStatus).
+		Field("new_status", newStatus).
+		StructuredOnly().
+		Log(context.Background())
 }
 
 // applySessionEnd marks a session as ended.
