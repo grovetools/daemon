@@ -266,6 +266,11 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/config", s.handleGetConfig)
 	mux.HandleFunc("/api/focus", s.handleFocus)
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
+	// Privileged Claude folder-trust seeding — unix socket only. The daemon
+	// derives the trusted paths from the worktree registry (never the caller),
+	// so a sandboxed provisioner can delegate the ~/.claude.json write it cannot
+	// perform itself. See handleSeedTrust for the security rationale.
+	mux.HandleFunc("/api/trust/seed", unixOnly(s.handleSeedTrust))
 	mux.HandleFunc("/api/notes/index", s.handleNoteIndex)
 	mux.HandleFunc("/api/notes/event", s.handleNoteEvent)
 	// Workflow/subagent aggregation endpoints. Served on the 0600 unix
