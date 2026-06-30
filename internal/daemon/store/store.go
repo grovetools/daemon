@@ -223,6 +223,12 @@ func (s *Store) ApplyUpdate(u Update) {
 				if d.GitStatus != nil {
 					ws.GitStatus = d.GitStatus
 				}
+				if d.ChangedFiles != nil {
+					ws.ChangedFiles = d.ChangedFiles
+				}
+				if d.BlobHashes != nil {
+					ws.BlobHashes = d.BlobHashes
+				}
 				if d.NoteCounts != nil {
 					ws.NoteCounts = d.NoteCounts
 				}

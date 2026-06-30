@@ -21,6 +21,37 @@ var gitWorkers = max(min(runtime.NumCPU()/2, 8), 2)
 // Uses a long interval since CLI commands trigger /api/refresh on demand.
 const backgroundScanInterval = 5 * time.Minute
 
+// maxFocusedChangedFiles caps how many changed files a focused repo may have
+// before the daemon skips computing per-file blob hashes for it. A huge change
+// set (e.g. a checked-in node_modules) would make the batch hash-object too
+// costly; above the cap we still cache the file list but leave BlobHashes nil so
+// the consumer falls back to live hashing.
+const maxFocusedChangedFiles = 500
+
+// focusedFileData computes the per-file change list and (when the set is small
+// enough) the per-file working-tree blob hashes for a focused workspace. It is
+// best-effort: any git error yields nil for the affected field so the emitted
+// delta still carries the coarse GitStatus. Above maxFocusedChangedFiles the
+// file list is returned but blob hashes are skipped to bound cost.
+func focusedFileData(repoPath string) ([]git.FileStatus, map[string]string) {
+	files, err := git.GetChangedFiles(repoPath)
+	if err != nil {
+		return nil, nil
+	}
+	if len(files) > maxFocusedChangedFiles {
+		return files, nil
+	}
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		paths = append(paths, f.Path)
+	}
+	hashes, err := git.GetBlobHashes(repoPath, paths)
+	if err != nil {
+		return files, nil
+	}
+	return files, hashes
+}
+
 // dynamicInterval returns a scan interval based on workspace count.
 // Fewer workspaces = faster scanning since it's cheaper.
 func dynamicInterval(count int, baseInterval time.Duration) time.Duration {
@@ -109,11 +140,19 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 
 				status, err := git.GetExtendedStatus(ws.Path)
 				if err == nil && !store.GitStatusEqual(ws.GitStatus, status) {
-					mu.Lock()
-					deltas = append(deltas, &models.WorkspaceDelta{
+					delta := &models.WorkspaceDelta{
 						Path:      ws.Path,
 						GitStatus: status,
-					})
+					}
+					// Granular per-file data is computed ONLY for focused repos
+					// (git-viewer panels / nav) — never on the 5-min background
+					// sweep — to bound git cost. Best-effort: a fetch error just
+					// leaves the file-level fields nil and the coarse status stands.
+					if st.IsFocused(ws.Path) {
+						delta.ChangedFiles, delta.BlobHashes = focusedFileData(ws.Path)
+					}
+					mu.Lock()
+					deltas = append(deltas, delta)
 					mu.Unlock()
 				}
 			}(ws)

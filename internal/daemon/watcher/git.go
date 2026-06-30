@@ -230,12 +230,51 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		Field("behind_main", status.BehindMainCount).
 		Log(ctx)
 
+	delta := &models.WorkspaceDelta{Path: node.Path, GitStatus: status}
+	// Granular per-file data is computed ONLY for focused repos to bound git
+	// cost; the watcher only ever fires for the focused watched set, but guard
+	// explicitly to mirror the collector. Best-effort: a fetch error leaves the
+	// file-level fields nil and the coarse status stands.
+	if h.store.IsFocused(node.Path) {
+		delta.ChangedFiles, delta.BlobHashes = focusedFileData(node.Path)
+	}
+
 	h.store.ApplyUpdate(store.Update{
 		Type:    store.UpdateWorkspacesDelta,
 		Source:  "git_watcher",
 		Scanned: 1,
-		Payload: []*models.WorkspaceDelta{{Path: node.Path, GitStatus: status}},
+		Payload: []*models.WorkspaceDelta{delta},
 	})
+}
+
+// maxFocusedChangedFiles caps how many changed files a focused repo may have
+// before the watcher skips computing per-file blob hashes for it, mirroring the
+// collector's bound so a huge change set can't make batch hashing too costly.
+const maxFocusedChangedFiles = 500
+
+// focusedFileData computes the per-file change list and (when the set is small
+// enough) the per-file working-tree blob hashes for a focused workspace. It is
+// best-effort: any git error yields nil for the affected field so the emitted
+// delta still carries the coarse GitStatus. Above maxFocusedChangedFiles the
+// file list is returned but blob hashes are skipped to bound cost. It mirrors
+// the collector's helper of the same name.
+func focusedFileData(repoPath string) ([]git.FileStatus, map[string]string) {
+	files, err := git.GetChangedFiles(repoPath)
+	if err != nil {
+		return nil, nil
+	}
+	if len(files) > maxFocusedChangedFiles {
+		return files, nil
+	}
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		paths = append(paths, f.Path)
+	}
+	hashes, err := git.GetBlobHashes(repoPath, paths)
+	if err != nil {
+		return files, nil
+	}
+	return files, hashes
 }
 
 // HandleStoreUpdate reacts to store changes. On UpdateWorkspaces it diffs the
