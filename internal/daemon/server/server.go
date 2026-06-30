@@ -26,6 +26,7 @@ import (
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/repo"
 	"github.com/grovetools/core/pkg/sessions"
+	coretmux "github.com/grovetools/core/pkg/tmux"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/version"
 	"github.com/grovetools/daemon/internal/daemon/channels"
@@ -2972,6 +2973,14 @@ func (s *Server) handleNavGroup(w http.ResponseWriter, r *http.Request) {
 		s.ulog.Warn("Failed to regenerate tmux bindings").Err(err).Log(r.Context())
 	}
 
+	// Source-file the freshly generated conf into every running tmux server so
+	// standalone tmux sessions pick up the change immediately — not just nav
+	// CLI callers. The daemon now owns artifact generation AND the live reload,
+	// so a binding edit made inside treemux (which no-ops its own
+	// RegenerateBindings) still reaches plain tmux. Resolves the same
+	// paths.CacheDir() conf path the generator just wrote.
+	coretmux.ReloadAllServers()
+
 	// Update store and broadcast SSE
 	s.engine.Store().ApplyUpdate(store.Update{
 		Type:    store.UpdateNavBindings,
@@ -3015,6 +3024,11 @@ func (s *Server) handleNavLockedKeys(w http.ResponseWriter, r *http.Request) {
 	if err := navbindings.GenerateTmuxConf(groupBindings, paths.BinDir(), paths.CacheDir()); err != nil {
 		s.ulog.Warn("Failed to regenerate tmux bindings").Err(err).Log(r.Context())
 	}
+
+	// Source-file the regenerated conf into every running tmux server so a
+	// locked-keys change is reflected live in standalone tmux (same rationale
+	// as handleNavGroup).
+	coretmux.ReloadAllServers()
 
 	s.engine.Store().ApplyUpdate(store.Update{
 		Type:    store.UpdateNavBindings,
