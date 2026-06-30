@@ -241,30 +241,89 @@ func (h *SettingsHandler) reconcile(filterWorkspacePath string) {
 		}
 	}
 
-	for _, node := range provider.All() {
-		if node == nil || !node.IsWorktree() {
+	// Derive each ecosystem ROOT's member-repo set from discovery: the registry
+	// only tracks XDG worktrees, so the primary checkout (KindEcosystemRoot) has
+	// NO registry entry. Group discovered sub-projects by their parent ecosystem
+	// and use the subdir basename as the repo name, mirroring the union an XDG
+	// ecosystem worktree gets. Keyed by raw path (node.Path matches discovery's
+	// ParentEcosystemPath verbatim — both come from the same discovery pass).
+	ecoReposByPath := make(map[string][]string)
+	for _, proj := range discoveryResult.Projects {
+		if proj.ParentEcosystemPath == "" || proj.Path == "" {
+			continue
+		}
+		ecoReposByPath[proj.ParentEcosystemPath] = append(
+			ecoReposByPath[proj.ParentEcosystemPath], filepath.Base(proj.Path))
+	}
+
+	nodes := provider.All()
+	h.ulog.Debug("Claude settings reconcile node set").
+		Field("node_count", len(nodes)).
+		Field("filter", filterWorkspacePath).
+		Log(ctx)
+
+	var seeded, skipped int
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		// Seedable nodes are worktrees (the historical scope) PLUS the ecosystem
+		// ROOT / primary checkout (KindEcosystemRoot), which IsWorktree()==false
+		// and was therefore silently skipped before — leaving an agent launched at
+		// the ecosystem root reading a stale settings.local.json.
+		seedable := node.IsWorktree() || node.Kind == workspace.KindEcosystemRoot
+		if !seedable {
+			skipped++
+			h.ulog.Debug("Skipping non-seedable node during Claude settings reconcile").
+				Field("path", node.Path).
+				Field("kind", string(node.Kind)).
+				Field("is_worktree", node.IsWorktree()).
+				Log(ctx)
 			continue
 		}
 		if filterWorkspacePath != "" && !worktreeBelongsTo(node, filterWorkspacePath) {
+			skipped++
 			continue
 		}
-		// Skip worktrees whose paths no longer exist (transient teardown state).
+		// Skip nodes whose paths no longer exist (transient teardown state).
 		if _, statErr := os.Stat(node.Path); statErr != nil {
+			skipped++
 			continue
 		}
 
 		repos := reposByPath[node.Path]
+		// The ecosystem root has no registry entry; fall back to its discovered
+		// member subdirs so it gets the same member union (and notebook dirs) an
+		// XDG ecosystem worktree gets.
+		if len(repos) == 0 && node.Kind == workspace.KindEcosystemRoot {
+			repos = ecoReposByPath[node.Path]
+		}
+		h.ulog.Debug("Seeding Claude settings for node").
+			Field("path", node.Path).
+			Field("kind", string(node.Kind)).
+			Field("is_worktree", node.IsWorktree()).
+			Field("repos", repos).
+			Log(ctx)
 		if seedErr := workspace.SeedClaudeSettingsForWorktree(node.Path, repos, provider); seedErr != nil {
-			h.ulog.Warn("Failed to reconcile Claude settings for worktree").
+			h.ulog.Warn("Failed to reconcile Claude settings for node").
 				Err(seedErr).
-				Field("worktree", node.Path).
+				Field("path", node.Path).
+				Field("kind", string(node.Kind)).
 				Log(ctx)
 			continue
 		}
-		h.ulog.Debug("Reconciled Claude settings for worktree").
-			Field("worktree", node.Path).
+		seeded++
+		h.ulog.Debug("Reconciled Claude settings for node").
+			Field("path", node.Path).
+			Field("kind", string(node.Kind)).
 			Log(ctx)
 	}
+
+	h.ulog.Info("Claude settings reconcile complete").
+		Field("seeded", seeded).
+		Field("skipped", skipped).
+		Field("filter", filterWorkspacePath).
+		Log(ctx)
 }
 
 // worktreeBelongsTo reports whether a worktree node is owned by (or is) the
