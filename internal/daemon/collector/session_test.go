@@ -65,7 +65,7 @@ func TestSessionCollector_ReapsDeadPIDAfterSeenAlive(t *testing.T) {
 		},
 	})
 
-	c := NewSessionCollector(50 * time.Millisecond)
+	c := NewSessionCollector(50*time.Millisecond, "")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -138,7 +138,7 @@ func TestSessionCollector_ReapsPIDZeroViaRegistry(t *testing.T) {
 		},
 	})
 
-	c := NewSessionCollector(50 * time.Millisecond)
+	c := NewSessionCollector(50*time.Millisecond, "")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	updates := make(chan store.Update, 100)
@@ -181,7 +181,7 @@ func TestSessionCollector_SkipsPIDZeroWithoutRegistry(t *testing.T) {
 		},
 	})
 
-	c := NewSessionCollector(50 * time.Millisecond)
+	c := NewSessionCollector(50*time.Millisecond, "")
 	if drainForSessionEnd(t, c, st, sessionID, 600*time.Millisecond) {
 		t.Fatal("collector reaped a PID-0 session with no confirmed PID (unstarted-intent regression)")
 	}
@@ -206,7 +206,7 @@ func TestSessionCollector_SkipsGracePeriod(t *testing.T) {
 		},
 	})
 
-	c := NewSessionCollector(50 * time.Millisecond)
+	c := NewSessionCollector(50*time.Millisecond, "")
 	if drainForSessionEnd(t, c, st, sessionID, 500*time.Millisecond) {
 		t.Fatal("collector reaped a session within the grace period")
 	}
@@ -228,7 +228,7 @@ func TestSessionCollector_SkipsNeverAliveDeadPID(t *testing.T) {
 		},
 	})
 
-	c := NewSessionCollector(50 * time.Millisecond)
+	c := NewSessionCollector(50*time.Millisecond, "")
 	// Note: this session was injected via the store (not crash recovery), so it
 	// is not seeded as seenAlive — the collector must leave it alone.
 	if drainForSessionEnd(t, c, st, sessionID, 600*time.Millisecond) {

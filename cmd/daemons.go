@@ -101,6 +101,56 @@ func scopeFromPidFilename(name string) string {
 	return rest[:idx]
 }
 
+// scopeHashFromPidFilename extracts the 8-hex scope hash suffix from a pidfile
+// basename, or "" for the unscoped daemon / a malformed name.
+// "groved.pid"                        → ""
+// "groved-env-continued-e2435831.pid" → "e2435831"
+// The hash is the last hyphen-delimited segment (see paths.scopedPath).
+func scopeHashFromPidFilename(name string) string {
+	name = strings.TrimSuffix(name, ".pid")
+	if !strings.HasPrefix(name, "groved-") {
+		return ""
+	}
+	rest := strings.TrimPrefix(name, "groved-")
+	idx := strings.LastIndex(rest, "-")
+	if idx < 0 || idx+1 >= len(rest) {
+		return ""
+	}
+	return rest[idx+1:]
+}
+
+// resolveUpgradeTarget builds the predicate that selects which running daemon
+// `groved upgrade` targets, plus a human-readable description for errors.
+//
+// Precedence: global (unscoped) > scope (legacy label match) > cwdScope (the
+// CWD-inferred ecosystem-boundary path). An empty cwdScope means the CWD is
+// outside any ecosystem, so the unscoped daemon is the target.
+//
+// For the CWD path we prefer the exact scope string from a daemon's .scope
+// sidecar (ExactScope); legacy daemons without a sidecar are matched by the
+// 8-hex scope hash embedded in their pidfile name (paths.scopedPath scheme),
+// recomputed via paths.PidFilePath so the hashing is not duplicated here.
+func resolveUpgradeTarget(global bool, scope, cwdScope string) (func(daemonEntry) bool, string) {
+	switch {
+	case global:
+		return func(e daemonEntry) bool { return e.Scope == "" }, "(unscoped)"
+	case scope != "":
+		lbl := scope
+		return func(e daemonEntry) bool { return e.Scope == lbl }, fmt.Sprintf("scope %q", scope)
+	case cwdScope == "":
+		return func(e daemonEntry) bool { return e.Scope == "" }, "(unscoped, from cwd)"
+	default:
+		targetHash := scopeHashFromPidFilename(filepath.Base(paths.PidFilePath(cwdScope)))
+		matches := func(e daemonEntry) bool {
+			if e.ExactScope != "" {
+				return e.ExactScope == cwdScope
+			}
+			return targetHash != "" && scopeHashFromPidFilename(filepath.Base(e.PidPath)) == targetHash
+		}
+		return matches, fmt.Sprintf("scope %q (from cwd)", cwdScope)
+	}
+}
+
 // displayScope returns a human-friendly scope label for display.
 func displayScope(scope string) string {
 	if scope == "" {

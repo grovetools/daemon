@@ -49,20 +49,26 @@ type SessionCollector struct {
 	interval  time.Duration
 	ulog      *logging.UnifiedLogger
 	ptyKiller PtyKiller
+	// scope is this daemon's owning scope ("" == unscoped/global). The collector
+	// only ever seeds and reaps sessions whose owning scope matches, so a
+	// daemon can never reap another scope's agents.
+	scope string
 	// liveness tracks per-session reap bookkeeping (seen-alive + dead strikes)
 	// across ticks. Only accessed from the single Run goroutine.
 	liveness map[string]*pidLiveness
 }
 
 // NewSessionCollector creates a new SessionCollector.
-// Defaults to 2 seconds for PID verification.
-func NewSessionCollector(interval time.Duration) *SessionCollector {
+// Defaults to 2 seconds for PID verification. scope is the owning daemon scope
+// ("" == unscoped/global) and bounds which sessions this collector seeds/reaps.
+func NewSessionCollector(interval time.Duration, scope string) *SessionCollector {
 	if interval == 0 {
 		interval = 2 * time.Second
 	}
 	return &SessionCollector{
 		interval: interval,
 		ulog:     logging.NewUnifiedLogger("groved.collector.session"),
+		scope:    scope,
 		liveness: make(map[string]*pidLiveness),
 	}
 }
@@ -82,7 +88,10 @@ func (c *SessionCollector) Name() string { return "session" }
 func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates chan<- store.Update) error {
 	// 1. Initial Crash Recovery
 	// Load sessions that were running before the daemon started/restarted.
-	recoveredSessions, err := sessions.RecoverSessions()
+	// Scope-filtered: a daemon only adopts sessions whose owning scope matches
+	// its own, so the operational store (and thus the shutdown kill-list and the
+	// liveness reaper below) can never touch another scope's agents.
+	recoveredSessions, err := sessions.RecoverSessionsForScope(c.scope)
 	if err != nil {
 		c.ulog.Warn("Failed to recover sessions from disk").Err(err).Log(ctx)
 	} else if len(recoveredSessions) > 0 {
@@ -157,12 +166,20 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				if pid == 0 {
 					if registry != nil {
 						if md, err := registry.Find(session.ID); err == nil && md != nil && md.PID > 0 {
-							pid = md.PID
-							recovered = md
+							// registry.Find is a global cross-scope point-lookup. Only
+							// adopt its PID (and thus make this record reapable) when the
+							// recovered record's owning scope matches ours; otherwise this
+							// is another scope's confirmed session and reaping it would be
+							// the cross-scope leak we're guarding against.
+							if md.Scope == c.scope {
+								pid = md.PID
+								recovered = md
+							}
 						}
 					}
 					if pid == 0 {
-						// No confirmed PID anywhere — a true unstarted intent. Can't judge.
+						// No confirmed PID for our scope — a true unstarted intent or a
+						// foreign-scope record we must not touch. Can't/shouldn't judge.
 						continue
 					}
 				}

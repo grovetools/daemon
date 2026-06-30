@@ -351,7 +351,7 @@ func newGrovedStartCmd() *cobra.Command {
 			}
 			var sessionColl *collector.SessionCollector
 			if isEnabled("session") {
-				sessionColl = collector.NewSessionCollector(sessionInterval)
+				sessionColl = collector.NewSessionCollector(sessionInterval, scope)
 				eng.Register(sessionColl)
 			}
 			if isEnabled("plan") {
@@ -633,6 +633,12 @@ func newGrovedStartCmd() *cobra.Command {
 				// drain path, which leaves PTYs untouched for upgrade survival)
 				// must explicitly kill them via the tuimux daemon, leaving the
 				// tuimux daemon process itself running (other tools may share it).
+				//
+				// Scope safety: st.GetSessions() only ever contains THIS scope's
+				// sessions — the SessionCollector seeds the store via
+				// RecoverSessionsForScope(scope) and never adopts foreign-scope
+				// records — so this loop can only kill agents owned by this daemon's
+				// scope. That is what closes the cross-scope reaping leak (Gap A).
 				if tuimuxClient != nil {
 					for _, sess := range st.GetSessions() {
 						if sess.PtyID == "" {
@@ -932,28 +938,50 @@ func newGrovedStartCmd() *cobra.Command {
 
 func newGrovedUpgradeCmd() *cobra.Command {
 	var scope string
+	var global bool
 	cmd := &cobra.Command{
 		Use:   "upgrade",
 		Short: "Gracefully replace the running daemon with the current binary",
 		Long: `Zero-downtime upgrade: signals the running daemon with SIGUSR1 to enter
 drain mode (unlink the socket, finish in-flight requests), then starts this
 groved binary on the freed socket. The new daemon adopts running detached
-agents by PID, so live agent panes and headless jobs survive the swap.`,
+agents by PID, so live agent panes and headless jobs survive the swap.
+
+By default the target daemon is inferred from the current working directory
+(workspace.ResolveScope) — the same scope treemux pins — so running this inside
+a worktree upgrades that worktree's scoped daemon, not the global one. Use
+--global to force the unscoped daemon, or --scope <label> to target by label.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Select the running daemon to upgrade from the live enumeration —
-			// the same source of truth `status` and `kill` use. An empty --scope
-			// targets the global/unscoped daemon; a non-empty --scope matches a
-			// scoped daemon by its label (the pidfile's middle segment), exactly
-			// like `groved kill <scope>`.
+			// the same source of truth `status` and `kill` use.
 			//
-			// We never derive the target by hashing --scope and never fall back to
-			// the unscoped daemon when a scope was requested but not found: an
-			// earlier version did, and `upgrade --scope <name>` silently drained
-			// and replaced the *unscoped* daemon when the name failed to resolve.
+			// Target precedence: --global (unscoped) > --scope <label> (legacy
+			// label match) > CWD-inferred scope (workspace.ResolveScope(cwd)).
+			//
+			// We never silently fall back to the unscoped daemon when a specific
+			// scope was requested/inferred but not found: an earlier version did,
+			// and `upgrade` then drained and replaced the *unscoped* daemon by
+			// mistake. No match is always an error.
+			if global && scope != "" {
+				return fmt.Errorf("--global and --scope are mutually exclusive")
+			}
+
 			entries, err := enumerateDaemons()
 			if err != nil {
 				return fmt.Errorf("enumerate daemons: %w", err)
 			}
+
+			// Infer the CWD scope (the same resolution treemux uses) for the
+			// default target; --global / --scope override it inside the resolver.
+			var cwdScope string
+			if !global && scope == "" {
+				cwd, werr := os.Getwd()
+				if werr != nil {
+					return fmt.Errorf("resolve cwd: %w", werr)
+				}
+				cwdScope = workspace.ResolveScope(cwd)
+			}
+			matches, targetDesc := resolveUpgradeTarget(global, scope, cwdScope)
 
 			var match *daemonEntry
 			var runningLabels []string
@@ -963,21 +991,18 @@ agents by PID, so live agent panes and headless jobs survive the swap.`,
 					continue
 				}
 				runningLabels = append(runningLabels, displayScope(e.Scope))
-				if e.Scope != scope {
+				if !matches(e) {
 					continue
 				}
 				if match != nil {
-					return fmt.Errorf("scope %q matches multiple running daemons; `groved kill` the extras first", scope)
+					return fmt.Errorf("%s matches multiple running daemons; `groved kill` the extras first", targetDesc)
 				}
 				m := e
 				match = &m
 			}
 
 			if match == nil {
-				if scope == "" {
-					return fmt.Errorf("no running unscoped daemon to upgrade (running: %s)", strings.Join(runningLabels, ", "))
-				}
-				return fmt.Errorf("no running daemon for scope %q (running: %s)", scope, strings.Join(runningLabels, ", "))
+				return fmt.Errorf("no running daemon for %s (running: %s)", targetDesc, strings.Join(runningLabels, ", "))
 			}
 
 			// A scoped successor must inherit the predecessor's exact scope string
@@ -985,13 +1010,14 @@ agents by PID, so live agent panes and headless jobs survive the swap.`,
 			// we cannot guarantee the successor's child clients reconnect to the same
 			// socket, so refuse rather than guess.
 			if match.Scope != "" && match.ExactScope == "" {
-				return fmt.Errorf("daemon for scope %q has no .scope sidecar (started by an older binary); restart it under the current binary, then upgrade", scope)
+				return fmt.Errorf("daemon for %s has no .scope sidecar (started by an older binary); restart it under the current binary, then upgrade", targetDesc)
 			}
 
 			return daemon.UpgradeRunning(cmd.Context(), match.PidPath, match.SockPath, match.ExactScope)
 		},
 	}
-	cmd.Flags().StringVar(&scope, "scope", "", "label of the scoped daemon to upgrade (default: the global/unscoped daemon)")
+	cmd.Flags().StringVar(&scope, "scope", "", "label of the scoped daemon to upgrade (overrides the default CWD-inferred target)")
+	cmd.Flags().BoolVar(&global, "global", false, "upgrade the global/unscoped daemon (overrides the default CWD-inferred target)")
 	return cmd
 }
 

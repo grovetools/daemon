@@ -1411,6 +1411,9 @@ func (s *Server) persistConfirmedSessionToRegistry(c *store.SessionConfirmationP
 		Status:          "running",
 		StartedAt:       time.Now(),
 		User:            os.Getenv("USER"),
+		// Stamp the owning scope so only this daemon's scope adopts/reaps the
+		// session on recovery. Empty == unscoped/global.
+		Scope: s.scope,
 	}
 	// Enrich from the in-memory session record when available (plan, workdir,
 	// title, pty, mux) so a daemon restart's crash recovery restores full state.
@@ -1604,6 +1607,7 @@ func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 		Commit:           version.Commit,
 		BuildDate:        version.BuildDate,
 		UpgradeAvailable: upgradeAvailable,
+		Scope:            s.scope,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(info)
