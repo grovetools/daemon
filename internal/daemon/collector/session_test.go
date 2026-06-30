@@ -3,6 +3,7 @@ package collector
 import (
 	"context"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +11,152 @@ import (
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/daemon/internal/daemon/store"
 )
+
+// recordingPtyKiller records every PtyID the collector asks to kill, so a test
+// can assert which scopes' PTYs were (and were NOT) touched.
+type recordingPtyKiller struct {
+	mu     sync.Mutex
+	killed []string
+}
+
+func (k *recordingPtyKiller) KillPty(ptyID string) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.killed = append(k.killed, ptyID)
+	return nil
+}
+
+func (k *recordingPtyKiller) wasKilled(ptyID string) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for _, id := range k.killed {
+		if id == ptyID {
+			return true
+		}
+	}
+	return false
+}
+
+// pidZeroSession builds a PID-0 "running" session past the grace period — the
+// shape the filesystem job-watcher synthesizes on a daemon that did not itself
+// launch the agent. Its real PID is only discoverable via the registry. The
+// PtyID mirrors what crash-recovery puts on the store record, so a reap
+// exercises the KillPty path. (UpdateSessions replaces the whole set, so all
+// seed sessions must be applied in a single update.)
+func pidZeroSession(sessionID, ptyID string) *models.Session {
+	oldTime := time.Now().Add(-5 * time.Minute)
+	return &models.Session{ID: sessionID, PID: 0, PtyID: ptyID, Status: "running", StartedAt: oldTime, LastActivity: oldTime}
+}
+
+// TestSessionCollector_ReapsPIDZero_OnlyOwnScope is the core cross-scope
+// agent-reaping regression. The reaper recovers a PID-0 session's real PID from
+// the GLOBAL crash-recovery registry, but must only do so when the registry
+// record's owning scope matches this collector's own scope. A scoped collector
+// that adopts+reaps an agent owned by ANOTHER daemon is exactly the leak that
+// made killing one daemon interrupt another's agents.
+//
+// Same-scope: the dead PID is recovered, the session is reaped, and its PTY is
+// killed. Foreign-scope: the record is left strictly alone.
+func TestSessionCollector_ReapsPIDZero_OnlyOwnScope(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir()) // sandbox the shared global registry
+
+	const ownScope = "/sandbox/worktree-a"
+
+	// Two PID-0 store sessions: one whose registry record is owned by THIS
+	// scope, one owned by a DIFFERENT scope. Both registry PIDs are a real proc
+	// we then kill, so the only thing deciding "reap vs leave alone" is the scope
+	// gate on registry recovery — not liveness.
+	reg, err := sessions.NewFileSystemRegistry()
+	if err != nil {
+		t.Fatalf("NewFileSystemRegistry: %v", err)
+	}
+	procs := make([]*exec.Cmd, 0, 2)
+	register := func(sessionID, ptyID, scope string) {
+		p := exec.Command("sleep", "60")
+		if err := p.Start(); err != nil {
+			t.Fatalf("start proc for %s: %v", sessionID, err)
+		}
+		procs = append(procs, p)
+		if err := reg.Register(sessions.SessionMetadata{
+			SessionID:       sessionID,
+			JobID:           sessionID,
+			ClaudeSessionID: sessionID + "-native",
+			PID:             p.Process.Pid,
+			PtyID:           ptyID,
+			Scope:           scope,
+		}); err != nil {
+			t.Fatalf("Register %s: %v", sessionID, err)
+		}
+	}
+	register("own-session", "pty-own", ownScope)
+	register("foreign-session", "pty-foreign", "/sandbox/worktree-b")
+	defer func() {
+		for _, p := range procs {
+			_ = p.Process.Kill()
+			_, _ = p.Process.Wait()
+		}
+	}()
+
+	st := store.New()
+	st.ApplyUpdate(store.Update{
+		Type:    store.UpdateSessions,
+		Source:  "test",
+		Payload: []*models.Session{pidZeroSession("own-session", "pty-own"), pidZeroSession("foreign-session", "pty-foreign")},
+	})
+
+	killer := &recordingPtyKiller{}
+	c := NewSessionCollector(50*time.Millisecond, ownScope) // collector for OUR scope
+	c.SetPtyKiller(killer)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	updates := make(chan store.Update, 100)
+	go func() { _ = c.Run(ctx, st, updates) }()
+
+	// Let the collector recover the own-scope PID and observe it alive, then kill
+	// BOTH procs. The foreign one must never be adopted in the first place, so it
+	// can never be reaped regardless of liveness.
+	time.Sleep(300 * time.Millisecond)
+	for _, p := range procs {
+		_ = p.Process.Kill()
+		_, _ = p.Process.Wait()
+	}
+
+	sawOwnEnd := false
+	deadline := time.After(2 * time.Second)
+loop:
+	for {
+		select {
+		case u := <-updates:
+			if u.Type != store.UpdateSessionEnd {
+				continue
+			}
+			p, ok := u.Payload.(*store.SessionEndPayload)
+			if !ok {
+				continue
+			}
+			if p.JobID == "foreign-session" {
+				t.Fatalf("scoped collector reaped a FOREIGN-scope session — cross-scope leak")
+			}
+			if p.JobID == "own-session" {
+				sawOwnEnd = true
+				break loop
+			}
+		case <-deadline:
+			break loop
+		}
+	}
+
+	if !sawOwnEnd {
+		t.Fatal("collector did not reap its own dead PID-0 session via registry recovery")
+	}
+	if !killer.wasKilled("pty-own") {
+		t.Error("collector did not KillPty its own agent's PTY")
+	}
+	if killer.wasKilled("pty-foreign") {
+		t.Fatal("collector called KillPty on a FOREIGN-scope agent's PTY — cross-scope leak")
+	}
+}
 
 // drainForSessionEnd runs the collector against st and reports whether it
 // emitted an UpdateSessionEnd for sessionID before the deadline.
