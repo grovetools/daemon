@@ -136,6 +136,14 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 			// Preserve existing data if we have it
 			if existing, ok := currentState.Workspaces[node.Path]; ok {
 				ew.GitStatus = existing.GitStatus
+				// Preserve the daemon-computed per-file git cache. Without this,
+				// every ~10s workspace rescan rebuilt the map and dropped
+				// ChangedFiles/BlobHashes, so any client full-pull (/api/workspaces)
+				// returned coarse-only data and the git-viewer cache-missed →
+				// live git in the TUI. The git collector/watcher refresh these via
+				// deltas; the rescan must not clobber them.
+				ew.ChangedFiles = existing.ChangedFiles
+				ew.BlobHashes = existing.BlobHashes
 				ew.NoteCounts = existing.NoteCounts
 				ew.PlanStats = existing.PlanStats
 				ew.ReleaseInfo = existing.ReleaseInfo

@@ -213,10 +213,16 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		return
 	}
 
-	// Compare against the currently stored status to suppress no-op updates.
+	// Compare against the currently stored status to suppress no-op updates —
+	// but never suppress when a focused repo is still missing its per-file cache,
+	// so a fsnotify event on a repo whose coarse status didn't change (or whose
+	// per-file data was never backfilled) still populates ChangedFiles for the
+	// git-viewer cache. Mirrors the collector's backfill gate.
+	focused := h.store.IsFocused(node.Path)
 	state := h.store.Get()
 	if current, ok := state.Workspaces[node.Path]; ok {
-		if store.GitStatusEqual(current.GitStatus, status) {
+		needsFileBackfill := focused && current.ChangedFiles == nil
+		if store.GitStatusEqual(current.GitStatus, status) && !needsFileBackfill {
 			h.ulog.Debug("git watcher: scan no-op (status unchanged)").Field("path", node.Path).Log(ctx)
 			return
 		}
@@ -235,7 +241,7 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 	// cost; the watcher only ever fires for the focused watched set, but guard
 	// explicitly to mirror the collector. Best-effort: a fetch error leaves the
 	// file-level fields nil and the coarse status stands.
-	if h.store.IsFocused(node.Path) {
+	if focused {
 		delta.ChangedFiles, delta.BlobHashes = focusedFileData(node.Path)
 	}
 

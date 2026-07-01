@@ -3,7 +3,6 @@ package collector
 import (
 	"context"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -139,22 +138,37 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				defer func() { <-sem }() // Release
 
 				status, err := git.GetExtendedStatus(ws.Path)
-				if err == nil && !store.GitStatusEqual(ws.GitStatus, status) {
-					delta := &models.WorkspaceDelta{
-						Path:      ws.Path,
-						GitStatus: status,
-					}
-					// Granular per-file data is computed ONLY for focused repos
-					// (git-viewer panels / nav) — never on the 5-min background
-					// sweep — to bound git cost. Best-effort: a fetch error just
-					// leaves the file-level fields nil and the coarse status stands.
-					if st.IsFocused(ws.Path) {
-						delta.ChangedFiles, delta.BlobHashes = focusedFileData(ws.Path)
-					}
-					mu.Lock()
-					deltas = append(deltas, delta)
-					mu.Unlock()
+				if err != nil {
+					return
 				}
+				coarseChanged := !store.GitStatusEqual(ws.GitStatus, status)
+				focused := st.IsFocused(ws.Path)
+				// Backfill: a focused repo whose coarse status is unchanged still
+				// needs its per-file data computed the FIRST time it becomes
+				// focused. The daemon boots / rescans with the focus set empty, so
+				// ChangedFiles starts nil; without this, a stable focused repo
+				// never gets per-file data (the coarse-changed gate alone never
+				// fires) and the git-viewer cache-misses forever, falling back to
+				// live git in the TUI. Emit when the coarse status changed OR a
+				// focused repo is missing its per-file cache.
+				needsFileBackfill := focused && ws.ChangedFiles == nil
+				if !coarseChanged && !needsFileBackfill {
+					return
+				}
+				delta := &models.WorkspaceDelta{
+					Path:      ws.Path,
+					GitStatus: status,
+				}
+				// Granular per-file data is computed ONLY for focused repos
+				// (git-viewer panels / nav) — never on the 5-min background
+				// sweep — to bound git cost. Best-effort: a fetch error just
+				// leaves the file-level fields nil and the coarse status stands.
+				if focused {
+					delta.ChangedFiles, delta.BlobHashes = focusedFileData(ws.Path)
+				}
+				mu.Lock()
+				deltas = append(deltas, delta)
+				mu.Unlock()
 			}(ws)
 		}
 		wg.Wait()
@@ -192,13 +206,13 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				toScan = append(toScan, ws)
 			}
 		} else {
-			// Focused scan: only focused workspaces
-			focusLower := make(map[string]struct{}, len(focus))
-			for p := range focus {
-				focusLower[strings.ToLower(p)] = struct{}{}
-			}
+			// Focused scan: only focused workspaces. Select via the same
+			// st.IsFocused check the per-file ChangedFiles attachment uses below,
+			// so a repo that is scanned as focused ALWAYS also gets its per-file
+			// data — previously selection was case-insensitive while attachment
+			// was case-sensitive, dropping ChangedFiles for case-mismatched paths.
 			for _, ws := range state.Workspaces {
-				if _, ok := focusLower[strings.ToLower(ws.Path)]; ok {
+				if st.IsFocused(ws.Path) {
 					toScan = append(toScan, ws)
 				}
 			}

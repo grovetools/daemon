@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -714,10 +715,27 @@ func (s *Store) Unsubscribe(ch chan Update) {
 	close(ch)
 }
 
+// normFocusPath canonicalizes a focus path so SetFocus and IsFocused key off the
+// same normalized string regardless of case/symlink differences between the
+// path a client pushes (e.g. treemux's ScopeReposForFocus / a raw nav peek path)
+// and the daemon's discovered ws.Path. Without this the focus set matched a repo
+// case-insensitively for scan-selection but case-SENSITIVELY for the per-file
+// ChangedFiles attachment, so a focused repo was scanned yet silently emitted
+// no per-file data — the git-viewer cache-missed and fell back to live git.
+// Falls back to a lowercased raw path when canonicalization fails (path not on
+// disk yet); NormalizeForLookup is memoized so this is cheap on the hot path.
+func normFocusPath(p string) string {
+	if n, err := pathutil.NormalizeForLookup(p); err == nil {
+		return n
+	}
+	return strings.ToLower(p)
+}
+
 // SetFocus replaces the set of focused workspace paths for a single source.
 // Each source (e.g. "nav", "treemux_git") owns its own path set; multiple
 // sources are aggregated across IsFocused/GetFocus so they don't clobber each
-// other. Focused workspaces get priority scanning by collectors.
+// other. Focused workspaces get priority scanning by collectors. Paths are
+// normalized (see normFocusPath) so lookups are case/symlink-insensitive.
 func (s *Store) SetFocus(source string, paths []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -726,7 +744,7 @@ func (s *Store) SetFocus(source string, paths []string) {
 	} else {
 		set := make(map[string]struct{}, len(paths))
 		for _, p := range paths {
-			set[p] = struct{}{}
+			set[normFocusPath(p)] = struct{}{}
 		}
 		s.focus[source] = set
 	}
@@ -773,12 +791,16 @@ func (s *Store) GetFocus() map[string]struct{} {
 	return result
 }
 
-// IsFocused returns true if the given path is focused by any source.
+// IsFocused returns true if the given path is focused by any source. The lookup
+// normalizes the query path the same way SetFocus normalized the stored keys, so
+// a case/symlink difference between the pushed focus path and the daemon's
+// ws.Path can no longer make a focused repo miss its per-file enrichment.
 func (s *Store) IsFocused(path string) bool {
+	key := normFocusPath(path)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, set := range s.focus {
-		if _, ok := set[path]; ok {
+		if _, ok := set[key]; ok {
 			return true
 		}
 	}
