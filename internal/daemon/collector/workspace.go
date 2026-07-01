@@ -2,6 +2,8 @@ package collector
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/grovetools/core/logging"
@@ -69,7 +71,17 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
-	scan := func() {
+	// lastSig fingerprints the discovered node SET (path + kind) from the previous
+	// emit. Discovery runs every tick — as fast as every 10s while a TUI is
+	// focused — but the set is unchanged the vast majority of ticks. Emitting
+	// UpdateWorkspaces regardless made every idle tick fan out into a full
+	// ecosystem-wide claude-settings reseed, a treemux SSE refetch, and a git
+	// watcher watch-set recompute. Suppress the redundant emit when the set is
+	// identical; per-workspace enrichment (git status, etc.) still flows via
+	// UpdateWorkspacesDelta, and add/remove/kind changes still emit here.
+	lastSig := ""
+
+	scan := func(force bool) {
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 1*time.Second {
@@ -95,6 +107,23 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 		if err != nil {
 			return
 		}
+
+		// Fingerprint the discovered set. A stable signature across ticks means
+		// no worktree was added/removed/retyped, so re-broadcasting would only
+		// trigger redundant downstream work.
+		sigs := make([]string, 0, len(nodes))
+		for _, node := range nodes {
+			if node == nil {
+				continue
+			}
+			sigs = append(sigs, node.Path+"\x00"+string(node.Kind))
+		}
+		sort.Strings(sigs)
+		sig := strings.Join(sigs, "\n")
+		if !force && sig == lastSig {
+			return
+		}
+		lastSig = sig
 
 		// 2. Convert to EnrichedWorkspace (initially empty enrichment)
 		// Preserve existing enrichment data if available in the store
@@ -124,8 +153,8 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 		}
 	}
 
-	// Initial scan
-	scan()
+	// Initial scan — always emit to seed the store.
+	scan(true)
 
 	currentInterval := c.interval
 
@@ -134,7 +163,7 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			scan()
+			scan(false)
 
 			// Dynamically adjust interval based on active client focus.
 			// When the TUI is open (focus set), scan more frequently to catch
@@ -150,7 +179,10 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 				ticker.Reset(currentInterval)
 			}
 		case replyCh := <-c.refresh:
-			scan()
+			// Explicit on-demand refresh always emits so callers that just
+			// mutated the worktree set see it propagate even if discovery
+			// races the filesystem change.
+			scan(true)
 			close(replyCh)
 		}
 	}
