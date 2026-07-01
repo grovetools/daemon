@@ -194,6 +194,12 @@ func (h *WorkspaceHandler) triggerRefresh() {
 			// Preserve existing enrichments
 			if existing, ok := currentState.Workspaces[node.Path]; ok {
 				ew.GitStatus = existing.GitStatus
+				// Preserve the per-file cache + computed flag across a structural
+				// rescan (mirrors the collector); dropping them forces a
+				// re-backfill and a git-viewer cache miss.
+				ew.ChangedFiles = existing.ChangedFiles
+				ew.BlobHashes = existing.BlobHashes
+				ew.ChangedFilesComputed = existing.ChangedFilesComputed
 				ew.NoteCounts = existing.NoteCounts
 				ew.PlanStats = existing.PlanStats
 				ew.ReleaseInfo = existing.ReleaseInfo

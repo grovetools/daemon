@@ -230,6 +230,10 @@ func (s *Store) ApplyUpdate(u Update) {
 				if d.BlobHashes != nil {
 					ws.BlobHashes = d.BlobHashes
 				}
+				// *bool: only git deltas set this, so non-git deltas can't reset it.
+				if d.ChangedFilesComputed != nil {
+					ws.ChangedFilesComputed = *d.ChangedFilesComputed
+				}
 				if d.NoteCounts != nil {
 					ws.NoteCounts = d.NoteCounts
 				}

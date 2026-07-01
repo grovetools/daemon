@@ -221,7 +221,7 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 	focused := h.store.IsFocused(node.Path)
 	state := h.store.Get()
 	if current, ok := state.Workspaces[node.Path]; ok {
-		needsFileBackfill := focused && current.ChangedFiles == nil
+		needsFileBackfill := focused && !current.ChangedFilesComputed
 		if store.GitStatusEqual(current.GitStatus, status) && !needsFileBackfill {
 			h.ulog.Debug("git watcher: scan no-op (status unchanged)").Field("path", node.Path).Log(ctx)
 			return
@@ -243,6 +243,8 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 	// file-level fields nil and the coarse status stands.
 	if focused {
 		delta.ChangedFiles, delta.BlobHashes = focusedFileData(node.Path)
+		computed := true
+		delta.ChangedFilesComputed = &computed
 	}
 
 	h.store.ApplyUpdate(store.Update{

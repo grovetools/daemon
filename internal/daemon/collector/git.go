@@ -150,8 +150,10 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				// never gets per-file data (the coarse-changed gate alone never
 				// fires) and the git-viewer cache-misses forever, falling back to
 				// live git in the TUI. Emit when the coarse status changed OR a
-				// focused repo is missing its per-file cache.
-				needsFileBackfill := focused && ws.ChangedFiles == nil
+				// focused repo is missing its per-file cache. Gate on the computed
+				// flag, not ChangedFiles == nil: a clean repo's file list is nil, so
+				// the nil test would re-run focusedFileData every tick.
+				needsFileBackfill := focused && !ws.ChangedFilesComputed
 				if !coarseChanged && !needsFileBackfill {
 					return
 				}
@@ -165,6 +167,8 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				// leaves the file-level fields nil and the coarse status stands.
 				if focused {
 					delta.ChangedFiles, delta.BlobHashes = focusedFileData(ws.Path)
+					computed := true
+					delta.ChangedFilesComputed = &computed
 				}
 				mu.Lock()
 				deltas = append(deltas, delta)

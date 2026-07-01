@@ -144,6 +144,7 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 				// deltas; the rescan must not clobber them.
 				ew.ChangedFiles = existing.ChangedFiles
 				ew.BlobHashes = existing.BlobHashes
+				ew.ChangedFilesComputed = existing.ChangedFilesComputed
 				ew.NoteCounts = existing.NoteCounts
 				ew.PlanStats = existing.PlanStats
 				ew.ReleaseInfo = existing.ReleaseInfo
