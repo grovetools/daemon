@@ -6,7 +6,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/claudenotebook"
 	"github.com/grovetools/core/pkg/claudetrust"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
@@ -98,7 +100,29 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 		// without this sweep every finished worktree leaks a dead
 		// ~/.claude.json projects[] entry. The daemon runs unsandboxed, so
 		// this privileged write succeeds.
-		claudetrust.PruneOrphanTrust(paths.WorktreesDir()) //nolint:errcheck // best-effort
+		//
+		// Gate: prune runs only when grove is asked to manage folder-trust via
+		// the daemon's resolved [claude] preference (manageTrust=true, default
+		// off). Unlike seeding (per-worktree), pruning is a single global sweep
+		// with no per-worktree context, and it mutates the shared ~/.claude.json,
+		// so the daemon's own resolved preference is the right authority — a
+		// per-project manageTrust must not empower the daemon to delete keys.
+		// config.LoadDefault == LoadFrom(cwd): it includes the global layer, but
+		// if the daemon runs inside a project dir carrying a [claude] block that
+		// project's value wins (matches the job/note collector pattern). Any load
+		// error degrades to disabled (safe default). Flipping the flag off does
+		// NOT retroactively remove already-seeded keys — acceptable/safe.
+		coreCfg, cfgErr := config.LoadDefault()
+		if cfgErr != nil {
+			coreCfg = &config.Config{}
+		}
+		var cc claudenotebook.ClaudeConfig
+		if coreCfg != nil {
+			_ = coreCfg.UnmarshalExtension("claude", &cc)
+		}
+		if cc.ManagesTrust() {
+			claudetrust.PruneOrphanTrust(paths.WorktreesDir()) //nolint:errcheck // best-effort
+		}
 
 		// Discover base nodes globally — a scoped daemon still serves the
 		// full workspace list so nav can show the whole worldview. Heavy

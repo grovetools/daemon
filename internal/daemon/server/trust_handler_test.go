@@ -56,6 +56,12 @@ func seedTrustTestEnv(t *testing.T, repos []string) (home, worktreePath string, 
 	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
 		t.Fatalf("mkdir worktree: %v", err)
 	}
+	// Opt this worktree into grove-managed trust so the handler's config gate
+	// (manageTrust=true, default off) passes and the positive tests exercise the
+	// actual seed. The disabled/no-op path is covered separately.
+	if err := os.WriteFile(filepath.Join(worktreePath, "grove.toml"), []byte("[claude]\nmanageTrust = true\n"), 0o644); err != nil {
+		t.Fatalf("write grove.toml: %v", err)
+	}
 	for _, r := range repos {
 		if err := os.MkdirAll(filepath.Join(worktreePath, r), 0o755); err != nil {
 			t.Fatalf("mkdir repo %s: %v", r, err)
@@ -141,6 +147,39 @@ func TestHandleSeedTrustHonorsGate(t *testing.T) {
 	}
 	if projects := readClaudeProjects(t, home); projects != nil {
 		t.Errorf("gate off but ~/.claude.json projects were written: %v", projects)
+	}
+}
+
+// TestHandleSeedTrustSkipsWhenManageTrustDisabled proves the config gate: when
+// the worktree's resolved [claude] profile does not enable manageTrust (the
+// opt-in default), the handler returns 200 but writes nothing — grove never
+// touches ~/.claude.json. This is the daemon-side defense-in-depth mirror of
+// the caller gate.
+func TestHandleSeedTrustSkipsWhenManageTrustDisabled(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+
+	worktreePath := filepath.Join(t.TempDir(), "my-worktree")
+	if err := os.MkdirAll(filepath.Join(worktreePath, "core"), 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	// A [claude] block WITHOUT manageTrust (unrelated settings only): the gate
+	// must resolve disabled and no-op.
+	if err := os.WriteFile(filepath.Join(worktreePath, "grove.toml"), []byte("[claude.permissions]\nallow = [\"Bash(git:*)\"]\n"), 0o644); err != nil {
+		t.Fatalf("write grove.toml: %v", err)
+	}
+	if err := worktreeregistry.Save(&worktreeregistry.Entry{AbsPath: worktreePath, Repos: []string{"core"}}); err != nil {
+		t.Fatalf("save registry entry: %v", err)
+	}
+
+	rec := postSeedTrust(t, map[string]any{"worktree_ref": worktreePath})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if projects := readClaudeProjects(t, home); projects != nil {
+		t.Errorf("manageTrust disabled but ~/.claude.json projects were written: %v", projects)
 	}
 }
 

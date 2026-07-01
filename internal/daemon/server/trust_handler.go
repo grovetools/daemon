@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/pkg/claudenotebook"
 	"github.com/grovetools/core/pkg/claudetrust"
 	"github.com/grovetools/core/pkg/worktreeregistry"
 	"github.com/grovetools/core/util/pathutil"
@@ -51,6 +53,25 @@ func (s *Server) handleSeedTrust(w http.ResponseWriter, r *http.Request) {
 	entry, err := worktreeregistry.FindByRef(req.WorktreeRef)
 	if err != nil || entry == nil {
 		http.Error(w, fmt.Sprintf("worktree not found for ref %q: %v", req.WorktreeRef, err), http.StatusNotFound)
+		return
+	}
+
+	// Config gate (defense-in-depth): grove manages ~/.claude.json only when the
+	// worktree's resolved [claude] profile sets manageTrust=true (default off,
+	// opt-in). Callers already gate before delegating, but this RPC is a
+	// privileged surface, so re-check here from the daemon's own authority.
+	// config.LoadFrom cascades the global ~/.config/grove config into the
+	// worktree layer. Any load/parse error degrades to disabled (safe default).
+	cfg, cfgErr := config.LoadFrom(entry.AbsPath)
+	var cc claudenotebook.ClaudeConfig
+	if cfgErr == nil && cfg != nil {
+		_ = cfg.UnmarshalExtension("claude", &cc)
+	}
+	if !cc.ManagesTrust() {
+		s.ulog.Debug("trust seed: skipped (manageTrust not enabled)").
+			Field("ref", req.WorktreeRef).Log(r.Context())
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]int{"trusted": 0})
 		return
 	}
 
