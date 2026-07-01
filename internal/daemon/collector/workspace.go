@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/claudetrust"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/workspace"
@@ -79,6 +80,13 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 		// Reconcile the worktree registry before discovery so stale entries
 		// are pruned and newly-created XDG dirs are adopted in one pass.
 		worktreeregistry.Reconcile(paths.WorktreesDir()) //nolint:errcheck // best-effort
+
+		// Garbage-collect Claude folder-trust keys for worktrees that no
+		// longer exist under WorktreesDir. SeedTrust is write-only, so
+		// without this sweep every finished worktree leaks a dead
+		// ~/.claude.json projects[] entry. The daemon runs unsandboxed, so
+		// this privileged write succeeds.
+		claudetrust.PruneOrphanTrust(paths.WorktreesDir()) //nolint:errcheck // best-effort
 
 		// Discover base nodes globally — a scoped daemon still serves the
 		// full workspace list so nav can show the whole worldview. Heavy
