@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	coredaemon "github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/models"
 )
 
@@ -212,5 +213,59 @@ func TestStore_JobLifecycleUpdates(t *testing.T) {
 	})
 	if got := s.GetJob("job-abc"); got.Status != "completed" {
 		t.Errorf("expected status completed, got %s", got.Status)
+	}
+}
+
+func TestStore_BroadcastThemeChanged(t *testing.T) {
+	s := New()
+	sub1 := s.Subscribe()
+	sub2 := s.Subscribe()
+	defer s.Unsubscribe(sub1)
+	defer s.Unsubscribe(sub2)
+
+	payload := &coredaemon.ThemeChangedPayload{
+		Family: "kanagawa",
+		Mode:   "hex",
+		Dark:   &coredaemon.ThemePalette{Name: "kanagawa-dark", Appearance: "dark", Bg: "#1f1f28"},
+	}
+	s.BroadcastThemeChanged("kanagawa", payload)
+
+	for i, sub := range []chan Update{sub1, sub2} {
+		select {
+		case update := <-sub:
+			if update.Type != UpdateThemeChanged {
+				t.Errorf("subscriber %d: expected update type %q, got %q", i, UpdateThemeChanged, update.Type)
+			}
+			if update.Source != "config" {
+				t.Errorf("subscriber %d: expected source %q, got %q", i, "config", update.Source)
+			}
+			got, ok := update.Payload.(*coredaemon.ThemeChangedPayload)
+			if !ok {
+				t.Fatalf("subscriber %d: expected *coredaemon.ThemeChangedPayload payload, got %T", i, update.Payload)
+			}
+			// BroadcastThemeChanged fills an empty payload Name from the name arg.
+			if got.Name != "kanagawa" {
+				t.Errorf("subscriber %d: expected payload name %q, got %q", i, "kanagawa", got.Name)
+			}
+			if got.Dark == nil || got.Dark.Bg != "#1f1f28" {
+				t.Errorf("subscriber %d: dark palette did not survive broadcast: %+v", i, got.Dark)
+			}
+		case <-time.After(1 * time.Second):
+			t.Fatalf("subscriber %d: timed out waiting for theme_changed update", i)
+		}
+	}
+}
+
+func TestStore_BroadcastThemeChanged_NilPayloadIsDropped(t *testing.T) {
+	s := New()
+	sub := s.Subscribe()
+	defer s.Unsubscribe(sub)
+
+	s.BroadcastThemeChanged("kanagawa", nil)
+
+	select {
+	case update := <-sub:
+		t.Fatalf("expected no update for nil payload, got %v", update.Type)
+	case <-time.After(50 * time.Millisecond):
 	}
 }

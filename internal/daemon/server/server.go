@@ -20,6 +20,7 @@ import (
 	"github.com/grovetools/agentlogs/pkg/agentstream"
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
+	coredaemon "github.com/grovetools/core/pkg/daemon"
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/models"
 	muxpkg "github.com/grovetools/core/pkg/mux"
@@ -37,6 +38,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
+	"github.com/grovetools/daemon/internal/daemon/theming"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/daemon/internal/enrichment"
 	daemonweb "github.com/grovetools/daemon/web"
@@ -1488,9 +1490,12 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
-	// Send current state immediately so client has data right away
+	// Send current state immediately so client has data right away. The
+	// snapshot also carries the current resolved theme so a theme change
+	// that happened while the client was disconnected isn't lost.
 	state := s.engine.Store().Get()
-	if len(state.Workspaces) > 0 {
+	themePayload := theming.CurrentPayload()
+	if len(state.Workspaces) > 0 || themePayload != nil {
 		workspaces := make([]*models.EnrichedWorkspace, 0, len(state.Workspaces))
 		for _, ws := range state.Workspaces {
 			workspaces = append(workspaces, ws)
@@ -1498,6 +1503,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 		initialUpdate := &apiStateUpdate{
 			Workspaces: workspaces,
 			UpdateType: "initial",
+			Theme:      themePayload,
 		}
 		if data, err := json.Marshal(initialUpdate); err == nil {
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
@@ -1989,6 +1995,9 @@ type apiStateUpdate struct {
 	Scanned         int                         `json:"scanned,omitempty"`
 	ConfigFile      string                      `json:"config_file,omitempty"`
 	Payload         interface{}                 `json:"payload,omitempty"`
+	// Theme stamps the current resolved theme onto the "initial" snapshot so
+	// clients reconnecting after a disconnect never miss a theme change.
+	Theme *coredaemon.ThemeChangedPayload `json:"theme,omitempty"`
 }
 
 // convertToAPIUpdate converts internal store.Update to the public API format.
@@ -2045,6 +2054,16 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			UpdateType: "config_reload",
 			Source:     u.Source,
 			ConfigFile: configFile,
+		}
+
+	// Theme change — the resolved tui.theme value changed. Without this
+	// case the event would be silently dropped before reaching the SSE
+	// wire. Payload is *coredaemon.ThemeChangedPayload.
+	case store.UpdateThemeChanged:
+		return &apiStateUpdate{
+			UpdateType: string(store.UpdateThemeChanged),
+			Source:     u.Source,
+			Payload:    u.Payload,
 		}
 	case store.UpdateSkillSync:
 		return &apiStateUpdate{

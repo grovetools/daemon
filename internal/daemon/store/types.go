@@ -42,6 +42,7 @@ const (
 	UpdateSessions      UpdateType = "sessions"
 	UpdateFocus         UpdateType = "focus"
 	UpdateConfigReload  UpdateType = "config_reload"
+	UpdateThemeChanged  UpdateType = "theme_changed"
 	UpdateSkillSync     UpdateType = "skill_sync"
 	UpdateWatcherStatus UpdateType = "watcher_status"
 

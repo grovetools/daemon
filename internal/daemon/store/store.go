@@ -7,6 +7,7 @@ import (
 	"time"
 
 	grovelogging "github.com/grovetools/core/logging"
+	coredaemon "github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/flow/pkg/orchestration"
@@ -841,6 +842,36 @@ func (s *Store) BroadcastConfigReload(file string) {
 		Type:    UpdateConfigReload,
 		Source:  "config",
 		Payload: file, // The file that changed
+	}
+	for ch := range s.subscribers {
+		select {
+		case ch <- update:
+		default:
+		}
+	}
+}
+
+// BroadcastThemeChanged sends a theme change notification to all subscribers.
+// It is emitted by the groved ConfigWatcher wiring when the resolved global
+// tui.theme value actually changes (the coarse config_reload event still
+// fires for every config write). The palette payload carries fully resolved
+// role colors for both appearances so consumers never re-parse layered
+// config.
+func (s *Store) BroadcastThemeChanged(name string, palette *coredaemon.ThemeChangedPayload) {
+	if palette == nil {
+		return
+	}
+	if palette.Name == "" {
+		palette.Name = name
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	update := Update{
+		Type:    UpdateThemeChanged,
+		Source:  "config",
+		Payload: palette,
 	}
 	for ch := range s.subscribers {
 		select {

@@ -38,6 +38,7 @@ import (
 	daemonssh "github.com/grovetools/daemon/internal/daemon/ssh"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
+	"github.com/grovetools/daemon/internal/daemon/theming"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/grovetools/grove-gemini/pkg/gemini"
@@ -732,9 +733,30 @@ func newGrovedStartCmd() *cobra.Command {
 			// 7. Start ConfigWatcher if enabled
 			if configWatchEnabled(cfg) {
 				debounceMs := configDebounceMs(cfg)
+				// Track the resolved global tui.theme across reloads so a
+				// dedicated theme_changed event (with the resolved palette)
+				// fires only when the theme actually changes. The callback
+				// runs on the watcher's single goroutine, so lastTheme
+				// needs no locking.
+				lastTheme := theming.CurrentThemeName()
 				configWatcher, err := daemon.NewConfigWatcher(debounceMs, func(file string) {
 					// Broadcast config reload event to all subscribers
 					st.BroadcastConfigReload(file)
+
+					// Diff the resolved theme and broadcast on change.
+					themeName := theming.CurrentThemeName()
+					if themeName == lastTheme {
+						return
+					}
+					lastTheme = themeName
+					if payload, ok := theming.BuildPayload(themeName); ok {
+						st.BroadcastThemeChanged(themeName, payload)
+						ulog.Info("Theme changed, broadcasting").
+							Field("theme", themeName).Log(ctx)
+					} else {
+						ulog.Warn("Configured theme not found in registry, skipping theme broadcast").
+							Field("theme", themeName).Log(ctx)
+					}
 				})
 				if err != nil {
 					ulog.Warn("Failed to start config watcher, continuing without it").Err(err).Log(ctx)
