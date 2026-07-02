@@ -39,6 +39,13 @@ type SettingsHandler struct {
 	watchedPaths map[string]*workspace.WorkspaceNode
 	pathsMutex   sync.RWMutex
 
+	// knownPaths is the workspace path-set seen in the last UpdateWorkspaces,
+	// used by HandleStoreUpdate to skip the full reconcile when the set is
+	// unchanged (the periodic workspace collector re-broadcasts the same set
+	// every few minutes). Mirrors GitHandler.knownPaths: owned exclusively by
+	// HandleStoreUpdate, which runs under the UnifiedWatcher lock.
+	knownPaths map[string]bool
+
 	// Debounce timers per workspace path (the empty-string key coalesces the
 	// "reconcile all worktrees" passes triggered by store updates).
 	timers      map[string]*time.Timer
@@ -58,6 +65,7 @@ func NewSettingsHandler(st *store.Store, cfg *config.Config, debounceMs int) (*S
 		debounceMs:   debounceMs,
 		ulog:         logging.NewUnifiedLogger("groved.watcher.claude_settings"),
 		watchedPaths: make(map[string]*workspace.WorkspaceNode),
+		knownPaths:   make(map[string]bool),
 		timers:       make(map[string]*time.Timer),
 	}, nil
 }
@@ -133,12 +141,37 @@ func (h *SettingsHandler) HandleEvents(ctx context.Context, events []fsnotify.Ev
 
 // HandleStoreUpdate responds to store-level updates like config reloads and
 // workspace discovery, scheduling a debounced reconcile of all worktrees.
+// UpdateWorkspaces only triggers a full reconcile when the workspace path-set
+// actually changed (mirrors GitHandler.HandleStoreUpdate's knownPaths diff) —
+// the periodic collector re-broadcasts an identical set every few minutes and
+// those no-op updates must not schedule ~200-node reconciles. Config-reload
+// and grove.toml triggers are unaffected.
 func (h *SettingsHandler) HandleStoreUpdate(update store.Update) {
 	switch update.Type {
 	case store.UpdateConfigReload:
 		h.handleConfigReload()
 	case store.UpdateWorkspaces:
-		h.scheduleReconcile("", "")
+		workspaces, ok := update.Payload.(map[string]*models.EnrichedWorkspace)
+		if !ok {
+			return
+		}
+		changed := len(workspaces) != len(h.knownPaths)
+		if !changed {
+			for path := range workspaces {
+				if !h.knownPaths[path] {
+					changed = true
+					break
+				}
+			}
+		}
+		known := make(map[string]bool, len(workspaces))
+		for path := range workspaces {
+			known[path] = true
+		}
+		h.knownPaths = known
+		if changed {
+			h.scheduleReconcile("", "")
+		}
 	}
 }
 
@@ -264,7 +297,7 @@ func (h *SettingsHandler) reconcile(filterWorkspacePath string) {
 		Field("filter", filterWorkspacePath).
 		Log(ctx)
 
-	var seeded, skipped int
+	var seeded, seededChanged, skipped int
 	for _, node := range nodes {
 		if node == nil {
 			continue
@@ -300,13 +333,19 @@ func (h *SettingsHandler) reconcile(filterWorkspacePath string) {
 		if len(repos) == 0 && node.Kind == workspace.KindEcosystemRoot {
 			repos = ecoReposByPath[node.Path]
 		}
-		h.ulog.Debug("Seeding Claude settings for node").
-			Field("path", node.Path).
-			Field("kind", string(node.Kind)).
-			Field("is_worktree", node.IsWorktree()).
-			Field("repos", repos).
-			Log(ctx)
-		if seedErr := workspace.SeedClaudeSettingsForWorktree(node.Path, repos, provider); seedErr != nil {
+		nodeChanged, seedErr := workspace.SeedClaudeSettingsForWorktreeChanged(node.Path, repos, provider)
+		if seedErr != nil {
+			// A worktree torn down mid-reconcile makes the tmp+rename fail with a
+			// vanished path — that's expected churn, not degradation. Re-stat and
+			// demote to Debug when the node's path no longer exists.
+			if _, statErr := os.Stat(node.Path); statErr != nil {
+				h.ulog.Debug("Skipping Claude settings for node removed mid-reconcile").
+					Err(seedErr).
+					Field("path", node.Path).
+					Field("kind", string(node.Kind)).
+					Log(ctx)
+				continue
+			}
 			h.ulog.Warn("Failed to reconcile Claude settings for node").
 				Err(seedErr).
 				Field("path", node.Path).
@@ -315,14 +354,26 @@ func (h *SettingsHandler) reconcile(filterWorkspacePath string) {
 			continue
 		}
 		seeded++
-		h.ulog.Debug("Reconciled Claude settings for node").
-			Field("path", node.Path).
-			Field("kind", string(node.Kind)).
-			Log(ctx)
+		// Per-node line only when the settings file was actually rewritten; a
+		// no-op reconcile of ~200 nodes must not emit ~200 lines.
+		if nodeChanged {
+			seededChanged++
+			h.ulog.Debug("Reconciled Claude settings for node").
+				Field("path", node.Path).
+				Field("kind", string(node.Kind)).
+				Field("repos", repos).
+				Log(ctx)
+		}
 	}
 
-	h.ulog.Info("Claude settings reconcile complete").
+	// Info only when something actually changed; a fully no-op pass is Debug.
+	summary := h.ulog.Debug("Claude settings reconcile complete")
+	if seededChanged > 0 {
+		summary = h.ulog.Info("Claude settings reconcile complete")
+	}
+	summary.
 		Field("seeded", seeded).
+		Field("seeded_changed", seededChanged).
 		Field("skipped", skipped).
 		Field("filter", filterWorkspacePath).
 		Log(ctx)

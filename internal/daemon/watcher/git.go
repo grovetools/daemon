@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,16 @@ type GitHandler struct {
 	// serialized because HandleStoreUpdate runs under the UnifiedWatcher lock.
 	knownPaths map[string]bool
 
+	// lastWatchSetKey and failedPaths state-change-gate ComputeWatchPaths'
+	// logging so a 15s refresh that changes nothing emits nothing:
+	// lastWatchSetKey is a canonical key of the previous watch set (summary
+	// logged only when it changes) and failedPaths is the set of workspace
+	// paths whose ResolveGitDirs already failed (each non-repo path logged
+	// once). Both are owned EXCLUSIVELY by ComputeWatchPaths, which runs under
+	// the UnifiedWatcher lock, so no extra locking is needed.
+	lastWatchSetKey string
+	failedPaths     map[string]bool
+
 	debounceMs  int
 	timers      map[string]*time.Timer
 	timersMutex sync.Mutex
@@ -57,6 +68,7 @@ func NewGitHandler(st *store.Store, debounceMs int) *GitHandler {
 		ulog:         logging.NewUnifiedLogger("groved.watcher.git"),
 		watchedPaths: make(map[string]*workspace.WorkspaceNode),
 		knownPaths:   make(map[string]bool),
+		failedPaths:  make(map[string]bool),
 		timers:       make(map[string]*time.Timer),
 		debounceMs:   debounceMs,
 	}
@@ -84,6 +96,7 @@ func (h *GitHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) [
 	}
 
 	focusedCount := 0
+	newFailed := make(map[string]bool)
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
 		if node == nil {
@@ -99,9 +112,12 @@ func (h *GitHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) [
 
 		gitDir, commonDir, err := git.ResolveGitDirs(ctx, node.Path)
 		if err != nil {
-			// Expected for non-repo container/ecosystem roots (no .git); keep at
-			// Debug so it doesn't flood the log on every refresh.
-			h.ulog.Debug("git watcher: ResolveGitDirs failed (non-repo?)").Err(err).Field("path", node.Path).Log(ctx)
+			// Expected for non-repo container/ecosystem roots (no .git). Log each
+			// failing path ONCE (at Debug) rather than on every 15s refresh.
+			newFailed[node.Path] = true
+			if !h.failedPaths[node.Path] {
+				h.ulog.Debug("git watcher: ResolveGitDirs failed (non-repo?)").Err(err).Field("path", node.Path).Log(ctx)
+			}
 			continue
 		}
 
@@ -115,21 +131,26 @@ func (h *GitHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) [
 	h.watchedPaths = newWatches
 	h.pathsMutex.Unlock()
 
+	h.failedPaths = newFailed
+
 	paths := make([]string, 0, len(newWatches))
 	for p := range newWatches {
 		paths = append(paths, p)
 	}
+	sort.Strings(paths)
 
-	// Debug: fires on every refresh (15s tick + each focus/workspace change), so
-	// keep it off the default level. Enable with GROVE_LOG_LEVEL=debug to confirm
-	// the watch set when freshness looks wrong.
-	h.ulog.Debug("git watcher: computed watch set").
-		Field("total_workspaces", len(workspaces)).
-		Field("focused", focusedCount).
-		Field("watch_paths", len(paths)).
-		Log(ctx)
-	for _, p := range paths {
-		h.ulog.Debug("git watcher: watching").Field("path", p).Log(ctx)
+	// Debug summary, state-change-gated: ComputeWatchPaths runs on every refresh
+	// (15s tick + each focus/workspace change), so only log when the watch set
+	// actually changed. Enable with GROVE_LOG_LEVEL=debug to confirm the watch
+	// set when freshness looks wrong.
+	watchSetKey := strings.Join(paths, "\x00")
+	if watchSetKey != h.lastWatchSetKey {
+		h.lastWatchSetKey = watchSetKey
+		h.ulog.Debug("git watcher: computed watch set").
+			Field("total_workspaces", len(workspaces)).
+			Field("focused", focusedCount).
+			Field("watch_paths", len(paths)).
+			Log(ctx)
 	}
 	return paths
 }

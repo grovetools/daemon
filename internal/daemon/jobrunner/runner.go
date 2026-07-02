@@ -194,7 +194,9 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 	})
 
 	jr.queue <- info
-	jr.ulog.Info("Job submitted").
+	// Debug: the user-facing lifecycle events (event=job.launched/job.finished)
+	// are emitted by flow's orchestrator UpdateJobStatus funnel.
+	jr.ulog.Debug("Job submitted").
 		Field("job_id", info.ID).
 		Field("plan_dir", info.PlanDir).
 		Field("job_file", info.JobFile).
@@ -387,7 +389,7 @@ func (jr *JobRunner) executeJob(ctx context.Context, info *models.JobInfo) {
 		Payload: info,
 	})
 
-	jr.ulog.Info("Job started").
+	jr.ulog.Debug("Job started").
 		Field("job_id", info.ID).
 		Field("plan_dir", info.PlanDir).
 		Field("job_file", info.JobFile).
@@ -520,7 +522,10 @@ func (jr *JobRunner) markDone(info *models.JobInfo, status, errMsg string) {
 		Payload: info,
 	})
 
-	jr.ulog.Info("Job finished").
+	// Debug: misleading as a lifecycle event — this also fires when an
+	// interactive/headless agent detaches to "running" (see below). The real
+	// event=job.finished line comes from flow's UpdateJobStatus funnel.
+	jr.ulog.Debug("Job finished").
 		Field("job_id", info.ID).
 		Field("status", status).
 		Field("error", errMsg).

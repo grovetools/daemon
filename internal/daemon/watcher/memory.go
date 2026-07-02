@@ -34,6 +34,62 @@ type IndexJob struct {
 	// limiter instead of the 2/sec steady-state limiter, so ingesting a
 	// large workspace doesn't backlog embedding for hours.
 	Bulk bool
+	// retried marks a job that was already re-enqueued once after a
+	// busy/locked database error; such a job is never re-enqueued again.
+	retried bool
+}
+
+// warnDeduper suppresses repeated identical warnings. The first occurrence
+// of a key logs immediately; identical repeats within the flush interval are
+// counted and surfaced as a single summary line (with the suppressed count)
+// on the first occurrence after the interval elapses.
+type warnDeduper struct {
+	mu       sync.Mutex
+	interval time.Duration
+	entries  map[string]*warnDedupEntry
+}
+
+type warnDedupEntry struct {
+	lastLogged time.Time
+	suppressed int
+}
+
+func newWarnDeduper(interval time.Duration) *warnDeduper {
+	return &warnDeduper{interval: interval, entries: make(map[string]*warnDedupEntry)}
+}
+
+// shouldLog reports whether a log line should be emitted for key at time now.
+// First occurrence: (true, 0). Repeat within the interval: (false, 0).
+// First occurrence after the interval: (true, n) where n is the number of
+// suppressed repeats since the last emitted line.
+func (d *warnDeduper) shouldLog(key string, now time.Time) (bool, int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e, ok := d.entries[key]
+	if !ok {
+		d.entries[key] = &warnDedupEntry{lastLogged: now}
+		return true, 0
+	}
+	if now.Sub(e.lastLogged) < d.interval {
+		e.suppressed++
+		return false, 0
+	}
+	n := e.suppressed
+	e.suppressed = 0
+	e.lastLogged = now
+	return true, n
+}
+
+// isDatabaseBusyErr reports whether err looks like transient SQLite writer
+// contention (SQLITE_BUSY / SQLITE_LOCKED).
+func isDatabaseBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "database table is locked") ||
+		strings.Contains(msg, "SQLITE_BUSY")
 }
 
 // MemoryHandler implements DomainHandler for auto-indexing content into the memory store.
@@ -60,6 +116,8 @@ type MemoryHandler struct {
 
 	jobsQueued   atomic.Int32
 	jobsInFlight atomic.Int32
+
+	upsertWarns *warnDeduper
 }
 
 // NewMemoryHandler creates a new MemoryHandler for auto-indexing content.
@@ -85,6 +143,7 @@ func NewMemoryHandler(st *store.Store, cfg *config.Config, memStore memory.Docum
 		// snapshot pulls finish in minutes, but still bounded so a bulk
 		// ingest can't hammer the embedding API without limit.
 		bulkLimiter: rate.NewLimiter(rate.Limit(20), 4),
+		upsertWarns: newWarnDeduper(5 * time.Minute),
 	}
 
 	// Start a worker pool (2 workers) to handle embedding generation asynchronously
@@ -693,10 +752,27 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 	}
 
 	if err := h.memStore.UpsertDocument(ctx, doc, mappedChunks); err != nil {
-		h.ulog.Warn("Failed to upsert document to memory index").
-			Err(err).
-			Field("path", job.Path).
-			Log(ctx)
+		if isDatabaseBusyErr(err) && !job.retried {
+			// Transient writer contention: re-enqueue once instead of
+			// silently dropping the document from the index.
+			job.retried = true
+			h.jobsQueued.Add(1)
+			go func(j IndexJob) { h.jobQueue <- j }(job)
+			h.ulog.Debug("Memory upsert hit busy database; re-enqueued").
+				Err(err).
+				Field("path", job.Path).
+				Log(ctx)
+			return
+		}
+		if logNow, suppressed := h.upsertWarns.shouldLog(err.Error(), time.Now()); logNow {
+			entry := h.ulog.Warn("Failed to upsert document to memory index").
+				Err(err).
+				Field("path", job.Path)
+			if suppressed > 0 {
+				entry = entry.Field("suppressed_repeats", suppressed)
+			}
+			entry.Log(ctx)
+		}
 	} else {
 		_ = h.memStore.LogAudit(ctx, "upsert", job.Path, map[string]any{
 			"doc_type":       docType,

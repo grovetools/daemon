@@ -647,9 +647,9 @@ func newGrovedStartCmd() *cobra.Command {
 				bgCtx := context.Background()
 				select {
 				case <-stop:
-					ulog.Info("Received stop signal").Log(bgCtx)
+					ulog.Info("Received stop signal").Field("event", "daemon.stopped").Log(bgCtx)
 				case <-shutdownReq:
-					ulog.Info("Auto-shutdown fired (idle TerminalHub)").Log(bgCtx)
+					ulog.Info("Auto-shutdown fired (idle TerminalHub)").Field("event", "daemon.stopped").Log(bgCtx)
 				}
 				// Reap the agent PTYs this daemon owns. With PTYs out-of-process,
 				// a plain stop (this SIGTERM/auto-shutdown path — NOT the SIGUSR1
@@ -917,6 +917,20 @@ func newGrovedStartCmd() *cobra.Command {
 				go unifiedWatcher.Start(ctx)
 			}
 
+			// 7.6. Log retention janitor: sweep dated *.log files older than the
+			// configured retention out of the state logs dir, on start and then
+			// every 24h. Judged by filename date (fallback ModTime); today's
+			// file is never touched.
+			logCfg := grovelogging.GetDefaultLoggingConfig()
+			if uerr := cfg.UnmarshalExtension("logging", &logCfg); uerr != nil {
+				ulog.Debug("Failed to parse logging config for retention janitor, using defaults").Err(uerr).Log(ctx)
+			}
+			retentionDays := logCfg.File.RetentionDays
+			if retentionDays <= 0 {
+				retentionDays = 14
+			}
+			go runLogRetentionJanitor(ctx, ulog, retentionDays)
+
 			// 7.7. Start SSH server if enabled
 			var sshCfg *config.DaemonSSHConfig
 			if cfg.Daemon != nil {
@@ -939,7 +953,7 @@ func newGrovedStartCmd() *cobra.Command {
 
 			// 8. Start Server (Blocking)
 			httpPort, _ := cmd.Flags().GetInt("http-port")
-			ulog.Info("Starting daemon").Field("pid", os.Getpid()).Log(ctx)
+			ulog.Info("Starting daemon").Field("event", "daemon.started").Field("pid", os.Getpid()).Log(ctx)
 
 			// If the parent passed --ready-fd, close that inherited fd as soon
 			// as the socket is bound. The parent reads EOF from its end of the
@@ -978,6 +992,110 @@ func newGrovedStartCmd() *cobra.Command {
 	cmd.Flags().Int("ready-fd", 0, "Close this inherited file descriptor once the socket is bound (0 disables readiness signaling)")
 
 	return cmd
+}
+
+// runLogRetentionJanitor sweeps the grove logs directory (system logs plus the
+// per-workspace subtree) on start and every 24h, deleting dated *.log files
+// older than retentionDays (logging.FileSinkConfig.RetentionDays, default 14).
+// One Info summary per sweep that deleted anything (event=log.retention_sweep);
+// Debug when there was nothing to delete.
+func runLogRetentionJanitor(ctx context.Context, ulog *grovelogging.UnifiedLogger, retentionDays int) {
+	logsDir := filepath.Join(paths.StateDir(), "logs")
+	sweep := func() {
+		deleted, freed, err := sweepOldLogs(logsDir, retentionDays, time.Now())
+		entry := ulog.Debug("Log retention sweep: nothing to delete")
+		if deleted > 0 {
+			entry = ulog.Info("Log retention sweep").Field("event", "log.retention_sweep")
+		}
+		entry = entry.
+			Field("deleted", deleted).
+			Field("freed_bytes", freed).
+			Field("retention_days", retentionDays).
+			Field("dir", logsDir)
+		if err != nil {
+			entry = entry.Err(err)
+		}
+		entry.Log(ctx)
+	}
+
+	sweep()
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
+// sweepOldLogs walks logsDir recursively and deletes every *.log file that
+// logFileExpired judges older than retentionDays. Best-effort: unreadable
+// entries are skipped; the first removal error is reported alongside whatever
+// was deleted. A missing logsDir is a no-op.
+func sweepOldLogs(logsDir string, retentionDays int, now time.Time) (deleted int, freed int64, firstErr error) {
+	if _, err := os.Stat(logsDir); err != nil {
+		return 0, 0, nil
+	}
+	_ = filepath.WalkDir(logsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".log") {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return nil
+		}
+		if !logFileExpired(d.Name(), info.ModTime(), now, retentionDays) {
+			return nil
+		}
+		if rerr := os.Remove(path); rerr != nil {
+			if firstErr == nil {
+				firstErr = rerr
+			}
+			return nil
+		}
+		deleted++
+		freed += info.Size()
+		return nil
+	})
+	return deleted, freed, firstErr
+}
+
+// logFileExpired reports whether a dated grove log file is older than
+// retentionDays, judged by the YYYY-MM-DD date embedded in the filename
+// (e.g. system-2026-07-01.log), falling back to modTime when the name carries
+// no parseable date. Today's (or a future-dated) file is never expired.
+// Comparison is at day granularity: a file is deleted only when its day is
+// strictly before now minus retentionDays.
+func logFileExpired(name string, modTime, now time.Time, retentionDays int) bool {
+	fileDate, ok := logFileDate(name)
+	if !ok {
+		fileDate = modTime
+	}
+	day := fileDate.Format("2006-01-02")
+	// ISO dates compare lexicographically.
+	if day >= now.Format("2006-01-02") {
+		return false
+	}
+	return day < now.AddDate(0, 0, -retentionDays).Format("2006-01-02")
+}
+
+// logFileDate extracts the trailing YYYY-MM-DD date from a dated log filename
+// like "system-2026-07-01.log" or "workspace-2026-07-01.log". ok=false when
+// the name has no parseable date suffix.
+func logFileDate(name string) (time.Time, bool) {
+	const layout = "2006-01-02"
+	base := strings.TrimSuffix(name, ".log")
+	if base == name || len(base) < len(layout) {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(layout, base[len(base)-len(layout):])
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 func newGrovedUpgradeCmd() *cobra.Command {

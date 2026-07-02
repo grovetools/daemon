@@ -180,6 +180,7 @@ func (m *Manager) Start(ctx context.Context) {
 		} else {
 			m.haChannel = haCh
 			m.ulog.Info("HA channel started").
+				Field("event", "channel.up").
 				Field("webhook_port", m.haCfg.WebhookPort).
 				Log(m.ctx)
 		}
@@ -891,7 +892,8 @@ func (m *Manager) startSignalChannel(ctx context.Context) {
 	})
 
 	if err := ch.Start(ctx, m.handleInbound); err != nil {
-		m.ulog.Error("Failed to start Signal channel").Err(err).Log(ctx)
+		m.ulog.Error("Failed to start Signal channel").Err(err).
+			Field("event", "channel.disabled").Log(ctx)
 		m.mu.Lock()
 		m.isRunning = false
 		m.mu.Unlock()
