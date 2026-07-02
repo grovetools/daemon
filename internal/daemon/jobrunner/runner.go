@@ -217,6 +217,13 @@ func (jr *JobRunner) areDependenciesMet(info *models.JobInfo) bool {
 		return true
 	}
 
+	// A held plan's jobs are never started via the daemon: keep them in the
+	// blocked queue until the hold is lifted (evaluateBlockedJobs re-checks
+	// this on every pass, so unholding promotes them automatically).
+	if planOnHold(plan) {
+		return false
+	}
+
 	job, found := plan.GetJobByFilename(info.JobFile)
 	if !found || job == nil {
 		return true // Can't find the job definition — let it run
@@ -229,6 +236,15 @@ func (jr *JobRunner) areDependenciesMet(info *models.JobInfo) bool {
 	}
 
 	return job.IsRunnable()
+}
+
+// planOnHold reports whether the plan is on hold — plan-level
+// `status: hold` in .grove-plan.yml — mirroring the CLI guard in
+// flow/cmd/plan_run.go. Hold prevents NEW runs only: a held plan's jobs
+// must never be started by the daemon, but jobs and agents that are
+// already executing continue unaffected.
+func planOnHold(plan *orchestration.Plan) bool {
+	return plan != nil && plan.Config != nil && plan.Config.Status == "hold"
 }
 
 // evaluateBlockedJobs re-checks every blocked job's dependencies and promotes
@@ -381,6 +397,34 @@ func (jr *JobRunner) executeJob(ctx context.Context, info *models.JobInfo) {
 	plan, err := orchestration.LoadPlan(info.PlanDir)
 	if err != nil {
 		jr.markDone(info, "failed", fmt.Sprintf("load plan: %v", err))
+		return
+	}
+
+	// Plan-level hold gate: never start a job whose plan is on hold. This
+	// catches jobs that were already queued when the hold was set. The job
+	// is returned to the blocked queue (not failed) and will be promoted by
+	// evaluateBlockedJobs once the hold is lifted.
+	if planOnHold(plan) {
+		info.Status = "blocked"
+		info.StartedAt = nil
+		if jr.persister != nil {
+			jr.persister.Save(info)
+		}
+		jr.store.ApplyUpdate(store.Update{
+			Type:    store.UpdateJobSubmitted,
+			Source:  "jobrunner",
+			Payload: info,
+		})
+
+		jr.blockedMu.Lock()
+		jr.blocked[info.ID] = info
+		jr.blockedMu.Unlock()
+
+		jr.ulog.Info("Job blocked (plan on hold)").
+			Field("job_id", info.ID).
+			Field("plan_dir", info.PlanDir).
+			Field("job_file", info.JobFile).
+			Log(ctx)
 		return
 	}
 

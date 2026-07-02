@@ -235,7 +235,9 @@ func (h *SettingsHandler) reconcile(filterWorkspacePath string) {
 	reposByPath := make(map[string][]string)
 	if entries, lerr := worktreeregistry.ListAll(); lerr == nil {
 		for _, entry := range entries {
-			if entry != nil && entry.AbsPath != "" {
+			// Archived worktrees are frozen — keep the settings reconcile
+			// from touching anything under the archive base.
+			if entry != nil && entry.AbsPath != "" && !entry.IsArchived() {
 				reposByPath[entry.AbsPath] = entry.Repos
 			}
 		}
