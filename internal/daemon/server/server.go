@@ -1091,34 +1091,43 @@ func (s *Server) killSession(sessionID string) error {
 	return nil
 }
 
-// resolveInputMode reads the grove config for a workspace to determine if vim input mode is active.
-func (s *Server) resolveInputMode(workDir string) string {
-	if workDir == "" {
-		return "vim" // default
-	}
-
-	coreCfg, err := config.LoadFrom(workDir)
-	if err != nil {
-		return "vim"
-	}
-
+// resolveInputMode determines the input mode for a session's agent UI. The
+// effective provider is the session's own recorded provider first (per-job
+// providers can differ from the global config), then the workspace's
+// flow.interactive_provider, then claude. The default comes from flow's
+// agent provider registry (AgentProviderSpec.DefaultInputMode — the single
+// declaration of per-provider input modes), overridable via
+// [flow.providers.<name>].input_mode. Claude with no config stays "vim",
+// the historical behavior.
+func (s *Server) resolveInputMode(workDir, sessionProvider string) string {
 	var flowCfg struct {
 		InteractiveProvider string `toml:"interactive_provider" yaml:"interactive_provider"`
 		Providers           map[string]struct {
 			InputMode string `toml:"input_mode" yaml:"input_mode"`
 		} `toml:"providers" yaml:"providers"`
 	}
-	_ = coreCfg.UnmarshalExtension("flow", &flowCfg)
+	if workDir != "" {
+		if coreCfg, err := config.LoadFrom(workDir); err == nil {
+			_ = coreCfg.UnmarshalExtension("flow", &flowCfg)
+		}
+	}
 
-	providerName := "claude"
-	if flowCfg.InteractiveProvider != "" {
+	providerName := sessionProvider
+	if providerName == "" {
 		providerName = flowCfg.InteractiveProvider
 	}
-	if providerCfg, ok := flowCfg.Providers[providerName]; ok && providerCfg.InputMode != "" {
-		return providerCfg.InputMode
+	if providerName == "" {
+		providerName = "claude"
 	}
 
-	return "vim"
+	inputMode := "vim" // historical default for unknown providers
+	if spec, ok := orchestration.LookupAgentProvider(providerName); ok && spec.DefaultInputMode != "" {
+		inputMode = spec.DefaultInputMode
+	}
+	if providerCfg, ok := flowCfg.Providers[providerName]; ok && providerCfg.InputMode != "" {
+		inputMode = providerCfg.InputMode
+	}
+	return inputMode
 }
 
 // sessionFromDeliveryState constructs a minimal Session from the persisted
@@ -1216,8 +1225,8 @@ func (s *Server) resolveSessionForRouting(jobID string) *models.Session {
 // The mux (treemux vs tmux) is read from session.Mux, with a fallback to
 // implicit inference for pre-existing sessions. For treemux, it prefers a
 // direct PTY write and falls back to an SSE relay when groveterm is
-// connected. For tmux, it uses agentstream.SendInput which handles the
-// vim-mode wrapping.
+// connected. For tmux, it uses agentstream.SendInput with the resolved
+// per-provider input mode (vim wrapping for claude, plain text for others).
 func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) error {
 	if s.engine == nil {
 		return fmt.Errorf("engine not initialized")
@@ -1227,7 +1236,7 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 		return fmt.Errorf("session not found: %s", jobID)
 	}
 
-	inputMode := s.resolveInputMode(session.WorkingDirectory)
+	inputMode := s.resolveInputMode(session.WorkingDirectory, session.Provider)
 	payload := rawInput + "\r"
 	if inputMode == "vim" {
 		payload = "\x1bi" + rawInput + "\r"
@@ -1278,7 +1287,7 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 		if session.TmuxTarget == "" {
 			return fmt.Errorf("tmux target missing for session %s", jobID)
 		}
-		if err := agentstream.SendInput(ctx, session.TmuxTarget, rawInput); err != nil {
+		if err := agentstream.SendInput(ctx, session.TmuxTarget, rawInput, agentstream.WithInputMode(inputMode)); err != nil {
 			return err
 		}
 		s.ulog.Debug("Injected input into agent").

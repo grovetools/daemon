@@ -107,10 +107,13 @@ func (c *WorkflowCollector) Run(ctx context.Context, st *store.Store, updates ch
 func (c *WorkflowCollector) reconcile(ctx context.Context, st *store.Store, updates chan<- store.Update, tracked map[string]*sessionTailers, wg *sync.WaitGroup) {
 	current := make(map[string]*models.Session)
 	for _, sess := range st.GetSessions() {
-		// Workflow internals are Claude-provider-only: codex/opencode (and
+		// Workflow internals are Claude-provider-only: codex/opencode/pi (and
 		// oneshot/chat jobs) have no journal source and degrade to no
-		// workflow data. An empty provider with a ClaudeSessionID set is
-		// treated as claude — the session ID only exists for claude runs.
+		// workflow data — deliberately a silent skip, never an error, so
+		// non-claude sessions keep their transcript-only observability. An
+		// empty provider with a ClaudeSessionID set is treated as claude —
+		// the session ID only exists for claude runs. (P5 decision: the gate
+		// stays until a non-claude runtime grows a subagent/workflow tree.)
 		if sess.ClaudeSessionID == "" || !isClaudeProvider(sess.Provider) {
 			continue
 		}
