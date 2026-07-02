@@ -51,6 +51,7 @@ const (
 	UpdateSessionConfirmation UpdateType = "session_confirmation" // Link intent with actual PID
 	UpdateSessionStatus       UpdateType = "session_status"       // Update session status (running/idle/pending_user)
 	UpdateSessionEnd          UpdateType = "session_end"          // Mark session as completed/interrupted/failed
+	UpdateSessionTokens       UpdateType = "session_tokens"       // In-place live token/cost/context fields (daemon-computed)
 
 	// Job lifecycle update types for the daemon's JobRunner.
 	UpdateJobSubmitted   UpdateType = "job_submitted"
@@ -228,6 +229,23 @@ type SessionStatusPayload struct {
 type SessionEndPayload struct {
 	JobID   string `json:"job_id"`
 	Outcome string `json:"outcome"` // "completed", "interrupted", "failed"
+}
+
+// SessionTokenUpdate carries daemon-computed live token usage for one session.
+// The fields mirror the derived models.Session token fields.
+type SessionTokenUpdate struct {
+	JobID       string  `json:"job_id"`
+	LiveTokens  int64   `json:"live_tokens"`
+	LiveCostUSD float64 `json:"live_cost_usd"`
+	ContextSize int64   `json:"context_size"`
+}
+
+// SessionTokensPayload batches live token updates for one or more sessions.
+// Applied in-place so it never clobbers concurrent session lifecycle mutations
+// (a full-set UpdateSessions replace, built from a snapshot, could drop a
+// session added/removed by another goroutine between read and apply).
+type SessionTokensPayload struct {
+	Updates []SessionTokenUpdate `json:"updates"`
 }
 
 // SpawnAgentPayload requests groveterm to spawn a native agent pane.

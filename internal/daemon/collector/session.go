@@ -2,9 +2,12 @@ package collector
 
 import (
 	"context"
+	"os"
 	"time"
 
+	"github.com/grovetools/agentlogs/pkg/usage"
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/process"
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/daemon/internal/daemon/store"
@@ -26,7 +29,24 @@ const (
 	// reapDeadStrikes is the number of consecutive polls a PID must read as dead
 	// before the session is reaped, to absorb transient IsProcessAlive blips.
 	reapDeadStrikes = 2
+
+	// liveTokenRefreshInterval throttles per-agent transcript re-summarization.
+	// Transcript parsing is expensive, so live token usage is recomputed at most
+	// this often — never on every 2s liveness tick — mirroring flow's
+	// runningTokenRefreshInterval (flow/pkg/tui/status/token_pane.go).
+	liveTokenRefreshInterval = 4 * time.Second
 )
+
+// liveTokenSummary caches the last-computed token snapshot for one session,
+// keyed by session ID inside the collector. mtime is the parent transcript's
+// modification time at summarization; an unchanged mtime lets the next refresh
+// skip the expensive re-parse entirely.
+type liveTokenSummary struct {
+	mtime   time.Time
+	tokens  int64
+	cost    float64
+	ctxSize int64
+}
 
 // pidLiveness is per-session reaper bookkeeping carried across poll ticks.
 // A PID is only eligible for reaping once it has been positively observed alive
@@ -56,6 +76,13 @@ type SessionCollector struct {
 	// liveness tracks per-session reap bookkeeping (seen-alive + dead strikes)
 	// across ticks. Only accessed from the single Run goroutine.
 	liveness map[string]*pidLiveness
+	// tokenCache memoizes the last live-token summary per session ID (with the
+	// transcript mtime) so an unchanged transcript skips re-parsing. Only
+	// accessed from the single Run goroutine.
+	tokenCache map[string]liveTokenSummary
+	// lastTokenRefresh throttles the live-token pass to liveTokenRefreshInterval,
+	// decoupling expensive transcript parsing from the 2s liveness tick.
+	lastTokenRefresh time.Time
 }
 
 // NewSessionCollector creates a new SessionCollector.
@@ -66,10 +93,11 @@ func NewSessionCollector(interval time.Duration, scope string) *SessionCollector
 		interval = 2 * time.Second
 	}
 	return &SessionCollector{
-		interval: interval,
-		ulog:     logging.NewUnifiedLogger("groved.collector.session"),
-		scope:    scope,
-		liveness: make(map[string]*pidLiveness),
+		interval:   interval,
+		ulog:       logging.NewUnifiedLogger("groved.collector.session"),
+		scope:      scope,
+		liveness:   make(map[string]*pidLiveness),
+		tokenCache: make(map[string]liveTokenSummary),
 	}
 }
 
@@ -261,9 +289,128 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				}
 			}
 
+			// Live per-agent token usage. Throttled to liveTokenRefreshInterval
+			// and skipped entirely on unchanged transcripts, so the 2s liveness
+			// tick never pays for transcript parsing.
+			if time.Since(c.lastTokenRefresh) >= liveTokenRefreshInterval {
+				c.lastTokenRefresh = time.Now()
+				c.refreshLiveTokens(ctx, activeSessions, updates)
+			}
+
 			if d := time.Since(start); d > 1*time.Second {
 				c.ulog.Debug("Slow PID verification detected").Field("duration", d).Log(ctx)
 			}
+		}
+	}
+}
+
+// isLiveAgentSession reports whether a session is a live Claude agent worth
+// summarizing: it must be active (running/idle/pending_user) and carry a
+// ClaudeSessionID (the marker of a Claude transcript — plain shells never have
+// one). Completed/failed sessions and non-agent shells are skipped.
+func isLiveAgentSession(s *models.Session) bool {
+	if s == nil || s.ClaudeSessionID == "" {
+		return false
+	}
+	switch s.Status {
+	case "running", "idle", "pending_user":
+		return true
+	default:
+		return false
+	}
+}
+
+// transcriptMtime returns the modification time of a session's parent transcript,
+// or the zero time when unknown. A zero mtime never compares equal to a cached
+// mtime, so such sessions are re-summarized each refresh (bounded by the
+// throttle) rather than being skipped.
+func transcriptMtime(transcriptPath string) time.Time {
+	if transcriptPath == "" {
+		return time.Time{}
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
+}
+
+// refreshLiveTokens summarizes live per-agent token usage for the active agent
+// sessions and emits a single in-place UpdateSessionTokens with whatever
+// changed. It is called at most once per liveTokenRefreshInterval. Per session
+// it skips the expensive re-parse when the transcript mtime is unchanged, and
+// only includes a session in the update when its token snapshot actually
+// changed — so an idle transcript produces no broadcast churn.
+func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions []*models.Session, updates chan<- store.Update) {
+	var tokenUpdates []store.SessionTokenUpdate
+	live := make(map[string]struct{})
+
+	for _, s := range activeSessions {
+		if !isLiveAgentSession(s) {
+			continue
+		}
+		live[s.ID] = struct{}{}
+
+		mtime := transcriptMtime(s.TranscriptPath)
+		if cached, ok := c.tokenCache[s.ID]; ok && !mtime.IsZero() && mtime.Equal(cached.mtime) {
+			// Transcript unchanged since the last summary; already applied.
+			continue
+		}
+
+		slugDirs := usage.SlugDirsForSession(s.ClaudeSessionID, s.TranscriptPath)
+		summary, err := usage.SummarizeSession(slugDirs, s.ClaudeSessionID, usage.CostModeCalculate)
+		if err != nil {
+			c.ulog.Debug("Failed to summarize live token usage").
+				Field("job_id", s.ID).
+				Field("claude_session_id", s.ClaudeSessionID).
+				Err(err).
+				Log(ctx)
+			continue
+		}
+
+		// LiveTokens is the context-preferred magnitude: the peak single-turn
+		// prompt size (Claude Code's /context analogue) when available, else the
+		// cache-read-inflated cumulative total — mirroring flow's token pane.
+		liveTokens := summary.ContextSize
+		if liveTokens == 0 {
+			liveTokens = summary.Usage.Total()
+		}
+
+		entry := liveTokenSummary{
+			mtime:   mtime,
+			tokens:  liveTokens,
+			cost:    summary.CostUSD,
+			ctxSize: summary.ContextSize,
+		}
+
+		prev, existed := c.tokenCache[s.ID]
+		c.tokenCache[s.ID] = entry
+		// Skip the broadcast when only the mtime moved but the numbers held.
+		if existed && prev.tokens == entry.tokens && prev.cost == entry.cost && prev.ctxSize == entry.ctxSize {
+			continue
+		}
+
+		tokenUpdates = append(tokenUpdates, store.SessionTokenUpdate{
+			JobID:       s.ID,
+			LiveTokens:  liveTokens,
+			LiveCostUSD: summary.CostUSD,
+			ContextSize: summary.ContextSize,
+		})
+	}
+
+	// Drop cache entries for sessions that are no longer live agents.
+	for id := range c.tokenCache {
+		if _, ok := live[id]; !ok {
+			delete(c.tokenCache, id)
+		}
+	}
+
+	if len(tokenUpdates) > 0 {
+		updates <- store.Update{
+			Type:    store.UpdateSessionTokens,
+			Source:  "session_token_collector",
+			Scanned: len(tokenUpdates),
+			Payload: &store.SessionTokensPayload{Updates: tokenUpdates},
 		}
 	}
 }

@@ -194,6 +194,10 @@ func (s *Store) ApplyUpdate(u Update) {
 		if payload, ok := u.Payload.(*SessionEndPayload); ok {
 			s.applySessionEnd(payload)
 		}
+	case UpdateSessionTokens:
+		if payload, ok := u.Payload.(*SessionTokensPayload); ok {
+			s.applySessionTokens(payload)
+		}
 
 	// Job lifecycle updates
 	case UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed, UpdateJobCancelled, UpdateJobPendingUser:
@@ -540,6 +544,22 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload) {
 	if job, exists := s.state.Jobs[payload.JobID]; exists {
 		job.Status = payload.Outcome
 		job.CompletedAt = &now
+	}
+}
+
+// applySessionTokens overlays daemon-computed live token usage onto existing
+// session records in place. It only stamps sessions that already exist (a token
+// snapshot for a since-ended session is simply dropped) and never touches
+// LastActivity — a token refresh is not agent activity.
+func (s *Store) applySessionTokens(payload *SessionTokensPayload) {
+	for _, u := range payload.Updates {
+		session, exists := s.state.Sessions[u.JobID]
+		if !exists {
+			continue
+		}
+		session.LiveTokens = u.LiveTokens
+		session.LiveCostUSD = u.LiveCostUSD
+		session.ContextSize = u.ContextSize
 	}
 }
 

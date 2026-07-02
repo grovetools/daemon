@@ -19,9 +19,6 @@ import (
 // FetchPlanStatsMap fetches plan statistics for all workspaces.
 // It uses a lightweight frontmatter parser to avoid importing flow packages.
 func FetchPlanStatsMap() (map[string]*models.PlanStats, error) {
-	statsByPath := make(map[string]*models.PlanStats)
-	seenDirs := make(map[string]*models.PlanStats)
-
 	logger := logrus.New()
 	logger.SetLevel(logrus.ErrorLevel)
 	discoveryService := workspace.NewDiscoveryService(logger)
@@ -37,83 +34,140 @@ func FetchPlanStatsMap() (map[string]*models.PlanStats, error) {
 	}
 	locator := workspace.NewNotebookLocator(coreCfg)
 
-	for _, node := range provider.All() {
-		plansRootDir, err := locator.GetPlansDir(node)
+	statsByPath := resolvePerNodePlanStats(
+		provider.All(),
+		func(node *workspace.WorkspaceNode) (string, error) { return locator.GetPlansDir(node) },
+		countPlanStats,
+		func(node *workspace.WorkspaceNode) string { return getActivePlanForPath(node, locator) },
+		planStatusForNode,
+	)
+
+	return statsByPath, nil
+}
+
+// resolvePerNodePlanStats builds the per-node PlanStats map. The job-count
+// aggregation over a plans directory is node-independent, so it is computed once
+// per plansRootDir and cached. ActivePlan and PlanStatus, however, are
+// PER-NODE: sibling worktrees under one project share a plans dir but each has
+// its own active plan / plan status. The prior implementation handed every
+// sibling the SAME *PlanStats pointer and stamped ActivePlan only on the
+// cache-miss (first-discovered) node, so the first sibling's plan leaked onto
+// all of them. Here each node gets a shallow copy of the shared counts with its
+// own ActivePlan/PlanStatus stamped, fixing every consumer of the map (HUD and
+// otherwise). Resolvers are injected so the logic is unit-testable without
+// filesystem discovery.
+func resolvePerNodePlanStats(
+	nodes []*workspace.WorkspaceNode,
+	plansDirFor func(*workspace.WorkspaceNode) (string, error),
+	countsFor func(plansRootDir string) *models.PlanStats,
+	activePlanFor func(*workspace.WorkspaceNode) string,
+	planStatusFor func(plansRootDir string, node *workspace.WorkspaceNode) string,
+) map[string]*models.PlanStats {
+	statsByPath := make(map[string]*models.PlanStats)
+	seenDirs := make(map[string]*models.PlanStats)
+
+	for _, node := range nodes {
+		plansRootDir, err := plansDirFor(node)
 		if err != nil {
 			statsByPath[node.Path] = &models.PlanStats{}
 			continue
 		}
 
-		if cachedStats, seen := seenDirs[plansRootDir]; seen {
-			statsByPath[node.Path] = cachedStats
-			continue
+		cached, seen := seenDirs[plansRootDir]
+		if !seen {
+			cached = countsFor(plansRootDir)
+			seenDirs[plansRootDir] = cached
 		}
 
-		stats := &models.PlanStats{}
-		statsByPath[node.Path] = stats
-		seenDirs[plansRootDir] = stats
+		// Shallow-copy the shared counts, then stamp the per-node fields.
+		nodeStats := *cached
+		nodeStats.ActivePlan = activePlanFor(node)
+		nodeStats.PlanStatus = planStatusFor(plansRootDir, node)
+		statsByPath[node.Path] = &nodeStats
+	}
 
-		entries, err := os.ReadDir(plansRootDir)
+	return statsByPath
+}
+
+// countPlanStats aggregates the node-independent job counts across every plan
+// directory under plansRootDir. PlanStatus/ActivePlan are intentionally NOT set
+// here — they are per-node (see resolvePerNodePlanStats).
+func countPlanStats(plansRootDir string) *models.PlanStats {
+	stats := &models.PlanStats{}
+	entries, err := os.ReadDir(plansRootDir)
+	if err != nil {
+		return stats
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		planPath := filepath.Join(plansRootDir, entry.Name())
+		processPlanCounts(planPath, stats)
+	}
+	return stats
+}
+
+// planStatusForNode returns the status of the plan whose worktree matches this
+// node (empty for non-worktree nodes or when no plan claims the worktree). It is
+// per-node because the same plans dir serves many sibling worktrees.
+func planStatusForNode(plansRootDir string, node *workspace.WorkspaceNode) string {
+	if !node.IsWorktree() {
+		return ""
+	}
+	worktreeName := node.GetWorktreeName()
+	if worktreeName == "" {
+		return ""
+	}
+
+	entries, err := os.ReadDir(plansRootDir)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		configPath := filepath.Join(plansRootDir, entry.Name(), "config.yml")
+		configData, err := os.ReadFile(configPath) //nolint:gosec // G304: path from known plan directory
 		if err != nil {
 			continue
 		}
+		content := string(configData)
 
-		for _, entry := range entries {
-			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
-				continue
+		var planWorktree, planStatus string
+		for _, line := range strings.Split(content, "\n") {
+			if strings.HasPrefix(line, "worktree:") {
+				if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
+					planWorktree = strings.TrimSpace(parts[1])
+				}
 			}
-
-			planPath := filepath.Join(plansRootDir, entry.Name())
-			processPlanDir(planPath, stats, node)
+			if strings.HasPrefix(line, "status:") {
+				if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
+					planStatus = strings.TrimSpace(parts[1])
+				}
+			}
 		}
-
-		if activePlan := getActivePlanForPath(node, locator); activePlan != "" {
-			stats.ActivePlan = activePlan
+		if planWorktree != "" && planWorktree == worktreeName {
+			return planStatus
 		}
 	}
-
-	return statsByPath, nil
+	return ""
 }
 
-// processPlanDir scans a plan directory and aggregates stats
-func processPlanDir(planPath string, stats *models.PlanStats, node *workspace.WorkspaceNode) {
-	// Read plan config to check status
+// processPlanCounts scans a single plan directory and aggregates node-independent
+// job counts into stats. Node-specific fields (PlanStatus/ActivePlan) are handled
+// separately per node (see resolvePerNodePlanStats), so this takes no node.
+func processPlanCounts(planPath string, stats *models.PlanStats) {
+	// Read plan config to check whether the plan is finished (finished plans are
+	// not counted as active).
 	configPath := filepath.Join(planPath, "config.yml")
 	configData, err := os.ReadFile(configPath) //nolint:gosec // G304: path from known plan directory
 	planFinished := false
-	var planWorktree string
 
 	if err == nil {
-		content := string(configData)
-		if strings.Contains(content, "status: finished") {
+		if strings.Contains(string(configData), "status: finished") {
 			planFinished = true
-		}
-		// Extract worktree field
-		for _, line := range strings.Split(content, "\n") {
-			if strings.HasPrefix(line, "worktree:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) == 2 {
-					planWorktree = strings.TrimSpace(parts[1])
-				}
-				break
-			}
-		}
-
-		// If this is a worktree node and plan's worktree matches, set PlanStatus
-		if node.IsWorktree() && planWorktree != "" {
-			worktreeName := node.GetWorktreeName()
-			if worktreeName != "" && planWorktree == worktreeName {
-				// Extract status from config
-				for _, line := range strings.Split(content, "\n") {
-					if strings.HasPrefix(line, "status:") {
-						parts := strings.SplitN(line, ":", 2)
-						if len(parts) == 2 {
-							stats.PlanStatus = strings.TrimSpace(parts[1])
-						}
-						break
-					}
-				}
-			}
 		}
 	}
 
