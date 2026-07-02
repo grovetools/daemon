@@ -128,6 +128,17 @@ const (
 	UpdateWorkflowAgentCompleted UpdateType = "workflow_agent_completed"
 	UpdateWorkflowRunStale       UpdateType = "workflow_run_stale"
 	UpdateWorkflowRunCompleted   UpdateType = "workflow_run_completed"
+
+	// Build queue lifecycle update types for the daemon's machine-wide
+	// build scheduler (buildqueue). Each maps to a DISTINCT SSE
+	// update_type string in convertToAPIUpdate (same wire rule as the
+	// workflow_* types above). Per-job build OUTPUT never goes through
+	// the store broadcast — it streams over the dedicated per-job SSE
+	// endpoint GET /api/build/jobs/{id}/stream.
+	// Payload: *BuildEventPayload.
+	UpdateBuildQueued   UpdateType = "build_queued"
+	UpdateBuildStarted  UpdateType = "build_started"
+	UpdateBuildFinished UpdateType = "build_finished"
 )
 
 // MemoryIndexPayload describes a single memory store mutation for SSE subscribers.
@@ -280,6 +291,20 @@ type AgentInputPayload struct {
 // CaptureRequestPayload requests a screen capture from a native agent pane.
 type CaptureRequestPayload struct {
 	JobID string `json:"job_id"`
+}
+
+// BuildEventPayload describes a build queue lifecycle transition for SSE
+// subscribers. Output lines are NOT included — they stream over the
+// dedicated per-job endpoint.
+type BuildEventPayload struct {
+	JobID      string `json:"job_id"`
+	GroupID    string `json:"group_id"`
+	Workspace  string `json:"workspace"`
+	Dir        string `json:"dir"`
+	Verb       string `json:"verb"`
+	Status     string `json:"status"` // "queued", "running", "succeeded", "failed", "cancelled"
+	ExitCode   int    `json:"exit_code,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
 }
 
 // TaskResultPayload contains data for reporting a task execution result.

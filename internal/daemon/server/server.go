@@ -29,6 +29,7 @@ import (
 	coretmux "github.com/grovetools/core/pkg/tmux"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/version"
+	"github.com/grovetools/daemon/internal/daemon/buildqueue"
 	"github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
@@ -67,6 +68,7 @@ type Server struct {
 	engine            *engine.Engine
 	runningConfig     *RunningConfig
 	jobRunner         *jobrunner.JobRunner
+	buildScheduler    *buildqueue.Scheduler
 	logStreamer       *logstreamer.LogStreamer
 	workspaceStreamer *logstreamer.WorkspaceStreamer
 	envManager        *daemonenv.Manager
@@ -253,6 +255,10 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	// State API endpoints
 	mux.HandleFunc("/api/state", s.handleGetState)
 	mux.HandleFunc("/api/tasks", s.handlePostTaskReport)
+	// Machine-wide build queue endpoints
+	mux.HandleFunc("/api/build/submit", s.handleBuildSubmit)
+	mux.HandleFunc("/api/build/cancel", s.handleBuildCancel)
+	mux.HandleFunc("/api/build/jobs/", s.handleBuildJobSubpath)
 	mux.HandleFunc("/api/workspaces/", s.handleWorkspaceSubpath)
 	mux.HandleFunc("/api/workspaces", s.handleGetWorkspaces)
 	mux.HandleFunc("/api/plans", s.handleGetPlans)
@@ -2142,6 +2148,16 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 	case store.UpdateWorkflowRunDiscovered, store.UpdateWorkflowAgentStarted,
 		store.UpdateWorkflowAgentCompleted, store.UpdateWorkflowRunStale,
 		store.UpdateWorkflowRunCompleted:
+		return &apiStateUpdate{
+			UpdateType: string(u.Type),
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
+
+	// Build queue lifecycle updates — distinct update_type strings (the
+	// job_*/workflow_* pattern). Per-job build output never passes through
+	// here; it streams over GET /api/build/jobs/{id}/stream.
+	case store.UpdateBuildQueued, store.UpdateBuildStarted, store.UpdateBuildFinished:
 		return &apiStateUpdate{
 			UpdateType: string(u.Type),
 			Source:     u.Source,

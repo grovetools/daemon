@@ -25,6 +25,7 @@ import (
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/daemon/internal/daemon/autonomous"
+	"github.com/grovetools/daemon/internal/daemon/buildqueue"
 	daemonchannels "github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/engine"
@@ -471,6 +472,20 @@ func newGrovedStartCmd() *cobra.Command {
 				ulog.Info("JobRunner started").Field("workers", workers).Log(ctx)
 			}
 
+			// 3.65 Setup the machine-wide build queue scheduler. Sized from
+			// [daemon.build] max_parallel; defaults to max(2, NumCPU/2).
+			// grove's orchestrator submits build jobs here so concurrent
+			// `grove build` invocations share one host-wide concurrency cap.
+			buildParallel := 0
+			if cfg.Daemon != nil && cfg.Daemon.Build != nil {
+				buildParallel = cfg.Daemon.Build.MaxParallel
+			}
+			buildScheduler := buildqueue.New(st, buildParallel)
+			buildScheduler.Start(ctx)
+			ulog.Info("Build queue started").
+				Field("max_parallel", buildScheduler.MaxParallel()).
+				Log(ctx)
+
 			// 3.7 Setup LogStreamer
 			logBufSize := 1000
 			logMaxSubs := 10
@@ -519,6 +534,7 @@ func newGrovedStartCmd() *cobra.Command {
 			if jr != nil {
 				srv.SetJobRunner(jr)
 			}
+			srv.SetBuildScheduler(buildScheduler)
 			srv.SetLogStreamer(streamer)
 			srv.SetWorkspaceStreamer(workspaceStreamer)
 
