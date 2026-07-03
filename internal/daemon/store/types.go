@@ -140,6 +140,14 @@ const (
 	UpdateBuildQueued   UpdateType = "build_queued"
 	UpdateBuildStarted  UpdateType = "build_started"
 	UpdateBuildFinished UpdateType = "build_finished"
+
+	// Daemon boot progress. Broadcast by the early-bind boot goroutine at
+	// each phase boundary so connected clients (treemux's cold-start splash)
+	// can render a progress bar while the daemon finishes booting. Payload is
+	// *daemon.BootStatus (core/pkg/daemon); the terminal event carries
+	// Done=true. Only fires under --ready-at=bind; the default bind-last
+	// ordering never broadcasts because no client can connect until boot ends.
+	UpdateBootPhase UpdateType = "boot_phase"
 )
 
 // MemoryIndexPayload describes a single memory store mutation for SSE subscribers.

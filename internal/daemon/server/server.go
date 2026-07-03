@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -69,12 +70,25 @@ type Server struct {
 	server            *http.Server
 	engine            *engine.Engine
 	runningConfig     *RunningConfig
-	jobRunner         *jobrunner.JobRunner
 	buildScheduler    *buildqueue.Scheduler
 	logStreamer       *logstreamer.LogStreamer
 	workspaceStreamer *logstreamer.WorkspaceStreamer
-	envManager        *daemonenv.Manager
-	channelManager    *channels.Manager
+
+	// Late-wired dependencies. Under --ready-at=bind the socket binds and the
+	// server starts accepting BEFORE these are set (they're wired from the
+	// background boot goroutine), so a handler can race their assignment.
+	// atomic.Pointer makes each read/write safe; every read site loads once
+	// and nil-checks the local. Under the default bind-last ordering they are
+	// all set before Serve, so the atomics are simply free.
+	jobRunner      atomic.Pointer[jobrunner.JobRunner]
+	envManager     atomic.Pointer[daemonenv.Manager]
+	channelManager atomic.Pointer[channels.Manager]
+
+	// bootStatus is the source of truth for GET /api/system/boot. Nil until
+	// the early-bind boot goroutine sets it; handleSystemBoot then reports
+	// Done=true (the daemon only reaches that handler once serving, which
+	// under bind-last means boot already finished).
+	bootStatus atomic.Pointer[coredaemon.BootStatus]
 
 	// scope is the daemon's configured ecosystem scope — empty for the
 	// global/unscoped daemon, non-empty for scoped daemons. Proxy
@@ -86,8 +100,10 @@ type Server struct {
 	// tuimuxClient talks to the standalone tuimux daemon that owns agent
 	// PTYs out-of-process. Agent spawn, input, and interrupt route through
 	// it so PTY panes survive a `groved upgrade`. May be nil if the tuimux
-	// daemon could not be started.
-	tuimuxClient *tuimux.ApiClient
+	// daemon could not be started. Late-wired (its EnsureDaemonWithBinary
+	// spawn is deferred past early bind), so it's atomic like the other
+	// boot-goroutine deps above.
+	tuimuxClient atomic.Pointer[tuimux.ApiClient]
 
 	// Memory store + embedder are wired via SetMemoryStore so /api/memory/*
 	// handlers can serve the same instance the MemoryHandler watcher uses.
@@ -168,7 +184,7 @@ func (s *Server) SetRunningConfig(cfg *RunningConfig) {
 
 // SetJobRunner sets the job runner for the server.
 func (s *Server) SetJobRunner(jr *jobrunner.JobRunner) {
-	s.jobRunner = jr
+	s.jobRunner.Store(jr)
 }
 
 // SetLogStreamer sets the log streamer for the server.
@@ -183,12 +199,12 @@ func (s *Server) SetWorkspaceStreamer(ws *logstreamer.WorkspaceStreamer) {
 
 // SetEnvManager sets the environment manager for the server.
 func (s *Server) SetEnvManager(m *daemonenv.Manager) {
-	s.envManager = m
+	s.envManager.Store(m)
 }
 
 // SetChannelManager sets the channel manager for the server.
 func (s *Server) SetChannelManager(m *channels.Manager) {
-	s.channelManager = m
+	s.channelManager.Store(m)
 }
 
 // SetScope records whether this daemon is global ("") or scoped (non-empty).
@@ -202,13 +218,34 @@ func (s *Server) SetScope(scope string) {
 // and drive agent PTYs out-of-process. /api/pty/ and /api/hub/ are reverse
 // proxied to the same tuimux daemon socket (see ListenAndServe).
 func (s *Server) SetTuimuxClient(c *tuimux.ApiClient) {
-	s.tuimuxClient = c
+	s.tuimuxClient.Store(c)
 }
 
-// ListenAndServe starts the daemon on the given unix socket path.
-// If httpPort > 0, also listens on localhost:httpPort for browser access
-// (web terminal viewer, API debugging). It blocks until the server stops.
+// SetBootStatus publishes the daemon's current boot progress for
+// GET /api/system/boot. Called from the early-bind boot goroutine at each
+// phase boundary; a nil status (never set) makes the endpoint report Done.
+func (s *Server) SetBootStatus(status *coredaemon.BootStatus) {
+	s.bootStatus.Store(status)
+}
+
+// ListenAndServe binds the socket and then blocks serving on it — the
+// original one-shot entrypoint, preserved for the default bind-last boot and
+// for every existing caller/test. It is Listen followed by Serve.
 func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
+	if err := s.Listen(socketPath, httpPort...); err != nil {
+		return err
+	}
+	return s.Serve()
+}
+
+// Listen binds the daemon's unix socket (and optional localhost:httpPort TCP
+// listener), builds the request mux, and fires OnReady — but does NOT start
+// accepting yet. Split out from Serve so the early-bind boot path
+// (--ready-at=bind) can bind the socket first (unblocking the client) and run
+// the slow boot steps in the background before Serve begins accepting.
+// If httpPort > 0, also listens on localhost:httpPort for browser access
+// (web terminal viewer, API debugging).
+func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	// PHASE 2: Store socket path for drain mode
 	s.socketPath = socketPath
 
@@ -376,6 +413,7 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/nav/last-accessed", s.handleNavLastAccessedGroup)
 	// System endpoints
 	mux.HandleFunc("/api/system/info", s.handleSystemInfo)
+	mux.HandleFunc("/api/system/boot", s.handleSystemBoot)
 	mux.HandleFunc("/api/system/treemux-status", s.handleTerminalStatus)
 	// Native agent pane relay endpoints
 	mux.HandleFunc("/api/agents/spawn", s.handleAgentSpawn)
@@ -409,7 +447,14 @@ func (s *Server) ListenAndServe(socketPath string, httpPort ...int) error {
 	}
 
 	s.ulog.Info("Daemon listening").Field("socket", socketPath).Log(context.Background())
-	err = s.server.Serve(listener)
+	return nil
+}
+
+// Serve blocks accepting and handling requests on the socket bound by Listen.
+// It must be called after Listen; calling it without a prior successful Listen
+// panics on the nil server (a programmer error, not a runtime condition).
+func (s *Server) Serve() error {
+	err := s.server.Serve(s.listener)
 
 	// A graceful drain (SIGUSR1 → EnterDrainMode) closes the listener out from
 	// under Serve, which then returns a "use of closed network connection"
@@ -867,13 +912,13 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 		// If channel manager is set, enable/disable channels
-		if s.channelManager != nil {
+		if cm := s.channelManager.Load(); cm != nil {
 			if len(req.Channels) > 0 {
-				if err := s.channelManager.EnableChannel(r.Context(), sessionID, req.Channels...); err != nil {
+				if err := cm.EnableChannel(r.Context(), sessionID, req.Channels...); err != nil {
 					s.ulog.Error("Failed to enable channel").Err(err).Log(r.Context())
 				}
 			} else {
-				s.channelManager.DisableChannel(r.Context(), sessionID)
+				cm.DisableChannel(r.Context(), sessionID)
 			}
 		}
 		w.WriteHeader(http.StatusOK)
@@ -1003,8 +1048,8 @@ func (s *Server) killSession(sessionID string) error {
 	// Kill the out-of-process PTY so the treemux NativeAgentPanel gets EOF
 	// and auto-closes its pane. Without this the pane stays open even after
 	// the agent process exits, requiring a daemon restart to clear the row.
-	if session.PtyID != "" && s.tuimuxClient != nil {
-		if err := s.tuimuxClient.KillPty(session.PtyID); err != nil {
+	if tc := s.tuimuxClient.Load(); session.PtyID != "" && tc != nil {
+		if err := tc.KillPty(session.PtyID); err != nil {
 			s.ulog.Warn("Failed to kill agent PTY on session kill").
 				Err(err).
 				Field("session_id", sessionID).
@@ -1099,10 +1144,14 @@ func (s *Server) sessionFromDeliveryState(jobID string) *models.Session {
 // depends on it) cannot save the session, so we mark the session interrupted
 // (not failed — the agent was alive; the route died) and return the error.
 func (s *Server) writePtyWithRetry(ctx context.Context, jobID, ptyID string, data []byte) error {
-	err := s.tuimuxClient.WritePty(ptyID, data)
+	tc := s.tuimuxClient.Load()
+	if tc == nil {
+		return fmt.Errorf("tuimux client unavailable")
+	}
+	err := tc.WritePty(ptyID, data)
 	if err != nil {
 		time.Sleep(50 * time.Millisecond)
-		err = s.tuimuxClient.WritePty(ptyID, data)
+		err = tc.WritePty(ptyID, data)
 	}
 	if err != nil {
 		s.ulog.Warn("PTY write to tuimux daemon failed after retry; marking session interrupted").
@@ -1193,7 +1242,7 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 		// transient failure we retry once, then mark the session interrupted —
 		// because once the tuimux daemon is unreachable the SSE fallback (which
 		// also depends on it) cannot recover the session either.
-		if session.PtyID != "" && s.tuimuxClient != nil {
+		if session.PtyID != "" && s.tuimuxClient.Load() != nil {
 			if err := s.writePtyWithRetry(ctx, jobID, session.PtyID, []byte(payload)); err != nil {
 				return err
 			}
@@ -1265,7 +1314,7 @@ func (s *Server) SendSessionInterrupt(ctx context.Context, jobID string) error {
 
 	switch mux {
 	case models.MuxTreemux:
-		if session.PtyID != "" && s.tuimuxClient != nil {
+		if session.PtyID != "" && s.tuimuxClient.Load() != nil {
 			if err := s.writePtyWithRetry(ctx, jobID, session.PtyID, []byte{0x03}); err != nil {
 				return err
 			}
@@ -1343,8 +1392,8 @@ func (s *Server) handleSessionIntent(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// If the intent includes channels, enable them in the channel manager
-	if s.channelManager != nil && len(intent.Channels) > 0 {
-		if err := s.channelManager.EnableChannel(r.Context(), intent.JobID, intent.Channels...); err != nil {
+	if cm := s.channelManager.Load(); cm != nil && len(intent.Channels) > 0 {
+		if err := cm.EnableChannel(r.Context(), intent.JobID, intent.Channels...); err != nil {
 			s.ulog.Warn("Failed to enable channel from intent").
 				Err(err).
 				Field("job_id", intent.JobID).
@@ -1492,10 +1541,15 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 
 	// Send current state immediately so client has data right away. The
 	// snapshot also carries the current resolved theme so a theme change
-	// that happened while the client was disconnected isn't lost.
+	// that happened while the client was disconnected isn't lost. Carry the
+	// current boot status on this initial frame too: a client that subscribes
+	// after the pre-stream GetBootStatus poll would otherwise miss a boot that
+	// finished in between, and never see a Done transition. Sent whenever boot
+	// is still in progress, regardless of whether any workspaces exist yet.
 	state := s.engine.Store().Get()
 	themePayload := theming.CurrentPayload()
-	if len(state.Workspaces) > 0 || themePayload != nil {
+	boot := s.bootStatus.Load()
+	if len(state.Workspaces) > 0 || themePayload != nil || (boot != nil && !boot.Done) {
 		workspaces := make([]*models.EnrichedWorkspace, 0, len(state.Workspaces))
 		for _, ws := range state.Workspaces {
 			workspaces = append(workspaces, ws)
@@ -1504,6 +1558,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 			Workspaces: workspaces,
 			UpdateType: "initial",
 			Theme:      themePayload,
+			BootPhase:  boot,
 		}
 		if data, err := json.Marshal(initialUpdate); err == nil {
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
@@ -1630,6 +1685,24 @@ func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(info)
 }
 
+// handleSystemBoot returns the daemon's boot progress. It intentionally does
+// NOT depend on the engine or any late-wired dependency so it answers from the
+// earliest moment the socket is serving. When bootStatus was never set — the
+// default bind-last ordering, where the socket only serves after boot
+// completes — it reports Done=true.
+func (s *Server) handleSystemBoot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	status := s.bootStatus.Load()
+	if status == nil {
+		status = &coredaemon.BootStatus{Done: true}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(status)
+}
+
 // checkJobSubmitWarnings detects unknown fields in a job submission request.
 // It returns a list of warnings about fields that will be ignored.
 func (s *Server) checkJobSubmitWarnings(bodyBytes []byte) []string {
@@ -1728,7 +1801,7 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 	// agent on the standalone tuimux daemon and send an attach event instead
 	// of a spawn event. Owning the PTY out-of-process is what lets the agent
 	// process and its pane survive a `groved upgrade`.
-	if s.tuimuxClient != nil && payload.Command != "" {
+	if tc := s.tuimuxClient.Load(); tc != nil && payload.Command != "" {
 		// Wrap the agent command in an interactive shell so the user's RC
 		// files are sourced (PATH includes nvm, homebrew, etc.). Export
 		// env vars inside the script to ensure they survive shell init.
@@ -1763,7 +1836,7 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		ptyID, err := s.tuimuxClient.CreatePty(
+		ptyID, err := tc.CreatePty(
 			wrapper,
 			payload.WorkDir,
 			[]string{"GROVE_PTY=1", "GROVE_TERMINAL=1"},
@@ -1889,8 +1962,9 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		// symmetric with the direct-PTY input path. On error, fall through to the
 		// groveterm SSE round-trip below.
 		var nativeErr error
-		if session := s.resolveSessionForRouting(agentID); session != nil && session.PtyID != "" && s.tuimuxClient != nil {
-			screen, err := s.tuimuxClient.CapturePty(session.PtyID)
+		tc := s.tuimuxClient.Load()
+		if session := s.resolveSessionForRouting(agentID); session != nil && session.PtyID != "" && tc != nil {
+			screen, err := tc.CapturePty(session.PtyID)
 			if err == nil {
 				w.Header().Set("Content-Type", "text/plain")
 				w.WriteHeader(http.StatusOK)
@@ -1998,6 +2072,10 @@ type apiStateUpdate struct {
 	// Theme stamps the current resolved theme onto the "initial" snapshot so
 	// clients reconnecting after a disconnect never miss a theme change.
 	Theme *coredaemon.ThemeChangedPayload `json:"theme,omitempty"`
+	// BootPhase mirrors StateUpdate.BootPhase so "boot_phase" SSE events carry
+	// the typed status in its own field, not the generic Payload. Nil on every
+	// other update type (omitempty keeps it off the wire).
+	BootPhase *coredaemon.BootStatus `json:"boot_phase,omitempty"`
 }
 
 // convertToAPIUpdate converts internal store.Update to the public API format.
@@ -2182,6 +2260,17 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
+
+	// Daemon boot progress — carried in the typed BootPhase field (mirroring
+	// StateUpdate.BootPhase), not Payload, so SSE consumers decode it directly.
+	case store.UpdateBootPhase:
+		if bs, ok := u.Payload.(*coredaemon.BootStatus); ok {
+			return &apiStateUpdate{
+				UpdateType: "boot_phase",
+				Source:     u.Source,
+				BootPhase:  bs,
+			}
+		}
 	}
 	return nil
 }
@@ -2338,7 +2427,8 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 
 // handleJobs handles POST (submit) and GET (list) for /api/jobs.
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
-	if s.jobRunner == nil {
+	jr := s.jobRunner.Load()
+	if jr == nil {
 		http.Error(w, "job runner not initialized", http.StatusServiceUnavailable)
 		return
 	}
@@ -2366,7 +2456,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		// Check for unknown fields in the JSON
 		warnings := s.checkJobSubmitWarnings(bodyBytes)
 
-		info, err := s.jobRunner.Submit(r.Context(), req)
+		info, err := jr.Submit(r.Context(), req)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -2437,11 +2527,12 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(info)
 
 	case http.MethodDelete:
-		if s.jobRunner == nil {
+		jr := s.jobRunner.Load()
+		if jr == nil {
 			http.Error(w, "job runner not initialized", http.StatusServiceUnavailable)
 			return
 		}
-		if err := s.jobRunner.Cancel(jobID); err != nil {
+		if err := jr.Cancel(jobID); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -2665,7 +2756,8 @@ func (s *Server) handleEnvUp(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.envManager == nil {
+	em := s.envManager.Load()
+	if em == nil {
 		http.Error(w, "env manager not initialized", http.StatusServiceUnavailable)
 		return
 	}
@@ -2676,7 +2768,7 @@ func (s *Server) handleEnvUp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.envManager.Up(r.Context(), req)
+	resp, err := em.Up(r.Context(), req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -2697,7 +2789,8 @@ func (s *Server) handleEnvStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.envManager == nil {
+	em := s.envManager.Load()
+	if em == nil {
 		http.Error(w, "env manager not initialized", http.StatusServiceUnavailable)
 		return
 	}
@@ -2708,7 +2801,7 @@ func (s *Server) handleEnvStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := s.envManager.Status(worktree)
+	resp := em.Status(worktree)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -2719,7 +2812,8 @@ func (s *Server) handleEnvDown(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.envManager == nil {
+	em := s.envManager.Load()
+	if em == nil {
 		http.Error(w, "env manager not initialized", http.StatusServiceUnavailable)
 		return
 	}
@@ -2730,7 +2824,7 @@ func (s *Server) handleEnvDown(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.envManager.Down(r.Context(), req)
+	resp, err := em.Down(r.Context(), req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -2759,7 +2853,8 @@ func (s *Server) handleProxyRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy registration is only served by the global (unscoped) daemon", http.StatusBadRequest)
 		return
 	}
-	if s.envManager == nil {
+	em := s.envManager.Load()
+	if em == nil {
 		http.Error(w, "env manager not initialized", http.StatusServiceUnavailable)
 		return
 	}
@@ -2772,7 +2867,7 @@ func (s *Server) handleProxyRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "worktree, route, and positive port are required", http.StatusBadRequest)
 		return
 	}
-	s.envManager.Proxy.Register(req.Worktree, req.Route, req.Port)
+	em.Proxy.Register(req.Worktree, req.Route, req.Port)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -2787,7 +2882,8 @@ func (s *Server) handleProxyUnregister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy registration is only served by the global (unscoped) daemon", http.StatusBadRequest)
 		return
 	}
-	if s.envManager == nil {
+	em := s.envManager.Load()
+	if em == nil {
 		http.Error(w, "env manager not initialized", http.StatusServiceUnavailable)
 		return
 	}
@@ -2800,7 +2896,7 @@ func (s *Server) handleProxyUnregister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "worktree is required", http.StatusBadRequest)
 		return
 	}
-	s.envManager.Proxy.Unregister(req.Worktree)
+	em.Proxy.Unregister(req.Worktree)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -2850,7 +2946,8 @@ func (s *Server) handleChannelSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.channelManager == nil {
+	cm := s.channelManager.Load()
+	if cm == nil {
 		http.Error(w, "channel manager not initialized", http.StatusServiceUnavailable)
 		return
 	}
@@ -2861,7 +2958,7 @@ func (s *Server) handleChannelSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sendResp, err := s.channelManager.Send(r.Context(), req)
+	sendResp, err := cm.Send(r.Context(), req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2877,12 +2974,13 @@ func (s *Server) handleChannelStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.channelManager == nil {
+	cm := s.channelManager.Load()
+	if cm == nil {
 		http.Error(w, "channel manager not initialized", http.StatusServiceUnavailable)
 		return
 	}
 
-	status := s.channelManager.Status()
+	status := cm.Status()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
 }
@@ -2893,12 +2991,13 @@ func (s *Server) handleChannelCleanup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.channelManager == nil {
+	cm := s.channelManager.Load()
+	if cm == nil {
 		http.Error(w, "channel manager not initialized", http.StatusServiceUnavailable)
 		return
 	}
 
-	purged, err := s.channelManager.CleanupOrphans(r.Context())
+	purged, err := cm.CleanupOrphans(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

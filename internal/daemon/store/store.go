@@ -880,3 +880,25 @@ func (s *Store) BroadcastThemeChanged(name string, palette *coredaemon.ThemeChan
 		}
 	}
 }
+
+// BroadcastBootPhase fans a daemon boot-progress transition out to all
+// subscribers. status is *daemon.BootStatus (core/pkg/daemon); it is passed
+// opaquely so the store keeps no dependency on the core client package —
+// convertToAPIUpdate type-asserts it back on the server side. Modeled on
+// BroadcastConfigReload: best-effort, non-blocking, drops on a full buffer.
+func (s *Store) BroadcastBootPhase(status interface{}) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	update := Update{
+		Type:    UpdateBootPhase,
+		Source:  "boot",
+		Payload: status,
+	}
+	for ch := range s.subscribers {
+		select {
+		case ch <- update:
+		default:
+		}
+	}
+}

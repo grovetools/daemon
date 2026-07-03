@@ -34,7 +34,7 @@ func dashboardAssetsFS() http.FileSystem {
 // by the TCP mux built on the dashboard listener, not the unix-socket mux —
 // scoped daemons never serve dashboard traffic.
 func (s *Server) registerDashboardRoutes(mux *http.ServeMux) {
-	agg := dashboard.New(s.envManager)
+	agg := dashboard.New(s.envManager.Load())
 
 	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFileFS(w, r, dashboardAssetsEmbed(), "dashboard_assets/index.html")

@@ -370,246 +370,22 @@ func newGrovedStartCmd() *cobra.Command {
 			// 3.5 Setup context early (needed by JobRunner and Engine)
 			ctx, cancel := context.WithCancel(context.Background())
 
-			// 3.6 Setup JobRunner
-			jobsEnabled := true
-			if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.Enabled != nil {
-				jobsEnabled = *cfg.Daemon.Jobs.Enabled
-			}
+			// 3.55 Boot ordering. --ready-at=bind (treemux's cold-start splash)
+			// binds the socket first and runs the slow boot steps in a
+			// background goroutine, streaming phase progress; the default
+			// --ready-at=boot preserves the historical fully synchronous
+			// bind-last ordering byte-for-byte (runBoot runs before serving,
+			// and advanceBoot is a no-op because no client can connect yet).
+			readyAt, _ := cmd.Flags().GetString("ready-at")
+			earlyBind := readyAt == "bind"
 
-			// Stand up the standalone tuimux daemon BEFORE the JobRunner so
-			// adoption can query it. PTY ownership now lives out-of-process in
-			// this daemon, so it survives a `groved upgrade` (the successor
-			// re-discovers the same live socket). On failure we log and
-			// continue with a nil client — adoption must fail-open, never block.
-			var tuimuxClient *tuimux.ApiClient
-			// Each daemon stands up / connects to a tuimux multiplexer keyed to
-			// its own scope, so a scoped daemon's PTY inspector sees ONLY its own
-			// PTYs. Empty scope resolves to the legacy machine-wide socket
-			// (backward compat — currently-running shells aren't orphaned).
-			// groved already exported GROVE_SCOPE above, so the spawned tuimux's
-			// own DefaultSocketPath() default agrees; passing the resolved scope
-			// explicitly is belt-and-suspenders.
-			tuimuxSock := tuimux.ScopedSocketPath(scope)
-			tuimuxBin, binErr := resolveTuimuxPath()
-			if binErr != nil {
-				ulog.Warn("tuimux binary not found; agent PTYs will be unavailable").
-					Err(binErr).Log(ctx)
-				tuimuxClient = nil
-			} else {
-				var tuimuxErr error
-				tuimuxClient, tuimuxErr = tuimux.EnsureDaemonWithBinary(tuimuxSock, tuimuxBin)
-				if tuimuxErr != nil {
-					ulog.Warn("Failed to ensure tuimux daemon; agent PTYs will be unavailable").
-						Err(tuimuxErr).Log(ctx)
-					tuimuxClient = nil
-				}
-			}
-			// Wire tuimux into the session collector so it can kill out-of-process
-			// PTYs when it detects a dead session PID (daemon-side reaper).
-			if sessionColl != nil && tuimuxClient != nil {
-				sessionColl.SetPtyKiller(tuimuxClient)
-			}
-
-			var jr *jobrunner.JobRunner
-			if jobsEnabled {
-				workers := 4
-				if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.MaxConcurrent > 0 {
-					workers = cfg.Daemon.Jobs.MaxConcurrent
-				}
-
-				execTimeout := 30 * time.Minute
-				if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.DefaultTimeout != "" {
-					if d, err := time.ParseDuration(cfg.Daemon.Jobs.DefaultTimeout); err == nil {
-						execTimeout = d
-					}
-				}
-
-				execConfig := &orchestration.ExecutorConfig{
-					MaxPromptLength: 1000000,
-					Timeout:         execTimeout,
-					RetryCount:      2,
-					Model:           "default",
-				}
-				localRuntime := orchestration.NewLocalRuntime(
-					execConfig,
-					&command.RealExecutor{},
-					&noopStatusUpdater{},
-					orchestration.NewDefaultLogger(),
-				)
-
-				var persistDir string
-				if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.PersistDir != "" {
-					persistDir = cfg.Daemon.Jobs.PersistDir
-				}
-				persister := jobrunner.NewPersistenceWithDir(persistDir)
-
-				jr = jobrunner.New(st, localRuntime, workers, persister, tuimuxClient)
-
-				// Synchronously recover persisted sessions into the store BEFORE
-				// adoption. The SessionCollector only populates the session map
-				// once the engine starts (~200 lines below), so without this
-				// adoption would see an empty map and could never read a job's
-				// PtyID to verify its out-of-process PTY survived the upgrade.
-				// Recovery failure must warn-and-continue, never block adoption.
-				//
-				// Scope-filter to this daemon's own scope (same as the collector
-				// seed below): seeding the unfiltered global set here would let
-				// adoption reap another scope's agents as orphans (their PtyIDs
-				// live in a different scoped tuimux), reopening the cross-scope
-				// leak this feature closes.
-				if recovered, rerr := sessions.RecoverSessionsForScope(scope); rerr != nil {
-					ulog.Warn("Synchronous session recovery failed; continuing").Err(rerr).Log(ctx)
-				} else if len(recovered) > 0 {
-					st.ApplyUpdate(store.Update{
-						Type:    store.UpdateSessions,
-						Source:  "boot_recovery",
-						Payload: recovered,
-					})
-				}
-
-				// PHASE 2: Adopt running agents from previous daemon instance
-				jr.AdoptRunningAgents(ctx)
-				go jr.Start(ctx)
-				ulog.Info("JobRunner started").Field("workers", workers).Log(ctx)
-			}
-
-			// 3.65 Setup the machine-wide build queue scheduler. Sized from
-			// [daemon.build] max_parallel; defaults to max(2, NumCPU/2).
-			// grove's orchestrator submits build jobs here so concurrent
-			// `grove build` invocations share one host-wide concurrency cap.
-			buildParallel := 0
-			if cfg.Daemon != nil && cfg.Daemon.Build != nil {
-				buildParallel = cfg.Daemon.Build.MaxParallel
-			}
-			buildScheduler := buildqueue.New(st, buildParallel)
-			buildScheduler.Start(ctx)
-			ulog.Info("Build queue started").
-				Field("max_parallel", buildScheduler.MaxParallel()).
-				Log(ctx)
-
-			// 3.7 Setup LogStreamer
-			logBufSize := 1000
-			logMaxSubs := 10
-			logPollInterval := 500 * time.Millisecond
-			streamer := logstreamer.New(st, logBufSize, logMaxSubs, logPollInterval)
-			if jr != nil {
-				jr.SetOnJobDetached(streamer.NotifyJobDetached)
-			}
-
-			// 3.8 Setup WorkspaceStreamer (aggregated workspace log stream)
-			workspaceStreamer := logstreamer.NewWorkspaceStreamer(st, 10000)
-			go workspaceStreamer.Start(ctx)
-
-			// 4. Setup Server with engine and env manager
-			envManager := daemonenv.NewManager()
-
-			// Restore environment state from disk to prevent port collisions.
-			// Phase 4: walk configured ecosystem base paths directly with
-			// filepath.WalkDir, which bypasses the racy workspace discovery
-			// pass. Newly-created worktrees are guaranteed to be present in
-			// the filesystem before Restore runs (the daemon was just
-			// started after them) but are NOT guaranteed to be present in
-			// workspace.Provider yet (fsnotify + git worktree creation
-			// takes a beat to settle).
-			basePaths := envBasePathsFromConfig(cfg)
-			envManager.Restore(basePaths)
-
-			// Only the global (unscoped) daemon binds :8443 — it owns the
-			// shared *.grove.local proxy table. Scoped daemons inject a
-			// client handle so they RPC their routes over to the global
-			// daemon rather than maintaining their own (conflicting) bind.
-			if scope == "" {
-				go func() {
-					if err := envManager.Proxy.ListenAndServe("127.0.0.1:8443"); err != nil {
-						ulog.Warn("Proxy server stopped").Err(err).Log(context.Background())
-					}
-				}()
-			} else {
-				envManager.SetGlobalClient(daemon.NewGlobalClient())
-			}
-
+			// Fast, side-effect-light setup wired BEFORE the socket can accept,
+			// so these handlers never observe a nil dependency even under early
+			// bind. The genuinely slow / late-wired dependencies (tuimux,
+			// jobrunner, envmanager, channels) are set from runBoot instead.
 			srv := server.New(autoShutdown)
 			srv.SetScope(scope)
 			srv.SetEngine(eng)
-			srv.SetEnvManager(envManager)
-			if jr != nil {
-				srv.SetJobRunner(jr)
-			}
-			srv.SetBuildScheduler(buildScheduler)
-			srv.SetLogStreamer(streamer)
-			srv.SetWorkspaceStreamer(workspaceStreamer)
-
-			// Dashboard: ephemeral TCP listener, global daemon only. The
-			// port is persisted so `grove env dashboard` can find us without
-			// any discovery protocol. Scoped daemons never serve it.
-			if scope == "" {
-				if dashAddr, err := srv.StartDashboard(ctx); err != nil {
-					ulog.Warn("dashboard server failed to start").Err(err).Log(ctx)
-				} else {
-					ulog.Info("Dashboard listening").
-						Field("url", "http://"+dashAddr+"/dashboard").
-						Log(ctx)
-				}
-			}
-
-			// Wire the out-of-process tuimux client onto the server so PTY
-			// create / input / interrupt route to the standalone tuimux daemon
-			// instead of an embedded in-process manager. PTYs now survive a
-			// `groved upgrade` because the tuimux daemon outlives groved.
-			srv.SetTuimuxClient(tuimuxClient)
-
-			// sendInputToSession delegates to Server.SendSessionInput so the
-			// channels manager and autonomous pinger both benefit from the
-			// mux-aware dispatch (direct treemux PTY write → SSE relay → tmux
-			// fallback).
-			sendInputToSession := func(ctx context.Context, jobID, message string) error {
-				return srv.SendSessionInput(ctx, jobID, message)
-			}
-
-			// Initialize channel manager if signal is configured.
-			// Declared at outer scope so the shutdown goroutine can call Stop().
-			var chMgr *daemonchannels.Manager
-			notifyCfg := notifyconfig.Load()
-			if notifyCfg.Signal.Enabled || notifyCfg.HomeAssistant.Enabled {
-				chMgr = daemonchannels.NewManager(st, daemonchannels.SignalConfig{
-					Enabled:     notifyCfg.Signal.Enabled,
-					CLIPath:     notifyCfg.Signal.CLIPath,
-					Account:     notifyCfg.Signal.Account,
-					Allowlist:   notifyCfg.Signal.Allowlist,
-					Groups:      notifyCfg.Signal.Groups,
-					Contacts:    notifyCfg.Signal.ContactsFlat(),
-					NamedGroups: notifyCfg.Signal.NamedGroupsFlat(),
-				}, daemonchannels.HAConfig{
-					Enabled:          notifyCfg.HomeAssistant.Enabled,
-					WebhookPort:      notifyCfg.HomeAssistant.WebhookPort,
-					WebhookSecret:    notifyCfg.HomeAssistant.WebhookSecret,
-					URL:              notifyCfg.HomeAssistant.URL,
-					Token:            notifyCfg.HomeAssistant.Token,
-					DefaultSatellite: notifyCfg.HomeAssistant.DefaultSatellite,
-				}, scope, sockPath)
-				chMgr.SendInput = sendInputToSession
-				// Scoped daemons proxy outbound sends to the global daemon
-				// (which owns signal-cli) and register their sessions in
-				// routing.json so global can forward inbound replies back.
-				if scope != "" {
-					chMgr.SetGlobalClient(daemon.NewGlobalClient())
-				}
-				chMgr.Start(ctx)
-				srv.SetChannelManager(chMgr)
-				ulog.Info("Channel manager initialized").
-					Field("signal", notifyCfg.Signal.Enabled).
-					Field("ha", notifyCfg.HomeAssistant.Enabled).
-					Field("scope", scope).
-					Field("proxy_mode", scope != "").
-					Log(ctx)
-			}
-
-			// Register autonomous pinger as a collector
-			pinger := autonomous.NewPinger(st, "")
-			pinger.SendInput = sendInputToSession
-			eng.Register(pinger)
-
-			// Set running config for introspection
 			srv.SetRunningConfig(&server.RunningConfig{
 				GitInterval:       gitInterval,
 				SessionInterval:   sessionInterval,
@@ -619,347 +395,33 @@ func newGrovedStartCmd() *cobra.Command {
 				StartedAt:         time.Now(),
 			})
 
-			// 5. Handle Signals + auto-shutdown
-			stop := make(chan os.Signal, 1)
-			signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-			drain := make(chan os.Signal, 1)
-			// PHASE 2: Listen for SIGUSR1 to trigger drain mode (zero-downtime upgrade)
-			signal.Notify(drain, syscall.SIGUSR1)
-
-			// 5.1 If paired to a parent PID, watch for its death and trigger
-			// the same graceful shutdown pathway as a SIGTERM. This pipes
-			// kernel-level parent-death events into pidfile cleanup, PTY
-			// teardown, and server stop without bypassing any of them.
-			if pairPID > 0 {
-				pairwatch.Watch(cmd.Context(), pairPID, func() {
-					stop <- syscall.SIGTERM
-				})
+			// 3.65 Machine-wide build queue scheduler. Sized from [daemon.build]
+			// max_parallel; defaults to max(2, NumCPU/2). Fast to construct, so
+			// wired before bind.
+			buildParallel := 0
+			if cfg.Daemon != nil && cfg.Daemon.Build != nil {
+				buildParallel = cfg.Daemon.Build.MaxParallel
 			}
+			buildScheduler := buildqueue.New(st, buildParallel)
+			buildScheduler.Start(ctx)
+			srv.SetBuildScheduler(buildScheduler)
+			ulog.Info("Build queue started").
+				Field("max_parallel", buildScheduler.MaxParallel()).
+				Log(ctx)
 
-			// shutdownReq fires when the TerminalHub idle timer expires
-			// (auto-shutdown mode). Nil if auto-shutdown is disabled.
-			shutdownReq := srv.TerminalHubShutdownReq()
+			// 3.7 Log + workspace streamers (fast; the jr↔streamer link is wired
+			// inside runBoot once the JobRunner exists).
+			streamer := logstreamer.New(st, 1000, 10, 500*time.Millisecond)
+			srv.SetLogStreamer(streamer)
+			workspaceStreamer := logstreamer.NewWorkspaceStreamer(st, 10000)
+			go workspaceStreamer.Start(ctx)
+			srv.SetWorkspaceStreamer(workspaceStreamer)
 
-			// sshServer is set later (step 7.7) and closed by the signal handler.
-			var sshServer *daemonssh.Server
-
-			go func() {
-				bgCtx := context.Background()
-				select {
-				case <-stop:
-					ulog.Info("Received stop signal").Field("event", "daemon.stopped").Log(bgCtx)
-				case <-shutdownReq:
-					ulog.Info("Auto-shutdown fired (idle TerminalHub)").Field("event", "daemon.stopped").Log(bgCtx)
-				}
-				// Reap the agent PTYs this daemon owns. With PTYs out-of-process,
-				// a plain stop (this SIGTERM/auto-shutdown path — NOT the SIGUSR1
-				// drain path, which leaves PTYs untouched for upgrade survival)
-				// must explicitly kill them via the tuimux daemon, leaving the
-				// tuimux daemon process itself running (other tools may share it).
-				//
-				// Scope safety: st.GetSessions() only ever contains THIS scope's
-				// sessions — the SessionCollector seeds the store via
-				// RecoverSessionsForScope(scope) and never adopts foreign-scope
-				// records — so this loop can only kill agents owned by this daemon's
-				// scope. That is what closes the cross-scope reaping leak (Gap A).
-				if tuimuxClient != nil {
-					for _, sess := range st.GetSessions() {
-						if sess.PtyID == "" {
-							continue
-						}
-						if err := tuimuxClient.KillPty(sess.PtyID); err != nil {
-							ulog.Warn("Failed to kill agent PTY on stop").
-								Err(err).Field("pty_id", sess.PtyID).Log(bgCtx)
-						}
-					}
-				}
-				// A scoped tuimux is owned by this scoped daemon and has no other
-				// owner once it exits — reap it so it doesn't orphan. The global
-				// (scope == "") tuimux is shared and intended to persist, so we
-				// NEVER stop it. This runs only on the plain-stop path (above);
-				// the SIGUSR1 drain/upgrade path leaves the scoped tuimux running
-				// so the successor re-binds the same socket and live PTYs survive.
-				if scope != "" {
-					if err := tuimux.StopDaemon(tuimuxSock); err != nil {
-						ulog.Warn("Failed to stop scoped tuimux daemon on shutdown").
-							Err(err).Field("socket", tuimuxSock).Log(bgCtx)
-					}
-				}
-				envManager.Shutdown()    // Teardown all running environments and proxy routes
-				streamer.Stop()          // Stop all job log tailing goroutines
-				workspaceStreamer.Stop() // Stop workspace log aggregation
-				if chMgr != nil {
-					// Stop signal-cli daemon subprocess so it doesn't orphan.
-					// A fresh signal-cli is spawned on the next groved boot,
-					// restoring the stdout reader + cross-daemon inbound routing.
-					chMgr.Stop(bgCtx)
-				}
-				if sshServer != nil {
-					_ = sshServer.Stop()
-				}
-				cancel() // Stop the engine
-
-				// Create shutdown context with timeout
-				shutdownCtx, shutdownCancel := context.WithTimeout(bgCtx, 5*time.Second)
-				defer shutdownCancel()
-
-				if err := srv.Shutdown(shutdownCtx); err != nil {
-					ulog.Error("Server shutdown error").Err(err).Log(bgCtx)
-				}
-
-				// Explicitly release pidfile before exit in signal handler
-				_ = pidfile.Release(pidPath)
-				os.Exit(0)
-			}()
-
-			// PHASE 2: Handle SIGUSR1 for graceful drain (zero-downtime upgrade)
-			go func() {
-				bgCtx := context.Background()
-				<-drain
-				ulog.Info("Received SIGUSR1 - entering drain mode").Log(bgCtx)
-				srv.EnterDrainMode(bgCtx)
-			}()
-
-			// 5.5. Start inline monitor early so it captures all events from boot
-			if monitor, _ := cmd.Flags().GetBool("monitor"); monitor {
-				monitorFormat, _ := cmd.Flags().GetString("monitor-format")
-				monitorCompact, _ := cmd.Flags().GetBool("monitor-compact")
-				go runInlineMonitor(ctx, st, monitorFormat, monitorCompact)
-			}
-
-			// 6. Start Engine in background
-			go eng.Start(ctx)
-
-			// 7. Start ConfigWatcher if enabled
-			if configWatchEnabled(cfg) {
-				debounceMs := configDebounceMs(cfg)
-				// Track the resolved global tui.theme across reloads so a
-				// dedicated theme_changed event (with the resolved palette)
-				// fires only when the theme actually changes. The callback
-				// runs on the watcher's single goroutine, so lastTheme
-				// needs no locking.
-				lastTheme := theming.CurrentThemeName()
-				configWatcher, err := daemon.NewConfigWatcher(debounceMs, func(file string) {
-					// Broadcast config reload event to all subscribers
-					st.BroadcastConfigReload(file)
-
-					// Diff the resolved theme and broadcast on change.
-					themeName := theming.CurrentThemeName()
-					if themeName == lastTheme {
-						return
-					}
-					lastTheme = themeName
-					if payload, ok := theming.BuildPayload(themeName); ok {
-						st.BroadcastThemeChanged(themeName, payload)
-						ulog.Info("Theme changed, broadcasting").
-							Field("theme", themeName).Log(ctx)
-					} else {
-						ulog.Warn("Configured theme not found in registry, skipping theme broadcast").
-							Field("theme", themeName).Log(ctx)
-					}
-				})
-				if err != nil {
-					ulog.Warn("Failed to start config watcher, continuing without it").Err(err).Log(ctx)
-				} else {
-					ulog.Info("Config watcher started").Log(ctx)
-					go configWatcher.Start(ctx)
-				}
-			}
-
-			// 7.5. Start UnifiedWatcher with registered domain handlers
-			unifiedWatcher, err := watcher.NewUnifiedWatcher(st, 100*time.Millisecond)
-			if err != nil {
-				ulog.Warn("Failed to start unified watcher, continuing without it").Err(err).Log(ctx)
-			} else {
-				// Register SkillHandler if auto-sync is enabled
-				autoSync := true
-				if cfg.Daemon != nil && cfg.Daemon.AutoSyncSkills != nil {
-					autoSync = *cfg.Daemon.AutoSyncSkills
-				}
-
-				if autoSync {
-					debounceMs := 1000
-					if cfg.Daemon != nil && cfg.Daemon.SkillSyncDebounceMs > 0 {
-						debounceMs = cfg.Daemon.SkillSyncDebounceMs
-					}
-
-					skillHandler, err := watcher.NewSkillHandler(st, cfg, debounceMs)
-					if err != nil {
-						ulog.Warn("Failed to initialize skill handler").Err(err).Log(ctx)
-					} else {
-						unifiedWatcher.Register(skillHandler)
-						ulog.Info("Skill handler registered with unified watcher").Log(ctx)
-					}
-				}
-
-				// Register SettingsHandler to reconcile .claude settings if enabled
-				autoSyncClaudeSettings := true
-				if cfg.Daemon != nil && cfg.Daemon.AutoSyncClaudeSettings != nil {
-					autoSyncClaudeSettings = *cfg.Daemon.AutoSyncClaudeSettings
-				}
-
-				if autoSyncClaudeSettings {
-					debounceMs := 1000
-					if cfg.Daemon != nil && cfg.Daemon.SkillSyncDebounceMs > 0 {
-						debounceMs = cfg.Daemon.SkillSyncDebounceMs
-					}
-
-					settingsHandler, err := watcher.NewSettingsHandler(st, cfg, debounceMs)
-					if err != nil {
-						ulog.Warn("Failed to initialize Claude settings handler").Err(err).Log(ctx)
-					} else {
-						unifiedWatcher.Register(settingsHandler)
-						ulog.Info("Claude settings handler registered with unified watcher").Log(ctx)
-					}
-				}
-
-				// Register WorkspaceHandler for instant discovery on fs changes
-				if isEnabled("workspace") {
-					workspaceHandler := watcher.NewWorkspaceHandler(st, cfg, 2000)
-					unifiedWatcher.Register(workspaceHandler)
-					ulog.Info("Workspace handler registered with unified watcher").Log(ctx)
-				}
-
-				// Register GitHandler for subsecond-fresh git status on the
-				// focused workspace set. It watches .git internals (HEAD, index,
-				// refs/heads, refs/remotes) and emits a WorkspaceDelta on change;
-				// the timer-driven GitStatusCollector remains the background
-				// fallback for unfocused workspaces.
-				if isEnabled("git") {
-					gitHandler := watcher.NewGitHandler(st, 150)
-					unifiedWatcher.Register(gitHandler)
-					ulog.Info("Git handler registered with unified watcher").Log(ctx)
-				}
-
-				// Register FlowHandler for plan directory watching
-				if isEnabled("plan") {
-					flowHandler := watcher.NewFlowHandler(st, cfg, 2000)
-					unifiedWatcher.Register(flowHandler)
-					ulog.Info("Flow handler registered with unified watcher").Log(ctx)
-				}
-
-				// Register NoteHandler for note directory watching
-				if isEnabled("note") {
-					noteHandler := watcher.NewNoteHandler(st, cfg, 3000)
-					unifiedWatcher.Register(noteHandler)
-					ulog.Info("Note handler registered with unified watcher").Log(ctx)
-				}
-
-				// Register NavHandler for nav keymap state (sessions.yml) watching
-				navHandler := watcher.NewNavHandler(st)
-				unifiedWatcher.Register(navHandler)
-				ulog.Info("Nav handler registered with unified watcher").Log(ctx)
-
-				// Register MemoryHandler for auto-indexing content.
-				// Only the global daemon owns the SQLite DB and embedder; scoped
-				// daemons proxy /api/memory/* to global via server-side forwarding.
-				if scope == "" {
-					dbPath, err := pathutil.Expand("~/.local/share/grove/memory/memory.db")
-					if err == nil {
-						memStore, err := memory.Open(dbPath, 3072) // gemini-embedding-001 outputs 3072 dimensions
-						if err != nil {
-							ulog.Warn("Failed to initialize memory store, indexing disabled").Err(err).Log(ctx)
-						} else {
-							// The embedder is optional: without a Gemini client the
-							// memory store still indexes and serves FTS (keyword)
-							// search; only semantic (vector) search is unavailable.
-							// Use grove-gemini's config resolver (secrets.toml, env var, api_key_command)
-							var embedder memory.Embedder
-							geminiClient, err := gemini.NewClient(ctx, "")
-							if err != nil {
-								ulog.Warn("Failed to initialize Gemini client, memory will run without semantic search").Err(err).Log(ctx)
-							} else {
-								embedder = memory.NewGeminiEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
-							}
-
-							memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
-							unifiedWatcher.Register(memoryHandler)
-							ulog.Info("Memory handler registered with unified watcher").
-								Field("fts_enabled", true).
-								Field("semantic_available", embedder != nil).
-								Log(ctx)
-
-							// Share the same store + embedder (possibly nil) with the
-							// HTTP server so /api/memory/* handlers can serve TUI
-							// clients without opening a second SQLite connection.
-							srv.SetMemoryStore(memStore, embedder, dbPath)
-						}
-					}
-				}
-
-				// Register SyncHandler for notebook sync change capture.
-				// DARK BY DEFAULT: it registers only when a sync config with
-				// workspace subscriptions exists (~/.config/grove/sync.toml),
-				// which Phase 0 ships no enable-path for — without it, no
-				// watcher, no sync.db, zero behavior change. Like memory.db,
-				// sync.db is owned by the global daemon only; scoped daemons
-				// proxy /api/sync/* to global.
-				if scope == "" {
-					if syncCfg, err := config.LoadSyncConfig(); err != nil {
-						ulog.Warn("Failed to load sync config, sync disabled").Err(err).Log(ctx)
-					} else if syncCfg != nil && len(syncCfg.Workspaces) > 0 {
-						syncDB, err := syncdb.Open(syncdb.DefaultDBPath())
-						if err != nil {
-							ulog.Warn("Failed to open sync database, sync disabled").Err(err).Log(ctx)
-						} else {
-							syncHandler := watcher.NewSyncHandler(st, cfg, syncCfg, syncDB, 0, 0)
-							unifiedWatcher.Register(syncHandler)
-							srv.SetSyncDB(syncDB)
-							ulog.Info("Sync handler registered with unified watcher").
-								Field("workspaces", len(syncCfg.Workspaces)).
-								Field("origin_id", syncDB.OriginID()).
-								Log(ctx)
-						}
-					}
-				}
-
-				ulog.Info("Unified watcher started").Log(ctx)
-				go unifiedWatcher.Start(ctx)
-			}
-
-			// 7.6. Log retention janitor: sweep dated *.log files older than the
-			// configured retention out of the state logs dir, on start and then
-			// every 24h. Judged by filename date (fallback ModTime); today's
-			// file is never touched.
-			logCfg := grovelogging.GetDefaultLoggingConfig()
-			if uerr := cfg.UnmarshalExtension("logging", &logCfg); uerr != nil {
-				ulog.Debug("Failed to parse logging config for retention janitor, using defaults").Err(uerr).Log(ctx)
-			}
-			retentionDays := logCfg.File.RetentionDays
-			if retentionDays <= 0 {
-				retentionDays = 14
-			}
-			go runLogRetentionJanitor(ctx, ulog, retentionDays)
-
-			// 7.7. Start SSH server if enabled
-			var sshCfg *config.DaemonSSHConfig
-			if cfg.Daemon != nil {
-				sshCfg = cfg.Daemon.SSH
-			}
-			if s, err := daemonssh.New(sshCfg); err != nil {
-				ulog.Warn("Failed to start SSH server").Err(err).Log(ctx)
-			} else if s != nil {
-				s.SetStore(st)
-				// PTYs are now owned out-of-process by the tuimux daemon; the
-				// SSH server's in-process ptyManager listing is left nil (its
-				// daemon-owned-PTY paths are nil-guarded and become no-ops).
-				sshServer = s
-				go func() {
-					if err := sshServer.Start(); err != nil {
-						ulog.Warn("SSH server stopped").Err(err).Log(context.Background())
-					}
-				}()
-			}
-
-			// 8. Start Server (Blocking)
-			httpPort, _ := cmd.Flags().GetInt("http-port")
-			ulog.Info("Starting daemon").Field("event", "daemon.started").Field("pid", os.Getpid()).Log(ctx)
-
-			// If the parent passed --ready-fd, close that inherited fd as soon
-			// as the socket is bound. The parent reads EOF from its end of the
-			// pipe and stops polling — replaces the old retry-with-backoff
-			// connect loop with a deterministic handshake. No-op when readyFd
-			// is 0 (default, ad-hoc / manual startups).
+			// If the parent passed --ready-fd, close that inherited fd as soon as
+			// the socket is bound (Listen fires OnReady). The parent reads EOF and
+			// stops polling — a deterministic handshake. Wired before Listen so
+			// early bind signals readiness at the earliest defensible point.
+			// No-op when readyFd is 0 (ad-hoc / manual startups).
 			if readyFd > 0 {
 				srv.OnReady = func() {
 					if err := syscall.Close(readyFd); err != nil {
@@ -969,6 +431,621 @@ func newGrovedStartCmd() *cobra.Command {
 				}
 			}
 
+			// Boot phases published under early bind. Each boundary updates the
+			// BootStatus behind GET /api/system/boot and broadcasts it over the
+			// store bus (the boot_phase SSE stream). No-op under the default
+			// ordering, where runBoot finishes before the socket serves.
+			bootPhases := []string{"tuimux", "jobrunner", "environment", "channels", "engine", "watchers", "ssh"}
+			advanceBoot := func(idx int) {
+				if !earlyBind {
+					return
+				}
+				status := &daemon.BootStatus{
+					Phase:      bootPhases[idx],
+					PhaseIndex: idx + 1,
+					PhaseTotal: len(bootPhases),
+				}
+				srv.SetBootStatus(status)
+				st.BroadcastBootPhase(status)
+			}
+
+			// runBoot performs the remaining boot steps in today's exact order.
+			// Under early bind it runs in a background goroutine AFTER the socket
+			// is already accepting; otherwise it runs synchronously before
+			// ListenAndServe, preserving the historical bind-last timing.
+			runBoot := func() {
+				// 3.6 Setup JobRunner
+				jobsEnabled := true
+				if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.Enabled != nil {
+					jobsEnabled = *cfg.Daemon.Jobs.Enabled
+				}
+
+				advanceBoot(0) // tuimux
+
+				// Stand up the standalone tuimux daemon BEFORE the JobRunner so
+				// adoption can query it. PTY ownership now lives out-of-process in
+				// this daemon, so it survives a `groved upgrade` (the successor
+				// re-discovers the same live socket). On failure we log and
+				// continue with a nil client — adoption must fail-open, never block.
+				var tuimuxClient *tuimux.ApiClient
+				// Each daemon stands up / connects to a tuimux multiplexer keyed to
+				// its own scope, so a scoped daemon's PTY inspector sees ONLY its own
+				// PTYs. Empty scope resolves to the legacy machine-wide socket
+				// (backward compat — currently-running shells aren't orphaned).
+				// groved already exported GROVE_SCOPE above, so the spawned tuimux's
+				// own DefaultSocketPath() default agrees; passing the resolved scope
+				// explicitly is belt-and-suspenders.
+				tuimuxSock := tuimux.ScopedSocketPath(scope)
+				tuimuxBin, binErr := resolveTuimuxPath()
+				if binErr != nil {
+					ulog.Warn("tuimux binary not found; agent PTYs will be unavailable").
+						Err(binErr).Log(ctx)
+					tuimuxClient = nil
+				} else {
+					var tuimuxErr error
+					tuimuxClient, tuimuxErr = tuimux.EnsureDaemonWithBinary(tuimuxSock, tuimuxBin)
+					if tuimuxErr != nil {
+						ulog.Warn("Failed to ensure tuimux daemon; agent PTYs will be unavailable").
+							Err(tuimuxErr).Log(ctx)
+						tuimuxClient = nil
+					}
+				}
+				// Wire tuimux into the session collector so it can kill out-of-process
+				// PTYs when it detects a dead session PID (daemon-side reaper).
+				if sessionColl != nil && tuimuxClient != nil {
+					sessionColl.SetPtyKiller(tuimuxClient)
+				}
+
+				advanceBoot(1) // jobrunner
+
+				var jr *jobrunner.JobRunner
+				if jobsEnabled {
+					workers := 4
+					if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.MaxConcurrent > 0 {
+						workers = cfg.Daemon.Jobs.MaxConcurrent
+					}
+
+					execTimeout := 30 * time.Minute
+					if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.DefaultTimeout != "" {
+						if d, err := time.ParseDuration(cfg.Daemon.Jobs.DefaultTimeout); err == nil {
+							execTimeout = d
+						}
+					}
+
+					execConfig := &orchestration.ExecutorConfig{
+						MaxPromptLength: 1000000,
+						Timeout:         execTimeout,
+						RetryCount:      2,
+						Model:           "default",
+					}
+					localRuntime := orchestration.NewLocalRuntime(
+						execConfig,
+						&command.RealExecutor{},
+						&noopStatusUpdater{},
+						orchestration.NewDefaultLogger(),
+					)
+
+					var persistDir string
+					if cfg.Daemon != nil && cfg.Daemon.Jobs != nil && cfg.Daemon.Jobs.PersistDir != "" {
+						persistDir = cfg.Daemon.Jobs.PersistDir
+					}
+					persister := jobrunner.NewPersistenceWithDir(persistDir)
+
+					jr = jobrunner.New(st, localRuntime, workers, persister, tuimuxClient)
+
+					// Synchronously recover persisted sessions into the store BEFORE
+					// adoption. The SessionCollector only populates the session map
+					// once the engine starts (~200 lines below), so without this
+					// adoption would see an empty map and could never read a job's
+					// PtyID to verify its out-of-process PTY survived the upgrade.
+					// Recovery failure must warn-and-continue, never block adoption.
+					//
+					// Scope-filter to this daemon's own scope (same as the collector
+					// seed below): seeding the unfiltered global set here would let
+					// adoption reap another scope's agents as orphans (their PtyIDs
+					// live in a different scoped tuimux), reopening the cross-scope
+					// leak this feature closes.
+					if recovered, rerr := sessions.RecoverSessionsForScope(scope); rerr != nil {
+						ulog.Warn("Synchronous session recovery failed; continuing").Err(rerr).Log(ctx)
+					} else if len(recovered) > 0 {
+						st.ApplyUpdate(store.Update{
+							Type:    store.UpdateSessions,
+							Source:  "boot_recovery",
+							Payload: recovered,
+						})
+					}
+
+					// PHASE 2: Adopt running agents from previous daemon instance
+					jr.AdoptRunningAgents(ctx)
+					go jr.Start(ctx)
+					ulog.Info("JobRunner started").Field("workers", workers).Log(ctx)
+				}
+
+				// Link the JobRunner to the (already-constructed) log streamer.
+				if jr != nil {
+					jr.SetOnJobDetached(streamer.NotifyJobDetached)
+				}
+
+				advanceBoot(2) // environment
+
+				// 4. Setup env manager
+				envManager := daemonenv.NewManager()
+
+				// Restore environment state from disk to prevent port collisions.
+				// Phase 4: walk configured ecosystem base paths directly with
+				// filepath.WalkDir, which bypasses the racy workspace discovery
+				// pass. Newly-created worktrees are guaranteed to be present in
+				// the filesystem before Restore runs (the daemon was just
+				// started after them) but are NOT guaranteed to be present in
+				// workspace.Provider yet (fsnotify + git worktree creation
+				// takes a beat to settle).
+				basePaths := envBasePathsFromConfig(cfg)
+				envManager.Restore(basePaths)
+
+				// Only the global (unscoped) daemon binds :8443 — it owns the
+				// shared *.grove.local proxy table. Scoped daemons inject a
+				// client handle so they RPC their routes over to the global
+				// daemon rather than maintaining their own (conflicting) bind.
+				if scope == "" {
+					go func() {
+						if err := envManager.Proxy.ListenAndServe("127.0.0.1:8443"); err != nil {
+							ulog.Warn("Proxy server stopped").Err(err).Log(context.Background())
+						}
+					}()
+				} else {
+					envManager.SetGlobalClient(daemon.NewGlobalClient())
+				}
+
+				srv.SetEnvManager(envManager)
+				if jr != nil {
+					srv.SetJobRunner(jr)
+				}
+
+				// Dashboard: ephemeral TCP listener, global daemon only. The
+				// port is persisted so `grove env dashboard` can find us without
+				// any discovery protocol. Scoped daemons never serve it.
+				if scope == "" {
+					if dashAddr, err := srv.StartDashboard(ctx); err != nil {
+						ulog.Warn("dashboard server failed to start").Err(err).Log(ctx)
+					} else {
+						ulog.Info("Dashboard listening").
+							Field("url", "http://"+dashAddr+"/dashboard").
+							Log(ctx)
+					}
+				}
+
+				// Wire the out-of-process tuimux client onto the server so PTY
+				// create / input / interrupt route to the standalone tuimux daemon
+				// instead of an embedded in-process manager. PTYs now survive a
+				// `groved upgrade` because the tuimux daemon outlives groved.
+				srv.SetTuimuxClient(tuimuxClient)
+
+				// sendInputToSession delegates to Server.SendSessionInput so the
+				// channels manager and autonomous pinger both benefit from the
+				// mux-aware dispatch (direct treemux PTY write → SSE relay → tmux
+				// fallback).
+				sendInputToSession := func(ctx context.Context, jobID, message string) error {
+					return srv.SendSessionInput(ctx, jobID, message)
+				}
+
+				advanceBoot(3) // channels
+
+				// Initialize channel manager if signal is configured.
+				// Declared at outer scope so the shutdown goroutine can call Stop().
+				var chMgr *daemonchannels.Manager
+				notifyCfg := notifyconfig.Load()
+				if notifyCfg.Signal.Enabled || notifyCfg.HomeAssistant.Enabled {
+					chMgr = daemonchannels.NewManager(st, daemonchannels.SignalConfig{
+						Enabled:     notifyCfg.Signal.Enabled,
+						CLIPath:     notifyCfg.Signal.CLIPath,
+						Account:     notifyCfg.Signal.Account,
+						Allowlist:   notifyCfg.Signal.Allowlist,
+						Groups:      notifyCfg.Signal.Groups,
+						Contacts:    notifyCfg.Signal.ContactsFlat(),
+						NamedGroups: notifyCfg.Signal.NamedGroupsFlat(),
+					}, daemonchannels.HAConfig{
+						Enabled:          notifyCfg.HomeAssistant.Enabled,
+						WebhookPort:      notifyCfg.HomeAssistant.WebhookPort,
+						WebhookSecret:    notifyCfg.HomeAssistant.WebhookSecret,
+						URL:              notifyCfg.HomeAssistant.URL,
+						Token:            notifyCfg.HomeAssistant.Token,
+						DefaultSatellite: notifyCfg.HomeAssistant.DefaultSatellite,
+					}, scope, sockPath)
+					chMgr.SendInput = sendInputToSession
+					// Scoped daemons proxy outbound sends to the global daemon
+					// (which owns signal-cli) and register their sessions in
+					// routing.json so global can forward inbound replies back.
+					if scope != "" {
+						chMgr.SetGlobalClient(daemon.NewGlobalClient())
+					}
+					chMgr.Start(ctx)
+					srv.SetChannelManager(chMgr)
+					ulog.Info("Channel manager initialized").
+						Field("signal", notifyCfg.Signal.Enabled).
+						Field("ha", notifyCfg.HomeAssistant.Enabled).
+						Field("scope", scope).
+						Field("proxy_mode", scope != "").
+						Log(ctx)
+				}
+
+				// Register autonomous pinger as a collector
+				pinger := autonomous.NewPinger(st, "")
+				pinger.SendInput = sendInputToSession
+				eng.Register(pinger)
+
+				// 5. Handle Signals + auto-shutdown
+				stop := make(chan os.Signal, 1)
+				signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+				drain := make(chan os.Signal, 1)
+				// PHASE 2: Listen for SIGUSR1 to trigger drain mode (zero-downtime upgrade)
+				signal.Notify(drain, syscall.SIGUSR1)
+
+				// 5.1 If paired to a parent PID, watch for its death and trigger
+				// the same graceful shutdown pathway as a SIGTERM. This pipes
+				// kernel-level parent-death events into pidfile cleanup, PTY
+				// teardown, and server stop without bypassing any of them.
+				if pairPID > 0 {
+					pairwatch.Watch(cmd.Context(), pairPID, func() {
+						stop <- syscall.SIGTERM
+					})
+				}
+
+				// shutdownReq fires when the TerminalHub idle timer expires
+				// (auto-shutdown mode). Nil if auto-shutdown is disabled.
+				shutdownReq := srv.TerminalHubShutdownReq()
+
+				// sshServer is set later (step 7.7) and closed by the signal handler.
+				var sshServer *daemonssh.Server
+
+				go func() {
+					bgCtx := context.Background()
+					select {
+					case <-stop:
+						ulog.Info("Received stop signal").Field("event", "daemon.stopped").Log(bgCtx)
+					case <-shutdownReq:
+						ulog.Info("Auto-shutdown fired (idle TerminalHub)").Field("event", "daemon.stopped").Log(bgCtx)
+					}
+					// Reap the agent PTYs this daemon owns. With PTYs out-of-process,
+					// a plain stop (this SIGTERM/auto-shutdown path — NOT the SIGUSR1
+					// drain path, which leaves PTYs untouched for upgrade survival)
+					// must explicitly kill them via the tuimux daemon, leaving the
+					// tuimux daemon process itself running (other tools may share it).
+					//
+					// Scope safety: st.GetSessions() only ever contains THIS scope's
+					// sessions — the SessionCollector seeds the store via
+					// RecoverSessionsForScope(scope) and never adopts foreign-scope
+					// records — so this loop can only kill agents owned by this daemon's
+					// scope. That is what closes the cross-scope reaping leak (Gap A).
+					if tuimuxClient != nil {
+						for _, sess := range st.GetSessions() {
+							if sess.PtyID == "" {
+								continue
+							}
+							if err := tuimuxClient.KillPty(sess.PtyID); err != nil {
+								ulog.Warn("Failed to kill agent PTY on stop").
+									Err(err).Field("pty_id", sess.PtyID).Log(bgCtx)
+							}
+						}
+					}
+					// A scoped tuimux is owned by this scoped daemon and has no other
+					// owner once it exits — reap it so it doesn't orphan. The global
+					// (scope == "") tuimux is shared and intended to persist, so we
+					// NEVER stop it. This runs only on the plain-stop path (above);
+					// the SIGUSR1 drain/upgrade path leaves the scoped tuimux running
+					// so the successor re-binds the same socket and live PTYs survive.
+					if scope != "" {
+						if err := tuimux.StopDaemon(tuimuxSock); err != nil {
+							ulog.Warn("Failed to stop scoped tuimux daemon on shutdown").
+								Err(err).Field("socket", tuimuxSock).Log(bgCtx)
+						}
+					}
+					envManager.Shutdown()    // Teardown all running environments and proxy routes
+					streamer.Stop()          // Stop all job log tailing goroutines
+					workspaceStreamer.Stop() // Stop workspace log aggregation
+					if chMgr != nil {
+						// Stop signal-cli daemon subprocess so it doesn't orphan.
+						// A fresh signal-cli is spawned on the next groved boot,
+						// restoring the stdout reader + cross-daemon inbound routing.
+						chMgr.Stop(bgCtx)
+					}
+					if sshServer != nil {
+						_ = sshServer.Stop()
+					}
+					cancel() // Stop the engine
+
+					// Create shutdown context with timeout
+					shutdownCtx, shutdownCancel := context.WithTimeout(bgCtx, 5*time.Second)
+					defer shutdownCancel()
+
+					if err := srv.Shutdown(shutdownCtx); err != nil {
+						ulog.Error("Server shutdown error").Err(err).Log(bgCtx)
+					}
+
+					// Explicitly release pidfile before exit in signal handler
+					_ = pidfile.Release(pidPath)
+					os.Exit(0)
+				}()
+
+				// PHASE 2: Handle SIGUSR1 for graceful drain (zero-downtime upgrade)
+				go func() {
+					bgCtx := context.Background()
+					<-drain
+					ulog.Info("Received SIGUSR1 - entering drain mode").Log(bgCtx)
+					srv.EnterDrainMode(bgCtx)
+				}()
+
+				// 5.5. Start inline monitor early so it captures all events from boot
+				if monitor, _ := cmd.Flags().GetBool("monitor"); monitor {
+					monitorFormat, _ := cmd.Flags().GetString("monitor-format")
+					monitorCompact, _ := cmd.Flags().GetBool("monitor-compact")
+					go runInlineMonitor(ctx, st, monitorFormat, monitorCompact)
+				}
+
+				advanceBoot(4) // engine
+
+				// 6. Start Engine in background
+				go eng.Start(ctx)
+
+				// 7. Start ConfigWatcher if enabled
+				if configWatchEnabled(cfg) {
+					debounceMs := configDebounceMs(cfg)
+					// Track the resolved global tui.theme across reloads so a
+					// dedicated theme_changed event (with the resolved palette)
+					// fires only when the theme actually changes. The callback
+					// runs on the watcher's single goroutine, so lastTheme
+					// needs no locking.
+					lastTheme := theming.CurrentThemeName()
+					configWatcher, err := daemon.NewConfigWatcher(debounceMs, func(file string) {
+						// Broadcast config reload event to all subscribers
+						st.BroadcastConfigReload(file)
+
+						// Diff the resolved theme and broadcast on change.
+						themeName := theming.CurrentThemeName()
+						if themeName == lastTheme {
+							return
+						}
+						lastTheme = themeName
+						if payload, ok := theming.BuildPayload(themeName); ok {
+							st.BroadcastThemeChanged(themeName, payload)
+							ulog.Info("Theme changed, broadcasting").
+								Field("theme", themeName).Log(ctx)
+						} else {
+							ulog.Warn("Configured theme not found in registry, skipping theme broadcast").
+								Field("theme", themeName).Log(ctx)
+						}
+					})
+					if err != nil {
+						ulog.Warn("Failed to start config watcher, continuing without it").Err(err).Log(ctx)
+					} else {
+						ulog.Info("Config watcher started").Log(ctx)
+						go configWatcher.Start(ctx)
+					}
+				}
+
+				advanceBoot(5) // watchers
+
+				// 7.5. Start UnifiedWatcher with registered domain handlers
+				unifiedWatcher, err := watcher.NewUnifiedWatcher(st, 100*time.Millisecond)
+				if err != nil {
+					ulog.Warn("Failed to start unified watcher, continuing without it").Err(err).Log(ctx)
+				} else {
+					// Register SkillHandler if auto-sync is enabled
+					autoSync := true
+					if cfg.Daemon != nil && cfg.Daemon.AutoSyncSkills != nil {
+						autoSync = *cfg.Daemon.AutoSyncSkills
+					}
+
+					if autoSync {
+						debounceMs := 1000
+						if cfg.Daemon != nil && cfg.Daemon.SkillSyncDebounceMs > 0 {
+							debounceMs = cfg.Daemon.SkillSyncDebounceMs
+						}
+
+						skillHandler, err := watcher.NewSkillHandler(st, cfg, debounceMs)
+						if err != nil {
+							ulog.Warn("Failed to initialize skill handler").Err(err).Log(ctx)
+						} else {
+							unifiedWatcher.Register(skillHandler)
+							ulog.Info("Skill handler registered with unified watcher").Log(ctx)
+						}
+					}
+
+					// Register SettingsHandler to reconcile .claude settings if enabled
+					autoSyncClaudeSettings := true
+					if cfg.Daemon != nil && cfg.Daemon.AutoSyncClaudeSettings != nil {
+						autoSyncClaudeSettings = *cfg.Daemon.AutoSyncClaudeSettings
+					}
+
+					if autoSyncClaudeSettings {
+						debounceMs := 1000
+						if cfg.Daemon != nil && cfg.Daemon.SkillSyncDebounceMs > 0 {
+							debounceMs = cfg.Daemon.SkillSyncDebounceMs
+						}
+
+						settingsHandler, err := watcher.NewSettingsHandler(st, cfg, debounceMs)
+						if err != nil {
+							ulog.Warn("Failed to initialize Claude settings handler").Err(err).Log(ctx)
+						} else {
+							unifiedWatcher.Register(settingsHandler)
+							ulog.Info("Claude settings handler registered with unified watcher").Log(ctx)
+						}
+					}
+
+					// Register WorkspaceHandler for instant discovery on fs changes
+					if isEnabled("workspace") {
+						workspaceHandler := watcher.NewWorkspaceHandler(st, cfg, 2000)
+						unifiedWatcher.Register(workspaceHandler)
+						ulog.Info("Workspace handler registered with unified watcher").Log(ctx)
+					}
+
+					// Register GitHandler for subsecond-fresh git status on the
+					// focused workspace set. It watches .git internals (HEAD, index,
+					// refs/heads, refs/remotes) and emits a WorkspaceDelta on change;
+					// the timer-driven GitStatusCollector remains the background
+					// fallback for unfocused workspaces.
+					if isEnabled("git") {
+						gitHandler := watcher.NewGitHandler(st, 150)
+						unifiedWatcher.Register(gitHandler)
+						ulog.Info("Git handler registered with unified watcher").Log(ctx)
+					}
+
+					// Register FlowHandler for plan directory watching
+					if isEnabled("plan") {
+						flowHandler := watcher.NewFlowHandler(st, cfg, 2000)
+						unifiedWatcher.Register(flowHandler)
+						ulog.Info("Flow handler registered with unified watcher").Log(ctx)
+					}
+
+					// Register NoteHandler for note directory watching
+					if isEnabled("note") {
+						noteHandler := watcher.NewNoteHandler(st, cfg, 3000)
+						unifiedWatcher.Register(noteHandler)
+						ulog.Info("Note handler registered with unified watcher").Log(ctx)
+					}
+
+					// Register NavHandler for nav keymap state (sessions.yml) watching
+					navHandler := watcher.NewNavHandler(st)
+					unifiedWatcher.Register(navHandler)
+					ulog.Info("Nav handler registered with unified watcher").Log(ctx)
+
+					// Register MemoryHandler for auto-indexing content.
+					// Only the global daemon owns the SQLite DB and embedder; scoped
+					// daemons proxy /api/memory/* to global via server-side forwarding.
+					if scope == "" {
+						dbPath, err := pathutil.Expand("~/.local/share/grove/memory/memory.db")
+						if err == nil {
+							memStore, err := memory.Open(dbPath, 3072) // gemini-embedding-001 outputs 3072 dimensions
+							if err != nil {
+								ulog.Warn("Failed to initialize memory store, indexing disabled").Err(err).Log(ctx)
+							} else {
+								// The embedder is optional: without a Gemini client the
+								// memory store still indexes and serves FTS (keyword)
+								// search; only semantic (vector) search is unavailable.
+								// Use grove-gemini's config resolver (secrets.toml, env var, api_key_command)
+								var embedder memory.Embedder
+								geminiClient, err := gemini.NewClient(ctx, "")
+								if err != nil {
+									ulog.Warn("Failed to initialize Gemini client, memory will run without semantic search").Err(err).Log(ctx)
+								} else {
+									embedder = memory.NewGeminiEmbedder(geminiClient, gemini.DefaultEmbeddingModel)
+								}
+
+								memoryHandler := watcher.NewMemoryHandler(st, cfg, memStore, embedder, 5000)
+								unifiedWatcher.Register(memoryHandler)
+								ulog.Info("Memory handler registered with unified watcher").
+									Field("fts_enabled", true).
+									Field("semantic_available", embedder != nil).
+									Log(ctx)
+
+								// Share the same store + embedder (possibly nil) with the
+								// HTTP server so /api/memory/* handlers can serve TUI
+								// clients without opening a second SQLite connection.
+								srv.SetMemoryStore(memStore, embedder, dbPath)
+							}
+						}
+					}
+
+					// Register SyncHandler for notebook sync change capture.
+					// DARK BY DEFAULT: it registers only when a sync config with
+					// workspace subscriptions exists (~/.config/grove/sync.toml),
+					// which Phase 0 ships no enable-path for — without it, no
+					// watcher, no sync.db, zero behavior change. Like memory.db,
+					// sync.db is owned by the global daemon only; scoped daemons
+					// proxy /api/sync/* to global.
+					if scope == "" {
+						if syncCfg, err := config.LoadSyncConfig(); err != nil {
+							ulog.Warn("Failed to load sync config, sync disabled").Err(err).Log(ctx)
+						} else if syncCfg != nil && len(syncCfg.Workspaces) > 0 {
+							syncDB, err := syncdb.Open(syncdb.DefaultDBPath())
+							if err != nil {
+								ulog.Warn("Failed to open sync database, sync disabled").Err(err).Log(ctx)
+							} else {
+								syncHandler := watcher.NewSyncHandler(st, cfg, syncCfg, syncDB, 0, 0)
+								unifiedWatcher.Register(syncHandler)
+								srv.SetSyncDB(syncDB)
+								ulog.Info("Sync handler registered with unified watcher").
+									Field("workspaces", len(syncCfg.Workspaces)).
+									Field("origin_id", syncDB.OriginID()).
+									Log(ctx)
+							}
+						}
+					}
+
+					ulog.Info("Unified watcher started").Log(ctx)
+					go unifiedWatcher.Start(ctx)
+				}
+
+				// 7.6. Log retention janitor: sweep dated *.log files older than the
+				// configured retention out of the state logs dir, on start and then
+				// every 24h. Judged by filename date (fallback ModTime); today's
+				// file is never touched.
+				logCfg := grovelogging.GetDefaultLoggingConfig()
+				if uerr := cfg.UnmarshalExtension("logging", &logCfg); uerr != nil {
+					ulog.Debug("Failed to parse logging config for retention janitor, using defaults").Err(uerr).Log(ctx)
+				}
+				retentionDays := logCfg.File.RetentionDays
+				if retentionDays <= 0 {
+					retentionDays = 14
+				}
+				go runLogRetentionJanitor(ctx, ulog, retentionDays)
+
+				advanceBoot(6) // ssh
+
+				// 7.7. Start SSH server if enabled
+				var sshCfg *config.DaemonSSHConfig
+				if cfg.Daemon != nil {
+					sshCfg = cfg.Daemon.SSH
+				}
+				if s, err := daemonssh.New(sshCfg); err != nil {
+					ulog.Warn("Failed to start SSH server").Err(err).Log(ctx)
+				} else if s != nil {
+					s.SetStore(st)
+					// PTYs are now owned out-of-process by the tuimux daemon; the
+					// SSH server's in-process ptyManager listing is left nil (its
+					// daemon-owned-PTY paths are nil-guarded and become no-ops).
+					sshServer = s
+					go func() {
+						if err := sshServer.Start(); err != nil {
+							ulog.Warn("SSH server stopped").Err(err).Log(context.Background())
+						}
+					}()
+				}
+
+				// Boot complete: report Done so GET /api/system/boot and the
+				// boot_phase stream flip a waiting splash out of its loading
+				// state.
+				if earlyBind {
+					done := &daemon.BootStatus{Done: true, PhaseIndex: len(bootPhases), PhaseTotal: len(bootPhases)}
+					srv.SetBootStatus(done)
+					st.BroadcastBootPhase(done)
+				}
+			} // end runBoot
+
+			// 8. Start Server.
+			httpPort, _ := cmd.Flags().GetInt("http-port")
+			ulog.Info("Starting daemon").Field("event", "daemon.started").Field("pid", os.Getpid()).Log(ctx)
+
+			if earlyBind {
+				// Bind first so the spawning client unblocks in milliseconds,
+				// seed an in-progress BootStatus, run the slow boot steps in the
+				// background, then serve. The socket is dialable the instant
+				// Listen returns; requests queue in the kernel accept backlog
+				// until Serve begins accepting.
+				srv.SetBootStatus(&daemon.BootStatus{PhaseTotal: len(bootPhases)})
+				if err := srv.Listen(sockPath, httpPort); err != nil {
+					return fmt.Errorf("server error: %w", err)
+				}
+				go runBoot()
+				if err := srv.Serve(); err != nil {
+					return fmt.Errorf("server error: %w", err)
+				}
+				return nil
+			}
+
+			// Default (--ready-at=boot): preserve the historical fully
+			// synchronous bind-last ordering — every boot step finishes before
+			// the socket binds, so no client ever observes a booting daemon.
+			runBoot()
 			if err := srv.ListenAndServe(sockPath, httpPort); err != nil {
 				return fmt.Errorf("server error: %w", err)
 			}
@@ -990,6 +1067,7 @@ func newGrovedStartCmd() *cobra.Command {
 	cmd.Flags().Bool("auto-shutdown", false, "Exit after 2m with no terminal WebSocket clients connected")
 	cmd.Flags().Int("pair-with-pid", 0, "Shut down when this parent PID exits (0 disables pairing)")
 	cmd.Flags().Int("ready-fd", 0, "Close this inherited file descriptor once the socket is bound (0 disables readiness signaling)")
+	cmd.Flags().String("ready-at", "boot", "When to consider the daemon ready: 'boot' (default) binds the socket last, after every boot step (historical ordering); 'bind' binds early and streams boot progress while the slow steps run in the background")
 
 	return cmd
 }
