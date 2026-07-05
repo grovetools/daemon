@@ -308,12 +308,11 @@ func (h *SettingsHandler) reconcile(filterWorkspacePath string) {
 		// the ecosystem root reading a stale settings.local.json.
 		seedable := node.IsWorktree() || node.Kind == workspace.KindEcosystemRoot
 		if !seedable {
+			// Non-seedable nodes are the common case (~38 of ~200 every
+			// reconcile); a per-node line here re-creates the very per-tick
+			// flood this handler was rewritten to avoid. The count lands in
+			// the reconcile-complete summary's "skipped" field instead.
 			skipped++
-			h.ulog.Debug("Skipping non-seedable node during Claude settings reconcile").
-				Field("path", node.Path).
-				Field("kind", string(node.Kind)).
-				Field("is_worktree", node.IsWorktree()).
-				Log(ctx)
 			continue
 		}
 		if filterWorkspacePath != "" && !worktreeBelongsTo(node, filterWorkspacePath) {
