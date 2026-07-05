@@ -258,6 +258,7 @@ type SessionTokenUpdate struct {
 	LiveTokens  int64   `json:"live_tokens"`
 	LiveCostUSD float64 `json:"live_cost_usd"`
 	ContextSize int64   `json:"context_size"`
+	Model       string  `json:"model,omitempty"`
 }
 
 // SessionTokensPayload batches live token updates for one or more sessions.

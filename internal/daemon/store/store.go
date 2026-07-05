@@ -561,6 +561,7 @@ func (s *Store) applySessionTokens(payload *SessionTokensPayload) {
 		session.LiveTokens = u.LiveTokens
 		session.LiveCostUSD = u.LiveCostUSD
 		session.ContextSize = u.ContextSize
+		session.Model = u.Model
 	}
 }
 

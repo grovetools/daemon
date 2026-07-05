@@ -160,3 +160,120 @@ func TestRefreshLiveTokens_SkipsNonAgents(t *testing.T) {
 		t.Error("completed session classified as live agent")
 	}
 }
+
+// TestIsLiveAgentSession_NonClaude verifies the relaxed gate: a non-claude
+// provider qualifies a session even without a ClaudeSessionID (opencode
+// registers with neither an ID nor a transcript path), while provider-less
+// shells stay excluded.
+func TestIsLiveAgentSession_NonClaude(t *testing.T) {
+	cases := []struct {
+		name string
+		s    *models.Session
+		want bool
+	}{
+		{"opencode running, no ids", &models.Session{Provider: "opencode", Status: "running"}, true},
+		{"codex running, no ids", &models.Session{Provider: "codex", Status: "running"}, true},
+		{"plain shell, all empty", &models.Session{Status: "running"}, false},
+		{"claude provider, no session id", &models.Session{Provider: "claude", Status: "running"}, false},
+		{"transcript path only", &models.Session{TranscriptPath: "/t.jsonl", Status: "running"}, true},
+		{"non-claude but completed", &models.Session{Provider: "codex", Status: "completed"}, false},
+		{"nil session", nil, false},
+	}
+	for _, tc := range cases {
+		if got := isLiveAgentSession(tc.s); got != tc.want {
+			t.Errorf("%s: isLiveAgentSession = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// writeCodexTranscript writes a minimal codex rollout fixture: session_meta,
+// a turn_context naming the model, and one cumulative token_count event.
+func writeCodexTranscript(t *testing.T, path, model string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := `{"timestamp":"2026-07-01T10:00:00.000Z","type":"session_meta","payload":{"id":"5973b6c0-94b8-487b-a530-2aeb6098ae0e","cwd":"/Users/test/project"}}
+{"timestamp":"2026-07-01T10:00:01.000Z","type":"turn_context","payload":{"model":"` + model + `"}}
+{"timestamp":"2026-07-01T10:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1200,"cached_input_tokens":1000,"output_tokens":150,"reasoning_output_tokens":40,"total_tokens":1350},"last_token_usage":{"input_tokens":1200,"cached_input_tokens":1000,"output_tokens":150,"reasoning_output_tokens":40,"total_tokens":1350},"model_context_window":272000},"rate_limits":null}}
+`
+	if err := os.WriteFile(path, []byte(lines), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSummarizeLiveSession_ProviderBranch verifies the collector's provider
+// branch: claude sessions summarize via slug-dir discovery, non-claude
+// sessions via the provider-routed single-transcript summarizer — and the
+// extracted model rides the SessionTokenUpdate into the store.
+func TestSummarizeLiveSession_ProviderBranch(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", root)
+
+	c := NewSessionCollector(2*time.Second, "")
+
+	// Claude branch: model comes from the transcript's assistant line.
+	sid := "agent-session-3"
+	claudeTranscript := filepath.Join(root, "projects", "-Users-me-proj3", sid+".jsonl")
+	writeTokenTranscript(t, claudeTranscript, sid, 500, 80)
+	claudeSess := &models.Session{ID: "job-claude", Status: "running", ClaudeSessionID: sid, TranscriptPath: claudeTranscript}
+
+	summary, usedPath, err := c.summarizeLiveSession(claudeSess)
+	if err != nil {
+		t.Fatalf("summarizeLiveSession(claude): %v", err)
+	}
+	if usedPath != claudeTranscript {
+		t.Errorf("claude usedPath = %q, want %q", usedPath, claudeTranscript)
+	}
+	if len(summary.ModelBreakdown) == 0 || summary.ModelBreakdown[0].Model != "claude-opus-4-5" {
+		t.Errorf("claude ModelBreakdown = %+v, want [0].Model = claude-opus-4-5", summary.ModelBreakdown)
+	}
+
+	// Codex branch: provider-routed transcript summarizer, model from
+	// turn_context.
+	codexTranscript := filepath.Join(root, "codex-sessions", "rollout-2026-07-01T10-00-00-5973b6c0-94b8-487b-a530-2aeb6098ae0e.jsonl")
+	writeCodexTranscript(t, codexTranscript, "gpt-5.5")
+	codexSess := &models.Session{ID: "job-codex", Status: "running", Provider: "codex", ClaudeSessionID: "native-codex-id", TranscriptPath: codexTranscript}
+
+	summary, usedPath, err = c.summarizeLiveSession(codexSess)
+	if err != nil {
+		t.Fatalf("summarizeLiveSession(codex): %v", err)
+	}
+	if usedPath != codexTranscript {
+		t.Errorf("codex usedPath = %q, want %q", usedPath, codexTranscript)
+	}
+	if len(summary.ModelBreakdown) == 0 || summary.ModelBreakdown[0].Model != "gpt-5.5" {
+		t.Fatalf("codex ModelBreakdown = %+v, want [0].Model = gpt-5.5", summary.ModelBreakdown)
+	}
+
+	// End-to-end: refreshLiveTokens emits Model and the store applies it.
+	st := store.New()
+	st.ApplyUpdate(store.Update{
+		Type:    store.UpdateSessions,
+		Source:  "test",
+		Payload: []*models.Session{codexSess},
+	})
+
+	updates := make(chan store.Update, 4)
+	c.refreshLiveTokens(context.Background(), []*models.Session{codexSess}, updates)
+	select {
+	case u := <-updates:
+		payload, ok := u.Payload.(*store.SessionTokensPayload)
+		if !ok || len(payload.Updates) != 1 {
+			t.Fatalf("payload = %#v, want 1 SessionTokenUpdate", u.Payload)
+		}
+		if payload.Updates[0].Model != "gpt-5.5" {
+			t.Errorf("update Model = %q, want gpt-5.5", payload.Updates[0].Model)
+		}
+		st.ApplyUpdate(u)
+		got := st.GetSession("job-codex")
+		if got == nil {
+			t.Fatal("session job-codex missing from store")
+		}
+		if got.Model != "gpt-5.5" {
+			t.Errorf("store session Model = %q, want gpt-5.5", got.Model)
+		}
+	default:
+		t.Fatal("refreshLiveTokens emitted no update for a live codex session")
+	}
+}

@@ -2,9 +2,12 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strings"
 	"time"
 
+	aglogsession "github.com/grovetools/agentlogs/pkg/sessioninfo"
 	"github.com/grovetools/agentlogs/pkg/usage"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
@@ -35,6 +38,13 @@ const (
 	// this often — never on every 2s liveness tick — mirroring flow's
 	// runningTokenRefreshInterval (flow/pkg/tui/status/token_pane.go).
 	liveTokenRefreshInterval = 4 * time.Second
+
+	// transcriptResolveRetryInterval is the negative-cache window for non-claude
+	// transcript resolution: a session whose transcript could not be resolved is
+	// not re-resolved more often than this, so a transcript-less live session
+	// (e.g. opencode before its plugin registers one) never hammers the resolver
+	// on every refresh tick.
+	transcriptResolveRetryInterval = 30 * time.Second
 )
 
 // liveTokenSummary caches the last-computed token snapshot for one session,
@@ -46,6 +56,13 @@ type liveTokenSummary struct {
 	tokens  int64
 	cost    float64
 	ctxSize int64
+	model   string
+	// resolvedTranscript caches the transcript path found by
+	// aglogsession.Resolve for a non-claude session that registered without one;
+	// lastResolveAttempt is the matching negative cache (see
+	// transcriptResolveRetryInterval).
+	resolvedTranscript string
+	lastResolveAttempt time.Time
 }
 
 // pidLiveness is per-session reaper bookkeeping carried across poll ticks.
@@ -304,12 +321,25 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 	}
 }
 
-// isLiveAgentSession reports whether a session is a live Claude agent worth
-// summarizing: it must be active (running/idle/pending_user) and carry a
-// ClaudeSessionID (the marker of a Claude transcript — plain shells never have
-// one). Completed/failed sessions and non-agent shells are skipped.
+// isNonClaudeProvider reports whether a session-registry provider value
+// denotes a non-Claude agent CLI (codex/pi/opencode). Empty means Claude:
+// older records omit the provider, and only Claude runs predate the field
+// (inverse of flow's isClaudeSessionProvider).
+func isNonClaudeProvider(provider string) bool {
+	return provider != "" && !strings.HasPrefix(provider, "claude")
+}
+
+// isLiveAgentSession reports whether a session is a live agent worth
+// summarizing: it must be active (running/idle/pending_user) and identify an
+// agent transcript — a ClaudeSessionID (Claude), an explicit TranscriptPath,
+// or a non-claude provider whose transcript is resolvable by job ID (opencode
+// registers with neither an ID nor a path). Plain shells carry none of the
+// three and are skipped, as are completed/failed sessions.
 func isLiveAgentSession(s *models.Session) bool {
-	if s == nil || s.ClaudeSessionID == "" {
+	if s == nil {
+		return false
+	}
+	if s.ClaudeSessionID == "" && s.TranscriptPath == "" && !isNonClaudeProvider(s.Provider) {
 		return false
 	}
 	switch s.Status {
@@ -351,21 +381,34 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 		}
 		live[s.ID] = struct{}{}
 
-		mtime := transcriptMtime(s.TranscriptPath)
+		// The transcript we expect to summarize: the registered path, else the
+		// path a previous refresh resolved for a non-claude session.
+		knownPath := s.TranscriptPath
+		if knownPath == "" {
+			knownPath = c.tokenCache[s.ID].resolvedTranscript
+		}
+		mtime := transcriptMtime(knownPath)
 		if cached, ok := c.tokenCache[s.ID]; ok && !mtime.IsZero() && mtime.Equal(cached.mtime) {
 			// Transcript unchanged since the last summary; already applied.
 			continue
 		}
 
-		slugDirs := usage.SlugDirsForSession(s.ClaudeSessionID, s.TranscriptPath)
-		summary, err := usage.SummarizeSession(slugDirs, s.ClaudeSessionID, usage.CostModeCalculate)
+		summary, usedPath, err := c.summarizeLiveSession(s)
 		if err != nil {
-			c.ulog.Debug("Failed to summarize live token usage").
-				Field("job_id", s.ID).
-				Field("claude_session_id", s.ClaudeSessionID).
-				Err(err).
-				Log(ctx)
+			if !errors.Is(err, errResolveThrottled) {
+				c.ulog.Debug("Failed to summarize live token usage").
+					Field("job_id", s.ID).
+					Field("provider", s.Provider).
+					Field("claude_session_id", s.ClaudeSessionID).
+					Err(err).
+					Log(ctx)
+			}
 			continue
+		}
+		if usedPath != knownPath {
+			// A fresh resolution found the transcript this tick; stat the real
+			// path so the next refresh's mtime comparison is meaningful.
+			mtime = transcriptMtime(usedPath)
 		}
 
 		// LiveTokens is the context-preferred magnitude: the peak single-turn
@@ -376,17 +419,28 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 			liveTokens = summary.Usage.Total()
 		}
 
-		entry := liveTokenSummary{
-			mtime:   mtime,
-			tokens:  liveTokens,
-			cost:    summary.CostUSD,
-			ctxSize: summary.ContextSize,
+		// The cost-dominant model: summarize sorts ModelBreakdown by cost
+		// descending, so index 0 is the model that did the session's real work.
+		model := ""
+		if len(summary.ModelBreakdown) > 0 {
+			model = summary.ModelBreakdown[0].Model
 		}
 
+		// Re-read after summarizeLiveSession: it stores resolution state
+		// (resolvedTranscript/lastResolveAttempt) that the new entry must keep.
 		prev, existed := c.tokenCache[s.ID]
+		entry := liveTokenSummary{
+			mtime:              mtime,
+			tokens:             liveTokens,
+			cost:               summary.CostUSD,
+			ctxSize:            summary.ContextSize,
+			model:              model,
+			resolvedTranscript: prev.resolvedTranscript,
+			lastResolveAttempt: prev.lastResolveAttempt,
+		}
 		c.tokenCache[s.ID] = entry
 		// Skip the broadcast when only the mtime moved but the numbers held.
-		if existed && prev.tokens == entry.tokens && prev.cost == entry.cost && prev.ctxSize == entry.ctxSize {
+		if existed && prev.tokens == entry.tokens && prev.cost == entry.cost && prev.ctxSize == entry.ctxSize && prev.model == entry.model {
 			continue
 		}
 
@@ -395,6 +449,7 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 			LiveTokens:  liveTokens,
 			LiveCostUSD: summary.CostUSD,
 			ContextSize: summary.ContextSize,
+			Model:       model,
 		})
 	}
 
@@ -413,4 +468,53 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 			Payload: &store.SessionTokensPayload{Updates: tokenUpdates},
 		}
 	}
+}
+
+// errResolveThrottled marks a non-claude session whose transcript resolution
+// failed recently enough that this refresh skips it (negative cache) — an
+// expected wait state, not a failure worth logging every tick.
+var errResolveThrottled = errors.New("transcript resolution throttled")
+
+// summarizeLiveSession computes one live session's usage summary, branched on
+// provider. Claude sessions go through slug-dir discovery (subagent-inclusive,
+// as before); non-claude sessions summarize their single transcript via the
+// provider-routed agentlogs summarizer, resolving the transcript by job ID
+// when the registration lacked a path (caching the resolved path and applying
+// the negative cache on failure). The second return is the transcript path
+// actually used, for the caller's mtime bookkeeping.
+func (c *SessionCollector) summarizeLiveSession(s *models.Session) (usage.Summary, string, error) {
+	if !isNonClaudeProvider(s.Provider) {
+		slugDirs := usage.SlugDirsForSession(s.ClaudeSessionID, s.TranscriptPath)
+		summary, err := usage.SummarizeSession(slugDirs, s.ClaudeSessionID, usage.CostModeCalculate)
+		return summary, s.TranscriptPath, err
+	}
+
+	provider := s.Provider
+	path := s.TranscriptPath
+	if path == "" {
+		cached := c.tokenCache[s.ID]
+		path = cached.resolvedTranscript
+		if path == "" {
+			if time.Since(cached.lastResolveAttempt) < transcriptResolveRetryInterval {
+				return usage.Summary{}, "", errResolveThrottled
+			}
+			cached.lastResolveAttempt = time.Now()
+			c.tokenCache[s.ID] = cached
+			info, err := aglogsession.Resolve(s.ID)
+			if err != nil {
+				return usage.Summary{}, "", err
+			}
+			if info.LogFilePath == "" {
+				return usage.Summary{}, "", errors.New("session resolved without a transcript path")
+			}
+			path = info.LogFilePath
+			if info.Provider != "" {
+				provider = info.Provider
+			}
+			cached.resolvedTranscript = path
+			c.tokenCache[s.ID] = cached
+		}
+	}
+	summary, err := usage.SummarizeSessionTranscript(path, provider, usage.CostModeCalculate)
+	return summary, path, err
 }
