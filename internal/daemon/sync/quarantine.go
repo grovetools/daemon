@@ -16,6 +16,7 @@ var secretPatterns = []struct {
 	{"aws access key id", regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)},
 	{"slack token", regexp.MustCompile(`xox[baprs]-[0-9A-Za-z-]{10,}`)},
 	{"openai project key", regexp.MustCompile(`sk-proj-[A-Za-z0-9_-]{20,}`)},
+	{"openrouter key", regexp.MustCompile(`sk-or-v1-[A-Za-z0-9]{20,}`)},
 	{"anthropic key", regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`)},
 }
 
