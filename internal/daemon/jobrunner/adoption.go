@@ -15,6 +15,7 @@ import (
 
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/flow/pkg/orchestration"
 	tuimux "github.com/grovetools/tuimux/api/client"
 	tuimuxpty "github.com/grovetools/tuimux/pty"
 )
@@ -87,6 +88,16 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 
 	for _, job := range jobs {
 		if job.Status != "running" {
+			// Already-stranded headless jobs (A4): the JobInfo is already
+			// terminal (a prior boot reconciled it, or it pre-dates the
+			// finalize fix), but the job-file frontmatter may still sit at
+			// running/idle — the exact strand this feature fixes.
+			// FinalizeHeadlessJob re-reads frontmatter from disk and no-ops if
+			// it is already terminal, so this is safe to call unconditionally
+			// for headless jobs and converts pre-fix strands at the next boot.
+			if job.Type == models.JobType("headless_agent") {
+				jr.finalizeHeadlessFrontmatter(ctx, job)
+			}
 			continue
 		}
 
@@ -184,6 +195,10 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 				Field("pid", job.PID).
 				Field("status", job.Status).
 				Log(ctx)
+			// markDone-equivalent above owns JobInfo; the finalizer owns
+			// frontmatter. For headless jobs, drive the job-file frontmatter to
+			// the same terminal state from the same .status.
+			jr.finalizeHeadlessFrontmatter(ctx, job)
 			continue
 		}
 
@@ -355,6 +370,11 @@ func (jr *JobRunner) adoptedPIDPoller(ctx context.Context, job *models.JobInfo) 
 					jr.markDone(job, "failed", "agent process exited without status file")
 				}
 
+				// markDone owns JobInfo; the finalizer owns frontmatter. For
+				// headless jobs, drive the job-file frontmatter to the same
+				// terminal state from the same .status.
+				jr.finalizeHeadlessFrontmatter(ctx, job)
+
 				jr.ulog.Info("Adoption poller: process exited").
 					Field("job_id", job.ID).
 					Field("pid", job.PID).
@@ -370,6 +390,50 @@ func (jr *JobRunner) adoptedPIDPoller(ctx context.Context, job *models.JobInfo) 
 // Format: .artifacts/<job-id>/.status
 func (jr *JobRunner) getStatusFilePath(job *models.JobInfo) string {
 	return filepath.Join(job.PlanDir, ".artifacts", job.ID, ".status")
+}
+
+// finalizeHeadlessFrontmatter reconciles a headless job's job-file frontmatter
+// to a terminal status via flow's FinalizeHeadlessJob. Adoption's markDone owns
+// the daemon-side JobInfo; this owns the frontmatter side (they read the same
+// .status so they never diverge). No-op for non-headless jobs.
+// FinalizeHeadlessJob re-reads the frontmatter from disk and is idempotent, so
+// this is safe to call from every adoption branch.
+func (jr *JobRunner) finalizeHeadlessFrontmatter(ctx context.Context, job *models.JobInfo) {
+	if job == nil || job.Type != models.JobType("headless_agent") {
+		return
+	}
+
+	plan, err := orchestration.LoadPlan(job.PlanDir)
+	if err != nil {
+		jr.ulog.Warn("Adoption: failed to load plan for headless finalize").
+			Field("job_id", job.ID).
+			Field("plan_dir", job.PlanDir).
+			Err(err).
+			Log(ctx)
+		return
+	}
+
+	fjob, found := plan.GetJobByFilename(job.JobFile)
+	if !found {
+		jr.ulog.Warn("Adoption: headless job not found in plan for finalize").
+			Field("job_id", job.ID).
+			Field("job_file", job.JobFile).
+			Log(ctx)
+		return
+	}
+
+	if err := orchestration.FinalizeHeadlessJob(fjob, plan); err != nil {
+		jr.ulog.Warn("Adoption: FinalizeHeadlessJob failed").
+			Field("job_id", job.ID).
+			Err(err).
+			Log(ctx)
+		return
+	}
+
+	jr.ulog.Info("Adoption: finalized headless job frontmatter").
+		Field("job_id", job.ID).
+		Field("status", fjob.Status).
+		Log(ctx)
 }
 
 // readStatusFile reads and parses a .status file written by an agent.
