@@ -2253,7 +2253,14 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 	// these as triggers and reconcile via GET /api/workflows.
 	case store.UpdateWorkflowRunDiscovered, store.UpdateWorkflowAgentStarted,
 		store.UpdateWorkflowAgentCompleted, store.UpdateWorkflowRunStale,
-		store.UpdateWorkflowRunCompleted:
+		store.UpdateWorkflowRunCompleted, store.UpdateWorkflowChildrenSnapshot,
+		store.UpdateWorkflowBashStarted:
+		// UpdateWorkflowChildrenSnapshot / UpdateWorkflowBashStarted are kept on
+		// the wire for consumers that reconcile on workflow frames (web viewer).
+		// treemux does NOT read these frames: it surfaces the resulting
+		// Session.LiveChildren / Session.Subagents via the full /api/sessions list
+		// it re-fetches on the next "session" lifecycle frame (the identical
+		// delivery path LiveTokens uses — see the R1 trace).
 		return &apiStateUpdate{
 			UpdateType: string(u.Type),
 			Source:     u.Source,

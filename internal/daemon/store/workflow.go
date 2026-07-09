@@ -41,6 +41,10 @@ func UpdateTypeForWorkflowKind(k models.WorkflowKind) (UpdateType, bool) {
 		return UpdateWorkflowRunStale, true
 	case models.WorkflowRunCompleted:
 		return UpdateWorkflowRunCompleted, true
+	case models.WorkflowChildrenSnapshot:
+		return UpdateWorkflowChildrenSnapshot, true
+	case models.WorkflowBashStarted:
+		return UpdateWorkflowBashStarted, true
 	}
 	return "", false
 }
@@ -100,6 +104,32 @@ func (s *Store) applyWorkflowEvent(p *WorkflowEventPayload, persist bool) {
 	}
 
 	switch ev.Kind {
+	case models.WorkflowChildrenSnapshot:
+		// A session-level live-background-child count, not a per-agent
+		// lifecycle delta: write ev.LiveChildren onto the owning session and
+		// return BEFORE the persist block below. Snapshot counts must never be
+		// journaled — a stale nonzero count replayed by loadPersistedWorkflowEvents
+		// at boot would fake idle-busy.
+		s.applyChildrenSnapshot(ev)
+		// A hook-sourced snapshot's background_tasks[] view is the authoritative
+		// live set of background bash jobs; reconcile it into the bash-child
+		// bookkeeping (start new, clear absent). Daemon-derived snapshots
+		// (Source=="") carry no bash view and never touch it.
+		if ev.Source == models.WorkflowSourceHooks {
+			s.reconcileBashChildren(ev)
+		}
+		return
+
+	case models.WorkflowBashStarted:
+		// A background bash spawn (PostToolUse backgroundTaskId). Additive only —
+		// it starts/refreshes one bash child and never clears others. Ephemeral:
+		// return BEFORE the persist block (a replayed start would fake liveness).
+		if ev.AgentID == "" {
+			return
+		}
+		s.applyBashStarted(ev)
+		return
+
 	case models.WorkflowRunDiscovered:
 		if ev.RunID == "" {
 			return
@@ -243,6 +273,15 @@ func (s *Store) applyWorkflowAgentEvent(ev models.WorkflowEvent) bool {
 	}
 
 	s.upsertSessionSubagent(ev.JobID, agent)
+	// Non-flow (raw claude) sessions carry no GROVE_FLOW_JOB_ID, so the
+	// job-keyed fold above is a no-op for them. Fold by claude session id too
+	// so their Session.Subagents populates — this is what lets treemux render
+	// per-child titles for a raw interactive agent's background subagents (F4b).
+	// Skipped when a job id was present (the job-keyed fold already handled the
+	// flow session; avoids a redundant scan).
+	if ev.JobID == "" && ev.ClaudeSessionID != "" {
+		s.upsertSessionSubagentByClaudeID(ev.ClaudeSessionID, agent)
+	}
 	return true
 }
 
@@ -337,6 +376,13 @@ func mergeWorkflowAgentEvent(agent *models.Subagent, ev models.WorkflowEvent) {
 	if ev.AgentType != "" && agent.TaskType == "" {
 		agent.TaskType = ev.AgentType
 	}
+	// Carry the spawn-source discriminator onto the durable record so the live
+	// drawer can fall back to it as a title when a still-running child has no
+	// meta.json-derived Name/TaskDescription yet (F5). Never clobber a good
+	// value with a later empty one.
+	if ev.AgentType != "" && agent.AgentType == "" {
+		agent.AgentType = ev.AgentType
+	}
 	if ev.Prompt != "" && (agent.TaskDescription == "" || !fromHooks) {
 		agent.TaskDescription = ev.Prompt
 	}
@@ -406,6 +452,274 @@ func (s *Store) upsertSessionSubagent(jobID string, agent *models.Subagent) {
 		}
 	}
 	session.Subagents = append(session.Subagents, *agent)
+}
+
+// upsertSessionSubagentByClaudeID mirrors a per-agent record onto the owning
+// session's Subagents slice, locating the session by its claude session id
+// (Session.ClaudeSessionID, or Session.ID for raw sessions whose map key IS
+// the claude UUID). Used for non-flow sessions the job-ID fold can't serve.
+// Silent no-op when no session matches (invariant 5).
+func (s *Store) upsertSessionSubagentByClaudeID(claudeID string, agent *models.Subagent) {
+	if claudeID == "" || agent == nil {
+		return
+	}
+	for _, session := range s.state.Sessions {
+		if session.ClaudeSessionID != claudeID && session.ID != claudeID {
+			continue
+		}
+		for i := range session.Subagents {
+			if session.Subagents[i].ID == agent.ID {
+				session.Subagents[i] = *agent
+				return
+			}
+		}
+		session.Subagents = append(session.Subagents, *agent)
+		return
+	}
+}
+
+// liveSubagentCount counts the still-running agents in a bucket keyed by
+// session/claude id: an agent is live iff its Status is not a terminal value
+// (completed/failed). Started-but-unfinished agents carry Status "running"
+// (mergeWorkflowAgentEvent); the ones that have finished carry "completed".
+func liveSubagentCount(agents map[string]*models.Subagent) int {
+	n := 0
+	for _, a := range agents {
+		if a == nil {
+			continue
+		}
+		switch a.Status {
+		case "completed", "failed":
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// LiveChildCounts returns the daemon-derived live background-child count for
+// every tracked session, computed from the store's OWN workflow-run and ad-hoc
+// subagent bookkeeping (not the hook snapshot). Unlike the hook's
+// children_snapshot this is self-clearing: once a child's agent_completed lands
+// (Status=="completed") it drops out, so a session whose children have all
+// finished derives 0 even when no further SubagentStop ever fires — the F3
+// clearing guarantee. Per session the count is (live ad-hoc subagents keyed to
+// it) + (live workflow-run agents = StartedCount−CompletedCount for runs it
+// owns). Live background *bash* jobs (F6) ride the ad-hoc bucket as
+// bashChildTaskType records, so they are counted here too; their clear paths
+// are drop-reconciliation (reconcileBashChildren) and the ExpireBashChildren
+// TTL floor rather than a completion hook. Read-locked; returns a fresh map keyed by
+// session ID (== the s.state.Sessions key), so the caller can key a
+// children_snapshot update by JobID directly.
+func (s *Store) LiveChildCounts() map[string]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	counts := make(map[string]int, len(s.state.Sessions))
+	for id, session := range s.state.Sessions {
+		if session == nil {
+			continue
+		}
+		n := 0
+		// Ad-hoc subagents are bucketed by workflowSessionKey (job id when set,
+		// else claude session id). A raw session's map key IS its claude UUID,
+		// so check both the session id and ClaudeSessionID; a given agent lives
+		// under exactly one key, so there is no double counting.
+		n += liveSubagentCount(s.state.AdhocSubagents[id])
+		if session.ClaudeSessionID != "" && session.ClaudeSessionID != id {
+			n += liveSubagentCount(s.state.AdhocSubagents[session.ClaudeSessionID])
+		}
+		// Live workflow-run agents for runs this session owns.
+		for _, run := range s.state.WorkflowRuns {
+			if run == nil || run.Completed {
+				continue
+			}
+			owned := (run.JobID != "" && run.JobID == id) ||
+				(session.ClaudeSessionID != "" && run.ClaudeSessionID == session.ClaudeSessionID) ||
+				run.ClaudeSessionID == id
+			if !owned {
+				continue
+			}
+			if live := run.StartedCount - run.CompletedCount; live > 0 {
+				n += live
+			}
+		}
+		counts[id] = n
+	}
+	return counts
+}
+
+// applyChildrenSnapshot writes a live-background-child count onto the owning
+// session's derived LiveChildren field (models.Session, db:"-", never
+// persisted). Lookup mirrors upsertSessionSubagent: by ev.JobID first, then a
+// linear scan matching Session.ClaudeSessionID for non-flow interactive
+// sessions (which the job-ID key can't serve — the fallback works only
+// post-applySessionConfirmation, when ClaudeSessionID is set, which is fine:
+// no children exist before the agent starts). Silent no-op when no session
+// matches (invariant 5), so a snapshot for an unknown/ended session neither
+// creates a session nor errors. The assignment is unconditional — a zero count
+// clears a previously-nonzero LiveChildren (idle-busy → idle). Must be called
+// under the store write lock (ApplyUpdate holds it).
+func (s *Store) applyChildrenSnapshot(ev models.WorkflowEvent) {
+	if ev.JobID != "" {
+		if session, ok := s.state.Sessions[ev.JobID]; ok {
+			session.LiveChildren = ev.LiveChildren
+			return
+		}
+	}
+	if ev.ClaudeSessionID != "" {
+		for _, session := range s.state.Sessions {
+			if session.ClaudeSessionID == ev.ClaudeSessionID {
+				session.LiveChildren = ev.LiveChildren
+				return
+			}
+		}
+	}
+	// No matching session: silent no-op (mirrors upsertSessionSubagent).
+}
+
+// bashChildTaskType marks an ad-hoc subagent record as a live background bash
+// job rather than a real subagent. Background bash reuses the AdhocSubagents /
+// Session.Subagents machinery so the existing count (liveSubagentCount →
+// LiveChildCounts) and indented-title render (liveChildItems, Name first) cover
+// it for free; the marker is how the bash-specific clear paths (drop
+// reconciliation, TTL) find their own records without disturbing subagents.
+const bashChildTaskType = "background-bash"
+
+// mirrorBashChildToSession folds a bash-child record onto the owning session's
+// Subagents slice. The bash bucket is keyed by workflowSessionKey (job id when
+// set, else claude id); a job id lands via upsertSessionSubagent and a claude
+// id via upsertSessionSubagentByClaudeID, so calling both mirrors the record
+// regardless of which keying built it (the non-matching call is a no-op).
+func (s *Store) mirrorBashChildToSession(sessionKey string, agent *models.Subagent) {
+	s.upsertSessionSubagent(sessionKey, agent)
+	s.upsertSessionSubagentByClaudeID(sessionKey, agent)
+}
+
+// upsertBashChild starts or refreshes one live background bash child in the
+// session's ad-hoc bucket and mirrors it onto the session. A new record is
+// stamped running with StartedAt=now (the TTL clock); an existing one keeps its
+// original StartedAt (so a refreshing snapshot never resets the TTL) and is
+// re-marked running only if it had not already gone terminal. Name backfills
+// from the command when the record has none yet.
+func (s *Store) upsertBashChild(sessionKey, bashID, command string, now time.Time) {
+	if sessionKey == "" || bashID == "" {
+		return
+	}
+	if s.state.AdhocSubagents == nil {
+		s.state.AdhocSubagents = make(map[string]map[string]*models.Subagent)
+	}
+	agents, ok := s.state.AdhocSubagents[sessionKey]
+	if !ok {
+		agents = make(map[string]*models.Subagent)
+		s.state.AdhocSubagents[sessionKey] = agents
+	}
+	agent, ok := agents[bashID]
+	if !ok {
+		agent = &models.Subagent{ID: bashID, TaskType: bashChildTaskType, StartedAt: now}
+		agents[bashID] = agent
+	}
+	if agent.Name == "" && command != "" {
+		agent.Name = command
+	}
+	switch agent.Status {
+	case "completed", "failed":
+		// A prior clear won; do not resurrect it.
+	default:
+		agent.Status = "running"
+	}
+	s.mirrorBashChildToSession(sessionKey, agent)
+}
+
+// completeBashChild marks one bash child terminal and re-mirrors it so it drops
+// from both the live count (liveSubagentCount) and the rendered child list
+// (liveChildItems skips completed).
+func (s *Store) completeBashChild(sessionKey string, agent *models.Subagent) {
+	if agent.Status == "completed" {
+		return
+	}
+	agent.Status = "completed"
+	s.mirrorBashChildToSession(sessionKey, agent)
+}
+
+// applyBashStarted records a background bash spawn (WorkflowBashStarted). It is
+// additive: it never clears sibling bash children (the PostToolUse hook sees
+// only the one new job, not the full live set). This is the sole liveness
+// signal for a session with no subagent — such a session never fires
+// SubagentStop, so its bash is cleared only by ExpireBashChildren's TTL.
+func (s *Store) applyBashStarted(ev models.WorkflowEvent) {
+	sessionKey := workflowSessionKey(ev)
+	ts := ev.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	s.upsertBashChild(sessionKey, ev.AgentID, ev.Name, ts)
+}
+
+// reconcileBashChildren folds a hook-sourced children snapshot's authoritative
+// live-bash set into the bookkeeping: every listed job is started/refreshed,
+// and every bash child currently tracked for the session that is ABSENT from
+// the list is marked completed. The SubagentStop background_tasks[] view lists
+// exactly the still-live children, so absence is a reliable "gone" signal — the
+// accurate clear path for any session that fires SubagentStop (TTL is the floor
+// for those that never do). Only ever called for hook-sourced snapshots.
+func (s *Store) reconcileBashChildren(ev models.WorkflowEvent) {
+	sessionKey := workflowSessionKey(ev)
+	if sessionKey == "" {
+		return
+	}
+	ts := ev.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	live := make(map[string]bool, len(ev.LiveBashChildren))
+	for _, b := range ev.LiveBashChildren {
+		if b.ID == "" {
+			continue
+		}
+		live[b.ID] = true
+		s.upsertBashChild(sessionKey, b.ID, b.Command, ts)
+	}
+	for id, agent := range s.state.AdhocSubagents[sessionKey] {
+		if agent == nil || agent.TaskType != bashChildTaskType {
+			continue
+		}
+		if !live[id] {
+			s.completeBashChild(sessionKey, agent)
+		}
+	}
+}
+
+// ExpireBashChildren is the guaranteed-clear floor for background bash: it marks
+// every still-running bash child older than ttl completed (re-mirroring so the
+// count and title drop) and reports whether anything changed. Bash liveness has
+// no reliable per-job completion hook (background_tasks[] entries only ever
+// carry status "running"; a bash-only session never fires SubagentStop at all),
+// so without this a finished bash on such a session would show forever. The
+// collector calls it each tick; the resulting count change propagates through
+// the normal LiveChildCounts → children_snapshot diff. This bounds the display
+// to at most ttl past a bash's true finish — the accepted F6 reliability bound.
+func (s *Store) ExpireBashChildren(now time.Time, ttl time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for sessionKey, agents := range s.state.AdhocSubagents {
+		for _, agent := range agents {
+			if agent == nil || agent.TaskType != bashChildTaskType {
+				continue
+			}
+			switch agent.Status {
+			case "completed", "failed":
+				continue
+			}
+			if now.Sub(agent.StartedAt) < ttl {
+				continue
+			}
+			s.completeBashChild(sessionKey, agent)
+			changed = true
+		}
+	}
+	return changed
 }
 
 // workflowPersister appends enriched workflow events to

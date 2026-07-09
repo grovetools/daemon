@@ -1,10 +1,13 @@
 package store
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/paths"
 )
 
 // newTestStore creates a Store backed by a temp state dir so workflow
@@ -673,9 +676,9 @@ func TestIsSpawnAgentID(t *testing.T) {
 	}{
 		{"a62124203bfeb94f0", true}, // real spawn: a + 16 hex
 		{"a1234567890abcdef", true},
-		{"a03e225", false},          // phantom: a + 6 hex (Explore/Plan registration)
-		{"ac81b9b", false},          // phantom
-		{"", false},                 // empty
+		{"a03e225", false},            // phantom: a + 6 hex (Explore/Plan registration)
+		{"ac81b9b", false},            // phantom
+		{"", false},                   // empty
 		{"a62124203bfeb94f0a", false}, // 17 hex (too long)
 		{"a62124203bfeb94g0", false},  // non-hex digit
 		{"explore-1", false},          // synthetic / not spawn form
@@ -745,5 +748,287 @@ func TestPhantomSubagentStartDropped(t *testing.T) {
 	}
 	if len(adhoc["job-1"]) != 1 {
 		t.Errorf("only the real spawn should be present, got %+v", adhoc["job-1"])
+	}
+}
+
+func childrenSnapshot(jobID, claudeSessionID string, count int, now time.Time) Update {
+	return wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowChildrenSnapshot,
+		JobID:           jobID,
+		ClaudeSessionID: claudeSessionID,
+		LiveChildren:    count,
+		Timestamp:       now,
+		Source:          models.WorkflowSourceHooks,
+	})
+}
+
+func TestChildrenSnapshotSetsLiveChildren(t *testing.T) {
+	s := newTestStore(t)
+	seedSession(t, s, "job-1", "sess-1")
+	now := time.Date(2026, 7, 8, 11, 0, 0, 0, time.UTC)
+
+	s.ApplyUpdate(childrenSnapshot("job-1", "sess-1", 3, now))
+	if got := s.GetSession("job-1").LiveChildren; got != 3 {
+		t.Fatalf("LiveChildren = %d, want 3", got)
+	}
+
+	// A zero snapshot clears idle-busy (assignment is unconditional).
+	s.ApplyUpdate(childrenSnapshot("job-1", "sess-1", 0, now.Add(time.Second)))
+	if got := s.GetSession("job-1").LiveChildren; got != 0 {
+		t.Fatalf("LiveChildren after zero snapshot = %d, want 0", got)
+	}
+}
+
+func TestChildrenSnapshotClaudeSessionFallback(t *testing.T) {
+	s := newTestStore(t)
+	seedSession(t, s, "job-1", "sess-1")
+	now := time.Date(2026, 7, 8, 11, 0, 0, 0, time.UTC)
+
+	// Empty JobID: the lookup must fall back to matching ClaudeSessionID (works
+	// post-applySessionConfirmation, which seedSession performs).
+	s.ApplyUpdate(childrenSnapshot("", "sess-1", 2, now))
+	if got := s.GetSession("job-1").LiveChildren; got != 2 {
+		t.Fatalf("LiveChildren via ClaudeSessionID fallback = %d, want 2", got)
+	}
+}
+
+func TestChildrenSnapshotUnknownSessionNoop(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Date(2026, 7, 8, 11, 0, 0, 0, time.UTC)
+
+	// No session seeded: must be a silent no-op — no session created, no
+	// runs/adhoc buckets touched.
+	s.ApplyUpdate(childrenSnapshot("ghost-job", "ghost-sess", 5, now))
+
+	if sess := s.GetSession("ghost-job"); sess != nil {
+		t.Errorf("snapshot must not create a session, got %+v", sess)
+	}
+	if got := s.GetWorkflowRuns(); len(got) != 0 {
+		t.Errorf("snapshot must not create runs, got %+v", got)
+	}
+	if got := s.GetAdhocSubagents(); len(got) != 0 {
+		t.Errorf("snapshot must not create ad-hoc subagents, got %+v", got)
+	}
+}
+
+func TestChildrenSnapshotNotPersisted(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	now := time.Date(2026, 7, 8, 11, 0, 0, 0, time.UTC)
+
+	s1 := New()
+	// Seed a session so the snapshot actually lands (not just a miss no-op).
+	s1.ApplyUpdate(Update{
+		Type:    UpdateSessionIntent,
+		Source:  "test",
+		Payload: &SessionIntentPayload{JobID: "job-1", Provider: "claude"},
+	})
+	s1.ApplyUpdate(Update{
+		Type:   UpdateSessionConfirmation,
+		Source: "test",
+		Payload: &SessionConfirmationPayload{
+			JobID: "job-1", NativeID: "sess-1", PID: 1234,
+		},
+	})
+	s1.ApplyUpdate(childrenSnapshot("job-1", "sess-1", 4, now))
+	if got := s1.GetSession("job-1").LiveChildren; got != 4 {
+		t.Fatalf("precondition: LiveChildren = %d, want 4", got)
+	}
+
+	// The snapshot must not have been journaled: the workflows state dir has no
+	// .jsonl files, and a restart store rebuilds no runs/adhoc.
+	wfDir := filepath.Join(paths.StateDir(), "daemon", "workflows")
+	if entries, err := os.ReadDir(wfDir); err == nil {
+		for _, e := range entries {
+			if filepath.Ext(e.Name()) == ".jsonl" {
+				t.Errorf("snapshot must not persist a jsonl, found %q", e.Name())
+			}
+		}
+	}
+
+	s2 := New()
+	if got := s2.GetWorkflowRuns(); len(got) != 0 {
+		t.Errorf("restart must rebuild no runs from a snapshot, got %+v", got)
+	}
+	if got := s2.GetAdhocSubagents(); len(got) != 0 {
+		t.Errorf("restart must rebuild no ad-hoc subagents from a snapshot, got %+v", got)
+	}
+	// LiveChildren is derived (db:"-"): it does not survive a restart. Session
+	// only exists post-restart if it was persisted through another path; here
+	// no UpdateSessions was emitted, so the restart store has no session at all.
+	if sess := s2.GetSession("job-1"); sess != nil && sess.LiveChildren != 0 {
+		t.Errorf("LiveChildren must not survive restart, got %d", sess.LiveChildren)
+	}
+}
+
+func TestChildrenSnapshotBroadcast(t *testing.T) {
+	s := newTestStore(t)
+	seedSession(t, s, "job-1", "sess-1")
+	ch := s.Subscribe()
+	defer s.Unsubscribe(ch)
+
+	s.ApplyUpdate(childrenSnapshot("job-1", "sess-1", 1, time.Now()))
+
+	select {
+	case got := <-ch:
+		if got.Type != UpdateWorkflowChildrenSnapshot {
+			t.Errorf("broadcast type = %q, want %q", got.Type, UpdateWorkflowChildrenSnapshot)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no broadcast received")
+	}
+}
+
+func TestUpdateSessionsPreservesLiveChildren(t *testing.T) {
+	s := newTestStore(t)
+	seedSession(t, s, "job-1", "sess-1")
+	now := time.Date(2026, 7, 8, 11, 0, 0, 0, time.UTC)
+	s.ApplyUpdate(childrenSnapshot("job-1", "sess-1", 3, now))
+
+	// A bulk UpdateSessions replace whose incoming session carries LiveChildren=0
+	// (rebuilt from DB) must copy-forward the prior nonzero value for matching IDs.
+	s.ApplyUpdate(Update{
+		Type:   UpdateSessions,
+		Source: "session_recovery",
+		Payload: []*models.Session{
+			{ID: "job-1", ClaudeSessionID: "sess-1", Status: "idle"},
+		},
+	})
+	if got := s.GetSession("job-1").LiveChildren; got != 3 {
+		t.Errorf("LiveChildren after UpdateSessions = %d, want 3 (copy-forward)", got)
+	}
+
+	// A session absent from the prior map gets no copy-forward: it stays zero.
+	s.ApplyUpdate(Update{
+		Type:   UpdateSessions,
+		Source: "session_recovery",
+		Payload: []*models.Session{
+			{ID: "job-2", ClaudeSessionID: "sess-2", Status: "idle"},
+		},
+	})
+	if got := s.GetSession("job-2").LiveChildren; got != 0 {
+		t.Errorf("new session LiveChildren = %d, want 0", got)
+	}
+}
+
+// startAdhoc / completeAdhoc fire agent lifecycle events for a run-less
+// (Agent-tool) subagent, the shape the collector's LiveChildCounts derivation
+// keys on.
+func startAdhoc(t *testing.T, s *Store, jobID, claudeID, agentID string, ts time.Time) {
+	t.Helper()
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentStarted,
+		JobID:           jobID,
+		ClaudeSessionID: claudeID,
+		AgentID:         agentID,
+		AgentType:       "Explore",
+		Name:            "explore the handler",
+		Timestamp:       ts,
+		Source:          models.WorkflowSourceHooks,
+	}))
+}
+
+func completeAdhoc(t *testing.T, s *Store, jobID, claudeID, agentID string, ts time.Time) {
+	t.Helper()
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind:            models.WorkflowAgentCompleted,
+		JobID:           jobID,
+		ClaudeSessionID: claudeID,
+		AgentID:         agentID,
+		AgentType:       "Explore",
+		Timestamp:       ts,
+		Source:          models.WorkflowSourceHooks,
+	}))
+}
+
+// TestLiveChildCountsSelfClears is the F3 regression guard: a session with two
+// live ad-hoc subagents derives LiveChildren==2 from the daemon's own
+// bookkeeping, and after both complete the derivation returns 0 on the next
+// pass — WITHOUT any further children_snapshot. This is what returns an
+// idle-busy agent to truly-idle when no more SubagentStop hooks fire.
+func TestLiveChildCountsSelfClears(t *testing.T) {
+	s := newTestStore(t)
+	seedSession(t, s, "job-1", "sess-1")
+	ts := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+
+	startAdhoc(t, s, "job-1", "sess-1", "a1111111111111111", ts)
+	startAdhoc(t, s, "job-1", "sess-1", "a2222222222222222", ts)
+
+	if got := s.LiveChildCounts()["job-1"]; got != 2 {
+		t.Fatalf("LiveChildCounts = %d, want 2 (two running subagents)", got)
+	}
+
+	completeAdhoc(t, s, "job-1", "sess-1", "a1111111111111111", ts.Add(time.Second))
+	if got := s.LiveChildCounts()["job-1"]; got != 1 {
+		t.Fatalf("LiveChildCounts after one completion = %d, want 1", got)
+	}
+
+	completeAdhoc(t, s, "job-1", "sess-1", "a2222222222222222", ts.Add(2*time.Second))
+	if got := s.LiveChildCounts()["job-1"]; got != 0 {
+		t.Fatalf("LiveChildCounts after both complete = %d, want 0 (self-cleared)", got)
+	}
+}
+
+// TestLiveChildCountsRawSessionByClaudeID covers a raw (non-flow) interactive
+// session: its subagents forward with an EMPTY job id, keyed on the claude
+// session id. The derivation must still count them (F3 for raw sessions), and
+// the ClaudeSessionID fold must populate Session.Subagents so treemux can
+// render per-child titles (F4b).
+func TestLiveChildCountsRawSessionByClaudeID(t *testing.T) {
+	s := newTestStore(t)
+	// Raw session: job id == claude UUID (its store key), as hooks register it.
+	seedSession(t, s, "sess-raw", "sess-raw")
+	ts := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+
+	startAdhoc(t, s, "" /* no GROVE_FLOW_JOB_ID */, "sess-raw", "a3333333333333333", ts)
+
+	if got := s.LiveChildCounts()["sess-raw"]; got != 1 {
+		t.Fatalf("raw-session LiveChildCounts = %d, want 1", got)
+	}
+	// The ClaudeSessionID fold must have populated the session mirror so the
+	// child's title is available to the renderer.
+	sess := s.GetSession("sess-raw")
+	if len(sess.Subagents) != 1 || sess.Subagents[0].Name != "explore the handler" {
+		t.Fatalf("raw-session Subagents = %+v, want one titled child", sess.Subagents)
+	}
+
+	completeAdhoc(t, s, "", "sess-raw", "a3333333333333333", ts.Add(time.Second))
+	if got := s.LiveChildCounts()["sess-raw"]; got != 0 {
+		t.Fatalf("raw-session LiveChildCounts after completion = %d, want 0", got)
+	}
+}
+
+// TestLiveChildCountsWorkflowRun covers the workflow-run arm of the derivation:
+// live agents = StartedCount − CompletedCount for a run the session owns.
+func TestLiveChildCountsWorkflowRun(t *testing.T) {
+	s := newTestStore(t)
+	seedSession(t, s, "job-1", "sess-1")
+	ts := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+
+	// Two workflow agents start, one completes → one still live.
+	for _, id := range []string{"a1111111111111111", "a2222222222222222"} {
+		s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+			Kind: models.WorkflowAgentStarted, RunID: "wf_1", JobID: "job-1",
+			ClaudeSessionID: "sess-1", AgentID: id, Timestamp: ts,
+			Source: models.WorkflowSourceHooks,
+		}))
+	}
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind: models.WorkflowAgentCompleted, RunID: "wf_1", JobID: "job-1",
+		ClaudeSessionID: "sess-1", AgentID: "a1111111111111111", Timestamp: ts.Add(time.Second),
+		Source: models.WorkflowSourceHooks,
+	}))
+
+	if got := s.LiveChildCounts()["job-1"]; got != 1 {
+		t.Fatalf("LiveChildCounts (workflow run) = %d, want 1", got)
+	}
+
+	// Completing the run marks it Completed → excluded → 0.
+	s.ApplyUpdate(wfUpdate(models.WorkflowEvent{
+		Kind: models.WorkflowAgentCompleted, RunID: "wf_1", JobID: "job-1",
+		ClaudeSessionID: "sess-1", AgentID: "a2222222222222222", Timestamp: ts.Add(2 * time.Second),
+		Source: models.WorkflowSourceHooks,
+	}))
+	if got := s.LiveChildCounts()["job-1"]; got != 0 {
+		t.Fatalf("LiveChildCounts after all workflow agents complete = %d, want 0", got)
 	}
 }

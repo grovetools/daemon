@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -103,7 +104,7 @@ func TestConvertWorkflowUpdatesRoundTrip(t *testing.T) {
 			if err := json.Unmarshal(payloadJSON, &got); err != nil {
 				t.Fatalf("decode payload: %v", err)
 			}
-			if got.Event != tc.event {
+			if !reflect.DeepEqual(got.Event, tc.event) {
 				t.Errorf("event round-trip mismatch:\n  in:  %+v\n  out: %+v", tc.event, got.Event)
 			}
 			if got.RunName != "flow" || len(got.Phases) != 1 {

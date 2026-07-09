@@ -129,6 +129,16 @@ const (
 	UpdateWorkflowAgentCompleted UpdateType = "workflow_agent_completed"
 	UpdateWorkflowRunStale       UpdateType = "workflow_run_stale"
 	UpdateWorkflowRunCompleted   UpdateType = "workflow_run_completed"
+	// UpdateWorkflowChildrenSnapshot carries a live-background-child count
+	// (WorkflowChildrenSnapshot) that the store writes onto the owning
+	// session's LiveChildren field. Unlike the other workflow_* types it
+	// mints no run/agent rows and is never persisted (no boot replay).
+	UpdateWorkflowChildrenSnapshot UpdateType = "workflow_children_snapshot"
+	// UpdateWorkflowBashStarted announces a background bash spawn
+	// (WorkflowBashStarted) that the store records as a live bash child (F6).
+	// Like the snapshot it mints no run rows and is never persisted — bash
+	// liveness is ephemeral and TTL-bounded.
+	UpdateWorkflowBashStarted UpdateType = "workflow_bash_started"
 
 	// Build queue lifecycle update types for the daemon's machine-wide
 	// build scheduler (buildqueue). Each maps to a DISTINCT SSE

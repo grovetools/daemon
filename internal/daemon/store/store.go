@@ -170,9 +170,19 @@ func (s *Store) ApplyUpdate(u Update) {
 		}
 	case UpdateSessions:
 		if sessions, ok := u.Payload.([]*models.Session); ok {
-			// Rebuild map
+			// Rebuild map. Copy-forward the derived LiveChildren field from the
+			// prior map for matching IDs: this wholesale replace otherwise wipes
+			// it (the count is db:"-" and rebuilt-from-DB sessions carry 0), and
+			// unlike LiveTokens there is no ~4s repopulator — LiveChildren only
+			// refreshes on the next SubagentStop, minutes away for a long-running
+			// background workflow. Zeroing mid-flight would falsely demote
+			// idle-busy → truly-idle. Scoped to LiveChildren only (contract D5 /
+			// J2 §4); LiveTokens/Subagents are deliberately not copied here.
 			newMap := make(map[string]*models.Session)
 			for _, sess := range sessions {
+				if prev, ok := s.state.Sessions[sess.ID]; ok && sess.LiveChildren == 0 {
+					sess.LiveChildren = prev.LiveChildren
+				}
 				newMap[sess.ID] = sess
 			}
 			s.state.Sessions = newMap
@@ -339,8 +349,12 @@ func (s *Store) ApplyUpdate(u Update) {
 	// Workflow/subagent lifecycle events (hooks + journal watcher).
 	case UpdateWorkflowRunDiscovered, UpdateWorkflowAgentStarted,
 		UpdateWorkflowAgentCompleted, UpdateWorkflowRunStale,
-		UpdateWorkflowRunCompleted:
+		UpdateWorkflowRunCompleted, UpdateWorkflowChildrenSnapshot,
+		UpdateWorkflowBashStarted:
 		if payload, ok := u.Payload.(*WorkflowEventPayload); ok {
+			// persist=true is neutralized for the children_snapshot and
+			// bash_started kinds by a case-local return in applyWorkflowEvent
+			// (both are ephemeral and never journaled).
 			s.applyWorkflowEvent(payload, true)
 		}
 	}

@@ -45,6 +45,17 @@ const (
 	// (e.g. opencode before its plugin registers one) never hammers the resolver
 	// on every refresh tick.
 	transcriptResolveRetryInterval = 30 * time.Second
+
+	// bashChildTTL bounds how long a live background bash job stays shown (F6).
+	// Background bash has no reliable per-job completion hook: background_tasks[]
+	// entries only ever report status "running", and a session with no subagent
+	// never fires the SubagentStop that would list them at all. The accurate
+	// clear is drop-reconciliation from a SubagentStop snapshot; this TTL is the
+	// guaranteed floor for sessions that never fire one, capping a finished
+	// bash's lingering display. Long enough that a genuinely long-running bg bash
+	// (poll loops, daemons) stays visible for a useful window; a stuck count can
+	// never outlive it.
+	bashChildTTL = 10 * time.Minute
 )
 
 // liveTokenSummary caches the last-computed token snapshot for one session,
@@ -314,6 +325,21 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				c.refreshLiveTokens(ctx, activeSessions, updates)
 			}
 
+			// Expire any live background bash children past the TTL floor before
+			// deriving counts, so a finished bash on a session that never fires
+			// SubagentStop still clears (F6 guaranteed-clear path). Cheap in-memory
+			// pass; a no-op when no bash children are tracked.
+			st.ExpireBashChildren(time.Now(), bashChildTTL)
+
+			// Daemon-authoritative live-background-child count. Recomputed every
+			// tick (cheap — pure in-memory map math, no transcript parsing) so a
+			// session whose subagents/workflow-run children have all finished
+			// self-clears to 0 without needing another SubagentStop (the F3
+			// clearing guarantee). This is the authoritative source; the hook's
+			// children_snapshot is a best-effort inter-tick bump that this
+			// reconciles within one tick.
+			c.refreshLiveChildren(st, activeSessions, updates)
+
 			if d := time.Since(start); d > 1*time.Second {
 				c.ulog.Debug("Slow PID verification detected").Field("duration", d).Log(ctx)
 			}
@@ -466,6 +492,44 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 			Source:  "session_token_collector",
 			Scanned: len(tokenUpdates),
 			Payload: &store.SessionTokensPayload{Updates: tokenUpdates},
+		}
+	}
+}
+
+// refreshLiveChildren reconciles each active session's derived live-child count
+// with the daemon's own authoritative view (store.LiveChildCounts, computed
+// from WorkflowRuns + AdhocSubagents) and emits a children_snapshot for every
+// session whose count changed. Because the derivation self-clears (completed
+// children drop out), this is what returns an idle-busy agent to truly-idle
+// once its background subagents/workflow finish — even if no further
+// SubagentStop hook ever fires (F3). It reuses the existing children_snapshot
+// apply path (applyChildrenSnapshot sets Session.LiveChildren unconditionally),
+// so a zero count clears a previously-nonzero value. Emitted updates are keyed
+// by JobID == the session's store key, so applyChildrenSnapshot's primary
+// lookup lands directly. Only changed sessions are emitted, so a steady state
+// produces no broadcast churn.
+//
+// Reconciliation with the hook snapshot: the daemon derivation is authoritative
+// and wins each tick. The hook's turn-boundary snapshot still provides an
+// immediate bump between ticks, but for a child kind the daemon cannot see
+// (background bash — no liveness event exists), the derivation lowers the count
+// back to its floor within one tick. That is the accepted F2 bash residual.
+func (c *SessionCollector) refreshLiveChildren(st *store.Store, activeSessions []*models.Session, updates chan<- store.Update) {
+	counts := st.LiveChildCounts()
+	for _, s := range activeSessions {
+		want := counts[s.ID]
+		if want == s.LiveChildren {
+			continue
+		}
+		updates <- store.Update{
+			Type:    store.UpdateWorkflowChildrenSnapshot,
+			Source:  "session_child_collector",
+			Scanned: 1,
+			Payload: &store.WorkflowEventPayload{Event: models.WorkflowEvent{
+				Kind:         models.WorkflowChildrenSnapshot,
+				JobID:        s.ID,
+				LiveChildren: want,
+			}},
 		}
 	}
 }
