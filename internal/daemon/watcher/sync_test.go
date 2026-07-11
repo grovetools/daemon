@@ -29,7 +29,7 @@ func newTestSyncHandler(t *testing.T, quietMs, maxWaitMs int) (*SyncHandler, str
 
 	h := NewSyncHandler(nil, nil, nil, db, quietMs, maxWaitMs)
 	h.watchedPaths = map[string]*syncWatch{
-		wsRoot: {workspace: "testws", root: wsRoot},
+		wsRoot: {workspace: "testws", root: wsRoot, space: syncdb.NewDocSpace(nil)},
 	}
 	return h, wsRoot
 }
@@ -44,43 +44,10 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
-func TestSyncExclusionManifest(t *testing.T) {
-	cases := []struct {
-		rel      string
-		extra    []string
-		excluded bool
-	}{
-		// Default exclusion manifest.
-		{rel: ".obsidian/workspace.json", excluded: true},
-		{rel: "notes/.obsidian/app.json", excluded: true},
-		{rel: ".stfolder", excluded: true},
-		{rel: ".stversions/old.md", excluded: true},
-		{rel: "notes/a.sync-conflict-20240101-ABCDEF.md", excluded: true},
-		{rel: "notes/a.conflict.md", excluded: true},
-		{rel: ".grove/rules", excluded: true},
-		{rel: ".grove/rules/extra.rules", excluded: true},
-		{rel: ".cx/state.json", excluded: true},
-		{rel: "plans/my-plan/.artifacts/briefing.xml", excluded: true},
-		{rel: "plans/my-plan.lock", excluded: true},
-		{rel: ".DS_Store", excluded: true},
-		{rel: "notes/.DS_Store", excluded: true},
-		// Allowed content.
-		{rel: "notes/inbox/idea.md", excluded: false},
-		{rel: "plans/my-plan/01-spec.md", excluded: false},
-		{rel: "chats/session.md", excluded: false},
-		{rel: ".grove/other", excluded: false},
-		// Per-workspace extra globs.
-		{rel: "notes/secret-draft.md", extra: []string{"*-draft.md"}, excluded: true},
-		{rel: "private/x.md", extra: []string{"private/"}, excluded: true},
-		{rel: "notes/public.md", extra: []string{"private/"}, excluded: false},
-	}
-
-	for _, tc := range cases {
-		if got := syncExcluded(tc.rel, tc.extra); got != tc.excluded {
-			t.Errorf("syncExcluded(%q, %v) = %v, want %v", tc.rel, tc.extra, got, tc.excluded)
-		}
-	}
-}
+// The default exclusion-manifest table formerly tested here (TestSyncExclusion
+// Manifest against syncExcluded) moved with the logic into the sync package's
+// DocSpace — see daemon/internal/daemon/sync/docspace_test.go. MatchesEvent
+// below still exercises the manifest end-to-end via the DocSpace delegation.
 
 func TestSyncMatchesEvent(t *testing.T) {
 	h, wsRoot := newTestSyncHandler(t, 50, 500)

@@ -20,7 +20,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -45,68 +44,11 @@ const (
 	defaultSyncMaxWaitMs = 15000
 )
 
-// defaultSyncExclusionDirs are directory names excluded from sync anywhere
-// in a document's path. These are tool-local or editor-local state that must
-// never replicate (the protocol's default exclusion manifest).
-var defaultSyncExclusionDirs = map[string]bool{
-	".obsidian":   true, // Obsidian vault-local state
-	".stfolder":   true, // Syncthing marker
-	".stversions": true, // Syncthing versioning
-	".cx":         true, // cx-local context state
-	".artifacts":  true, // generated briefings/aggregated contexts
-}
-
-// syncExcluded reports whether a slash-normalized workspace-relative path is
-// excluded by the protocol's default exclusion manifest or by per-workspace
-// extra exclusion globs (matched against both the full relative path and the
-// basename).
-func syncExcluded(relPath string, extra []string) bool {
-	relPath = strings.Trim(path.Clean(relPath), "/")
-	base := path.Base(relPath)
-
-	// Suffix/basename rules.
-	switch {
-	case base == ".DS_Store":
-		return true
-	case strings.Contains(base, ".sync-conflict-"): // Syncthing conflict copies
-		return true
-	case strings.HasSuffix(base, ".conflict.md"): // grove sync conflict copies
-		return true
-	case strings.HasSuffix(base, ".lock"): // flow plan locks etc.
-		return true
-	}
-
-	// Directory-segment rules, including ".grove/rules" as a pair.
-	segs := strings.Split(relPath, "/")
-	for i, seg := range segs {
-		if defaultSyncExclusionDirs[seg] {
-			return true
-		}
-		if seg == ".grove" && i+1 < len(segs) && segs[i+1] == "rules" {
-			return true
-		}
-	}
-
-	// Per-workspace extra exclusions from sync config.
-	for _, pattern := range extra {
-		if ok, _ := path.Match(pattern, relPath); ok {
-			return true
-		}
-		if ok, _ := path.Match(pattern, base); ok {
-			return true
-		}
-		if strings.HasSuffix(pattern, "/") && strings.HasPrefix(relPath, strings.TrimSuffix(pattern, "/")+"/") {
-			return true
-		}
-	}
-	return false
-}
-
 // syncWatch maps a watched directory to its sync workspace subscription.
 type syncWatch struct {
-	workspace string   // sync workspace name
-	root      string   // workspace root dir; wire paths are relative to this
-	excludes  []string // per-workspace extra exclusion globs
+	workspace string           // sync workspace name
+	root      string           // workspace root dir; wire paths are relative to this
+	space     *syncdb.DocSpace // exclusion + routing policy for this subscription
 }
 
 // SyncHandler implements DomainHandler for sync change capture.
@@ -219,6 +161,9 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 		if err != nil {
 			continue
 		}
+		// Build the DocSpace once per subscription (per-workspace excludes +
+		// size cap), shared across all of the workspace's watched dirs.
+		space := syncdb.NewDocSpace(sub)
 		for _, dir := range dirs {
 			if sub.Mode == config.SyncModePlansOnly && dir.Type != "plans" {
 				continue
@@ -229,7 +174,7 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 			newWatches[dir.Path] = &syncWatch{
 				workspace: sub.Name,
 				root:      workspaceRootForDir(dir.Path),
-				excludes:  sub.Excludes,
+				space:     space,
 			}
 		}
 	}
@@ -291,7 +236,7 @@ func (h *SyncHandler) MatchesEvent(event fsnotify.Event) bool {
 	if watch == nil {
 		return false
 	}
-	return !syncExcluded(rel, watch.excludes)
+	return watch.space.Included(rel)
 }
 
 // HandleEvents debounces matched filesystem events per path.
@@ -342,7 +287,7 @@ func (h *SyncHandler) scheduleFlush(absPath string) {
 // echo-suppression backstop).
 func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 	watch, rel := h.lookupWatch(absPath)
-	if watch == nil || syncExcluded(rel, watch.excludes) {
+	if watch == nil || !watch.space.Included(rel) {
 		return
 	}
 
@@ -360,6 +305,18 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 	content, err := os.ReadFile(absPath) //nolint:gosec // G304: path from watched notebook tree
 	if err != nil {
 		h.ulog.Warn("Failed to read file for sync capture").Err(err).Field("path", absPath).Log(ctx)
+		return
+	}
+
+	// Big-file policy: a per-workspace MaxFileSize skip is a quiet, user-
+	// configured policy (not an error). The server-ceiling skip is the
+	// surfaced one and happens at push time (DrainOutbox).
+	if watch.space.Route(rel, int64(len(content))) == syncdb.RouteSkip {
+		h.ulog.Debug("sync skip: file over workspace size cap").
+			Field("workspace", watch.workspace).
+			Field("path", rel).
+			Field("size", len(content)).
+			StructuredOnly().Log(ctx)
 		return
 	}
 
@@ -484,7 +441,7 @@ func (h *SyncHandler) handleNoteEvent(ctx context.Context, event *models.NoteEve
 	if prevWatch == nil || newWatch == nil {
 		return
 	}
-	if syncExcluded(newRel, newWatch.excludes) {
+	if !newWatch.space.Included(newRel) {
 		// Moved out of sync scope — record as a delete of the old path.
 		h.recordDelete(ctx, prevWatch.workspace, prevRel)
 		return
@@ -594,6 +551,17 @@ func (h *SyncHandler) ensurePipelines() {
 		sub := h.subscription(name)
 
 		push := syncdb.NewPushPipeline(h.db, client, name, h.ulog, syncdb.PushConfig{})
+		// Surface server-ceiling oversize skips as a sync_conflict SSE update
+		// (convertToAPIUpdate already forwards UpdateSyncConflict). The quiet
+		// per-workspace MaxFileSize skip stays in flush; this is the loud one.
+		push.OnOversizeSkipped = func(ws, path string, size, limit int64) {
+			h.broadcastConflict(&store.SyncConflictPayload{
+				Kind:      "oversize_skipped",
+				Workspace: ws,
+				Path:      path,
+				Detail:    fmt.Sprintf("%d bytes exceeds server blob ceiling %d", size, limit),
+			})
+		}
 		go h.runWithRecovery(pctx, name, "push", func() error {
 			return push.RunPushLoop(pctx, root)
 		})

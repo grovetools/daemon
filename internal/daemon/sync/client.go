@@ -245,6 +245,17 @@ func (c *Client) MaxInlineSize() int64 {
 	return 256 * 1024 // 256KB default
 }
 
+// MaxBlobSize returns the server's advertised single-blob ceiling in bytes, or
+// 0 when the server did not advertise one. Zero is the "unknown, don't enforce
+// client-side" sentinel: DrainOutbox skips its oversize check entirely against
+// such servers, preserving today's behavior.
+func (c *Client) MaxBlobSize() int64 {
+	if c.caps != nil {
+		return c.caps.Capabilities.MaxBlobSize
+	}
+	return 0
+}
+
 // SupportsBlobs reports whether the server supports the blob tier.
 func (c *Client) SupportsBlobs() bool {
 	if c.caps != nil {

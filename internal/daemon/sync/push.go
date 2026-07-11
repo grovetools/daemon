@@ -31,6 +31,13 @@ type PushPipeline struct {
 	cfg       PushConfig
 	log       *logging.UnifiedLogger
 	workspace string
+
+	// OnOversizeSkipped, when non-nil, is invoked for each outbox entry
+	// dropped because its content exceeds the server's advertised blob
+	// ceiling. It lets the watcher surface the skip (e.g. broadcast a
+	// SyncConflictPayload) without coupling the push pipeline to the store.
+	// Phase 4 will generalize this into a parked-entry surfacing hook.
+	OnOversizeSkipped func(workspace, path string, size, limit int64)
 }
 
 // NewPushPipeline constructs a push pipeline for a single workspace.
@@ -129,29 +136,74 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 			events[i] = event
 		}
 
-		// Handle blob uploads for large files
+		// Handle blob uploads for large files, with per-entry oversize
+		// disposition. A file larger than the server's advertised blob ceiling
+		// is NOT a batch error (that livelocked the whole outbox on one file:
+		// oversize → truncated upload → hash mismatch → forever): it is skipped
+		// with a warning, surfaced, and dropped so the batch keeps flowing.
+		// Transient blob-upload failures still fail the batch for a retry.
+		//
+		// The entries/events slices stay index-aligned as they are rebuilt —
+		// the result loop below maps pushResp.Results[i] ↔ entries[i].
 		if p.client.SupportsBlobs() {
-			maxInlineSize := p.client.MaxInlineSize()
-			blobErrors := make(map[int]error)
+			maxInline := p.client.MaxInlineSize()
+			maxBlob := p.client.MaxBlobSize()
+
+			keptEntries := make([]*OutboxEntry, 0, len(entries))
+			keptEvents := make([]syncproto.SyncEvent, 0, len(events))
+			var skippedIDs []int64
 			for i := range events {
-				if events[i].Size > maxInlineSize {
-					// Large file: upload chunks and clear inline content
+				switch {
+				case events[i].Size <= maxInline:
+					// Inline path, unchanged.
+				case maxBlob > 0 && events[i].Size > maxBlob:
+					// Oversize: exceeds the server blob ceiling. Decide → collect
+					// the ID → dispose below; do NOT keep the entry/event.
+					skippedIDs = append(skippedIDs, entries[i].ID)
+					p.log.Warn("oversize file skipped by sync").
+						Field("path", events[i].Path).
+						Field("size", events[i].Size).
+						Field("limit", maxBlob).Log(ctx)
+					if p.OnOversizeSkipped != nil {
+						p.OnOversizeSkipped(p.workspace, events[i].Path, events[i].Size, maxBlob)
+					}
+					continue
+				default:
+					// Between the inline threshold and the blob ceiling (or an
+					// old server that advertised no ceiling): upload the blob and
+					// clear inline content. A transient upload failure keeps
+					// today's batch-error return so the batch retries.
 					if err := p.uploadFileBlobs(ctx, events[i].Path, events[i].Content); err != nil {
-						// Mark blob upload failure; will skip this event from push
 						p.log.Warn("failed to upload blob").
 							Field("path", events[i].Path).
 							Err(err).Log(ctx)
-						blobErrors[i] = err
-						continue
+						return successCount, fmt.Errorf("blob upload failed for %s: %w", events[i].Path, err)
 					}
 					events[i].Content = nil // Don't send inline content for large files
 				}
+				keptEntries = append(keptEntries, entries[i])
+				keptEvents = append(keptEvents, events[i])
 			}
 
-			// If any blob uploads failed, return early to retry the entire batch
-			// (don't push events with missing blobs)
-			if len(blobErrors) > 0 {
-				return successCount, fmt.Errorf("blob upload failures: %v", blobErrors)
+			// Delete-with-warning is the Phase-1 disposition for oversize
+			// entries. Deciding, collecting IDs, and disposing are kept as
+			// separate steps so Phase 4 swaps only this disposal.
+			if len(skippedIDs) > 0 {
+				// Phase 4: park instead of delete
+				if err := p.db.DeleteOutbox(skippedIDs); err != nil {
+					p.log.Warn("failed to delete oversize outbox entries").
+						Err(err).Log(ctx)
+				}
+			}
+
+			entries = keptEntries
+			events = keptEvents
+
+			// The whole batch was oversize skips: those entries are deleted, so
+			// the next ListOutbox returns fresh work — loop rather than push an
+			// empty batch (no infinite loop, since the skips no longer requeue).
+			if len(events) == 0 {
+				continue
 			}
 		}
 
