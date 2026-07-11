@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -53,15 +54,19 @@ CREATE TABLE IF NOT EXISTS sync_documents (
 );
 
 CREATE TABLE IF NOT EXISTS sync_outbox (
-	id           INTEGER PRIMARY KEY AUTOINCREMENT,
-	document_id  TEXT NOT NULL DEFAULT '',
-	workspace    TEXT NOT NULL,
-	event_type   TEXT NOT NULL,
-	path         TEXT NOT NULL,
-	prev_path    TEXT NOT NULL DEFAULT '',
-	content_hash TEXT NOT NULL DEFAULT '',
-	payload      TEXT NOT NULL DEFAULT '',
-	created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	id            INTEGER PRIMARY KEY AUTOINCREMENT,
+	document_id   TEXT NOT NULL DEFAULT '',
+	workspace     TEXT NOT NULL,
+	event_type    TEXT NOT NULL,
+	path          TEXT NOT NULL,
+	prev_path     TEXT NOT NULL DEFAULT '',
+	content_hash  TEXT NOT NULL DEFAULT '',
+	payload       TEXT NOT NULL DEFAULT '',
+	created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	parked        INTEGER NOT NULL DEFAULT 0,
+	attempts      INTEGER NOT NULL DEFAULT 0,
+	next_retry_at DATETIME,
+	park_reason   TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
@@ -110,6 +115,38 @@ type OutboxEntry struct {
 	ContentHash string
 	Payload     string
 	CreatedAt   time.Time
+
+	// Phase 4 parking state. A parked entry stays queued (visible to
+	// ListOutbox / CountOutbox — a parked entry IS unsynced) but is skipped by
+	// ListOutboxDrainable until NextRetryAt passes. ParkReason is a free-form
+	// string ("conflict", "oversize_skipped"; P5 adds "diverged").
+	Parked      bool
+	Attempts    int
+	NextRetryAt time.Time
+	ParkReason  string
+}
+
+// outboxColumns is the shared SELECT column list for outbox scanners; the
+// order must match scanOutboxEntry.
+const outboxColumns = `id, document_id, workspace, event_type, path, prev_path, content_hash, payload, created_at, parked, attempts, next_retry_at, park_reason`
+
+// scanOutboxEntry scans one outbox row selected via outboxColumns. next_retry_at
+// is nullable (an entry only has a retry time once parked); parked is stored as
+// an INTEGER 0/1.
+func scanOutboxEntry(rows *sql.Rows) (*OutboxEntry, error) {
+	var e OutboxEntry
+	var parked int64
+	var nextRetry sql.NullTime
+	if err := rows.Scan(&e.ID, &e.DocumentID, &e.Workspace, &e.EventType, &e.Path,
+		&e.PrevPath, &e.ContentHash, &e.Payload, &e.CreatedAt,
+		&parked, &e.Attempts, &nextRetry, &e.ParkReason); err != nil {
+		return nil, err
+	}
+	e.Parked = parked != 0
+	if nextRetry.Valid {
+		e.NextRetryAt = nextRetry.Time
+	}
+	return &e, nil
 }
 
 // WorkspaceState is the per-workspace replication state.
@@ -145,12 +182,45 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("failed to apply sync db schema: %w", err)
 	}
 
+	// The client sync.db has no versioned migration mechanism (the server's
+	// embedded-FS migrations in sync/pkg/store are a different database). The
+	// CREATE TABLE IF NOT EXISTS schema above never alters an existing table,
+	// so columns added after a DB was first created are applied here with
+	// idempotent ALTER-swallow guards.
+	if err := migrateOutbox(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
 	d := &DB{db: db, path: path}
 	if err := d.ensureOriginID(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return d, nil
+}
+
+// migrateOutbox brings a pre-existing sync_outbox up to the current schema by
+// adding the Phase 4 parking columns to DBs created before they existed. Each
+// ALTER is idempotent: on a fresh DB (where the schema const already created
+// the columns) SQLite reports "duplicate column name", which is swallowed —
+// this is the established net-new pattern for this migration-less client DB.
+func migrateOutbox(db *sql.DB) error {
+	alters := []string{
+		`ALTER TABLE sync_outbox ADD COLUMN parked INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sync_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE sync_outbox ADD COLUMN next_retry_at DATETIME`,
+		`ALTER TABLE sync_outbox ADD COLUMN park_reason TEXT NOT NULL DEFAULT ''`,
+	}
+	for _, stmt := range alters {
+		if _, err := db.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue // column already present — idempotent no-op
+			}
+			return fmt.Errorf("failed to migrate sync_outbox: %w", err)
+		}
+	}
+	return nil
 }
 
 // Close closes the underlying database.
@@ -316,8 +386,7 @@ func (d *DB) EnqueueOutbox(e *OutboxEntry) (int64, error) {
 // ListOutbox returns pending outbox entries in insertion order. An empty
 // workspace lists all workspaces; limit <= 0 means no limit.
 func (d *DB) ListOutbox(workspace string, limit int) ([]*OutboxEntry, error) {
-	query := `SELECT id, document_id, workspace, event_type, path, prev_path, content_hash, payload, created_at
-		 FROM sync_outbox`
+	query := `SELECT ` + outboxColumns + ` FROM sync_outbox`
 	var args []interface{}
 	if workspace != "" {
 		query += ` WHERE workspace = ?`
@@ -337,12 +406,11 @@ func (d *DB) ListOutbox(workspace string, limit int) ([]*OutboxEntry, error) {
 
 	var entries []*OutboxEntry
 	for rows.Next() {
-		var e OutboxEntry
-		if err := rows.Scan(&e.ID, &e.DocumentID, &e.Workspace, &e.EventType, &e.Path,
-			&e.PrevPath, &e.ContentHash, &e.Payload, &e.CreatedAt); err != nil {
+		e, err := scanOutboxEntry(rows)
+		if err != nil {
 			return nil, fmt.Errorf("failed to scan sync outbox entry: %w", err)
 		}
-		entries = append(entries, &e)
+		entries = append(entries, e)
 	}
 	return entries, rows.Err()
 }
@@ -381,11 +449,38 @@ func (d *DB) UpdateOutboxContentHashForPath(workspace, path, hash string) error 
 	return nil
 }
 
-// CountOutbox returns the number of pending outbox entries.
+// ParkOutbox marks an outbox entry parked with an exponential/next retry time
+// and a reason, incrementing its attempt count. A parked entry stays in the
+// outbox (still counted as pending, still visible to the anti-entropy sweep's
+// pending-set) but ListOutboxDrainable skips it until nextRetryAt passes. The
+// entry unparks implicitly: expiry makes it drainable again, a successful push
+// deletes it, and a repeat conflict re-parks with attempts+1 → longer backoff.
+func (d *DB) ParkOutbox(id int64, reason string, nextRetryAt time.Time) error {
+	_, err := d.db.Exec(
+		`UPDATE sync_outbox SET parked = 1, attempts = attempts + 1, next_retry_at = ?, park_reason = ? WHERE id = ?`,
+		nextRetryAt, reason, id)
+	if err != nil {
+		return fmt.Errorf("failed to park sync outbox entry %d: %w", id, err)
+	}
+	return nil
+}
+
+// CountOutbox returns the number of pending outbox entries (parked included —
+// a parked entry is still unsynced state).
 func (d *DB) CountOutbox() (int, error) {
 	var n int
 	if err := d.db.QueryRow(`SELECT COUNT(*) FROM sync_outbox`).Scan(&n); err != nil {
 		return 0, fmt.Errorf("failed to count sync outbox: %w", err)
+	}
+	return n, nil
+}
+
+// CountOutboxParked returns the number of parked outbox entries, for the
+// /api/sync/status surface (the grove-status parked line, the S3 assertion).
+func (d *DB) CountOutboxParked() (int, error) {
+	var n int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM sync_outbox WHERE parked = 1`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("failed to count parked sync outbox: %w", err)
 	}
 	return n, nil
 }

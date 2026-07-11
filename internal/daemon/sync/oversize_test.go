@@ -128,9 +128,21 @@ func TestDrainOutboxSkipsOversize(t *testing.T) {
 	if got := pushCount.Load(); got != 1 {
 		t.Fatalf("expected exactly 1 push batch, got %d (livelock regression)", got)
 	}
-	// Outbox drains fully: the oversize entry is deleted, the small one acked.
-	if remaining, _ := db.CountOutbox(); remaining != 0 {
-		t.Fatalf("expected empty outbox, got %d entries", remaining)
+	// Phase 4: the small one acked (deleted); the oversize one is PARKED, not
+	// deleted — still counted as pending (unsynced), surfaced not lost.
+	if remaining, _ := db.CountOutbox(); remaining != 1 {
+		t.Fatalf("expected the oversize entry to stay parked, got %d entries", remaining)
+	}
+	if parked, _ := db.CountOutboxParked(); parked != 1 {
+		t.Fatalf("expected 1 parked entry, got %d", parked)
+	}
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected 1 remaining outbox entry, got %d (err=%v)", len(entries), err)
+	}
+	if entries[0].Path != "inbox/big.md" || entries[0].ParkReason != "oversize_skipped" || entries[0].Attempts != 1 {
+		t.Fatalf("unexpected parked entry: path=%q reason=%q attempts=%d",
+			entries[0].Path, entries[0].ParkReason, entries[0].Attempts)
 	}
 }
 
@@ -185,8 +197,14 @@ func TestDrainOutboxAllOversizeDrains(t *testing.T) {
 	if got := skipCount.Load(); got != 1 {
 		t.Fatalf("expected OnOversizeSkipped once, got %d", got)
 	}
-	if remaining, _ := db.CountOutbox(); remaining != 0 {
-		t.Fatalf("expected empty outbox, got %d entries", remaining)
+	// Phase 4: the all-oversize batch parks its entries (rather than deleting)
+	// and the loop still terminates — the parked entry drops out of the next
+	// ListOutboxDrainable call (future retry time).
+	if remaining, _ := db.CountOutbox(); remaining != 1 {
+		t.Fatalf("expected the oversize entry to stay parked, got %d entries", remaining)
+	}
+	if parked, _ := db.CountOutboxParked(); parked != 1 {
+		t.Fatalf("expected 1 parked entry, got %d", parked)
 	}
 }
 

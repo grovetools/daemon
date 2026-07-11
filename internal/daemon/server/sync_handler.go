@@ -40,6 +40,7 @@ type syncStatusResponse struct {
 	OriginID      string                `json:"origin_id,omitempty"`
 	Documents     int                   `json:"documents"`
 	OutboxPending int                   `json:"outbox_pending"`
+	OutboxParked  int                   `json:"outbox_parked"`
 	Workspaces    []syncWorkspaceStatus `json:"workspaces,omitempty"`
 }
 
@@ -71,8 +72,15 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		if n, err := s.syncDB.CountDocuments(); err == nil {
 			out.Documents = n
 		}
+		// OutboxPending is the TOTAL count, parked included — a parked entry is
+		// still unsynced state, so hiding it would let waitForSync (and the
+		// cluster harness) pass while data is stuck. OutboxParked splits out the
+		// parked subset for the grove-status parked line and the S3 assertion.
 		if n, err := s.syncDB.CountOutbox(); err == nil {
 			out.OutboxPending = n
+		}
+		if n, err := s.syncDB.CountOutboxParked(); err == nil {
+			out.OutboxParked = n
 		}
 		if states, err := s.syncDB.ListStates(); err == nil {
 			for _, st := range states {
@@ -157,6 +165,10 @@ type syncOutboxResponse struct {
 	PrevPath    string    `json:"prev_path,omitempty"`
 	ContentHash string    `json:"content_hash"`
 	CreatedAt   time.Time `json:"created_at"`
+	Parked      bool      `json:"parked,omitempty"`
+	Attempts    int       `json:"attempts,omitempty"`
+	NextRetryAt time.Time `json:"next_retry_at,omitzero"`
+	ParkReason  string    `json:"park_reason,omitempty"`
 }
 
 // handleSyncOutbox handles GET /api/sync/outbox[?workspace=W], returning the
@@ -192,6 +204,10 @@ func (s *Server) handleSyncOutbox(w http.ResponseWriter, r *http.Request) {
 			PrevPath:    e.PrevPath,
 			ContentHash: e.ContentHash,
 			CreatedAt:   e.CreatedAt,
+			Parked:      e.Parked,
+			Attempts:    e.Attempts,
+			NextRetryAt: e.NextRetryAt,
+			ParkReason:  e.ParkReason,
 		})
 	}
 

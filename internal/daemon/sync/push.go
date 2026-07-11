@@ -14,6 +14,19 @@ import (
 	"github.com/grovetools/core/pkg/syncproto"
 )
 
+const (
+	// oversizeRetryInterval is the fixed park duration for an entry whose
+	// content exceeds the server's blob ceiling. Exponential backoff is
+	// meaningless for a size condition; a long, flat retry is enough — the
+	// cheap disk re-read at push time self-heals a shrunk file or a raised
+	// server ceiling.
+	oversizeRetryInterval = 1 * time.Hour
+
+	// conflictBackoffCap bounds the exponential backoff applied to a parked
+	// conflict entry so attempts never stretch past ~10 minutes.
+	conflictBackoffCap = 10 * time.Minute
+)
+
 // PushConfig holds the configuration for the push pipeline.
 type PushConfig struct {
 	BatchSize     int           // Events per push (default 50)
@@ -84,8 +97,12 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 		default:
 		}
 
-		// Fetch a batch of outbox entries
-		entries, err := p.db.ListOutbox(p.workspace, p.cfg.BatchSize)
+		// Fetch a batch of drainable outbox entries. ListOutboxDrainable skips
+		// parked entries whose retry time is still in the future and enforces
+		// the doc/prefix barrier rules (F7), so a parked conflict isolates only
+		// itself instead of head-of-line-blocking the queue (S3).
+		now := time.Now()
+		entries, err := p.db.ListOutboxDrainable(p.workspace, p.cfg.BatchSize, now)
 		if err != nil {
 			return successCount, fmt.Errorf("failed to list outbox: %w", err)
 		}
@@ -185,14 +202,17 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				keptEvents = append(keptEvents, events[i])
 			}
 
-			// Delete-with-warning is the Phase-1 disposition for oversize
-			// entries. Deciding, collecting IDs, and disposing are kept as
-			// separate steps so Phase 4 swaps only this disposal.
-			if len(skippedIDs) > 0 {
-				// Phase 4: park instead of delete
-				if err := p.db.DeleteOutbox(skippedIDs); err != nil {
-					p.log.Warn("failed to delete oversize outbox entries").
-						Err(err).Log(ctx)
+			// Phase 4: park oversize entries instead of deleting them, so the
+			// surfaced-not-deleted disposition is uniform (a parked entry is
+			// still counted as unsynced and stays visible on /api/sync/outbox).
+			// A fixed long retry — exponential backoff is meaningless for a size
+			// condition; DrainOutbox re-reads disk content at push time, so a
+			// shrunk file or a raised server ceiling self-heals on the next
+			// retry.
+			for _, id := range skippedIDs {
+				if err := p.db.ParkOutbox(id, "oversize_skipped", now.Add(oversizeRetryInterval)); err != nil {
+					p.log.Warn("failed to park oversize outbox entry").
+						Field("id", id).Err(err).Log(ctx)
 				}
 			}
 
@@ -242,6 +262,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 
 		// Process results
 		var idsToDelete []int64
+		parkedCount := 0
 		for i, result := range pushResp.Results {
 			if i >= len(entries) {
 				break
@@ -288,13 +309,21 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 					Field("server_version", result.Version).Log(ctx)
 				// Push-side diff3 rebase: 3-way merge base_content / local
 				// disk / server head. A clean merge rewrites the file and
-				// retargets the entry at the new server head so the next
-				// drain tick re-pushes it; overlapping hunks (or a transient
-				// fetch failure) leave the entry parked exactly as before —
-				// one retry per tick, head-of-line blocking, no-progress
-				// guard below.
+				// retargets the entry at the new server head; overlapping hunks
+				// (or a transient fetch failure) leave the content untouched and
+				// write a conflict artifact. Either way (P4) the entry is parked
+				// with an exponential backoff below rather than retried every
+				// tick — a clean rebase re-pushes the merged content after the
+				// backoff; a failed one just backs off instead of spinning.
+				// P5 owns rebaseConflictedEntry itself; do not touch it here.
 				if events[i].Type == syncproto.EventDocumentUpdated {
 					p.rebaseConflictedEntry(ctx, workspaceRoot, entries[i], &result)
+				}
+				if err := p.db.ParkOutbox(entries[i].ID, "conflict", now.Add(p.conflictBackoff(entries[i].Attempts))); err != nil {
+					p.log.Warn("failed to park conflicted outbox entry").
+						Field("path", events[i].Path).Err(err).Log(ctx)
+				} else {
+					parkedCount++
 				}
 
 			case syncproto.PushStatusRejected:
@@ -312,14 +341,16 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				p.log.Warn("failed to delete outbox entries").
 					Err(err).Log(ctx)
 			}
-		} else {
-			// No-progress guard: every entry in this batch stayed in the
-			// outbox (conflicts awaiting merge). Another pass would refetch
-			// the same rows and spin hot for the rest of the process's life
-			// — yield until the next CheckInterval tick instead so the pull
-			// pipeline gets a chance to advance the merge base. Conflicted
-			// entries at the head of the queue block later entries until
-			// they resolve (ordering is preserved deliberately).
+		}
+
+		// No-progress guard: break only when this batch neither deleted nor
+		// parked anything. Parking IS progress — a parked entry drops out of
+		// the next ListOutboxDrainable call (its retry time is in the future),
+		// so the loop terminates naturally without refetching the same rows and
+		// spinning hot (the ~2,300 log-lines/sec regression). When something
+		// parked, loop again to drain the entries the parked one is no longer
+		// head-of-line-blocking.
+		if len(idsToDelete) == 0 && parkedCount == 0 {
 			break
 		}
 
@@ -334,6 +365,21 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 	}
 
 	return successCount, nil
+}
+
+// conflictBackoff returns the exponential retry delay for a conflict entry that
+// has already been parked `attempts` times: RetryBackoff << attempts, capped at
+// conflictBackoffCap. The shift is guarded against overflow (a large attempts
+// count shifts the duration negative).
+func (p *PushPipeline) conflictBackoff(attempts int) time.Duration {
+	if attempts < 0 {
+		attempts = 0
+	}
+	d := p.cfg.RetryBackoff << attempts
+	if d <= 0 || d > conflictBackoffCap {
+		return conflictBackoffCap
+	}
+	return d
 }
 
 // rebaseConflictedEntry implements the push-side diff3 rebase for a parked

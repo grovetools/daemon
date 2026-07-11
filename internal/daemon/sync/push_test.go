@@ -126,6 +126,98 @@ func TestDrainOutboxConflictTerminates(t *testing.T) {
 	}
 }
 
+// TestDrainOutboxParksConflictInIsolation is the S3 unit-level assertion: one
+// conflicted document is parked (with a backoff) and isolates ONLY itself — the
+// other documents in the same batch drain, the drain terminates (no hot loop),
+// and a second drain before the backoff expires does not re-attempt the parked
+// entry.
+func TestDrainOutboxParksConflictInIsolation(t *testing.T) {
+	db := openTestDB(t)
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a", "b", "c"} {
+		if err := os.WriteFile(filepath.Join(root, "inbox", name+".md"), []byte("content "+name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.EnqueueOutbox(&OutboxEntry{
+			DocumentID: "doc-" + name, Workspace: "default",
+			EventType: syncproto.EventDocumentCreated, Path: "inbox/" + name + ".md", ContentHash: "h" + name,
+		}); err != nil {
+			t.Fatalf("EnqueueOutbox %s: %v", name, err)
+		}
+	}
+
+	// Server conflicts inbox/a.md, accepts the rest.
+	var pushCount atomic.Int64
+	pushedPaths := map[string]int{}
+	srv := servePushStub(t, func(req *syncproto.PushRequest) *syncproto.PushResponse {
+		pushCount.Add(1)
+		resp := &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
+		for i, ev := range req.Events {
+			pushedPaths[ev.Path]++
+			if ev.Path == "inbox/a.md" {
+				resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusConflict, DocumentID: "doc-a", Version: 9}
+				continue
+			}
+			resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusAccepted, DocumentID: ev.DocumentID, Version: 1}
+		}
+		return resp
+	})
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	// Long backoff so the "second drain" below lands well inside the park window.
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{RetryBackoff: time.Hour})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	n, err := pipeline.DrainOutbox(ctx, root)
+	if err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected the 2 non-conflicted docs to ack, got %d", n)
+	}
+	// Exactly one push batch — the conflict must not trigger a hot refetch loop.
+	if got := pushCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 push batch, got %d (hot-loop regression)", got)
+	}
+
+	// Only inbox/a.md remains, parked as a conflict with attempts=1.
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected only the conflicted entry to remain, got %d (err=%v)", len(entries), err)
+	}
+	e := entries[0]
+	if e.Path != "inbox/a.md" || !e.Parked || e.ParkReason != "conflict" || e.Attempts != 1 {
+		t.Fatalf("unexpected remaining entry: path=%q parked=%v reason=%q attempts=%d",
+			e.Path, e.Parked, e.ParkReason, e.Attempts)
+	}
+	if parked, _ := db.CountOutboxParked(); parked != 1 {
+		t.Fatalf("expected 1 parked entry, got %d", parked)
+	}
+	if !e.NextRetryAt.After(time.Now()) {
+		t.Fatalf("parked conflict must have a future next_retry_at, got %v", e.NextRetryAt)
+	}
+
+	// Second drain before the backoff expires: the parked entry is skipped, so
+	// no additional push happens and it stays parked.
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox (second pass): %v", err)
+	}
+	if got := pushCount.Load(); got != 1 {
+		t.Fatalf("parked entry must not be re-pushed before its retry time, got %d push batches", got)
+	}
+	if remaining, _ := db.CountOutbox(); remaining != 1 {
+		t.Fatalf("conflicted entry must stay queued, got %d", remaining)
+	}
+}
+
 // TestDrainOutboxPopulatesBaseVersion verifies update events carry the
 // document's last-synced version as the OCC base — pushing base_version 0
 // against a server head manufactures a conflict on every real edit.
@@ -325,12 +417,18 @@ func TestDrainOutboxRebasesCleanConflict(t *testing.T) {
 
 	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
 	handshake(t, client)
-	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+	// Phase 4: a clean rebase retargets the entry AND parks it with a backoff,
+	// so the re-push happens on a later drain (after next_retry_at). Use a short
+	// backoff so the test's second drain lands past it without a long sleep; the
+	// backoff (100ms) still far exceeds the sub-ms localhost drain loop, so the
+	// entry reliably stays parked for the intermediate assertions below.
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{RetryBackoff: 100 * time.Millisecond})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// First drain: conflict → rebase, entry stays queued for the re-push.
+	// First drain: conflict → rebase (retarget) → park with backoff; the entry
+	// stays queued (parked) for the re-push after next_retry_at.
 	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
 		t.Fatalf("DrainOutbox (rebase pass): %v", err)
 	}
@@ -361,8 +459,15 @@ func TestDrainOutboxRebasesCleanConflict(t *testing.T) {
 	if entries[0].ContentHash != sha([]byte(wantMerged)) {
 		t.Fatalf("outbox entry not retargeted at merged content: %q", entries[0].ContentHash)
 	}
+	// The retargeted entry is parked with a conflict backoff until next_retry_at.
+	if !entries[0].Parked || entries[0].ParkReason != "conflict" {
+		t.Fatalf("rebased entry must be parked as conflict, got parked=%v reason=%q",
+			entries[0].Parked, entries[0].ParkReason)
+	}
 
-	// Second drain: the rebased entry pushes cleanly with base_version 7.
+	// Wait past the conflict backoff so the parked entry becomes drainable, then
+	// re-drain: it pushes cleanly with the server head (v7) as base_version.
+	time.Sleep(150 * time.Millisecond)
 	n, err := pipeline.DrainOutbox(ctx, root)
 	if err != nil {
 		t.Fatalf("DrainOutbox (re-push pass): %v", err)
