@@ -44,9 +44,10 @@ type syncStatusResponse struct {
 }
 
 type syncWorkspaceStatus struct {
-	Name         string    `json:"name"`
-	Cursor       int64     `json:"cursor"`
-	LastSyncedAt time.Time `json:"last_synced_at,omitzero"`
+	Name         string                    `json:"name"`
+	Cursor       int64                     `json:"cursor"`
+	LastSyncedAt time.Time                 `json:"last_synced_at,omitzero"`
+	Hydration    *syncdb.HydrationProgress `json:"hydration,omitempty"`
 }
 
 // handleSyncStatus handles GET /api/sync/status.
@@ -79,6 +80,7 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 					Name:         st.Workspace,
 					Cursor:       st.Cursor,
 					LastSyncedAt: st.LastSyncedAt,
+					Hydration:    syncdb.HydrationStatus(st.Workspace),
 				})
 			}
 		}

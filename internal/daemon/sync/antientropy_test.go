@@ -35,7 +35,7 @@ func serveSnapshotStub(t *testing.T, manifest *syncproto.SnapshotManifest) *http
 
 func newTestAntiEntropy(db *DB, client *Client, root string) *AntiEntropyPass {
 	return NewAntiEntropyPass(db, client, "default", root,
-		logging.NewUnifiedLogger("test.antientropy"), AntiEntropyConfig{})
+		NewDocSpace(nil), logging.NewUnifiedLogger("test.antientropy"), AntiEntropyConfig{})
 }
 
 // TestAntiEntropyAdoptRollsMergeBase is the defect-#13 regression: adopting
@@ -338,5 +338,172 @@ func TestSweepHandlesMissingFiles(t *testing.T) {
 	}
 	if doc, _ := db.GetDocument("doc-1"); doc != nil {
 		t.Fatal("deleted document row should be dropped from the identity map")
+	}
+}
+
+// writeTreeFile writes content to root/rel, creating parent dirs.
+func writeTreeFile(t *testing.T, root, rel, content string) {
+	t.Helper()
+	abs := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWalkLocalTreeHydrates: on an empty sync.db, the tree walk enqueues every
+// Included file (first-sync = hydration) and never enqueues excluded content
+// (.git/, .artifacts/).
+func TestWalkLocalTreeHydrates(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+
+	writeTreeFile(t, root, "inbox/a.md", "alpha\n")
+	writeTreeFile(t, root, "quick/deep/b.md", "beta\n")
+	writeTreeFile(t, root, "concepts/c.md", "gamma\n")
+	// Excluded: must never enqueue.
+	writeTreeFile(t, root, ".git/config", "[core]\n")
+	writeTreeFile(t, root, "plans/p/.artifacts/x.md", "generated\n")
+	writeTreeFile(t, root, "inbox/.DS_Store", "junk\n")
+
+	ae := newTestAntiEntropy(db, nil, root)
+	if err := ae.walkLocalTree(context.Background()); err != nil {
+		t.Fatalf("walkLocalTree: %v", err)
+	}
+
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, e := range entries {
+		got[e.Path] = e.EventType
+	}
+	want := []string{"inbox/a.md", "quick/deep/b.md", "concepts/c.md"}
+	if len(entries) != len(want) {
+		t.Fatalf("outbox entries = %d (%v), want %d", len(entries), got, len(want))
+	}
+	for _, p := range want {
+		if got[p] != syncproto.EventDocumentCreated {
+			t.Fatalf("path %q event = %q, want document_created", p, got[p])
+		}
+	}
+	for excluded := range map[string]bool{".git/config": true, "plans/p/.artifacts/x.md": true, "inbox/.DS_Store": true} {
+		if _, ok := got[excluded]; ok {
+			t.Fatalf("excluded path %q was enqueued", excluded)
+		}
+	}
+}
+
+// TestWalkLocalTreeSkipsTracked is the create-storm guard: a file that already
+// has a sync.db row (a partial sync.db meeting a full tree) is skipped, never
+// re-pushed. Drift on tracked docs is sweepLocalDocuments' job.
+func TestWalkLocalTreeSkipsTracked(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+
+	writeTreeFile(t, root, "inbox/tracked.md", "already synced\n")
+	writeTreeFile(t, root, "inbox/fresh.md", "brand new\n")
+
+	// Pre-seed a row for tracked.md, mimicking a partial sync.db.
+	if err := db.UpsertDocument(&Document{
+		DocumentID:  "doc-tracked",
+		Workspace:   "default",
+		Path:        "inbox/tracked.md",
+		ContentHash: hashContent([]byte("already synced\n")),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ae := newTestAntiEntropy(db, nil, root)
+	if err := ae.walkLocalTree(context.Background()); err != nil {
+		t.Fatalf("walkLocalTree: %v", err)
+	}
+
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("outbox entries = %d, want 1 (only the untracked file)", len(entries))
+	}
+	if entries[0].Path != "inbox/fresh.md" {
+		t.Fatalf("enqueued %q, want inbox/fresh.md (tracked file must be skipped)", entries[0].Path)
+	}
+}
+
+// TestWalkLocalTreeIdempotent: a second reconcile pass over an unchanged tree
+// enqueues nothing new — every file now has a row from the first pass.
+func TestWalkLocalTreeIdempotent(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+
+	writeTreeFile(t, root, "inbox/a.md", "alpha\n")
+	writeTreeFile(t, root, "quick/b.md", "beta\n")
+
+	ae := newTestAntiEntropy(db, nil, root)
+	if err := ae.walkLocalTree(context.Background()); err != nil {
+		t.Fatalf("first walkLocalTree: %v", err)
+	}
+	firstCount, err := db.CountOutbox()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCount != 2 {
+		t.Fatalf("after first pass outbox = %d, want 2", firstCount)
+	}
+
+	if err := ae.walkLocalTree(context.Background()); err != nil {
+		t.Fatalf("second walkLocalTree: %v", err)
+	}
+	secondCount, err := db.CountOutbox()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondCount != firstCount {
+		t.Fatalf("second pass enqueued %d new entries, want 0 (idempotence)", secondCount-firstCount)
+	}
+}
+
+// TestWalkLocalTreeQuarantines: a secret file is logged + counted but never
+// enqueued, and produces no tracked row.
+func TestWalkLocalTreeQuarantines(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+
+	writeTreeFile(t, root, "inbox/ok.md", "safe\n")
+	writeTreeFile(t, root, "inbox/secret.md", "github_pat_1234567890123456789012\n")
+
+	ae := newTestAntiEntropy(db, nil, root)
+	if err := ae.walkLocalTree(context.Background()); err != nil {
+		t.Fatalf("walkLocalTree: %v", err)
+	}
+
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Path != "inbox/ok.md" {
+		t.Fatalf("outbox = %+v, want only inbox/ok.md (secret quarantined)", entries)
+	}
+	if doc, _ := db.GetDocumentByPath("default", "inbox/secret.md"); doc != nil {
+		t.Fatal("quarantined secret must not be tracked")
+	}
+
+	// Progress registry reflects one quarantine.
+	prog := HydrationStatus("default")
+	if prog == nil {
+		t.Fatal("expected hydration progress to be recorded")
+	}
+	if prog.Quarantined != 1 {
+		t.Fatalf("quarantined count = %d, want 1", prog.Quarantined)
+	}
+	if prog.Enqueued != 1 {
+		t.Fatalf("enqueued count = %d, want 1", prog.Enqueued)
+	}
+	if prog.Running {
+		t.Fatal("hydration should be marked finished after the pass returns")
 	}
 }

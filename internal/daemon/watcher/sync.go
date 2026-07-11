@@ -16,8 +16,6 @@ package watcher
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"maps"
 	"os"
@@ -27,7 +25,6 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/google/uuid"
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
@@ -375,23 +372,20 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 		return
 	}
 
-	sum := sha256.Sum256(content)
-	hash := hex.EncodeToString(sum[:])
-
-	doc, err := h.db.GetDocumentByPath(watch.workspace, rel)
+	// Record the change through the shared seeding helper: hash-gate → secret
+	// quarantine (honoring the allow-list override) → UpsertDocument →
+	// EnqueueOutbox. The anti-entropy reconcile's walkLocalTree calls the same
+	// helper, so watch and reconcile can never disagree about the doc space or
+	// the quarantine judgement.
+	reason, err := syncdb.InsertAndEnqueue(h.db, watch.workspace, rel, content)
 	if err != nil {
-		h.ulog.Warn("Failed to query sync document").Err(err).Field("path", rel).Log(ctx)
+		h.ulog.Warn("Failed to record sync change").Err(err).Field("path", rel).Log(ctx)
 		return
 	}
-
-	// Hash-gate: unchanged content never re-enters the outbox.
-	if doc != nil && doc.ContentHash == hash {
-		return
-	}
-
-	// Secret quarantine: drop the event before anything reaches the outbox.
-	// The heuristic gate is shared with the anti-entropy push sweep.
-	if reason, found := syncdb.ScanForSecrets(content); found {
+	if reason != "" {
+		// The watcher surfaces quarantine as a sync_conflict SSE update
+		// (addendum #8: the watcher keeps its Store broadcast; the reconcile
+		// only logs + counts).
 		h.ulog.Warn("Sync quarantine: document matches secret heuristic, not queued").
 			Field("workspace", watch.workspace).
 			Field("path", rel).
@@ -403,34 +397,6 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 			Path:      rel,
 			Detail:    reason,
 		})
-		return
-	}
-
-	eventType := syncproto.EventDocumentCreated
-	documentID := uuid.New().String()
-	if doc != nil {
-		eventType = syncproto.EventDocumentUpdated
-		documentID = doc.DocumentID
-	}
-
-	if err := h.db.UpsertDocument(&syncdb.Document{
-		DocumentID:  documentID,
-		Workspace:   watch.workspace,
-		Path:        rel,
-		ContentHash: hash,
-	}); err != nil {
-		h.ulog.Warn("Failed to upsert sync document").Err(err).Field("path", rel).Log(ctx)
-		return
-	}
-
-	if _, err := h.db.EnqueueOutbox(&syncdb.OutboxEntry{
-		DocumentID:  documentID,
-		Workspace:   watch.workspace,
-		EventType:   eventType,
-		Path:        rel,
-		ContentHash: hash,
-	}); err != nil {
-		h.ulog.Warn("Failed to enqueue sync outbox entry").Err(err).Field("path", rel).Log(ctx)
 	}
 }
 
@@ -628,7 +594,10 @@ func (h *SyncHandler) ensurePipelines() {
 			})
 		}
 
-		ae := syncdb.NewAntiEntropyPass(h.db, client, name, root, h.ulog, syncdb.AntiEntropyConfig{})
+		// Build the reconcile with the same per-workspace DocSpace the watcher
+		// uses (sub is already resolved above), so walk coverage and reconcile
+		// coverage judge the doc space identically.
+		ae := syncdb.NewAntiEntropyPass(h.db, client, name, root, syncdb.NewDocSpace(sub), h.ulog, syncdb.AntiEntropyConfig{})
 		go h.runWithRecovery(pctx, name, "anti-entropy", func() error {
 			// One immediate pass (initial reconciliation), then the loop.
 			if err := ae.Run(pctx); err != nil {
