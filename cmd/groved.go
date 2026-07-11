@@ -427,6 +427,17 @@ func newGrovedStartCmd() *cobra.Command {
 			srv.SetSatelliteConnManager(satCM)
 			if satCM != nil {
 				srv.StartSatelliteLeaseReleaser(ctx)
+				// ntfy-primary notification bridge (P10, M2 contract C18): fire
+				// on remote-job terminal events. ntfy is the reliable
+				// cross-machine transport; the notifier's SendSystem adjunct
+				// no-ops on a headless host. URL/topic come from the existing
+				// notify config loader ([notifications].ntfy); an empty topic (or
+				// ntfy disabled) leaves the primary send off, system-notify only.
+				ntfyURL, ntfyTopic := "", ""
+				if ntfyCfg := notifyconfig.Load(); ntfyCfg != nil && ntfyCfg.Ntfy.Enabled {
+					ntfyURL, ntfyTopic = ntfyCfg.Ntfy.URL, ntfyCfg.Ntfy.Topic
+				}
+				srv.StartSatelliteNotifier(ctx, ntfyURL, ntfyTopic)
 			}
 
 			// 3.65 Machine-wide build queue scheduler. Sized from [daemon.build]

@@ -439,6 +439,12 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/nav/groups/", s.handleNavGroup)
 	mux.HandleFunc("/api/nav/locked-keys", s.handleNavLockedKeys)
 	mux.HandleFunc("/api/nav/last-accessed", s.handleNavLastAccessedGroup)
+	// Satellite federation read surface (P10, M2 contract C17). This is a
+	// laptop-side READ endpoint returning the global daemon's ConnManager
+	// health map — NOT an inbound verb the laptop invokes on a satellite, so
+	// C3's direction invariant holds. The mux.HandleFunc count increases here
+	// deliberately for this local read surface.
+	mux.HandleFunc("/api/satellites", s.handleSatellites)
 	// System endpoints
 	mux.HandleFunc("/api/system/info", s.handleSystemInfo)
 	mux.HandleFunc("/api/system/boot", s.handleSystemBoot)
@@ -762,6 +768,31 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	sessions := s.engine.Store().GetSessions()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(sessions)
+}
+
+// handleSatellites handles GET for the satellite connection-health map
+// (path: /api/satellites, P10 / M2 contract C17). The global daemon's
+// ConnManager populates the Store; scoped/satellite-less daemons return an
+// empty object. The store's SatelliteStatusPayload shares JSON tags with
+// models.SatelliteStatus, so it serializes straight through. This is a
+// laptop-side read surface only — C3's direction invariant is unaffected.
+func (s *Server) handleSatellites(w http.ResponseWriter, r *http.Request) {
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	statuses := s.engine.Store().GetSatelliteStatuses()
+	if statuses == nil {
+		statuses = map[string]*store.SatelliteStatusPayload{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(statuses)
 }
 
 // handleSessionByID handles session-specific operations (path: /api/sessions/{id}/*).
