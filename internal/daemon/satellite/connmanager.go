@@ -194,6 +194,13 @@ func (cm *ConnManager) keepalive(ctx context.Context, client *ssh.Client) {
 	}
 }
 
+// HasSatellite reports whether name is a registered satellite. Callers use it
+// to fail a dispatch fast with a clear error before attempting a dial.
+func (cm *ConnManager) HasSatellite(name string) bool {
+	_, ok := cm.registry.Get(name)
+	return ok
+}
+
 // DialSatelliteSocket is the ONLY downstream primitive (C1). It opens a
 // direct-streamlocal@openssh.com channel to the satellite's remote groved unix
 // socket and returns it as a net.Conn. It errors immediately if the satellite

@@ -418,6 +418,17 @@ func newGrovedStartCmd() *cobra.Command {
 				StartedAt:         time.Now(),
 			})
 
+			// Satellite dispatch (P9): give the server the SSH transport so a
+			// `Satellite`-tagged /api/jobs submit forwards to that satellite
+			// (M2 C1/C10). satCM is nil on scoped/satellite-less daemons, in
+			// which case such submits get a 503. When present, also start the
+			// advisory-lease releaser that clears .grove-lease.yml on a
+			// forwarded job's terminal federated event (C14).
+			srv.SetSatelliteConnManager(satCM)
+			if satCM != nil {
+				srv.StartSatelliteLeaseReleaser(ctx)
+			}
+
 			// 3.65 Machine-wide build queue scheduler. Sized from [daemon.build]
 			// max_parallel; defaults to max(2, NumCPU/2). Fast to construct, so
 			// wired before bind.

@@ -37,6 +37,7 @@ import (
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
+	"github.com/grovetools/daemon/internal/daemon/satellite"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
 	"github.com/grovetools/daemon/internal/daemon/theming"
@@ -83,6 +84,21 @@ type Server struct {
 	jobRunner      atomic.Pointer[jobrunner.JobRunner]
 	envManager     atomic.Pointer[daemonenv.Manager]
 	channelManager atomic.Pointer[channels.Manager]
+
+	// satelliteCM is the SSH transport to registered satellites (M2 C1/C10).
+	// It is wired ONLY on the global daemon (scope==""); scoped daemons leave
+	// it nil, so a `Satellite`-tagged submit there returns 503. handleJobs uses
+	// it to forward a satellite-routed job to that satellite's existing
+	// POST /api/jobs (C3 — the satellite gains no new verb).
+	satelliteCM atomic.Pointer[satellite.ConnManager]
+
+	// satelliteLeases maps a forwarded job's ID to the LOCAL plan dir the
+	// laptop wrote a .grove-lease.yml into at dispatch (M2 C14). The lease is
+	// removed when the job's federated terminal event arrives (see
+	// StartSatelliteLeaseReleaser); a laptop restart loses this map and the
+	// lease then releases by TTL expiry. Guarded by satelliteLeasesMu.
+	satelliteLeasesMu sync.Mutex
+	satelliteLeases   map[string]string
 
 	// bootStatus is the source of truth for GET /api/system/boot. Nil until
 	// the early-bind boot goroutine sets it; handleSystemBoot then reports
@@ -159,9 +175,10 @@ func New(autoShutdown bool) *Server {
 		IdleTimeout:    2 * time.Minute,
 	}
 	return &Server{
-		ulog:           logging.NewUnifiedLogger("groved.server"),
-		captureWaiters: make(map[string]chan string),
-		terminalHub:    hub.NewHub(hubCfg),
+		ulog:            logging.NewUnifiedLogger("groved.server"),
+		captureWaiters:  make(map[string]chan string),
+		terminalHub:     hub.NewHub(hubCfg),
+		satelliteLeases: make(map[string]string),
 	}
 }
 
@@ -185,6 +202,14 @@ func (s *Server) SetRunningConfig(cfg *RunningConfig) {
 // SetJobRunner sets the job runner for the server.
 func (s *Server) SetJobRunner(jr *jobrunner.JobRunner) {
 	s.jobRunner.Store(jr)
+}
+
+// SetSatelliteConnManager wires the satellite SSH transport used to forward
+// satellite-routed job submits (M2 C1/C10). Only the global daemon calls this
+// with a non-nil manager; a nil cm (scoped daemon or empty registry) leaves
+// satellite dispatch unavailable and handleJobs returns 503 for such submits.
+func (s *Server) SetSatelliteConnManager(cm *satellite.ConnManager) {
+	s.satelliteCM.Store(cm)
 }
 
 // SetLogStreamer sets the log streamer for the server.
@@ -1758,6 +1783,8 @@ func (s *Server) checkJobSubmitWarnings(bodyBytes []byte) []string {
 		"timeout":      true,
 		"env":          true,
 		"agent_target": true,
+		"satellite":    true, // M2 C11: laptop-side satellite routing field
+		"plan_bundle":  true, // M2 C11: shipped plan files for satellite materialize
 	}
 
 	// Check for unknown fields
@@ -2518,6 +2545,31 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 
 		// Check for unknown fields in the JSON
 		warnings := s.checkJobSubmitWarnings(bodyBytes)
+
+		// Satellite routing (M2 C1/C3/C10): a Satellite-tagged submit is
+		// forwarded to that satellite's own POST /api/jobs over the SSH
+		// transport rather than run locally. The satellite gains no new verb.
+		if req.Satellite != "" {
+			cm := s.satelliteCM.Load()
+			if cm == nil {
+				http.Error(w, "satellite dispatch unavailable: this daemon has no satellite transport (scoped daemon or empty registry)", http.StatusServiceUnavailable)
+				return
+			}
+			if !cm.HasSatellite(req.Satellite) {
+				http.Error(w, fmt.Sprintf("unknown satellite %q", req.Satellite), http.StatusBadRequest)
+				return
+			}
+			info, err := s.forwardJobToSatellite(r.Context(), cm, req)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			response := models.JobSubmitResponse{JobInfo: info, Warnings: warnings}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
 
 		info, err := jr.Submit(r.Context(), req)
 		if err != nil {

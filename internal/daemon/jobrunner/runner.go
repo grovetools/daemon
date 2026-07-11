@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -134,6 +135,29 @@ func (jr *JobRunner) Start(ctx context.Context) {
 // yet satisfied, it is placed in the blocked queue and will be automatically
 // promoted when its dependencies reach a terminal state.
 func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*models.JobInfo, error) {
+	// Materialize a shipped plan bundle onto this node's replica plan dir
+	// (M2 C12) before anything reads the plan from disk. The written files are
+	// ordinary replica-notebook content from here on and converge home via M1
+	// sync (C13 — no new sync machinery). Sets req.PlanDir to the local path.
+	if req.PlanBundle != nil {
+		planDir, err := jr.materializeBundle(ctx, req.PlanBundle)
+		if err != nil {
+			return nil, fmt.Errorf("materializing plan bundle: %w", err)
+		}
+		req.PlanDir = planDir
+	}
+
+	// F1 (C15): normalize the plan dir to an absolute path before it is stored
+	// on the job and re-stat'd by orchestration.LoadPlan. A relative or
+	// non-canonical PlanDir otherwise resolves against the daemon's cwd, so
+	// LoadPlan opens the wrong (or a nonexistent) directory and dispatch fails
+	// with "job not found". Covers both local dispatch and bundle materialize.
+	if req.PlanDir != "" {
+		if abs, err := filepath.Abs(req.PlanDir); err == nil {
+			req.PlanDir = abs
+		}
+	}
+
 	// Jobs run with no deadline unless the submitter sets an explicit,
 	// parseable timeout. Hung jobs are handled by cancellation, not a
 	// wall clock.
