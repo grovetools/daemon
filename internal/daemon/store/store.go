@@ -38,6 +38,7 @@ func New() *Store {
 			Plans:          make(map[string][]*orchestration.Plan),
 			WorkflowRuns:   make(map[string]*models.WorkflowRunState),
 			AdhocSubagents: make(map[string]map[string]*models.Subagent),
+			Satellites:     make(map[string]*SatelliteStatusPayload),
 		},
 		subscribers:       make(map[chan Update]struct{}),
 		focus:             make(map[string]map[string]struct{}),
@@ -121,6 +122,20 @@ func (s *Store) GetJobs() []*models.JobInfo {
 	for _, job := range s.state.Jobs {
 		jobCopy := *job
 		result = append(result, &jobCopy)
+	}
+	return result
+}
+
+// GetSatelliteStatuses returns a copy of the latest connection-health status
+// for every satellite the ConnManager has reported on, keyed by registry name.
+// This is the read path P10's `grove status` satellite line consumes (C17).
+func (s *Store) GetSatelliteStatuses() map[string]*SatelliteStatusPayload {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make(map[string]*SatelliteStatusPayload, len(s.state.Satellites))
+	for name, status := range s.state.Satellites {
+		statusCopy := *status
+		result[name] = &statusCopy
 	}
 	return result
 }
@@ -356,6 +371,18 @@ func (s *Store) ApplyUpdate(u Update) {
 			// bash_started kinds by a case-local return in applyWorkflowEvent
 			// (both are ephemeral and never journaled).
 			s.applyWorkflowEvent(payload, true)
+		}
+
+	// Satellite connection-health transition from the ConnManager (C17). Record
+	// the latest payload per registry name; the broadcast below then carries it
+	// to SSE subscribers via convertToAPIUpdate. Not persisted — connection
+	// health is live-only and re-emitted on the next dial after a restart.
+	case UpdateSatelliteStatus:
+		if payload, ok := u.Payload.(*SatelliteStatusPayload); ok {
+			if s.state.Satellites == nil {
+				s.state.Satellites = make(map[string]*SatelliteStatusPayload)
+			}
+			s.state.Satellites[payload.Name] = payload
 		}
 	}
 

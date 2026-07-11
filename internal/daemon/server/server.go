@@ -2249,6 +2249,15 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			Payload:    u.Payload,
 		}
 
+	// Satellite connection-health transition (C17) — passthrough so the treemux
+	// badge and (P10) `grove status` see it over SSE. Mirrors sync_conflict.
+	case store.UpdateSatelliteStatus:
+		return &apiStateUpdate{
+			UpdateType: "satellite_status",
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
+
 	// Workflow/subagent lifecycle updates — each keeps its DISTINCT
 	// update_type string (the job_* pattern, NOT the collapsed "session"
 	// pattern). Dropping a case here silently hides events from SSE

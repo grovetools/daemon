@@ -2,6 +2,8 @@
 package store
 
 import (
+	"time"
+
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/flow/pkg/orchestration"
 )
@@ -32,6 +34,14 @@ type State struct {
 	// migrates into WorkflowRuns). Keyed by session key (job ID, falling
 	// back to claude session ID), then agent ID.
 	AdhocSubagents map[string]map[string]*models.Subagent `json:"adhoc_subagents,omitempty"`
+
+	// Satellites holds the latest connection-health status per satellite,
+	// keyed by registry name. Written by the satellite ConnManager
+	// (daemon/internal/daemon/satellite) via UpdateSatelliteStatus and read by
+	// P10's `grove status` line and the treemux badge (M2 contract C17). Only
+	// the global daemon populates this (the ConnManager is constructed under
+	// the scope=="" gate); scoped daemons leave it empty.
+	Satellites map[string]*SatelliteStatusPayload `json:"satellites,omitempty"`
 }
 
 // UpdateType defines what kind of data changed.
@@ -119,6 +129,14 @@ const (
 	// Payload: *SyncConflictPayload.
 	UpdateSyncConflict UpdateType = "sync_conflict"
 
+	// Satellite connection-health update — emitted by the satellite ConnManager
+	// (daemon/internal/daemon/satellite) on every dial/keepalive/backoff state
+	// transition. The store records the latest payload into State.Satellites and
+	// passes it through convertToAPIUpdate so the treemux badge and (P10) the
+	// `grove status` satellite line see it over SSE for free (M2 contract C17).
+	// Payload: *SatelliteStatusPayload.
+	UpdateSatelliteStatus UpdateType = "satellite_status"
+
 	// Workflow/subagent lifecycle update types. Each maps to a DISTINCT
 	// SSE update_type string in convertToAPIUpdate (mirroring the job_*
 	// lifecycle pattern, never the collapsed "session" pattern) — a
@@ -181,6 +199,19 @@ type SyncConflictPayload struct {
 	Path       string `json:"path"` // slash-normalized workspace-relative path
 	DocumentID string `json:"document_id,omitempty"`
 	Detail     string `json:"detail,omitempty"`
+}
+
+// SatelliteStatusPayload describes a satellite's connection health for SSE
+// subscribers and State.Satellites. Emitted by the ConnManager on every state
+// transition (M2 contract C17). State is one of "connected", "backoff",
+// "disconnected". LastError carries the most recent dial/keepalive failure
+// (empty when connected). Since marks when the current State was entered.
+type SatelliteStatusPayload struct {
+	Name      string    `json:"name"`
+	State     string    `json:"state"`
+	Addr      string    `json:"addr,omitempty"`
+	LastError string    `json:"last_error,omitempty"`
+	Since     time.Time `json:"since"`
 }
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation

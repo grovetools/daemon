@@ -34,6 +34,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/pairwatch"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
+	"github.com/grovetools/daemon/internal/daemon/satellite"
 	"github.com/grovetools/daemon/internal/daemon/server"
 	daemonssh "github.com/grovetools/daemon/internal/daemon/ssh"
 	"github.com/grovetools/daemon/internal/daemon/store"
@@ -968,6 +969,24 @@ func newGrovedStartCmd() *cobra.Command {
 									Field("origin_id", syncDB.OriginID()).
 									Log(ctx)
 							}
+						}
+					}
+
+					// Register satellite ConnManager for federation transport (P7).
+					// GLOBAL-ONLY, following the sync-handler precedent above (C10),
+					// NOT the collector precedent: scoped daemons gain satellite
+					// awareness only by talking to the global daemon. An empty
+					// [satellites] section → empty registry → skip entirely (zero
+					// goroutines, zero log noise on satellite-less machines). Built
+					// after the Store exists so it can emit satellite_status (C17).
+					if scope == "" {
+						if reg, err := satellite.LoadRegistry(cfg); err != nil {
+							ulog.Warn("Failed to load satellite registry, satellites disabled").Err(err).Log(ctx)
+						} else if len(reg.Names()) > 0 {
+							cm := satellite.NewConnManager(reg, st)
+							cm.Start(ctx)
+							ulog.Info("Satellite ConnManager started").
+								Field("satellites", len(reg.Names())).Log(ctx)
 						}
 					}
 
