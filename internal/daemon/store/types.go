@@ -176,7 +176,7 @@ type MemoryReindexPayload struct {
 // subscribers. In Phase 0 only secret quarantine fires; pull conflicts
 // arrive with the Phase 1 sync server.
 type SyncConflictPayload struct {
-	Kind       string `json:"kind"` // "secret_quarantine" | "conflict"
+	Kind       string `json:"kind"` // "secret_quarantine" | "conflict" | "oversize_skipped" | "diverged"
 	Workspace  string `json:"workspace"`
 	Path       string `json:"path"` // slash-normalized workspace-relative path
 	DocumentID string `json:"document_id,omitempty"`

@@ -583,6 +583,17 @@ func (h *SyncHandler) ensurePipelines() {
 				Detail:    fmt.Sprintf("%d bytes exceeds server blob ceiling %d", size, limit),
 			})
 		}
+		// Surface a push-side divergence (S5): the merged server head was pushed
+		// but the local file was left untouched, so it lags until the user runs
+		// `nb sync adopt`. Same SSE surfacing as an oversize skip.
+		push.OnDiverged = func(ws, path string) {
+			h.broadcastConflict(&store.SyncConflictPayload{
+				Kind:      "diverged",
+				Workspace: ws,
+				Path:      path,
+				Detail:    "local file lags the merged server head; run `nb sync adopt` to take it",
+			})
+		}
 		go h.runWithRecovery(pctx, name, "push", func() error {
 			return push.RunPushLoop(pctx, root)
 		})

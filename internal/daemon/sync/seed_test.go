@@ -155,3 +155,35 @@ func TestInsertAndEnqueueQuarantineOverride(t *testing.T) {
 		t.Fatalf("allow-listed content should enqueue exactly once, got %d", len(entries))
 	}
 }
+
+// TestInsertAndEnqueueSkipsDivergedDoc: a diverged document is frozen from BOTH
+// producers routed through InsertAndEnqueue (the watcher flush and
+// walkLocalTree). New content for a diverged path must NOT enqueue — the local
+// file lags the merged server head on purpose and stays frozen until adopt.
+func TestInsertAndEnqueueSkipsDivergedDoc(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.InsertDocument(&Document{
+		DocumentID: "doc-1", Workspace: "default", Path: "inbox/n.md",
+		ContentHash: hashContent([]byte("old local")), LastSyncedHash: hashContent([]byte("merged head")),
+		LastSyncedVersion: 7, Diverged: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Even brand-new content (a fresh local edit) must be dropped while diverged.
+	reason, err := InsertAndEnqueue(db, "default", "inbox/n.md", []byte("a newer local edit"))
+	if err != nil {
+		t.Fatalf("InsertAndEnqueue: %v", err)
+	}
+	if reason != "" {
+		t.Fatalf("unexpected quarantine reason %q", reason)
+	}
+	if n, _ := db.CountOutbox(); n != 0 {
+		t.Fatalf("diverged doc must not enqueue via InsertAndEnqueue, got %d entries", n)
+	}
+	// content_hash must be untouched (the frozen state).
+	doc, _ := db.GetDocumentByPath("default", "inbox/n.md")
+	if doc == nil || doc.ContentHash != hashContent([]byte("old local")) {
+		t.Fatalf("diverged doc content_hash must not change, got %+v", doc)
+	}
+}

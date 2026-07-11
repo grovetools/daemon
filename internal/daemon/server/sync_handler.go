@@ -35,13 +35,14 @@ func (s *Server) SetSyncDB(db *syncdb.DB) {
 
 // syncStatusResponse is the GET /api/sync/status payload.
 type syncStatusResponse struct {
-	Enabled       bool                  `json:"enabled"`
-	DBPath        string                `json:"db_path,omitempty"`
-	OriginID      string                `json:"origin_id,omitempty"`
-	Documents     int                   `json:"documents"`
-	OutboxPending int                   `json:"outbox_pending"`
-	OutboxParked  int                   `json:"outbox_parked"`
-	Workspaces    []syncWorkspaceStatus `json:"workspaces,omitempty"`
+	Enabled           bool                  `json:"enabled"`
+	DBPath            string                `json:"db_path,omitempty"`
+	OriginID          string                `json:"origin_id,omitempty"`
+	Documents         int                   `json:"documents"`
+	DocumentsDiverged int                   `json:"documents_diverged"`
+	OutboxPending     int                   `json:"outbox_pending"`
+	OutboxParked      int                   `json:"outbox_parked"`
+	Workspaces        []syncWorkspaceStatus `json:"workspaces,omitempty"`
 }
 
 type syncWorkspaceStatus struct {
@@ -71,6 +72,9 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		out.OriginID = s.syncDB.OriginID()
 		if n, err := s.syncDB.CountDocuments(); err == nil {
 			out.Documents = n
+		}
+		if n, err := s.syncDB.CountDocumentsDiverged(); err == nil {
+			out.DocumentsDiverged = n
 		}
 		// OutboxPending is the TOTAL count, parked included — a parked entry is
 		// still unsynced state, so hiding it would let waitForSync (and the
@@ -110,6 +114,7 @@ type syncDocumentResponse struct {
 	ContentHash    string `json:"content_hash"`
 	LastSyncedHash string `json:"last_synced_hash"`
 	IsDirty        bool   `json:"is_dirty"`
+	Diverged       bool   `json:"diverged"`
 }
 
 // handleSyncDocuments handles GET /api/sync/documents[?workspace=W], returning
@@ -145,6 +150,7 @@ func (s *Server) handleSyncDocuments(w http.ResponseWriter, r *http.Request) {
 			ContentHash:    doc.ContentHash,
 			LastSyncedHash: doc.LastSyncedHash,
 			IsDirty:        doc.ContentHash != doc.LastSyncedHash,
+			Diverged:       doc.Diverged,
 		})
 	}
 
@@ -550,4 +556,119 @@ func (s *Server) handleSyncRestore(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	_, _ = w.Write(content)
+}
+
+// handleSyncAdopt handles POST /api/sync/adopt with body {"workspace","path"}.
+// It is the ONLY sanctioned path by which a diverged document's local file is
+// brought to the server head — and even here the daemon does NOT write the
+// workspace tree: it fetches the head content, rolls the sync.db merge base +
+// clears the diverged flag, and returns the raw head bytes; the CLI (nb sync
+// adopt) performs the local os.WriteFile as a user-initiated edit. Modeled on
+// handleSyncAllow (unix-only, global-scope forwarded). Distinct from
+// handleSyncRestore, which is version-explicit history playback; adopt is
+// head-fetch + metadata roll.
+func (s *Server) handleSyncAdopt(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Scoped daemons never open sync.db — forward to the global daemon.
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		Workspace string `json:"workspace"`
+		Path      string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+	if req.Workspace == "" || req.Path == "" {
+		http.Error(w, "workspace and path are required", http.StatusBadRequest)
+		return
+	}
+
+	// Must be a tracked document (mirrors handleSyncRestore). AdoptDocument does
+	// not error on zero rows affected, so this existence check is load-bearing.
+	doc, err := s.syncDB.GetDocumentByPath(req.Workspace, req.Path)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("document lookup failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if doc == nil {
+		http.Error(w, "document is not tracked by sync", http.StatusNotFound)
+		return
+	}
+
+	// Refuse to adopt past an unpushed merge: if any outbox entry still exists
+	// for this path (e.g. the merged payload has not yet drained), adopting to
+	// the server head would drop the user's merged-in lines from the hub. In the
+	// normal flow the parked entry drains before the user reaches for adopt.
+	if n, err := s.syncDB.CountOutboxForPath(req.Workspace, req.Path); err != nil {
+		http.Error(w, fmt.Sprintf("outbox lookup failed: %v", err), http.StatusInternalServerError)
+		return
+	} else if n > 0 {
+		http.Error(w, "a pending push exists for this document; wait for it to drain before adopting", http.StatusConflict)
+		return
+	}
+
+	// Resolve the server head: there is no head-content endpoint, so compose the
+	// existing read-only calls — snapshot to find the document's current
+	// version, then HistoryBlob at that version (head versions retain content in
+	// the events table, the same mechanism handleSyncRestore relies on).
+	client, err := s.historyClient(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	manifest, err := client.Snapshot(r.Context(), req.Workspace)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("snapshot fetch failed: %v", err), http.StatusBadGateway)
+		return
+	}
+	var snap *snapshotDoc
+	for i := range manifest.Documents {
+		if manifest.Documents[i].Path == req.Path {
+			d := manifest.Documents[i]
+			snap = &snapshotDoc{ID: d.ID, Version: d.Version, Hash: d.Hash}
+			break
+		}
+	}
+	if snap == nil {
+		http.Error(w, "document is not present in the server snapshot", http.StatusNotFound)
+		return
+	}
+	content, err := client.HistoryBlob(r.Context(), req.Workspace, snap.ID, snap.Version)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("head fetch failed: %v", err), http.StatusBadGateway)
+		return
+	}
+
+	// Roll the merge base to the head and clear diverged. Ordering note: the DB
+	// says "clean" before the CLI writes the file; if the CLI write then fails,
+	// the next reconcile sweep sees diskHash != last_synced_hash and re-enqueues
+	// — self-healing, acceptable.
+	if err := s.syncDB.AdoptDocument(req.Workspace, req.Path, snap.ID, snap.Version, snap.Hash, content); err != nil {
+		http.Error(w, fmt.Sprintf("adopt failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Content-Hash", snap.Hash)
+	_, _ = w.Write(content)
+}
+
+// snapshotDoc is the subset of a snapshot document entry the adopt handler
+// needs (id/version/hash), decoupling the handler from the wire struct.
+type snapshotDoc struct {
+	ID      string
+	Version int64
+	Hash    string
 }

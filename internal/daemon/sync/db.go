@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS sync_documents (
 	last_synced_hash    TEXT NOT NULL DEFAULT '',
 	last_synced_version INTEGER NOT NULL DEFAULT 0,
 	base_content        BLOB,
+	diverged            INTEGER NOT NULL DEFAULT 0,
 	updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	UNIQUE(workspace, path)
 );
@@ -101,8 +102,18 @@ type Document struct {
 	LastSyncedHash    string // hash last confirmed by the server
 	LastSyncedVersion int64  // version last confirmed by the server
 	BaseContent       []byte // 3-way merge base (server content at last sync)
-	UpdatedAt         time.Time
+	// Diverged (P5, S5) marks a document whose merged server head was pushed
+	// but whose local file was deliberately NOT rewritten — the local file
+	// lags the server head. A diverged doc is frozen from the push sweep and
+	// the watcher flush until the user runs `nb sync adopt`; strict push-only
+	// means sync never writes the workspace tree to resolve the lag.
+	Diverged  bool
+	UpdatedAt time.Time
 }
+
+// documentColumns is the shared SELECT column list for document scanners; the
+// order must match scanDocumentRow.
+const documentColumns = `document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged, updated_at`
 
 // OutboxEntry is one pending local change awaiting push.
 type OutboxEntry struct {
@@ -191,6 +202,10 @@ func Open(path string) (*DB, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := migrateDocuments(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	d := &DB{db: db, path: path}
 	if err := d.ensureOriginID(); err != nil {
@@ -218,6 +233,26 @@ func migrateOutbox(db *sql.DB) error {
 				continue // column already present — idempotent no-op
 			}
 			return fmt.Errorf("failed to migrate sync_outbox: %w", err)
+		}
+	}
+	return nil
+}
+
+// migrateDocuments brings a pre-existing sync_documents up to the current
+// schema by adding the Phase 5 diverged column to DBs created before it
+// existed. Same idempotent ALTER-swallow pattern as migrateOutbox: on a fresh
+// DB (where the schema const already created the column) SQLite reports
+// "duplicate column name", which is swallowed.
+func migrateDocuments(db *sql.DB) error {
+	alters := []string{
+		`ALTER TABLE sync_documents ADD COLUMN diverged INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, stmt := range alters {
+		if _, err := db.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue // column already present — idempotent no-op
+			}
+			return fmt.Errorf("failed to migrate sync_documents: %w", err)
 		}
 	}
 	return nil
@@ -258,28 +293,34 @@ func (d *DB) ensureOriginID() error {
 // GetDocumentByPath returns the document for (workspace, path), or nil when
 // the path is untracked.
 func (d *DB) GetDocumentByPath(workspace, path string) (*Document, error) {
-	return d.scanDocument(d.db.QueryRow(
-		`SELECT document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, updated_at
-		 FROM sync_documents WHERE workspace = ? AND path = ?`, workspace, path))
+	return scanDocumentRow(d.db.QueryRow(
+		`SELECT `+documentColumns+` FROM sync_documents WHERE workspace = ? AND path = ?`,
+		workspace, path).Scan)
 }
 
 // GetDocument returns the document by its stable UUID, or nil when unknown.
 func (d *DB) GetDocument(documentID string) (*Document, error) {
-	return d.scanDocument(d.db.QueryRow(
-		`SELECT document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, updated_at
-		 FROM sync_documents WHERE document_id = ?`, documentID))
+	return scanDocumentRow(d.db.QueryRow(
+		`SELECT `+documentColumns+` FROM sync_documents WHERE document_id = ?`,
+		documentID).Scan)
 }
 
-func (d *DB) scanDocument(row *sql.Row) (*Document, error) {
+// scanDocumentRow scans one sync_documents row selected via documentColumns
+// (shared by the single-row QueryRow scanners and the ListDocuments loop, the
+// consolidation P4 did for outbox). diverged is stored as an INTEGER 0/1; a
+// sql.ErrNoRows from a single-row scan maps to (nil, nil) — untracked path.
+func scanDocumentRow(scan func(dest ...any) error) (*Document, error) {
 	var doc Document
-	err := row.Scan(&doc.DocumentID, &doc.Workspace, &doc.Path, &doc.ContentHash,
-		&doc.LastSyncedHash, &doc.LastSyncedVersion, &doc.BaseContent, &doc.UpdatedAt)
+	var diverged int64
+	err := scan(&doc.DocumentID, &doc.Workspace, &doc.Path, &doc.ContentHash,
+		&doc.LastSyncedHash, &doc.LastSyncedVersion, &doc.BaseContent, &diverged, &doc.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan sync document: %w", err)
 	}
+	doc.Diverged = diverged != 0
 	return &doc, nil
 }
 
@@ -288,16 +329,19 @@ func (d *DB) scanDocument(row *sql.Row) (*Document, error) {
 // last-synced fields and base content (those advance only on server
 // confirmation, via SetSynced in Phase 1).
 func (d *DB) UpsertDocument(doc *Document) error {
+	// The ON CONFLICT clause deliberately leaves last_synced_* AND diverged
+	// untouched: those advance only on server confirmation / explicit adopt,
+	// never from watcher-side content tracking.
 	_, err := d.db.Exec(
-		`INSERT INTO sync_documents (document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		`INSERT INTO sync_documents (document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		 ON CONFLICT(document_id) DO UPDATE SET
 			workspace = excluded.workspace,
 			path = excluded.path,
 			content_hash = excluded.content_hash,
 			updated_at = CURRENT_TIMESTAMP`,
 		doc.DocumentID, doc.Workspace, doc.Path, doc.ContentHash,
-		doc.LastSyncedHash, doc.LastSyncedVersion, doc.BaseContent)
+		doc.LastSyncedHash, doc.LastSyncedVersion, doc.BaseContent, boolToInt(doc.Diverged))
 	if err != nil {
 		return fmt.Errorf("failed to upsert sync document %s: %w", doc.DocumentID, err)
 	}
@@ -331,8 +375,7 @@ func (d *DB) DeleteDocument(documentID string) error {
 // empty workspace lists every workspace; a non-empty one filters to it. Used
 // by the read-only /api/sync/documents introspection endpoint (dev UI).
 func (d *DB) ListDocuments(workspace string) ([]*Document, error) {
-	query := `SELECT document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, updated_at
-		 FROM sync_documents`
+	query := `SELECT ` + documentColumns + ` FROM sync_documents`
 	var args []interface{}
 	if workspace != "" {
 		query += ` WHERE workspace = ?`
@@ -348,12 +391,11 @@ func (d *DB) ListDocuments(workspace string) ([]*Document, error) {
 
 	var docs []*Document
 	for rows.Next() {
-		var doc Document
-		if err := rows.Scan(&doc.DocumentID, &doc.Workspace, &doc.Path, &doc.ContentHash,
-			&doc.LastSyncedHash, &doc.LastSyncedVersion, &doc.BaseContent, &doc.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan sync document: %w", err)
+		doc, err := scanDocumentRow(rows.Scan)
+		if err != nil {
+			return nil, err
 		}
-		docs = append(docs, &doc)
+		docs = append(docs, doc)
 	}
 	return docs, rows.Err()
 }
@@ -449,6 +491,23 @@ func (d *DB) UpdateOutboxContentHashForPath(workspace, path, hash string) error 
 	return nil
 }
 
+// UpdateOutboxEntryContent retargets a SINGLE outbox entry (by id) at new
+// payload bytes and their hash. The push-side rebase (push.go
+// rebaseConflictedEntry) holds the exact entry in hand and must carry the merged
+// result as the entry's Payload — DrainOutbox prefers Payload over the disk
+// read, so the merged content pushes without the local file ever being written.
+// Distinct from the path-scoped, hash-only UpdateOutboxContentHashForPath (still
+// used by pull.go applyUpdate).
+func (d *DB) UpdateOutboxEntryContent(id int64, payload, contentHash string) error {
+	_, err := d.db.Exec(
+		`UPDATE sync_outbox SET payload = ?, content_hash = ? WHERE id = ?`,
+		payload, contentHash, id)
+	if err != nil {
+		return fmt.Errorf("failed to update outbox entry %d content: %w", id, err)
+	}
+	return nil
+}
+
 // ParkOutbox marks an outbox entry parked with an exponential/next retry time
 // and a reason, incrementing its attempt count. A parked entry stays in the
 // outbox (still counted as pending, still visible to the anti-entropy sweep's
@@ -481,6 +540,21 @@ func (d *DB) CountOutboxParked() (int, error) {
 	var n int
 	if err := d.db.QueryRow(`SELECT COUNT(*) FROM sync_outbox WHERE parked = 1`).Scan(&n); err != nil {
 		return 0, fmt.Errorf("failed to count parked sync outbox: %w", err)
+	}
+	return n, nil
+}
+
+// CountOutboxForPath returns the number of pending outbox entries for a
+// workspace/path (parked included). The adopt endpoint (item 5) uses it to
+// refuse adopting past an unpushed merge — adopting to the server head while a
+// merged payload is still queued would drop the user's merged-in lines from the
+// hub.
+func (d *DB) CountOutboxForPath(workspace, path string) (int, error) {
+	var n int
+	if err := d.db.QueryRow(
+		`SELECT COUNT(*) FROM sync_outbox WHERE workspace = ? AND path = ?`,
+		workspace, path).Scan(&n); err != nil {
+		return 0, fmt.Errorf("failed to count outbox for %s/%s: %w", workspace, path, err)
 	}
 	return n, nil
 }
@@ -650,9 +724,9 @@ func (d *DB) UpdateWorkspaceCursor(workspace string, cursor int64) error {
 // InsertDocument inserts a new document into sync_documents.
 func (d *DB) InsertDocument(doc *Document) error {
 	_, err := d.db.Exec(
-		`INSERT INTO sync_documents (document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		doc.DocumentID, doc.Workspace, doc.Path, doc.ContentHash, doc.LastSyncedHash, doc.LastSyncedVersion, doc.BaseContent)
+		`INSERT INTO sync_documents (document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		doc.DocumentID, doc.Workspace, doc.Path, doc.ContentHash, doc.LastSyncedHash, doc.LastSyncedVersion, doc.BaseContent, boolToInt(doc.Diverged))
 	if err != nil {
 		return fmt.Errorf("failed to insert sync document %s: %w", doc.DocumentID, err)
 	}
@@ -678,14 +752,63 @@ func (d *DB) UpdateDocument(doc *Document) error {
 // MarkDocumentSynced) — rolling the version alone leaves a stale merge base,
 // the phantom-conflict trap.
 func (d *DB) AdoptDocument(workspace, path, documentID string, version int64, hash string, content []byte) error {
+	// diverged = 0: adopting the server head IS the resolution of divergence.
+	// The reconcile self-heal path (antientropy.go reconcileDocument's hash-equal
+	// branch) and `nb sync adopt` both land here, so a disk drift back to
+	// hash-equal-with-server clears the diverged flag for free.
 	_, err := d.db.Exec(
-		`UPDATE sync_documents SET document_id = ?, last_synced_version = ?, last_synced_hash = ?, content_hash = ?, base_content = ?, updated_at = CURRENT_TIMESTAMP
+		`UPDATE sync_documents SET document_id = ?, last_synced_version = ?, last_synced_hash = ?, content_hash = ?, base_content = ?, diverged = 0, updated_at = CURRENT_TIMESTAMP
 		 WHERE workspace = ? AND path = ?`,
 		documentID, version, hash, hash, content, workspace, path)
 	if err != nil {
 		return fmt.Errorf("failed to adopt document %s: %w", documentID, err)
 	}
 	return nil
+}
+
+// MarkDiverged sets the diverged flag on a document (P5, S5): the push-side
+// rebase produced a merged server head that the local file does NOT match, and
+// strict push-only forbids rewriting the file. A diverged doc is frozen from the
+// push sweep (antientropy.go) and the watcher flush (InsertAndEnqueue) until the
+// user runs `nb sync adopt`.
+func (d *DB) MarkDiverged(documentID string) error {
+	if _, err := d.db.Exec(
+		`UPDATE sync_documents SET diverged = 1, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?`,
+		documentID); err != nil {
+		return fmt.Errorf("failed to mark document %s diverged: %w", documentID, err)
+	}
+	return nil
+}
+
+// ClearDiverged clears the diverged flag on a document. AdoptDocument already
+// clears it as part of rolling the merge base; this is the standalone verb for
+// callers that only need the flag cleared.
+func (d *DB) ClearDiverged(documentID string) error {
+	if _, err := d.db.Exec(
+		`UPDATE sync_documents SET diverged = 0, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?`,
+		documentID); err != nil {
+		return fmt.Errorf("failed to clear diverged on document %s: %w", documentID, err)
+	}
+	return nil
+}
+
+// CountDocumentsDiverged returns the number of documents in the diverged state,
+// for the /api/sync/status surface (the diverged line / adopt prompt).
+func (d *DB) CountDocumentsDiverged() (int, error) {
+	var n int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM sync_documents WHERE diverged = 1`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("failed to count diverged sync documents: %w", err)
+	}
+	return n, nil
+}
+
+// boolToInt maps a Go bool to the 0/1 INTEGER storage the sync schema uses for
+// boolean columns (diverged, parked).
+func boolToInt(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // InsertOutboxEntry inserts an outbox entry (alias for EnqueueOutbox).

@@ -51,6 +51,14 @@ type PushPipeline struct {
 	// SyncConflictPayload) without coupling the push pipeline to the store.
 	// Phase 4 will generalize this into a parked-entry surfacing hook.
 	OnOversizeSkipped func(workspace, path string, size, limit int64)
+
+	// OnDiverged, when non-nil, is invoked when a push-side rebase produces a
+	// merged server head that the local file does not match (S5): the merged
+	// content is pushed but the workspace file is deliberately left untouched.
+	// It lets the watcher surface the diverged disposition (broadcast a
+	// SyncConflictPayload{Kind:"diverged"}) so the user knows to `nb sync adopt`.
+	// Same decoupling pattern as OnOversizeSkipped.
+	OnDiverged func(workspace, path string)
 }
 
 // NewPushPipeline constructs a push pipeline for a single workspace.
@@ -112,45 +120,85 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 			break
 		}
 
-		// Convert outbox entries to SyncEvents, reading file content from disk
-		events := make([]syncproto.SyncEvent, len(entries))
-		for i, entry := range entries {
+		// Convert outbox entries to SyncEvents. The entry may carry its own
+		// bytes in Payload (the S5 push-only source: the rebase merges the
+		// server head and retargets the entry's Payload so push never re-reads
+		// — nor writes — the workspace file); otherwise content comes from disk.
+		// A no-op update (push-content hash == the last-synced hash) is dropped
+		// client-side (S4) so an adoption-shaped edit dies here instead of
+		// round-tripping to the server's inline-size rejection.
+		keptEntries := make([]*OutboxEntry, 0, len(entries))
+		keptEvents := make([]syncproto.SyncEvent, 0, len(entries))
+		var noopIDs []int64
+		for _, entry := range entries {
 			event := entry.ToSyncEvent()
 
-			// Read file content for document_created and document_updated events
+			// Resolve content for document_created and document_updated events.
 			if entry.EventType == syncproto.EventDocumentCreated ||
 				entry.EventType == syncproto.EventDocumentUpdated {
-				localPath := filepath.Join(workspaceRoot, syncproto.LocalizePath(entry.Path))
-				content, err := os.ReadFile(localPath)
-				if err != nil {
-					if os.IsNotExist(err) {
-						// File was deleted; convert to delete event
-						event.Type = syncproto.EventDocumentDeleted
-						event.Content = nil
-					} else {
-						return successCount, fmt.Errorf("failed to read file %s: %w", localPath, err)
-					}
+				if entry.Payload != "" {
+					// Payload-carried bytes exist regardless of disk — no
+					// missing-file → delete conversion on this path.
+					event.Content = []byte(entry.Payload)
+					event.Size = int64(len(entry.Payload))
 				} else {
-					event.Content = content
-					event.Size = int64(len(content))
+					localPath := filepath.Join(workspaceRoot, syncproto.LocalizePath(entry.Path))
+					content, err := os.ReadFile(localPath)
+					if err != nil {
+						if os.IsNotExist(err) {
+							// File was deleted; convert to delete event
+							event.Type = syncproto.EventDocumentDeleted
+							event.Content = nil
+						} else {
+							return successCount, fmt.Errorf("failed to read file %s: %w", localPath, err)
+						}
+					} else {
+						event.Content = content
+						event.Size = int64(len(content))
+					}
 				}
 			}
 
-			// OCC guard: the server compares base_version against the
-			// document head and conflicts on mismatch. Populate it from the
-			// local sync record (the version we last saw from the server) —
-			// without it every non-hash-equal update is a manufactured
-			// conflict (base_version defaults to 0).
+			// OCC guard + no-op drop for updates. The server compares
+			// base_version against the document head and conflicts on mismatch;
+			// populate it from the local sync record (the version we last saw
+			// from the server) — without it every non-hash-equal update is a
+			// manufactured conflict (base_version defaults to 0).
 			if event.Type == syncproto.EventDocumentUpdated {
 				if doc, derr := p.db.GetDocumentByPath(p.workspace, entry.Path); derr == nil && doc != nil {
 					event.BaseVersion = doc.LastSyncedVersion
 					if event.DocumentID == "" {
 						event.DocumentID = doc.DocumentID
 					}
+					// No-op drop (S4): compute the hash of the content actually
+					// being pushed (not the possibly-stale entry.ContentHash
+					// against fresh disk bytes). If it already equals the
+					// server-confirmed head, the change is a no-op — delete it
+					// rather than round-trip to the server.
+					if hashContent(event.Content) == doc.LastSyncedHash {
+						noopIDs = append(noopIDs, entry.ID)
+						continue
+					}
 				}
 			}
 
-			events[i] = event
+			keptEntries = append(keptEntries, entry)
+			keptEvents = append(keptEvents, event)
+		}
+
+		// Drop the no-op updates from the outbox. A batch that was entirely
+		// no-ops must loop (fetch fresh work) rather than push zero events —
+		// mirror the oversize path's empty-batch continue. No infinite loop:
+		// the dropped entries no longer requeue.
+		if len(noopIDs) > 0 {
+			if err := p.db.DeleteOutbox(noopIDs); err != nil {
+				p.log.Warn("failed to delete no-op outbox entries").Err(err).Log(ctx)
+			}
+		}
+		entries = keptEntries
+		events := keptEvents
+		if len(events) == 0 {
+			continue
 		}
 
 		// Handle blob uploads for large files, with per-entry oversize
@@ -293,7 +341,22 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 					// merge base, not just the version. (Version-only updates
 					// left last_synced_hash stale, which broke the pull
 					// pipeline's local-dirtiness check.)
-					if err := p.db.MarkDocumentSynced(result.DocumentID, result.Version,
+					//
+					// Diverged doc (S5): the accepted content is the merged
+					// payload, not the local file. Roll last_synced_* +
+					// base_content to it, but do NOT let MarkDocumentSynced
+					// overwrite content_hash (which tracks the disk file, still
+					// lagging) or clear the diverged flag — the file stays
+					// diverged until `nb sync adopt`.
+					if doc, derr := p.db.GetDocumentByPath(p.workspace, events[i].Path); derr == nil && doc != nil && doc.Diverged {
+						doc.LastSyncedVersion = result.Version
+						doc.LastSyncedHash = events[i].ContentHash
+						doc.BaseContent = events[i].Content
+						if err := p.db.UpdateDocument(doc); err != nil {
+							p.log.Warn("failed to roll diverged document after push").
+								Field("path", events[i].Path).Err(err).Log(ctx)
+						}
+					} else if err := p.db.MarkDocumentSynced(result.DocumentID, result.Version,
 						events[i].ContentHash, events[i].Content); err != nil {
 						p.log.Warn("failed to update document after push").
 							Field("path", events[i].Path).
@@ -315,11 +378,22 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				// with an exponential backoff below rather than retried every
 				// tick — a clean rebase re-pushes the merged content after the
 				// backoff; a failed one just backs off instead of spinning.
-				// P5 owns rebaseConflictedEntry itself; do not touch it here.
+				// The rebase retargets the entry's Payload at the merged server
+				// head and advances the doc's merge base; it NEVER writes the
+				// workspace file (S5). When the merge diverges from disk it
+				// flags the doc diverged and the entry parks with reason
+				// "diverged" (free-form park_reason, no schema change) so the
+				// user knows to `nb sync adopt`.
+				reason := "conflict"
 				if events[i].Type == syncproto.EventDocumentUpdated {
-					p.rebaseConflictedEntry(ctx, workspaceRoot, entries[i], &result)
+					if _, diverged := p.rebaseConflictedEntry(ctx, workspaceRoot, entries[i], &result); diverged {
+						reason = "diverged"
+						if p.OnDiverged != nil {
+							p.OnDiverged(p.workspace, events[i].Path)
+						}
+					}
 				}
-				if err := p.db.ParkOutbox(entries[i].ID, "conflict", now.Add(p.conflictBackoff(entries[i].Attempts))); err != nil {
+				if err := p.db.ParkOutbox(entries[i].ID, reason, now.Add(p.conflictBackoff(entries[i].Attempts))); err != nil {
 					p.log.Warn("failed to park conflicted outbox entry").
 						Field("path", events[i].Path).Err(err).Log(ctx)
 				} else {
@@ -383,38 +457,46 @@ func (p *PushPipeline) conflictBackoff(attempts int) time.Duration {
 }
 
 // rebaseConflictedEntry implements the push-side diff3 rebase for a parked
-// Conflict entry: fetch the server head (HistoryBlob), 3-way merge it with
-// the local disk content over the stored merge base (frontmatter per-key LWW,
-// body line-based diff3), and on a clean merge rewrite the file and roll the
-// doc's merge base + the outbox hash forward so the next drain re-pushes the
-// merged content with the server head as base_version.
+// Conflict entry, under STRICT PUSH-ONLY (S5): fetch the server head
+// (HistoryBlob — a read-only shadow read), 3-way merge it with the local disk
+// content over the stored merge base (frontmatter per-key LWW, body line-based
+// diff3), and on a clean merge RETARGET THE OUTBOX ENTRY at the merged bytes
+// (carried as Payload) and roll the doc's merge base forward — WITHOUT ever
+// writing the workspace file. The local file is left as the user last saved it;
+// when the merge differs from disk the doc enters the `diverged` state, resolved
+// only by an explicit `nb sync adopt`.
 //
-// Returns true only when a clean rebase landed. Every failure mode leaves the
-// entry parked untouched: transient errors (head fetch, file read) get no
-// artifact; an overlapping merge writes a conflict artifact once per
-// divergence (same format/location as the pull side's).
-func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot string, entry *OutboxEntry, result *syncproto.PushResult) bool {
+// Returns (rebased, diverged). rebased is true only when a clean rebase landed;
+// diverged is true when the merged head differs from the on-disk bytes (the
+// normal case when the merge did anything). Every failure mode returns
+// (false, false) and leaves the entry parked untouched: transient errors (head
+// fetch, file read) get no artifact; an overlapping merge writes a conflict
+// artifact once per divergence (same format/location as the pull side's).
+//
+// There is NO mid-rebase re-read guard: nothing is written, so there is nothing
+// to guard. A local edit that lands mid-rebase is simply the next local state of
+// a now-diverged doc, held (like every diverged edit) until adopt.
+func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot string, entry *OutboxEntry, result *syncproto.PushResult) (rebased, diverged bool) {
 	docID := result.DocumentID
 	if docID == "" {
 		docID = entry.DocumentID
 	}
 	if docID == "" || result.Version == 0 {
 		// Server didn't identify the head; nothing to rebase onto. Transient.
-		return false
+		return false, false
 	}
 
 	doc, err := p.db.GetDocumentByPath(p.workspace, entry.Path)
 	if err != nil || doc == nil {
-		return false
+		return false, false
 	}
 
-	// Read the local disk content BEFORE the network fetch: the post-merge
-	// re-verify below compares against this snapshot, so any local edit that
-	// lands mid-rebase aborts this attempt (next tick retries).
+	// Read the local disk content — reading is fine, writing is not (S5). It is
+	// the "local" leg of the 3-way merge; the file is never modified.
 	localPath := filepath.Join(workspaceRoot, syncproto.LocalizePath(entry.Path))
 	localContent, err := os.ReadFile(localPath)
 	if err != nil {
-		return false
+		return false, false
 	}
 	localHash := hashContent(localContent)
 
@@ -425,7 +507,7 @@ func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot 
 			Field("path", entry.Path).
 			Field("server_version", result.Version).
 			Err(err).Log(ctx)
-		return false
+		return false, false
 	}
 
 	// Frontmatter merges per-key (LWW-map semantics — never conflicts);
@@ -440,49 +522,52 @@ func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot 
 		extractBody(serverContent))
 	if !clean {
 		p.recordConflictArtifact(ctx, entry.Path, docID, localContent)
-		return false
+		return false, false
 	}
 	merged := reconstructDocument(mergedVals, frontmatterKeys(localContent), mergedBody)
-
-	// A newer local edit mid-rebase invalidates the merge inputs: abort this
-	// attempt without touching anything; the next tick rebases the new state.
-	current, err := os.ReadFile(localPath)
-	if err != nil || hashContent(current) != localHash {
-		p.log.Debug("rebase: local file changed mid-rebase, aborting").
-			Field("path", entry.Path).Log(ctx)
-		return false
-	}
-
-	if err := writeFile(localPath, merged); err != nil {
-		p.log.Warn("rebase: failed to write merged content").
-			Field("path", entry.Path).Err(err).Log(ctx)
-		return false
-	}
-
-	// The server head becomes the merge base (and base_version for the
-	// re-push — DrainOutbox reads it from LastSyncedVersion); the merged
-	// content is the new local state. ContentHash must track the merged
-	// bytes so the watcher's hash gate suppresses the echo of our write.
 	mergedHash := hashContent(merged)
-	doc.ContentHash = mergedHash
+
+	// Retarget THIS entry at the merged bytes (carried as Payload): DrainOutbox
+	// prefers Payload over the disk read, so the merged content pushes with the
+	// advanced LastSyncedVersion as base_version — without the file being
+	// touched.
+	if err := p.db.UpdateOutboxEntryContent(entry.ID, string(merged), mergedHash); err != nil {
+		p.log.Warn("rebase: failed to retarget outbox entry").
+			Field("path", entry.Path).Err(err).Log(ctx)
+		return false, false
+	}
+
+	// Advance the doc record: the server head becomes the merge base (and
+	// base_version for the re-push — DrainOutbox reads it from
+	// LastSyncedVersion). content_hash tracks the DISK file (localHash), NOT the
+	// merged bytes: content_hash means "hash of the local file", and the local
+	// file no longer tracks the push.
+	doc.ContentHash = localHash
 	doc.LastSyncedHash = hashContent(serverContent)
 	doc.LastSyncedVersion = result.Version
 	doc.BaseContent = serverContent
 	if err := p.db.UpdateDocument(doc); err != nil {
 		p.log.Warn("rebase: failed to update document record").
 			Field("path", entry.Path).Err(err).Log(ctx)
-		return false
-	}
-	if err := p.db.UpdateOutboxContentHashForPath(p.workspace, entry.Path, mergedHash); err != nil {
-		p.log.Warn("rebase: failed to update outbox entry").
-			Field("path", entry.Path).Err(err).Log(ctx)
-		return false
+		return false, false
 	}
 
-	p.log.Info("rebased conflicted push onto server head").
+	// Diverged when the merged head differs from disk (true whenever the merge
+	// pulled in remote lines). The equality case means disk already equals the
+	// merge — no divergence, nothing to adopt.
+	diverged = mergedHash != localHash
+	if diverged {
+		if err := p.db.MarkDiverged(doc.DocumentID); err != nil {
+			p.log.Warn("rebase: failed to mark document diverged").
+				Field("path", entry.Path).Err(err).Log(ctx)
+		}
+	}
+
+	p.log.Info("rebased conflicted push onto server head (strict push-only)").
 		Field("path", entry.Path).
-		Field("base_version", result.Version).Log(ctx)
-	return true
+		Field("base_version", result.Version).
+		Field("diverged", diverged).Log(ctx)
+	return true, diverged
 }
 
 // recordConflictArtifact writes a conflict artifact for an unmergeable

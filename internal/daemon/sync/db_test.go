@@ -1,6 +1,8 @@
 package sync
 
 import (
+	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -235,5 +237,147 @@ func TestCursorState(t *testing.T) {
 	states, err := db.ListStates()
 	if err != nil || len(states) != 1 {
 		t.Fatalf("ListStates: %v (%d states)", err, len(states))
+	}
+}
+
+// TestMigrateDocumentsIdempotent: Open twice succeeds (the ALTER-swallow path),
+// and an OLD DB whose sync_documents predates the diverged column is migrated in
+// place so MarkDiverged works.
+func TestMigrateDocumentsIdempotent(t *testing.T) {
+	// Double-Open: schema + migrateDocuments run twice against the same file.
+	path := filepath.Join(t.TempDir(), "sync.db")
+	db1, err := Open(path)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	_ = db1.Close()
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second Open (migration must be idempotent): %v", err)
+	}
+	defer db2.Close()
+
+	// Old-shaped DB: sync_documents WITHOUT the diverged column, then Open must
+	// ALTER it in so the diverged flag works.
+	oldPath := filepath.Join(t.TempDir(), "old.db")
+	dsn := fmt.Sprintf("file:%s?_busy_timeout=5000&_journal_mode=WAL", oldPath)
+	raw, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE sync_documents (
+		document_id         TEXT PRIMARY KEY,
+		workspace           TEXT NOT NULL,
+		path                TEXT NOT NULL,
+		content_hash        TEXT NOT NULL DEFAULT '',
+		last_synced_hash    TEXT NOT NULL DEFAULT '',
+		last_synced_version INTEGER NOT NULL DEFAULT 0,
+		base_content        BLOB,
+		updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(workspace, path)
+	)`); err != nil {
+		t.Fatalf("seed old schema: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO sync_documents (document_id, workspace, path) VALUES ('doc-old', 'default', 'inbox/old.md')`); err != nil {
+		t.Fatalf("seed old row: %v", err)
+	}
+	_ = raw.Close()
+
+	db, err := Open(oldPath)
+	if err != nil {
+		t.Fatalf("Open old DB (must migrate): %v", err)
+	}
+	defer db.Close()
+
+	doc, err := db.GetDocumentByPath("default", "inbox/old.md")
+	if err != nil || doc == nil {
+		t.Fatalf("old row not readable after migration: err=%v", err)
+	}
+	if doc.Diverged {
+		t.Fatal("migrated row must default diverged=false")
+	}
+	if err := db.MarkDiverged("doc-old"); err != nil {
+		t.Fatalf("MarkDiverged after migration: %v", err)
+	}
+	if n, _ := db.CountDocumentsDiverged(); n != 1 {
+		t.Fatalf("diverged count after migration = %d, want 1", n)
+	}
+}
+
+// TestMarkClearDiverged round-trips the diverged flag and its count, and
+// verifies UpsertDocument's ON CONFLICT never touches diverged (only explicit
+// calls do) while AdoptDocument clears it.
+func TestMarkClearDiverged(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.UpsertDocument(&Document{
+		DocumentID: "doc-1", Workspace: "default", Path: "inbox/n.md",
+		ContentHash: "local", LastSyncedHash: "server", LastSyncedVersion: 2, BaseContent: []byte("base"),
+	}); err != nil {
+		t.Fatalf("UpsertDocument: %v", err)
+	}
+
+	if err := db.MarkDiverged("doc-1"); err != nil {
+		t.Fatalf("MarkDiverged: %v", err)
+	}
+	doc, _ := db.GetDocumentByPath("default", "inbox/n.md")
+	if doc == nil || !doc.Diverged {
+		t.Fatalf("expected diverged=true, got %+v", doc)
+	}
+	if n, _ := db.CountDocumentsDiverged(); n != 1 {
+		t.Fatalf("CountDocumentsDiverged = %d, want 1", n)
+	}
+
+	// A content-tracking UpsertDocument (ON CONFLICT) must NOT clear diverged.
+	if err := db.UpsertDocument(&Document{
+		DocumentID: "doc-1", Workspace: "default", Path: "inbox/n.md", ContentHash: "local2",
+	}); err != nil {
+		t.Fatalf("UpsertDocument (conflict): %v", err)
+	}
+	doc, _ = db.GetDocumentByPath("default", "inbox/n.md")
+	if doc == nil || !doc.Diverged {
+		t.Fatal("UpsertDocument ON CONFLICT must preserve diverged")
+	}
+
+	if err := db.ClearDiverged("doc-1"); err != nil {
+		t.Fatalf("ClearDiverged: %v", err)
+	}
+	doc, _ = db.GetDocumentByPath("default", "inbox/n.md")
+	if doc == nil || doc.Diverged {
+		t.Fatalf("expected diverged=false after ClearDiverged, got %+v", doc)
+	}
+	if n, _ := db.CountDocumentsDiverged(); n != 0 {
+		t.Fatalf("CountDocumentsDiverged = %d, want 0", n)
+	}
+
+	// AdoptDocument also clears diverged as part of rolling the merge base.
+	if err := db.MarkDiverged("doc-1"); err != nil {
+		t.Fatalf("MarkDiverged (2): %v", err)
+	}
+	if err := db.AdoptDocument("default", "inbox/n.md", "doc-1", 5, "head", []byte("head content")); err != nil {
+		t.Fatalf("AdoptDocument: %v", err)
+	}
+	doc, _ = db.GetDocumentByPath("default", "inbox/n.md")
+	if doc == nil || doc.Diverged {
+		t.Fatal("AdoptDocument must clear diverged")
+	}
+}
+
+// TestUpdateOutboxEntryContent retargets a single entry's payload + hash by id
+// without disturbing sibling entries.
+func TestUpdateOutboxEntryContent(t *testing.T) {
+	db := openTestDB(t)
+	id, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: "doc-1", Workspace: "default", EventType: syncproto.EventDocumentUpdated,
+		Path: "inbox/n.md", ContentHash: "old",
+	})
+	if err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+	if err := db.UpdateOutboxEntryContent(id, "merged bytes", "newhash"); err != nil {
+		t.Fatalf("UpdateOutboxEntryContent: %v", err)
+	}
+	entries, _ := db.ListOutbox("default", 0)
+	if len(entries) != 1 || entries[0].Payload != "merged bytes" || entries[0].ContentHash != "newhash" {
+		t.Fatalf("entry not retargeted: %+v", entries)
 	}
 }

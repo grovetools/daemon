@@ -243,6 +243,14 @@ func (a *AntiEntropyPass) sweepLocalDocuments(ctx context.Context) error {
 			continue
 		}
 
+		// Diverged docs (S5) are frozen from the push sweep: their disk hash
+		// deliberately differs from last_synced_hash (the local file lags the
+		// merged server head), so re-enqueueing here would clobber the merged
+		// head — the finding-6 livelock. They stay frozen until `nb sync adopt`.
+		if doc.Diverged {
+			continue
+		}
+
 		localPath := filepath.Join(a.workspaceRoot, syncproto.LocalizePath(doc.Path))
 		content, err := os.ReadFile(localPath) //nolint:gosec // G304: path from tracked notebook tree
 		if err != nil {

@@ -34,6 +34,15 @@ func InsertAndEnqueue(db *DB, workspace, rel string, content []byte) (quarantine
 		return "", err
 	}
 
+	// Diverged docs (S5) are frozen from BOTH producers — the watcher flush and
+	// walkLocalTree both route through here. A diverged doc's local file lags the
+	// merged server head on purpose; enqueueing its bytes would clobber that head
+	// (finding-6 livelock). It stays frozen until `nb sync adopt` clears the flag
+	// (which then lets the next edit flow normally).
+	if doc != nil && doc.Diverged {
+		return "", nil
+	}
+
 	// Hash-equal no-op: unchanged content never re-enters the outbox (the
 	// watcher's former hash-gate, now shared with reconcile).
 	if doc != nil && doc.ContentHash == hash {

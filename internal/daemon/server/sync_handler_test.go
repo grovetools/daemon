@@ -1,6 +1,9 @@
 package server
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/grovetools/core/pkg/paths"
+	"github.com/grovetools/core/pkg/syncproto"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
 )
 
@@ -217,5 +221,155 @@ func TestHandleSyncConflictsEmptyWhenNoStore(t *testing.T) {
 	}
 	if len(conflicts) != 0 {
 		t.Fatalf("expected empty list, got %d", len(conflicts))
+	}
+}
+
+// serveAdoptSyncStub mimics grove-syncd for the adopt endpoint test: the
+// capabilities handshake, a snapshot manifest holding the target doc at head,
+// and the head blob.
+func serveAdoptSyncStub(t *testing.T, workspace, docID, docPath string, version int64, head []byte) *httptest.Server {
+	t.Helper()
+	hash := sha256.Sum256(head)
+	hashHex := hex.EncodeToString(hash[:])
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sync/capabilities":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
+				Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}},
+			})
+		case "/sync/snapshot":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(syncproto.SnapshotManifest{
+				Workspace: workspace,
+				Cursor:    version,
+				Documents: []syncproto.DocumentSnapshot{
+					{ID: docID, Path: docPath, Version: version, Hash: hashHex, Size: int64(len(head))},
+				},
+			})
+		case "/sync/history/blob":
+			_, _ = w.Write(head)
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+		}
+	}))
+}
+
+// writeSyncConfig points config.LoadSyncConfig (used by historyClient) at the
+// stub server. GROVE_HOME must already be set to a temp dir.
+func writeSyncConfig(t *testing.T, serverURL string) {
+	t.Helper()
+	dir := paths.ConfigDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	toml := "server = \"" + serverURL + "\"\ntoken = \"test-token\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "sync.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHandleSyncAdopt(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	t.Setenv("GROVE_SYNC_TOKEN", "")
+
+	head := []byte("---\ntitle: note\n---\nmerged server head body\n")
+	sum := sha256.Sum256(head)
+	headHash := hex.EncodeToString(sum[:])
+	srv := serveAdoptSyncStub(t, "ws", "doc-1", "inbox/note.md", 8, head)
+	defer srv.Close()
+	writeSyncConfig(t, srv.URL)
+
+	db, err := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatalf("open sync db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	s := New(false)
+	s.SetSyncDB(db)
+
+	// A diverged doc: the local file lags the merged head; content_hash tracks
+	// the (untouched) disk file, last_synced already rolled to the head.
+	localHash := "abc123localdiskhash"
+	if err := db.InsertDocument(&syncdb.Document{
+		DocumentID: "doc-1", Workspace: "ws", Path: "inbox/note.md",
+		ContentHash: localHash, LastSyncedHash: headHash, LastSyncedVersion: 8,
+		BaseContent: head, Diverged: true,
+	}); err != nil {
+		t.Fatalf("InsertDocument: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]string{"workspace": "ws", "path": "inbox/note.md"})
+	req := httptest.NewRequest(http.MethodPost, "/api/sync/adopt", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	s.handleSyncAdopt(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	if !bytes.Equal(w.Body.Bytes(), head) {
+		t.Fatalf("response body = %q, want head content %q", w.Body.Bytes(), head)
+	}
+	if got := w.Header().Get("X-Content-Hash"); got != headHash {
+		t.Fatalf("X-Content-Hash = %q, want %q", got, headHash)
+	}
+
+	// The DB rolled to the head and cleared diverged.
+	doc, err := db.GetDocumentByPath("ws", "inbox/note.md")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocumentByPath: %v", err)
+	}
+	if doc.Diverged {
+		t.Fatal("adopt must clear the diverged flag")
+	}
+	if doc.LastSyncedVersion != 8 || doc.LastSyncedHash != headHash || string(doc.BaseContent) != string(head) {
+		t.Fatalf("adopt must roll base_content/last_synced_* to head: v%d hash=%q", doc.LastSyncedVersion, doc.LastSyncedHash)
+	}
+}
+
+func TestHandleSyncAdoptNotTracked(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	s := newSyncTestServer(t, filepath.Join(t.TempDir(), "sync.db"))
+
+	body, _ := json.Marshal(map[string]string{"workspace": "ws", "path": "inbox/missing.md"})
+	req := httptest.NewRequest(http.MethodPost, "/api/sync/adopt", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	s.handleSyncAdopt(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for untracked path, got %d (%s)", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleSyncAdoptConflictsWithPendingPush(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	db, err := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatalf("open sync db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	s := New(false)
+	s.SetSyncDB(db)
+
+	if err := db.InsertDocument(&syncdb.Document{
+		DocumentID: "doc-1", Workspace: "ws", Path: "inbox/note.md",
+		ContentHash: "local", LastSyncedHash: "head", LastSyncedVersion: 8, Diverged: true,
+	}); err != nil {
+		t.Fatalf("InsertDocument: %v", err)
+	}
+	// An unpushed (merged) entry still queued for this path: adopting past it
+	// would drop the user's merged-in lines from the hub, so adopt must 409.
+	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{
+		DocumentID: "doc-1", Workspace: "ws", EventType: "document.updated",
+		Path: "inbox/note.md", ContentHash: "merged", Payload: "merged body",
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+
+	body, _ := json.Marshal(map[string]string{"workspace": "ws", "path": "inbox/note.md"})
+	req := httptest.NewRequest(http.MethodPost, "/api/sync/adopt", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	s.handleSyncAdopt(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when an outbox entry still exists, got %d (%s)", w.Code, w.Body.String())
 	}
 }

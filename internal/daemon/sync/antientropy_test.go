@@ -507,3 +507,38 @@ func TestWalkLocalTreeQuarantines(t *testing.T) {
 		t.Fatal("hydration should be marked finished after the pass returns")
 	}
 }
+
+// TestSweepSkipsDivergedDoc: a diverged document's disk hash deliberately
+// differs from last_synced_hash (the local file lags the merged server head),
+// but the push sweep must NOT re-enqueue it — doing so would clobber the merged
+// head (finding-6 livelock). It stays frozen until `nb sync adopt`.
+func TestSweepSkipsDivergedDoc(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+
+	local := []byte("---\ntitle: note\n---\nLOCAL body\n")
+	if err := os.MkdirAll(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "inbox", "note.md"), local, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Diverged doc: content_hash tracks disk (local), last_synced_hash is the
+	// merged server head — disk != last_synced, exactly the shape the sweep
+	// would normally re-enqueue.
+	if err := db.InsertDocument(&Document{
+		DocumentID: "doc-1", Workspace: "default", Path: "inbox/note.md",
+		ContentHash: sha(local), LastSyncedHash: sha([]byte("merged head")), LastSyncedVersion: 7,
+		BaseContent: []byte("merged head"), Diverged: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ae := newTestAntiEntropy(db, nil, root)
+	if err := ae.sweepLocalDocuments(context.Background()); err != nil {
+		t.Fatalf("sweepLocalDocuments: %v", err)
+	}
+	if n, _ := db.CountOutbox(); n != 0 {
+		t.Fatalf("diverged doc must not be enqueued by the sweep, got %d outbox entries", n)
+	}
+}

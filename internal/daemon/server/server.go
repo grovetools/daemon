@@ -373,6 +373,9 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	}))
 	mux.HandleFunc("/api/sync/history", unixOnly(s.handleSyncHistory))
 	mux.HandleFunc("/api/sync/restore", unixOnly(s.handleSyncRestore))
+	// Adopt (P5, S5): user-initiated resolution of a diverged document. The
+	// daemon fetches the server head + rolls the merge base; the CLI writes it.
+	mux.HandleFunc("/api/sync/adopt", unixOnly(s.handleSyncAdopt))
 	// Read-only introspection for the dev UI / playground god-view.
 	mux.HandleFunc("/api/sync/documents", unixOnly(s.handleSyncDocuments))
 	mux.HandleFunc("/api/sync/outbox", unixOnly(s.handleSyncOutbox))
