@@ -194,6 +194,15 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 			activeIDs := make(map[string]struct{}, len(activeSessions))
 
 			for _, session := range activeSessions {
+				// Remote (federated) sessions never enter the local liveness state
+				// machine (C8): their PID/PTY/transcript belong to a satellite, so
+				// IsProcessAlive would judge an unrelated local PID and the reaper
+				// could signal it. Staleness for remote rows is derived from
+				// satellite_status, not from this loop. Skip before anything reads
+				// c.liveness or a PID for this row.
+				if session.Origin != "" {
+					continue
+				}
 				// Only verify sessions we think are active.
 				if session.Status != "running" && session.Status != "idle" && session.Status != "pending_user" {
 					continue
@@ -402,6 +411,12 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 	live := make(map[string]struct{})
 
 	for _, s := range activeSessions {
+		// Remote sessions carry satellite-side transcript paths that don't exist
+		// locally (C8); summarizing them would spin the resolve-throttle on a path
+		// that can never resolve. Skip before isLiveAgentSession.
+		if s.Origin != "" {
+			continue
+		}
 		if !isLiveAgentSession(s) {
 			continue
 		}
@@ -517,6 +532,12 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 func (c *SessionCollector) refreshLiveChildren(st *store.Store, activeSessions []*models.Session, updates chan<- store.Update) {
 	counts := st.LiveChildCounts()
 	for _, s := range activeSessions {
+		// Remote sessions have no local workflow/subagent children to count (C8);
+		// the local derivation is always 0 for them and would emit spurious
+		// zeroing snapshots against the satellite's real counts. Skip them.
+		if s.Origin != "" {
+			continue
+		}
 		want := counts[s.ID]
 		if want == s.LiveChildren {
 			continue

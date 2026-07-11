@@ -137,6 +137,15 @@ const (
 	// Payload: *SatelliteStatusPayload.
 	UpdateSatelliteStatus UpdateType = "satellite_status"
 
+	// Satellite federation snapshot — the reconcile primitive the
+	// SatelliteCollector emits on every (re)connect and debounced re-snapshot
+	// (M2 contract C7/C16). ApplyUpdate deletes every job/session row whose
+	// Origin equals the payload's Origin, then inserts the (already sanitized,
+	// origin-stamped) snapshot rows — so a satellite that dropped a job has that
+	// row removed on the next snapshot without ever touching other origins or
+	// local rows. Payload: *SatelliteSnapshotPayload.
+	UpdateSatelliteSnapshot UpdateType = "satellite_snapshot"
+
 	// Workflow/subagent lifecycle update types. Each maps to a DISTINCT
 	// SSE update_type string in convertToAPIUpdate (mirroring the job_*
 	// lifecycle pattern, never the collapsed "session" pattern) — a
@@ -212,6 +221,18 @@ type SatelliteStatusPayload struct {
 	Addr      string    `json:"addr,omitempty"`
 	LastError string    `json:"last_error,omitempty"`
 	Since     time.Time `json:"since"`
+}
+
+// SatelliteSnapshotPayload carries a full jobs+sessions snapshot for a single
+// satellite origin (M2 contract C7). Origin is the satellite's registry name
+// (already stamped onto every row by the collector via SanitizeJobInfo/
+// SanitizeSession). ApplyUpdate treats it as an origin-scoped replacement:
+// remove that origin's rows, insert these. It never touches locals or other
+// origins, which is what makes reconnect-reconcile safe (C16).
+type SatelliteSnapshotPayload struct {
+	Origin   string            `json:"origin"`
+	Jobs     []*models.JobInfo `json:"jobs"`
+	Sessions []*models.Session `json:"sessions"`
 }
 
 // SkillSyncPayload contains data broadcasted after a skill sync operation
@@ -376,5 +397,10 @@ type Update struct {
 	Type    UpdateType
 	Source  string // Which collector sent this update (e.g., "git", "workspace", "session", "plan", "note")
 	Scanned int    // Number of items actually scanned (for focused updates)
+	// Origin scopes a wholesale-replacement update to one satellite's rows (M2
+	// contract C7). Empty == local: a local snapshot (SessionCollector) must not
+	// evict federated rows, and a remote-origin snapshot must not evict locals.
+	// Only UpdateSessions consults it today; other update types ignore it.
+	Origin  string
 	Payload interface{}
 }

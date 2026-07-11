@@ -371,6 +371,28 @@ func newGrovedStartCmd() *cobra.Command {
 			// 3.5 Setup context early (needed by JobRunner and Engine)
 			ctx, cancel := context.WithCancel(context.Background())
 
+			// Satellite federation collector (P8, C10). GLOBAL-ONLY (scope=="")
+			// following the sync-handler precedent, NOT the isEnabled collector
+			// path: scoped daemons gain satellite awareness only by talking to the
+			// global daemon. Registered HERE — before eng.Start below — because
+			// Engine.Start iterates the collector slice exactly once (F19), so a
+			// Register after Start is silently dead. The ConnManager is built now
+			// (the Store already exists) so the collector has its dialer; it is
+			// Started later in the watcher stage where cm.Start's goroutines
+			// belong. satCM stays nil (no collector, no ConnManager) on a
+			// satellite-less machine — empty [satellites] → empty registry.
+			var satCM *satellite.ConnManager
+			if scope == "" {
+				if reg, rerr := satellite.LoadRegistry(cfg); rerr != nil {
+					ulog.Warn("Failed to load satellite registry, satellites disabled").Err(rerr).Log(ctx)
+				} else if len(reg.Names()) > 0 {
+					satCM = satellite.NewConnManager(reg, st)
+					eng.Register(collector.NewSatelliteCollector(satCM, reg))
+					ulog.Info("Satellite federation collector registered").
+						Field("satellites", len(reg.Names())).Log(ctx)
+				}
+			}
+
 			// 3.55 Boot ordering. --ready-at=bind (treemux's cold-start splash)
 			// binds the socket first and runs the slow boot steps in a
 			// background goroutine, streaming phase progress; the default
@@ -972,22 +994,17 @@ func newGrovedStartCmd() *cobra.Command {
 						}
 					}
 
-					// Register satellite ConnManager for federation transport (P7).
-					// GLOBAL-ONLY, following the sync-handler precedent above (C10),
-					// NOT the collector precedent: scoped daemons gain satellite
-					// awareness only by talking to the global daemon. An empty
-					// [satellites] section → empty registry → skip entirely (zero
-					// goroutines, zero log noise on satellite-less machines). Built
-					// after the Store exists so it can emit satellite_status (C17).
-					if scope == "" {
-						if reg, err := satellite.LoadRegistry(cfg); err != nil {
-							ulog.Warn("Failed to load satellite registry, satellites disabled").Err(err).Log(ctx)
-						} else if len(reg.Names()) > 0 {
-							cm := satellite.NewConnManager(reg, st)
-							cm.Start(ctx)
-							ulog.Info("Satellite ConnManager started").
-								Field("satellites", len(reg.Names())).Log(ctx)
-						}
+					// Start the satellite ConnManager (P7 federation transport) that
+					// the P8 SatelliteCollector — registered before eng.Start above
+					// (F19 ordering) — dials through. Construction + collector
+					// registration happened up top where the collector slice is
+					// still mutable; only Start() belongs here, where ctx is live
+					// and the ConnManager's per-satellite goroutines join the other
+					// watcher-stage goroutines. satCM is nil on a satellite-less
+					// machine (empty registry) → skip, exactly as before.
+					if satCM != nil {
+						satCM.Start(ctx)
+						ulog.Info("Satellite ConnManager started").Log(ctx)
 					}
 
 					ulog.Info("Unified watcher started").Log(ctx)

@@ -585,6 +585,13 @@ func (jr *JobRunner) watchTransitions(ctx context.Context) {
 				if jobs, ok := update.Payload.([]*models.JobInfo); ok {
 					needsEval := false
 					for _, job := range jobs {
+						// Federated jobs (C8/C12) belong to a satellite: their PlanDir
+						// is a satellite-side path, so appendTranscriptAsync's
+						// LoadPlan(info.PlanDir) would fail/mis-resolve. The laptop
+						// jobrunner never drives a remote job's transitions.
+						if job.Origin != "" {
+							continue
+						}
 						if isJobTerminal(job.Status) {
 							if _, ok := processed[job.ID]; !ok {
 								processed[job.ID] = struct{}{}
@@ -607,6 +614,11 @@ func (jr *JobRunner) watchTransitions(ctx context.Context) {
 				}
 			case store.UpdateJobCompleted, store.UpdateJobFailed, store.UpdateJobCancelled:
 				if job, ok := update.Payload.(*models.JobInfo); ok {
+					// Skip federated jobs (C8/C12): appendTranscriptAsync /
+					// evaluateBlockedJobs LoadPlan a satellite-side PlanDir.
+					if job.Origin != "" {
+						continue
+					}
 					if isJobTerminal(job.Status) {
 						if _, ok := processed[job.ID]; !ok {
 							processed[job.ID] = struct{}{}

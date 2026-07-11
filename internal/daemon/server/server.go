@@ -1027,6 +1027,15 @@ func (s *Server) killSession(sessionID string) error {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
 
+	// Never signal a PID off a federated session (C8). GetSession is a bare-ID
+	// lookup so it already misses composite-keyed remote rows, but a satellite
+	// job could share a bare ID with... nothing local — still, guard explicitly:
+	// remote control is laptop→satellite only (dispatch, P9); killing here would
+	// SIGTERM an unrelated local PID. Proxying to the remote is deferred.
+	if session.Origin != "" {
+		return fmt.Errorf("session %s belongs to satellite %q; remote control is not supported (dispatch is laptop→satellite only)", sessionID, session.Origin)
+	}
+
 	// Resolve the PID to signal. This daemon's record may carry PID 0 when the
 	// session was synthesized by the filesystem job-watcher and the agent was
 	// actually confirmed against a different scoped daemon. In that case the
@@ -1238,6 +1247,13 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 	if session == nil {
 		return fmt.Errorf("session not found: %s", jobID)
 	}
+	// Refuse input routing to a federated session (C8): its PTY/tmux target is
+	// satellite-side. Remote control is not supported in M2 (dispatch is
+	// laptop→satellite only). Defense-in-depth — the bare-ID lookup already
+	// misses composite-keyed remote rows.
+	if session.Origin != "" {
+		return fmt.Errorf("session %s belongs to satellite %q; remote input is not supported (dispatch is laptop→satellite only)", jobID, session.Origin)
+	}
 
 	inputMode := s.resolveInputMode(session.WorkingDirectory, session.Provider)
 	payload := rawInput + "\r"
@@ -1320,6 +1336,13 @@ func (s *Server) SendSessionInterrupt(ctx context.Context, jobID string) error {
 	}
 	if session == nil {
 		return fmt.Errorf("session not found: %s", jobID)
+	}
+	// Refuse interrupt routing to a federated session (C8): the signal would land
+	// on a satellite-side agent we do not control from here. Remote control is
+	// laptop→satellite only (dispatch, P9). Defense-in-depth on top of the
+	// bare-ID lookup missing composite-keyed remote rows.
+	if session.Origin != "" {
+		return fmt.Errorf("session %s belongs to satellite %q; remote interrupt is not supported (dispatch is laptop→satellite only)", jobID, session.Origin)
 	}
 
 	mux := effectiveMux(session)
@@ -2254,6 +2277,18 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 	case store.UpdateSatelliteStatus:
 		return &apiStateUpdate{
 			UpdateType: "satellite_status",
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
+
+	// Satellite federation snapshot (C7/C16) — passthrough so SSE consumers can
+	// react to a federated jobs/sessions reconcile. The federated rows also
+	// appear in GET /api/jobs and /api/sessions (key-agnostic map-ranges), so
+	// treemux/hooks/nvim inherit them with zero per-tool change. Mirrors
+	// satellite_status.
+	case store.UpdateSatelliteSnapshot:
+		return &apiStateUpdate{
+			UpdateType: "satellite_snapshot",
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}

@@ -51,6 +51,24 @@ type Registry struct {
 	byName map[string]*SatelliteConfig
 }
 
+// NewRegistry builds a Registry from an already-parsed name→config map. It
+// stamps each entry's Name from its key (mirroring LoadRegistry). A nil map
+// yields an empty registry. This is the direct constructor used by LoadRegistry
+// and by callers that assemble configs by other means (e.g. tests, P10's
+// `grove satellite` writing entries programmatically).
+func NewRegistry(configs map[string]*SatelliteConfig) *Registry {
+	reg := &Registry{byName: make(map[string]*SatelliteConfig, len(configs))}
+	for name, sc := range configs {
+		if sc == nil {
+			continue
+		}
+		entry := *sc
+		entry.Name = name
+		reg.byName[name] = &entry
+	}
+	return reg
+}
+
 // LoadRegistry parses the [satellites.<name>] tables out of the grove config
 // via the existing extension mechanism (mirrors loadNavGroupConfigs' use of
 // cfg.UnmarshalExtension in daemon/internal/daemon/server/server.go). An

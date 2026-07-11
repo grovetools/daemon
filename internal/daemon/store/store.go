@@ -176,6 +176,8 @@ func (s *Store) ApplyUpdate(u Update) {
 
 	switch u.Type {
 	case UpdateWorkspaces:
+		// Wholesale map replace. Workspaces never federate (a satellite's repos
+		// are not the laptop's), so no origin-scoping is needed here (C7).
 		if workspaces, ok := u.Payload.(map[string]*models.EnrichedWorkspace); ok {
 			s.state.Workspaces = workspaces
 			if s.pendingRestore != nil {
@@ -185,20 +187,32 @@ func (s *Store) ApplyUpdate(u Update) {
 		}
 	case UpdateSessions:
 		if sessions, ok := u.Payload.([]*models.Session); ok {
-			// Rebuild map. Copy-forward the derived LiveChildren field from the
-			// prior map for matching IDs: this wholesale replace otherwise wipes
-			// it (the count is db:"-" and rebuilt-from-DB sessions carry 0), and
-			// unlike LiveTokens there is no ~4s repopulator — LiveChildren only
-			// refreshes on the next SubagentStop, minutes away for a long-running
-			// background workflow. Zeroing mid-flight would falsely demote
-			// idle-busy → truly-idle. Scoped to LiveChildren only (contract D5 /
-			// J2 §4); LiveTokens/Subagents are deliberately not copied here.
+			// Wholesale rebuild, but ORIGIN-SCOPED (C7): this replaces only the
+			// u.Origin slice of the map. A local SessionCollector snapshot
+			// (u.Origin == "") must not evict federated rows, and a remote-origin
+			// snapshot must not evict locals. Start by copying forward every
+			// entry whose Origin differs from this update's origin, then insert
+			// the payload rows (all of which carry Origin == u.Origin).
+			//
+			// Copy-forward the derived LiveChildren field from the prior map for
+			// matching keys: this wholesale replace otherwise wipes it (the count
+			// is db:"-" and rebuilt-from-DB sessions carry 0), and unlike
+			// LiveTokens there is no ~4s repopulator — LiveChildren only refreshes
+			// on the next SubagentStop, minutes away for a long-running background
+			// workflow. Zeroing mid-flight would falsely demote idle-busy →
+			// truly-idle. Scoped to LiveChildren only (contract D5 / J2 §4);
+			// LiveTokens/Subagents are deliberately not copied here.
 			newMap := make(map[string]*models.Session)
+			for k, sess := range s.state.Sessions {
+				if sess.Origin != u.Origin {
+					newMap[k] = sess
+				}
+			}
 			for _, sess := range sessions {
-				if prev, ok := s.state.Sessions[sess.ID]; ok && sess.LiveChildren == 0 {
+				if prev, ok := s.state.Sessions[sessionKey(sess)]; ok && sess.LiveChildren == 0 {
 					sess.LiveChildren = prev.LiveChildren
 				}
-				newMap[sess.ID] = sess
+				newMap[sessionKey(sess)] = sess
 			}
 			s.state.Sessions = newMap
 		}
@@ -228,7 +242,9 @@ func (s *Store) ApplyUpdate(u Update) {
 	// Job lifecycle updates
 	case UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed, UpdateJobCancelled, UpdateJobPendingUser:
 		if job, ok := u.Payload.(*models.JobInfo); ok {
-			s.state.Jobs[job.ID] = job
+			// jobKey (C7): bare ID for locals, origin-namespaced for federated
+			// rows. Local emitters set no Origin, so this is behavior-preserving.
+			s.state.Jobs[jobKey(job)] = job
 		}
 
 	// Note mutation events from nb
@@ -237,7 +253,9 @@ func (s *Store) ApplyUpdate(u Update) {
 			s.applyNoteEvent(event)
 		}
 
-	// Full note index replacement from collector scan
+	// Full note index replacement from collector scan. Wholesale map replace;
+	// the note index never federates (satellite notes converge home through the
+	// Record plane, not this Store), so no origin-scoping is needed here (C7).
 	case UpdateNoteIndex:
 		if noteIndex, ok := u.Payload.(map[string]*models.NoteIndexEntry); ok {
 			s.state.NoteIndex = noteIndex
@@ -289,7 +307,11 @@ func (s *Store) ApplyUpdate(u Update) {
 	case UpdateJobsDiscovered:
 		if jobs, ok := u.Payload.([]*models.JobInfo); ok {
 			for _, job := range jobs {
-				if existing, exists := s.state.Jobs[job.ID]; exists {
+				// Key both the existing lookup and the write through jobKey (C7) so
+				// filesystem-discovered local jobs (Origin == "") behave exactly as
+				// before while any federated row stays origin-namespaced.
+				key := jobKey(job)
+				if existing, exists := s.state.Jobs[key]; exists {
 					// Prevent stale filesystem reads from reverting active daemon states.
 					// If daemon says running/queued, but file says pending/queued/pending_user, ignore.
 					// However, if the file says completed/failed/idle, accept the update!
@@ -298,7 +320,7 @@ func (s *Store) ApplyUpdate(u Update) {
 						continue
 					}
 				}
-				s.state.Jobs[job.ID] = job
+				s.state.Jobs[key] = job
 			}
 		}
 
@@ -383,6 +405,33 @@ func (s *Store) ApplyUpdate(u Update) {
 				s.state.Satellites = make(map[string]*SatelliteStatusPayload)
 			}
 			s.state.Satellites[payload.Name] = payload
+		}
+
+	// Origin-scoped federation snapshot from the SatelliteCollector (C7/C16).
+	// The reconcile primitive: drop every job/session row for this origin, then
+	// insert the snapshot rows. Rows for other origins and all locals are left
+	// untouched, so a satellite that dropped a job has that row removed on the
+	// next snapshot without collateral. Rows arrive pre-sanitized and
+	// origin-stamped (SanitizeJobInfo/SanitizeSession), so the keys resolve to
+	// composite (non-local) keys here.
+	case UpdateSatelliteSnapshot:
+		if payload, ok := u.Payload.(*SatelliteSnapshotPayload); ok && payload.Origin != "" {
+			for k, job := range s.state.Jobs {
+				if job.Origin == payload.Origin {
+					delete(s.state.Jobs, k)
+				}
+			}
+			for k, sess := range s.state.Sessions {
+				if sess.Origin == payload.Origin {
+					delete(s.state.Sessions, k)
+				}
+			}
+			for _, job := range payload.Jobs {
+				s.state.Jobs[jobKey(job)] = job
+			}
+			for _, sess := range payload.Sessions {
+				s.state.Sessions[sessionKey(sess)] = sess
+			}
 		}
 	}
 
@@ -514,6 +563,13 @@ func isTerminalJobStatus(status orchestration.JobStatus) bool {
 // load/write failure is logged and swallowed: a markdown-write problem must never
 // break session-status application.
 func (s *Store) syncSessionStatusToJobMarkdown(session *models.Session, prevStatus, newStatus string) {
+	// Never drive a local-disk write off a remote session (C8/B9). A federated
+	// session's JobFilePath is a satellite-side path: LoadJob would error-spam at
+	// best and, on a coincidental path collision, clobber an unrelated local job
+	// markdown. Remote job status converges home via the Record plane, not here.
+	if session.Origin != "" {
+		return
+	}
 	// Only flow jobs carry a JobFilePath; skip raw, non-flow Claude sessions.
 	if session.JobFilePath == "" {
 		return
