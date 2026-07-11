@@ -23,7 +23,7 @@ func SyncMergeScenario() *harness.Scenario {
 			harness.NewStep("setup test workspace", func(ctx *harness.Context) error {
 				// Create a temporary notebook workspace for testing
 				wsDir := filepath.Join(ctx.RootDir, "test-ws")
-				if err := os.MkdirAll(wsDir, 0755); err != nil {
+				if err := os.MkdirAll(wsDir, 0o755); err != nil {
 					return fmt.Errorf("failed to create workspace: %w", err)
 				}
 
@@ -36,7 +36,7 @@ status: draft
 
 This is the test document body.
 `
-				if err := os.WriteFile(docPath, []byte(content), 0644); err != nil {
+				if err := os.WriteFile(docPath, []byte(content), 0o644); err != nil {
 					return fmt.Errorf("failed to write test document: %w", err)
 				}
 
@@ -46,7 +46,7 @@ This is the test document body.
 				// Verify that the conflict directory can be created
 				// In a real test, this would be created by the daemon during merge conflicts
 				stateDir := os.ExpandEnv("$HOME/.local/state/grove/sync/conflicts")
-				if err := os.MkdirAll(stateDir, 0700); err != nil {
+				if err := os.MkdirAll(stateDir, 0o700); err != nil {
 					return fmt.Errorf("failed to create conflict directory: %w", err)
 				}
 

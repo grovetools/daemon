@@ -4,12 +4,15 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/syncproto"
+	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
 )
@@ -48,6 +51,127 @@ func writeFile(t *testing.T, path, content string) {
 // Manifest against syncExcluded) moved with the logic into the sync package's
 // DocSpace — see daemon/internal/daemon/sync/docspace_test.go. MatchesEvent
 // below still exercises the manifest end-to-end via the DocSpace delegation.
+
+// newRecursiveTestWorkspace builds a workspace tree under a real
+// `.../workspaces/<name>` path (so workspaceRootForDir resolves the root the
+// way it does on a centralized notebook) containing a mix of Included content
+// dirs and excluded subtrees. It returns the workspace root and the fabricated
+// content-dir list (root as "notes", plans/ as "plans") — no locator needed,
+// which is the whole point of extracting computeWorkspaceWatches.
+func newRecursiveTestWorkspace(t *testing.T, subdirs []string) (string, []workspace.ContentDirectory) {
+	t.Helper()
+	wsRoot := filepath.Join(t.TempDir(), "workspaces", "testws")
+	for _, d := range subdirs {
+		if err := os.MkdirAll(filepath.Join(wsRoot, filepath.FromSlash(d)), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	dirs := []workspace.ContentDirectory{
+		{Path: wsRoot, Type: "notes"},
+		{Path: filepath.Join(wsRoot, "plans"), Type: "plans"},
+		{Path: filepath.Join(wsRoot, "chats"), Type: "chats"},
+	}
+	return wsRoot, dirs
+}
+
+// TestComputeWorkspaceWatchesRecursive is the S1 reproduction: files created
+// under quick/, inbox/, and a plan sub-subdir must land in the watch set —
+// today only the 3 whitelisted content dirs were registered. Also asserts the
+// excluded subtrees (.git/, .artifacts/) are never registered, and that
+// plans-only mode restricts to plans/ while keeping the workspace root as
+// syncWatch.root.
+func TestComputeWorkspaceWatchesRecursive(t *testing.T) {
+	wsRoot, dirs := newRecursiveTestWorkspace(t, []string{
+		"quick", "inbox", "daily", "concepts",
+		filepath.Join("plans", "myplan", "sub"), "chats",
+		".artifacts", ".git",
+	})
+
+	abs := func(rel string) string {
+		if rel == "" {
+			return wsRoot
+		}
+		return filepath.Join(wsRoot, filepath.FromSlash(rel))
+	}
+
+	// Full mode: every Included dir registered, excluded subtrees absent.
+	full := computeWorkspaceWatches(&config.SyncWorkspace{Name: "testws", Mode: config.SyncModeFull}, dirs)
+	for _, rel := range []string{"", "quick", "inbox", "daily", "concepts", "plans", "plans/myplan", "plans/myplan/sub", "chats"} {
+		w, ok := full[abs(rel)]
+		if !ok {
+			t.Errorf("full mode: missing watch for %q (S1)", rel)
+			continue
+		}
+		if w.root != wsRoot || w.workspace != "testws" {
+			t.Errorf("full mode: watch %q has root=%q ws=%q, want root=%q ws=testws", rel, w.root, w.workspace, wsRoot)
+		}
+	}
+	for path := range full {
+		rel, _ := filepath.Rel(wsRoot, path)
+		rel = filepath.ToSlash(rel)
+		if strings.HasPrefix(rel, ".git") || strings.HasPrefix(rel, ".artifacts") {
+			t.Errorf("full mode registered an excluded dir: %q", rel)
+		}
+	}
+
+	// Plans-only mode: only plans/… dirs, syncWatch.root still the workspace root.
+	plansOnly := computeWorkspaceWatches(&config.SyncWorkspace{Name: "testws", Mode: config.SyncModePlansOnly}, dirs)
+	if _, ok := plansOnly[abs("plans/myplan/sub")]; !ok {
+		t.Error("plans-only: missing plans/myplan/sub")
+	}
+	if _, ok := plansOnly[abs("quick")]; ok {
+		t.Error("plans-only: quick/ should not be registered")
+	}
+	for path, w := range plansOnly {
+		rel, _ := filepath.Rel(wsRoot, path)
+		rel = filepath.ToSlash(rel)
+		if !strings.HasPrefix(rel, "plans") {
+			t.Errorf("plans-only registered non-plans dir: %q", rel)
+		}
+		if w.root != wsRoot {
+			t.Errorf("plans-only: syncWatch.root = %q, want workspace root %q", w.root, wsRoot)
+		}
+	}
+}
+
+// TestRecursiveWatchFlushS1 is the literal S1 sentence made executable: seed the
+// watch table from computeWorkspaceWatches, write a file under quick/ and under
+// a plan sub-subdir, drive flush, and assert both reach the outbox with the
+// correct workspace-root-relative wire paths.
+func TestRecursiveWatchFlushS1(t *testing.T) {
+	wsRoot, dirs := newRecursiveTestWorkspace(t, []string{
+		"quick", filepath.Join("plans", "myplan", "sub"),
+	})
+
+	db, err := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatalf("open sync db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	h := NewSyncHandler(nil, nil, nil, db, 50, 500)
+	h.watchedPaths = computeWorkspaceWatches(&config.SyncWorkspace{Name: "testws", Mode: config.SyncModeFull}, dirs)
+
+	ctx := context.Background()
+	quickFile := filepath.Join(wsRoot, "quick", "x.md")
+	subFile := filepath.Join(wsRoot, "plans", "myplan", "sub", "y.md")
+	writeFile(t, quickFile, "quick note")
+	writeFile(t, subFile, "deep plan note")
+	h.flush(ctx, quickFile)
+	h.flush(ctx, subFile)
+
+	entries, _ := db.ListOutbox("testws", 0)
+	got := map[string]bool{}
+	for _, e := range entries {
+		got[e.Path] = true
+	}
+	if !got["quick/x.md"] {
+		t.Errorf("expected outbox entry for quick/x.md; got %+v", entries)
+	}
+	if !got["plans/myplan/sub/y.md"] {
+		t.Errorf("expected outbox entry for plans/myplan/sub/y.md; got %+v", entries)
+	}
+}
 
 func TestSyncMatchesEvent(t *testing.T) {
 	h, wsRoot := newTestSyncHandler(t, 50, 500)

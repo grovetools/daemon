@@ -33,6 +33,7 @@ var defaultExclusionDirs = map[string]bool{
 	".stversions": true, // Syncthing versioning
 	".cx":         true, // cx-local context state
 	".artifacts":  true, // generated briefings/aggregated contexts
+	".git":        true, // git object tree — a recursive walk would descend it
 }
 
 // DocSpace is the canonical "what syncs, and how" classifier for a workspace.

@@ -25,6 +25,8 @@ func TestDocSpaceIncluded(t *testing.T) {
 		{rel: ".grove/rules", excluded: true},
 		{rel: ".grove/rules/extra.rules", excluded: true},
 		{rel: ".cx/state.json", excluded: true},
+		{rel: ".git/objects/ab/cdef", excluded: true},
+		{rel: "notes/.git/config", excluded: true},
 		{rel: "plans/my-plan/.artifacts/briefing.xml", excluded: true},
 		{rel: "plans/my-plan.lock", excluded: true},
 		{rel: ".DS_Store", excluded: true},

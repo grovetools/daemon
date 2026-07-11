@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -142,7 +143,73 @@ func workspaceRootForDir(dir string) string {
 	return filepath.Dir(dir)
 }
 
-// ComputeWatchPaths returns the content directories of subscribed workspaces.
+// computeWorkspaceWatches enumerates every Included directory of one subscribed
+// workspace as its own watch entry, recursively (Phase 2, the S1 fix). fsnotify
+// is non-recursive, so every directory in the doc space needs an individual
+// watch; DocSpace.WalkTree prunes excluded subtrees (.git/, .artifacts/, …)
+// during the walk at O(included dirs) cost. syncWatch.root stays the workspace
+// root in every entry — lookupWatch/flush compute wire paths against it, and
+// that must not change with the walk root. Extracted from ComputeWatchPaths so
+// the S1 reproduction can test it without the locator machinery.
+func computeWorkspaceWatches(sub *config.SyncWorkspace, contentDirs []workspace.ContentDirectory) map[string]*syncWatch {
+	watches := make(map[string]*syncWatch)
+	if sub == nil {
+		return watches
+	}
+	// Build the DocSpace once per subscription (per-workspace excludes + size
+	// cap), shared across all of the workspace's watched dirs.
+	space := syncdb.NewDocSpace(sub)
+
+	// Derive the workspace root from the first stat-able content dir. The
+	// "notes" entry from GetAllContentDirs is already the workspace root itself
+	// (filepath.Dir of the inbox path), so workspaceRootForDir is a no-op there
+	// and generalizes the plans/chats entries to the same root.
+	var root string
+	for _, dir := range contentDirs {
+		if _, err := os.Stat(dir.Path); err != nil {
+			continue
+		}
+		root = workspaceRootForDir(dir.Path)
+		break
+	}
+	if root == "" {
+		return watches
+	}
+
+	// Walk roots by mode: Full covers everything from the workspace root in one
+	// walk (the plans/chats content dirs become redundant and are ignored);
+	// PlansOnly walks only the plans/ content dirs, preserving today's filter.
+	var walkRoots []string
+	switch sub.Mode {
+	case config.SyncModePlansOnly:
+		for _, dir := range contentDirs {
+			if dir.Type == "plans" {
+				walkRoots = append(walkRoots, dir.Path)
+			}
+		}
+	default: // SyncModeFull and "" — one walk from the root.
+		walkRoots = []string{root}
+	}
+
+	for _, walkRoot := range walkRoots {
+		if _, err := os.Stat(walkRoot); err != nil {
+			continue
+		}
+		onDir := func(abs, _ string) error {
+			watches[abs] = &syncWatch{workspace: sub.Name, root: root, space: space}
+			return nil
+		}
+		if err := space.WalkTree(walkRoot, onDir, nil); err != nil {
+			// Vanished/unreadable walk root: skip it this tick, mirroring the
+			// old per-dir stat-failure continue.
+			continue
+		}
+	}
+	return watches
+}
+
+// ComputeWatchPaths returns every Included directory of subscribed workspaces
+// (recursively) so the non-recursive fsnotify backend covers the whole tree.
 func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) []string {
 	newWatches := make(map[string]*syncWatch)
 
@@ -161,22 +228,10 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 		if err != nil {
 			continue
 		}
-		// Build the DocSpace once per subscription (per-workspace excludes +
-		// size cap), shared across all of the workspace's watched dirs.
-		space := syncdb.NewDocSpace(sub)
-		for _, dir := range dirs {
-			if sub.Mode == config.SyncModePlansOnly && dir.Type != "plans" {
-				continue
-			}
-			if _, err := os.Stat(dir.Path); err != nil {
-				continue
-			}
-			newWatches[dir.Path] = &syncWatch{
-				workspace: sub.Name,
-				root:      workspaceRootForDir(dir.Path),
-				space:     space,
-			}
-		}
+		// GetAllContentDirs is now the root-resolution source, not the watch
+		// list; the recursive walk (before pathsMutex — a 15k-dir walk must not
+		// hold the lock) produces the actual watch set.
+		maps.Copy(newWatches, computeWorkspaceWatches(sub, dirs))
 	}
 
 	h.pathsMutex.Lock()
