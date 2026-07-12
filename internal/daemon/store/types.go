@@ -143,7 +143,11 @@ const (
 	// Origin equals the payload's Origin, then inserts the (already sanitized,
 	// origin-stamped) snapshot rows — so a satellite that dropped a job has that
 	// row removed on the next snapshot without ever touching other origins or
-	// local rows. Payload: *SatelliteSnapshotPayload.
+	// local rows. ApplyUpdate also diffs the old vs new job rows and broadcasts
+	// synthesized per-job UpdateJobCompleted/Failed/Cancelled events for remote
+	// terminal transitions (B1) — the snapshot is the ONLY federated change
+	// signal, so without the diff the lease releaser and ntfy bridge would
+	// never fire. Payload: *SatelliteSnapshotPayload.
 	UpdateSatelliteSnapshot UpdateType = "satellite_snapshot"
 
 	// Workflow/subagent lifecycle update types. Each maps to a DISTINCT

@@ -100,6 +100,11 @@ type Server struct {
 	satelliteLeasesMu sync.Mutex
 	satelliteLeases   map[string]string
 
+	// satelliteNotifyFn is the terminal-notification sink StartSatelliteNotifier
+	// dispatches to. Nil (production) means notifySatelliteTerminal; tests set
+	// it to observe the bridge without real osascript/ntfy I/O.
+	satelliteNotifyFn func(ctx context.Context, job *models.JobInfo, updType store.UpdateType, ntfyURL, ntfyTopic string)
+
 	// bootStatus is the source of truth for GET /api/system/boot. Nil until
 	// the early-bind boot goroutine sets it; handleSystemBoot then reports
 	// Done=true (the daemon only reaches that handler once serving, which

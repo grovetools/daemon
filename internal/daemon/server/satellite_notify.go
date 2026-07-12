@@ -31,11 +31,18 @@ func (s *Server) StartSatelliteNotifier(ctx context.Context, ntfyURL, ntfyTopic 
 		return
 	}
 	ch := st.Subscribe()
-	// notified dedupes by job ID: a reconnect re-snapshot (UpdateSatelliteSnapshot)
-	// does not emit per-job events, but the SSE tail can replay a terminal event,
-	// so belt-and-braces guard against a double fire.
+	// notified dedupes by job ID: the Store synthesizes a per-job terminal
+	// event from every snapshot diff that shows the transition (B1), so a job
+	// that drops out of one snapshot and reappears terminal in a later one
+	// would re-fire. Lease release is idempotent; notifications are not.
 	var mu sync.Mutex
 	notified := make(map[string]struct{})
+	// Sink seam: tests observe the bridge here instead of firing real
+	// osascript/ntfy I/O. Production leaves the field nil.
+	notify := s.satelliteNotifyFn
+	if notify == nil {
+		notify = s.notifySatelliteTerminal
+	}
 	go func() {
 		defer st.Unsubscribe(ch)
 		for {
@@ -62,7 +69,7 @@ func (s *Server) StartSatelliteNotifier(ctx context.Context, ntfyURL, ntfyTopic 
 				notified[job.ID] = struct{}{}
 				mu.Unlock()
 
-				s.notifySatelliteTerminal(ctx, job, upd.Type, ntfyURL, ntfyTopic)
+				notify(ctx, job, upd.Type, ntfyURL, ntfyTopic)
 			}
 		}
 	}()

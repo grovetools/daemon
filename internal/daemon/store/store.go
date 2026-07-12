@@ -24,6 +24,13 @@ type Store struct {
 	workflowPersister *workflowPersister
 	pendingRestore    persistedState // Loaded from disk, applied when workspaces arrive
 	ulog              *grovelogging.UnifiedLogger
+
+	// satSeenSnapshot marks origins whose first UpdateSatelliteSnapshot of this
+	// process has been applied. The first snapshot per origin is a baseline
+	// (state transfer, not transitions): jobs already terminal in it synthesize
+	// no per-job events (see the UpdateSatelliteSnapshot branch of ApplyUpdate).
+	// Guarded by mu.
+	satSeenSnapshot map[string]struct{}
 }
 
 // New creates a new Store instance, loading any persisted task results and
@@ -42,6 +49,7 @@ func New() *Store {
 		},
 		subscribers:       make(map[chan Update]struct{}),
 		focus:             make(map[string]map[string]struct{}),
+		satSeenSnapshot:   make(map[string]struct{}),
 		persister:         newPersister(),
 		workflowPersister: newWorkflowPersister(),
 		ulog:              grovelogging.NewUnifiedLogger("groved.store"),
@@ -173,6 +181,10 @@ func (s *Store) GetPlans(planDir string) []*orchestration.Plan {
 func (s *Store) ApplyUpdate(u Update) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Per-job terminal updates synthesized from a satellite snapshot diff (B1);
+	// broadcast after u itself, below.
+	var synthesized []Update
 
 	switch u.Type {
 	case UpdateWorkspaces:
@@ -416,8 +428,14 @@ func (s *Store) ApplyUpdate(u Update) {
 	// composite (non-local) keys here.
 	case UpdateSatelliteSnapshot:
 		if payload, ok := u.Payload.(*SatelliteSnapshotPayload); ok && payload.Origin != "" {
+			// Keep the outgoing job rows: remote terminal transitions exist ONLY
+			// as snapshot deltas (the satellite's per-job jobrunner events never
+			// federate — the collector re-snapshots instead), so the old-vs-new
+			// diff below is where the laptop synthesizes them (B1).
+			prevJobs := make(map[string]*models.JobInfo)
 			for k, job := range s.state.Jobs {
 				if job.Origin == payload.Origin {
+					prevJobs[k] = job
 					delete(s.state.Jobs, k)
 				}
 			}
@@ -426,8 +444,42 @@ func (s *Store) ApplyUpdate(u Update) {
 					delete(s.state.Sessions, k)
 				}
 			}
+			// The first snapshot for an origin this process is a baseline (state
+			// transfer, not transitions): a satellite full of historically
+			// completed jobs must not fire a terminal-event burst on every boot.
+			// Suppressing it costs the lease releaser nothing — a restart empties
+			// the in-memory lease map anyway (TTL is the fallback there).
+			_, seeded := s.satSeenSnapshot[payload.Origin]
+			s.satSeenSnapshot[payload.Origin] = struct{}{}
 			for _, job := range payload.Jobs {
-				s.state.Jobs[jobKey(job)] = job
+				key := jobKey(job)
+				s.state.Jobs[key] = job
+				// Synthesize the per-job terminal update the local jobrunner would
+				// have emitted, so Store subscribers (the P9 lease releaser, the
+				// P10 ntfy bridge) see remote terminal transitions at all: on an
+				// observed non-terminal→terminal transition, or when a job APPEARS
+				// already terminal after the baseline (the laptop may have been
+				// disconnected while it finished). Broadcast-only — the row was
+				// just written above, and every local-only side-effect consumer
+				// (jobrunner.watchTransitions, syncSessionStatusToJobMarkdown)
+				// already skips Origin != "" payloads.
+				updType, terminal := terminalJobUpdateType(job.Status)
+				if !terminal {
+					continue
+				}
+				if prev := prevJobs[key]; prev != nil {
+					if _, prevTerminal := terminalJobUpdateType(prev.Status); prevTerminal {
+						continue // unchanged terminal row — nothing transitioned
+					}
+				} else if !seeded {
+					continue // baseline snapshot — history, not a transition
+				}
+				synthesized = append(synthesized, Update{
+					Type:    updType,
+					Source:  u.Source,
+					Origin:  payload.Origin,
+					Payload: job,
+				})
 			}
 			for _, sess := range payload.Sessions {
 				s.state.Sessions[sessionKey(sess)] = sess
@@ -442,6 +494,37 @@ func (s *Store) ApplyUpdate(u Update) {
 		default:
 			// Non-blocking send to prevent slow clients from stalling the daemon
 		}
+	}
+	// Broadcast the snapshot-diff terminal updates (B1) after the snapshot
+	// itself so subscribers observe state-then-transition ordering. These go
+	// straight to broadcast — never back through the apply switch above — so
+	// job rows are not double-written.
+	for _, su := range synthesized {
+		for ch := range s.subscribers {
+			select {
+			case ch <- su:
+			default:
+			}
+		}
+	}
+}
+
+// terminalJobUpdateType maps a federated job's terminal status to the per-job
+// update type the local jobrunner emits for it (see jobrunner markDone). The
+// other jobrunner-terminal statuses deliberately do NOT map: "idle" marks a
+// discovered-but-never-run job (a job_completed for it would release a dispatch
+// lease for work that never happened), and rare interrupted/abandoned rows are
+// left to the lease TTL rather than guessed into a lifecycle event.
+func terminalJobUpdateType(status string) (UpdateType, bool) {
+	switch status {
+	case "completed":
+		return UpdateJobCompleted, true
+	case "failed":
+		return UpdateJobFailed, true
+	case "cancelled":
+		return UpdateJobCancelled, true
+	default:
+		return "", false
 	}
 }
 
