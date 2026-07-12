@@ -297,8 +297,10 @@ func TestDrainOutboxPopulatesBaseVersion(t *testing.T) {
 	if doc.LastSyncedVersion != 7 {
 		t.Fatalf("expected LastSyncedVersion 7 after accepted push, got %d", doc.LastSyncedVersion)
 	}
-	if doc.LastSyncedHash != "deadbeef" {
-		t.Fatalf("expected LastSyncedHash to advance to pushed hash, got %q", doc.LastSyncedHash)
+	// The pushed hash is recomputed from the disk bytes at drain time (B9),
+	// so the enqueue-time "deadbeef" placeholder never reaches the wire.
+	if want := sha([]byte("v2 content")); doc.LastSyncedHash != want {
+		t.Fatalf("expected LastSyncedHash to advance to pushed hash %q, got %q", want, doc.LastSyncedHash)
 	}
 	if string(doc.BaseContent) != "v2 content" {
 		t.Fatalf("expected BaseContent to become pushed content, got %q", doc.BaseContent)
@@ -1610,5 +1612,144 @@ func TestDrainOutboxCarriesMtime(t *testing.T) {
 	// Never an OCC input: a create still pushes base_version 0.
 	if ev.BaseVersion != 0 {
 		t.Fatalf("mtime must not affect OCC: base_version = %d, want 0", ev.BaseVersion)
+	}
+}
+
+// TestDrainOutboxRecomputesHashOnDiskReRead is the B9 regression: when drain
+// re-reads content from disk (empty Payload), the wire event must carry the
+// hash/size of the bytes actually pushed, not the enqueue-time snapshot.
+// Sending the frozen hash makes the server's validateContent reject the push
+// ("content does not match content_hash") on every retry forever — the hourly
+// re-park re-reads fresh bytes but re-sends the stale hash.
+func TestDrainOutboxRecomputesHashOnDiskReRead(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldContent := []byte("enqueue-time body\n")
+	localPath := filepath.Join(root, "inbox", "note.md")
+	if err := os.WriteFile(localPath, oldContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Enqueue with the hash/size/mtime captured at enqueue time.
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		Workspace: "default", EventType: syncproto.EventDocumentCreated,
+		Path: "inbox/note.md", ContentHash: sha(oldContent), Mtime: statMtime(localPath),
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+
+	// The file changes between enqueue and drain (different length too, so a
+	// stale Size would also be caught).
+	newContent := []byte("drain-time body — changed after enqueue\n")
+	if err := os.WriteFile(localPath, newContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newMtime := time.Date(2026, 7, 12, 10, 15, 33, 0, time.Local)
+	if err := os.Chtimes(localPath, newMtime, newMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	var pushed atomic.Pointer[syncproto.SyncEvent]
+	srv := servePushStub(t, func(req *syncproto.PushRequest) *syncproto.PushResponse {
+		resp := &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
+		for i := range req.Events {
+			ev := req.Events[i]
+			pushed.Store(&ev)
+			resp.Results[i] = syncproto.PushResult{
+				Status: syncproto.PushStatusAccepted, DocumentID: "doc-1", Version: 1, Seq: int64(i) + 1,
+			}
+		}
+		return resp
+	})
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+
+	ev := pushed.Load()
+	if ev == nil {
+		t.Fatal("no event pushed")
+	}
+	// Hash, size, and mtime all describe the NEW bytes — the ones on the wire.
+	if got, want := ev.ContentHash, sha(newContent); got != want {
+		t.Fatalf("pushed content_hash = %s, want hash of drain-time bytes %s", got, want)
+	}
+	if got, want := ev.Size, int64(len(newContent)); got != want {
+		t.Fatalf("pushed size = %d, want %d", got, want)
+	}
+	if string(ev.Content) != string(newContent) {
+		t.Fatalf("pushed content = %q, want drain-time bytes %q", ev.Content, newContent)
+	}
+	if !ev.Mtime.Equal(newMtime) {
+		t.Fatalf("pushed mtime = %v, want drain-time %v", ev.Mtime, newMtime)
+	}
+}
+
+// TestDrainOutboxDropsHashEqualNoOpCreate extends the S4 no-op drop to
+// creates: a document_created entry whose pushed bytes already equal the
+// server-confirmed head (doc row exists with matching last_synced_hash) is
+// retired client-side instead of round-tripping to a guaranteed
+// occupied-path collision.
+func TestDrainOutboxDropsHashEqualNoOpCreate(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("already synced body\n")
+	if err := os.WriteFile(filepath.Join(root, "inbox", "note.md"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The doc row says the server already holds exactly these bytes.
+	if err := db.UpsertDocument(&Document{
+		DocumentID: "doc-1", Workspace: "default", Path: "inbox/note.md",
+		ContentHash: sha(content), LastSyncedHash: sha(content), LastSyncedVersion: 3,
+	}); err != nil {
+		t.Fatalf("UpsertDocument: %v", err)
+	}
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		Workspace: "default", EventType: syncproto.EventDocumentCreated,
+		Path: "inbox/note.md", ContentHash: sha(content),
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+
+	var pushCount atomic.Int64
+	srv := servePushStub(t, func(req *syncproto.PushRequest) *syncproto.PushResponse {
+		pushCount.Add(1)
+		return &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
+	})
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+
+	if got := pushCount.Load(); got != 0 {
+		t.Fatalf("hash-equal create must be dropped client-side, but %d push(es) reached the server", got)
+	}
+	remaining, err := db.CountOutbox()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected no-op create to be retired from outbox, found %d entries", remaining)
 	}
 }

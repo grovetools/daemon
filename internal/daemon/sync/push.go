@@ -163,11 +163,18 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 					} else {
 						event.Content = content
 						event.Size = int64(len(content))
-						// The pushed bytes are the disk bytes as of NOW, so
-						// refresh the fidelity mtime alongside them (the
-						// enqueue-time stat is stale whenever the file changed
-						// between enqueue and drain). Zero on a stat race —
-						// the entry's enqueue-time mtime then stands.
+						// The pushed bytes are the disk bytes as of NOW, so the
+						// wire hash must be recomputed from them: keeping the
+						// enqueue-time entry.ContentHash makes the server's
+						// validateContent reject the push ("content does not
+						// match content_hash") forever whenever the file changed
+						// between enqueue and drain — every retry re-reads fresh
+						// bytes but re-sends the frozen hash (B9).
+						event.ContentHash = hashContent(content)
+						// Refresh the fidelity mtime alongside them (the
+						// enqueue-time stat is stale for the same reason). Zero
+						// on a stat race — the entry's enqueue-time mtime then
+						// stands.
 						if mtime := statMtime(localPath); !mtime.IsZero() {
 							event.Mtime = mtime
 						}
@@ -180,17 +187,24 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 			// populate it from the local sync record (the version we last saw
 			// from the server) — without it every non-hash-equal update is a
 			// manufactured conflict (base_version defaults to 0).
-			if event.Type == syncproto.EventDocumentUpdated {
+			if event.Type == syncproto.EventDocumentUpdated ||
+				event.Type == syncproto.EventDocumentCreated {
 				if doc, derr := p.db.GetDocumentByPath(p.workspace, entry.Path); derr == nil && doc != nil {
-					event.BaseVersion = doc.LastSyncedVersion
-					if event.DocumentID == "" {
-						event.DocumentID = doc.DocumentID
+					if event.Type == syncproto.EventDocumentUpdated {
+						event.BaseVersion = doc.LastSyncedVersion
+						if event.DocumentID == "" {
+							event.DocumentID = doc.DocumentID
+						}
 					}
 					// No-op drop (S4): compute the hash of the content actually
 					// being pushed (not the possibly-stale entry.ContentHash
 					// against fresh disk bytes). If it already equals the
 					// server-confirmed head, the change is a no-op — delete it
-					// rather than round-trip to the server.
+					// rather than round-trip to the server. Applies to creates
+					// too: a doc row at this path with the same synced hash
+					// means the server already holds this exact document (e.g.
+					// after a pull raced the enqueue), so the create would only
+					// re-collide with the occupied path.
 					if hashContent(event.Content) == doc.LastSyncedHash {
 						noopIDs = append(noopIDs, entry.ID)
 						continue
