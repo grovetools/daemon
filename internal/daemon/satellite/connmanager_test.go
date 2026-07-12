@@ -2,7 +2,9 @@ package satellite
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/pem"
 	"fmt"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 // --- test key helpers -------------------------------------------------------
@@ -73,19 +76,20 @@ func shortTempSocket(t *testing.T) string {
 type testServer struct {
 	ln         net.Listener
 	hostSigner ssh.Signer
+	extraHKeys []ssh.Signer
 	remoteSock string
 
 	mu    sync.Mutex
 	conns []net.Conn
 }
 
-func newTestServer(t *testing.T, hostSigner ssh.Signer, remoteSock string) *testServer {
+func newTestServer(t *testing.T, hostSigner ssh.Signer, remoteSock string, extraHostKeys ...ssh.Signer) *testServer {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	ts := &testServer{ln: ln, hostSigner: hostSigner, remoteSock: remoteSock}
+	ts := &testServer{ln: ln, hostSigner: hostSigner, extraHKeys: extraHostKeys, remoteSock: remoteSock}
 	go ts.acceptLoop()
 	t.Cleanup(ts.close)
 	return ts
@@ -100,6 +104,9 @@ func (ts *testServer) acceptLoop() {
 		},
 	}
 	cfg.AddHostKey(ts.hostSigner)
+	for _, hk := range ts.extraHKeys {
+		cfg.AddHostKey(hk)
+	}
 
 	for {
 		nConn, err := ts.ln.Accept()
@@ -415,5 +422,95 @@ func TestReconnectAfterDrop(t *testing.T) {
 	respBytes, _ := io.ReadAll(conn)
 	if !strings.Contains(string(respBytes), "pong") {
 		t.Fatalf("expected forwarded response after reconnect, got:\n%s", respBytes)
+	}
+}
+
+// genECDSASigner returns an ecdsa-sha2-nistp256 host signer — a second key
+// *type* so multi-hostkey negotiation can pick something other than ed25519.
+func genECDSASigner(t *testing.T) ssh.Signer {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ecdsa key: %v", err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("new ecdsa signer: %v", err)
+	}
+	return signer
+}
+
+// TestPinnedKeyTypeNegotiated (B5 regression): a server with several host keys
+// (real sshd generates rsa+ecdsa+ed25519) negotiates by the CLIENT's algorithm
+// preference. Pinning an ed25519 key while the client's default order prefers
+// ecdsa made FixedHostKey reject a legitimate host ("host key mismatch") —
+// reproduced live against the PoC VM. The fix constrains HostKeyAlgorithms to
+// the pinned key's type.
+func TestPinnedKeyTypeNegotiated(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	edSigner, _ := genSigner(t)
+	ecSigner := genECDSASigner(t)
+	_, clientPriv := genSigner(t)
+	idFile := writeIdentity(t, clientPriv)
+
+	remoteSock := shortTempSocket(t)
+	serveCannedUnixHTTP(t, remoteSock, "pong")
+	// ecdsa first: the server supports both; only HostKeyAlgorithms keeps the
+	// negotiation on the pinned ed25519 type.
+	ts := newTestServer(t, ecSigner, remoteSock, edSigner)
+
+	reg := &Registry{byName: map[string]*SatelliteConfig{
+		"sat": {
+			Name:         "sat",
+			SSHAddr:      ts.addr(),
+			User:         "grovedev",
+			HostKey:      authorizedKeyLine(edSigner),
+			IdentityFile: idFile,
+			SocketPath:   remoteSock,
+		},
+	}}
+
+	st := store.New()
+	cm := newTestConnManager(reg, st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cm.Start(ctx)
+
+	waitState(t, st, "sat", stateConnected, 5*time.Second)
+}
+
+// TestEmptyAgentDoesNotPoisonAuth (B6 regression): a reachable SSH agent with
+// zero identities (fresh macOS login) must contribute no auth method —
+// otherwise its empty publickey attempt exhausts the server's method
+// negotiation and the identity_file signer is never tried.
+func TestEmptyAgentDoesNotPoisonAuth(t *testing.T) {
+	agentSock := shortTempSocket(t)
+	ln, err := net.Listen("unix", agentSock)
+	if err != nil {
+		t.Fatalf("listen agent sock: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go agent.ServeAgent(agent.NewKeyring(), conn)
+		}
+	}()
+	t.Setenv("SSH_AUTH_SOCK", agentSock)
+
+	_, clientPriv := genSigner(t)
+	idFile := writeIdentity(t, clientPriv)
+
+	methods, cleanup, err := authMethods(&SatelliteConfig{Name: "sat", IdentityFile: idFile})
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("authMethods: %v", err)
+	}
+	if len(methods) != 1 {
+		t.Fatalf("empty agent must be skipped: want 1 method (identity only), got %d", len(methods))
 	}
 }

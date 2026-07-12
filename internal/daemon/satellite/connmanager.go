@@ -91,7 +91,7 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 	// Validate the pinned host key up front (C2). Empty/unparseable → permanent
 	// hard-fail: no dial, no retry, never TOFU. Only P10 writing a real host_key
 	// can fix it, so spinning a retry loop would be pure noise.
-	hostKeyCB, err := fixedHostKeyCallback(cfg)
+	hostKeyCB, hostKeyAlgos, err := fixedHostKeyCallback(cfg)
 	if err != nil {
 		cm.setState(cfg, stateDisconnected, err)
 		cm.ulog.Warn("Satellite host key invalid; connection disabled (no TOFU)").
@@ -105,7 +105,7 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 			return
 		}
 
-		client, derr := cm.dial(cfg, hostKeyCB)
+		client, derr := cm.dial(cfg, hostKeyCB, hostKeyAlgos)
 		if derr != nil {
 			cm.setState(cfg, stateBackoff, derr)
 			cm.ulog.Warn("Satellite dial failed; backing off").
@@ -145,7 +145,7 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 
 // dial establishes one SSH connection with the pinned host-key callback and
 // agent-based (plus optional identity-file) auth.
-func (cm *ConnManager) dial(cfg *SatelliteConfig, hostKeyCB ssh.HostKeyCallback) (*ssh.Client, error) {
+func (cm *ConnManager) dial(cfg *SatelliteConfig, hostKeyCB ssh.HostKeyCallback, hostKeyAlgos []string) (*ssh.Client, error) {
 	auth, cleanup, err := authMethods(cfg)
 	if err != nil {
 		return nil, err
@@ -153,10 +153,11 @@ func (cm *ConnManager) dial(cfg *SatelliteConfig, hostKeyCB ssh.HostKeyCallback)
 	defer cleanup()
 
 	clientCfg := &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            auth,
-		HostKeyCallback: hostKeyCB,
-		Timeout:         cm.dialTimeout,
+		User:              cfg.User,
+		Auth:              auth,
+		HostKeyCallback:   hostKeyCB,
+		HostKeyAlgorithms: hostKeyAlgos,
+		Timeout:           cm.dialTimeout,
 	}
 
 	client, err := ssh.Dial("tcp", cfg.SSHAddr, clientCfg)
@@ -306,15 +307,29 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // fixedHostKeyCallback builds a pin-only HostKeyCallback from the registry's
 // authorized_keys-format HostKey. Empty or unparseable keys are a hard error
 // (C2) — the caller must NOT fall back to an accept-any callback.
-func fixedHostKeyCallback(cfg *SatelliteConfig) (ssh.HostKeyCallback, error) {
+//
+// It also returns the HostKeyAlgorithms the client must offer: a server with
+// several host keys (sshd generates rsa+ecdsa+ed25519) negotiates by the
+// client's algorithm preference, so without this constraint it may present a
+// key of a different type than the pinned one and FixedHostKey rejects a
+// legitimate host ("host key mismatch").
+func fixedHostKeyCallback(cfg *SatelliteConfig) (ssh.HostKeyCallback, []string, error) {
 	if cfg.HostKey == "" {
-		return nil, fmt.Errorf("satellite %q has no pinned host_key (refusing to TOFU)", cfg.Name)
+		return nil, nil, fmt.Errorf("satellite %q has no pinned host_key (refusing to TOFU)", cfg.Name)
 	}
 	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(cfg.HostKey))
 	if err != nil {
-		return nil, fmt.Errorf("satellite %q host_key unparseable: %w", cfg.Name, err)
+		return nil, nil, fmt.Errorf("satellite %q host_key unparseable: %w", cfg.Name, err)
 	}
-	return ssh.FixedHostKey(pub), nil
+	var algos []string
+	switch pub.Type() {
+	case ssh.KeyAlgoRSA:
+		// An RSA *key* is offered under the SHA-2 signature algorithm names.
+		algos = []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
+	default:
+		algos = []string{pub.Type()}
+	}
+	return ssh.FixedHostKey(pub), algos, nil
 }
 
 // authMethods assembles the SSH auth methods: agent signers from
@@ -329,8 +344,16 @@ func authMethods(cfg *SatelliteConfig) ([]ssh.AuthMethod, func(), error) {
 	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
 		if conn, err := net.Dial("unix", sock); err == nil {
 			ag := agent.NewClient(conn)
-			methods = append(methods, ssh.PublicKeysCallback(ag.Signers))
-			cleanup = func() { conn.Close() }
+			// Probe eagerly: a reachable agent holding zero keys (fresh macOS
+			// login shells) must not contribute a method — an empty publickey
+			// attempt burns the server's method negotiation and the
+			// identity_file signer below never gets tried.
+			if sgs, serr := ag.Signers(); serr == nil && len(sgs) > 0 {
+				methods = append(methods, ssh.PublicKeysCallback(ag.Signers))
+				cleanup = func() { conn.Close() }
+			} else {
+				conn.Close()
+			}
 		}
 	}
 
