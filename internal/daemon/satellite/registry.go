@@ -44,6 +44,23 @@ type SatelliteConfig struct {
 	// the default convention (see remoteSocketPath in connmanager.go). P10 can
 	// write the exact value from bootstrap output.
 	SocketPath string `yaml:"socket_path" toml:"socket_path"`
+
+	// SyncLocalPort, when > 0, has the daemon bind 127.0.0.1:<port> and forward
+	// every accepted connection over the satellite's SSH connection to
+	// SyncRemoteAddr via a direct-tcpip channel (see syncforward.go). This is
+	// the daemon-owned replacement for the manual `ssh -L` sync tunnel. 0 or
+	// absent = feature off.
+	SyncLocalPort int `yaml:"sync_local_port" toml:"sync_local_port"`
+
+	// SyncRemoteAddr is the loopback address on the satellite that the sync
+	// forward dials (syncd's bind address). Empty defaults to "127.0.0.1:8788"
+	// (see syncRemoteAddr in syncforward.go).
+	SyncRemoteAddr string `yaml:"sync_remote_addr" toml:"sync_remote_addr"`
+
+	// Note: a [satellites.<name>.sync] subtable may appear in the TOML (owned
+	// by the grove CLI side). The mapstructure decode behind LoadRegistry
+	// ignores unknown keys, so the daemon tolerates it without a field here —
+	// TestLoadRegistryToleratesSyncSubtable pins that behavior.
 }
 
 // Registry holds the parsed satellite configs, keyed by name.

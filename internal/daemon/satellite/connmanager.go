@@ -33,6 +33,14 @@ type satConn struct {
 	state   string
 	lastErr string
 	since   time.Time
+
+	// Sync-forward state (syncforward.go). forward is the human-readable
+	// status string surfaced through SatelliteStatusPayload.Forward; forwardLn
+	// is the bound local listener (nil = not bound); forwardConns tracks live
+	// forwarded connections for teardown.
+	forward      string
+	forwardLn    net.Listener
+	forwardConns map[net.Conn]struct{}
 }
 
 // ConnManager owns one SSH connection per registered satellite. Each satellite
@@ -99,6 +107,12 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 		return
 	}
 
+	// Bind the local sync forward up front (feature-gated on sync_local_port,
+	// see syncforward.go). A busy port is surfaced via status and retried on
+	// each successful connect below; the listener itself stays bound across
+	// reconnects — accepted conns just fail fast while disconnected.
+	cm.ensureSyncForward(ctx, cfg)
+
 	backoff := cm.backoffBase
 	for {
 		if ctx.Err() != nil {
@@ -123,6 +137,10 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 		cm.setState(cfg, stateConnected, nil)
 		cm.ulog.Info("Satellite connected").
 			Field("satellite", cfg.Name).Field("addr", cfg.SSHAddr).Log(ctx)
+
+		// Retry the sync-forward bind if the port was busy earlier (no-op when
+		// already bound or the feature is off).
+		cm.ensureSyncForward(ctx, cfg)
 
 		// Block until the connection dies or ctx is cancelled.
 		cm.keepalive(ctx, client)
@@ -266,21 +284,47 @@ func (cm *ConnManager) setState(cfg *SatelliteConfig, state string, err error) {
 	sc.state = state
 	sc.lastErr = lastErr
 	sc.since = now
+	forward := sc.forward
 	cm.mu.Unlock()
 
-	if cm.store != nil {
-		cm.store.ApplyUpdate(store.Update{
-			Type:   store.UpdateSatelliteStatus,
-			Source: "satellite",
-			Payload: &store.SatelliteStatusPayload{
-				Name:      cfg.Name,
-				State:     state,
-				Addr:      cfg.SSHAddr,
-				LastError: lastErr,
-				Since:     now,
-			},
-		})
+	cm.emitStatus(cfg, state, lastErr, forward, now)
+}
+
+// setForward records the sync-forward status string (syncforward.go) and
+// re-emits satellite_status so /api/satellites and SSE subscribers see it
+// alongside the connection state. Since is left at the connection state's
+// entry time — the Forward field is orthogonal to the state machine.
+func (cm *ConnManager) setForward(cfg *SatelliteConfig, forward string) {
+	cm.mu.Lock()
+	sc := cm.conns[cfg.Name]
+	if sc == nil {
+		sc = &satConn{cfg: cfg, state: stateDisconnected, since: time.Now()}
+		cm.conns[cfg.Name] = sc
 	}
+	sc.forward = forward
+	state, lastErr, since := sc.state, sc.lastErr, sc.since
+	cm.mu.Unlock()
+
+	cm.emitStatus(cfg, state, lastErr, forward, since)
+}
+
+// emitStatus publishes one satellite_status update to the store (C17).
+func (cm *ConnManager) emitStatus(cfg *SatelliteConfig, state, lastErr, forward string, since time.Time) {
+	if cm.store == nil {
+		return
+	}
+	cm.store.ApplyUpdate(store.Update{
+		Type:   store.UpdateSatelliteStatus,
+		Source: "satellite",
+		Payload: &store.SatelliteStatusPayload{
+			Name:      cfg.Name,
+			State:     state,
+			Addr:      cfg.SSHAddr,
+			LastError: lastErr,
+			Forward:   forward,
+			Since:     since,
+		},
+	})
 }
 
 // nextBackoff doubles the delay, capped at backoffCap.

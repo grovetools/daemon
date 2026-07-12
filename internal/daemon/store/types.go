@@ -219,11 +219,15 @@ type SyncConflictPayload struct {
 // transition (M2 contract C17). State is one of "connected", "backoff",
 // "disconnected". LastError carries the most recent dial/keepalive failure
 // (empty when connected). Since marks when the current State was entered.
+// Forward describes the daemon-owned local sync forward when the satellite
+// has sync_local_port configured (e.g. "active on 127.0.0.1:8788" or
+// "port busy on 127.0.0.1:8788: <err>"); empty when the feature is off.
 type SatelliteStatusPayload struct {
 	Name      string    `json:"name"`
 	State     string    `json:"state"`
 	Addr      string    `json:"addr,omitempty"`
 	LastError string    `json:"last_error,omitempty"`
+	Forward   string    `json:"forward,omitempty"`
 	Since     time.Time `json:"since"`
 }
 

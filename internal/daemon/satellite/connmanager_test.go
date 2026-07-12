@@ -138,17 +138,50 @@ func (ts *testServer) serveConn(nConn net.Conn, cfg *ssh.ServerConfig) {
 	}()
 
 	for newChan := range chans {
-		if newChan.ChannelType() != "direct-streamlocal@openssh.com" {
+		switch newChan.ChannelType() {
+		case "direct-streamlocal@openssh.com":
+			ch, chReqs, err := newChan.Accept()
+			if err != nil {
+				continue
+			}
+			go ssh.DiscardRequests(chReqs)
+			go ts.pipeToRemote(ch)
+		case "direct-tcpip":
+			// Wire format per RFC 4254 §7.2 (what x/crypto/ssh Client.Dial
+			// sends for "tcp" networks).
+			var msg struct {
+				DestAddr string
+				DestPort uint32
+				OrigAddr string
+				OrigPort uint32
+			}
+			if err := ssh.Unmarshal(newChan.ExtraData(), &msg); err != nil {
+				_ = newChan.Reject(ssh.ConnectionFailed, "bad direct-tcpip payload")
+				continue
+			}
+			ch, chReqs, err := newChan.Accept()
+			if err != nil {
+				continue
+			}
+			go ssh.DiscardRequests(chReqs)
+			go ts.pipeToTCP(ch, net.JoinHostPort(msg.DestAddr, fmt.Sprint(msg.DestPort)))
+		default:
 			_ = newChan.Reject(ssh.UnknownChannelType, "unsupported")
-			continue
 		}
-		ch, chReqs, err := newChan.Accept()
-		if err != nil {
-			continue
-		}
-		go ssh.DiscardRequests(chReqs)
-		go ts.pipeToRemote(ch)
 	}
+}
+
+// pipeToTCP forwards a direct-tcpip channel to a real TCP address — the
+// "remote loopback syncd" side of the sync-forward tests.
+func (ts *testServer) pipeToTCP(ch ssh.Channel, addr string) {
+	defer ch.Close()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	go func() { _, _ = io.Copy(c, ch) }()
+	_, _ = io.Copy(ch, c)
 }
 
 func (ts *testServer) pipeToRemote(ch ssh.Channel) {
