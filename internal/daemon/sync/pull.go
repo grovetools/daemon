@@ -212,9 +212,11 @@ func (p *PullPipeline) applyEvent(ctx context.Context, workspaceRoot string, ev 
 
 // applyCreate writes a new document to the local filesystem.
 func (p *PullPipeline) applyCreate(ctx context.Context, workspaceRoot string, ev *syncproto.SyncEvent) error {
-	// Fetch content if blob-tier
+	// Fetch content if blob-tier. A legitimately empty document (B10) also
+	// arrives with no content — materialize its zero bytes directly instead
+	// of chasing a blob that never existed.
 	content := ev.Content
-	if len(content) == 0 && ev.ContentHash != "" {
+	if len(content) == 0 && ev.ContentHash != "" && ev.ContentHash != emptyContentHash {
 		var err error
 		content, err = p.client.FetchBlob(ctx, ev.ContentHash)
 		if err != nil {
@@ -250,9 +252,9 @@ func (p *PullPipeline) applyCreate(ctx context.Context, workspaceRoot string, ev
 // applyUpdate applies a remote content update with 3-way merge conflict detection.
 // If a conflict is detected, a conflict artifact is written and UpdateSyncConflict is emitted.
 func (p *PullPipeline) applyUpdate(ctx context.Context, workspaceRoot string, ev *syncproto.SyncEvent) error {
-	// Fetch content if blob-tier
+	// Fetch content if blob-tier (same empty-document carve-out as applyCreate).
 	content := ev.Content
-	if len(content) == 0 && ev.ContentHash != "" {
+	if len(content) == 0 && ev.ContentHash != "" && ev.ContentHash != emptyContentHash {
 		var err error
 		content, err = p.client.FetchBlob(ctx, ev.ContentHash)
 		if err != nil {

@@ -242,6 +242,12 @@ func hashContent(content []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// emptyContentHash is the SHA-256 of zero bytes — the content_hash carried by
+// a legitimately empty document. Pull-side blob-tier detection must treat it
+// as inline-empty, never as "content elided, fetch the blob": no blob exists
+// for zero bytes.
+const emptyContentHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
 // readFile reads a file from disk.
 func readFile(path string) ([]byte, error) {
 	return os.ReadFile(path)

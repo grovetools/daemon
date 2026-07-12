@@ -316,6 +316,41 @@ func TestApplyCreateRestoresMtime(t *testing.T) {
 	}
 }
 
+// TestApplyCreateEmptyDocumentSkipsBlobFetch is the B10 client-side
+// regression: a legitimately empty document arrives with no content and the
+// empty-content hash, and must materialize as a zero-byte file directly —
+// NOT be mistaken for blob-tier. The pipeline's nil client makes the
+// assertion structural: any FetchBlob attempt panics.
+func TestApplyCreateEmptyDocumentSkipsBlobFetch(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	p := newTestPullPipeline(t, db)
+
+	ev := &syncproto.SyncEvent{
+		Type: syncproto.EventDocumentCreated, Workspace: "default",
+		DocumentID: "doc-1", Path: "rules/placeholder.md.rules",
+		ContentHash: emptyContentHash, Version: 1,
+	}
+	if err := p.applyEvent(context.Background(), root, ev); err != nil {
+		t.Fatalf("applyEvent: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(root, "rules/placeholder.md.rules"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected zero-byte file, got %d bytes", len(got))
+	}
+	doc, err := db.GetDocumentByPath("default", "rules/placeholder.md.rules")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocumentByPath: doc=%v err=%v", doc, err)
+	}
+	if doc.LastSyncedHash != emptyContentHash || doc.LastSyncedVersion != 1 {
+		t.Fatalf("unexpected doc record: %+v", doc)
+	}
+}
+
 // TestApplyUpdateFastForwardRestoresMtime: a clean fast-forward (local file
 // matches the last server-confirmed content) rewrites the file to the remote
 // bytes AND restores the remote's mtime with them.
