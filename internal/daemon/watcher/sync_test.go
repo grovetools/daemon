@@ -405,3 +405,47 @@ func TestSyncTypedMoveEvent(t *testing.T) {
 		t.Fatalf("post-move flush was not hash-gated: %+v", entries)
 	}
 }
+
+// TestSyncDeleteCapturesBaseVersion is the B7 watcher-side regression: the
+// deleted outbox entry must carry the doc's last-synced version as its OCC
+// base, captured BEFORE recordDelete destroys the doc row (the row is the only
+// other record of that version). Without it every delete of a server-known doc
+// pushes base_version 0, which the server's applyDelete OCC check rejects as a
+// conflict — permanently, since retries resend the same 0 (found live: a
+// push-only delete parked as conflict forever).
+func TestSyncDeleteCapturesBaseVersion(t *testing.T) {
+	h, wsRoot := newTestSyncHandler(t, 50, 500)
+	ctx := context.Background()
+
+	notePath := filepath.Join(wsRoot, "notes", "synced.md")
+	writeFile(t, notePath, "pushed content")
+	h.flush(ctx, notePath)
+
+	doc, _ := h.db.GetDocumentByPath("testws", "notes/synced.md")
+	if doc == nil {
+		t.Fatal("expected tracked document before delete")
+	}
+	// Server confirms the create at version 6 (what the push pipeline records
+	// on an accepted push).
+	if err := h.db.MarkDocumentSynced(doc.DocumentID, 6, doc.ContentHash, []byte("pushed content")); err != nil {
+		t.Fatalf("MarkDocumentSynced: %v", err)
+	}
+
+	if err := os.Remove(notePath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	h.flush(ctx, notePath)
+
+	entries, _ := h.db.ListOutbox("testws", 0)
+	if len(entries) != 2 || entries[1].EventType != syncproto.EventDocumentDeleted {
+		t.Fatalf("expected created+deleted, got %+v", entries)
+	}
+	if entries[1].BaseVersion != 6 {
+		t.Fatalf("deleted entry must carry the last-synced version 6 as base_version, got %d", entries[1].BaseVersion)
+	}
+	// The identity-map row is still dropped at enqueue time (keeping it alive
+	// would break delete-then-recreate on UNIQUE(workspace, path)).
+	if doc, _ := h.db.GetDocumentByPath("testws", "notes/synced.md"); doc != nil {
+		t.Fatalf("document still tracked after delete: %+v", doc)
+	}
+}

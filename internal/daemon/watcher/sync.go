@@ -402,16 +402,24 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 
 // recordDelete enqueues a deleted event for a tracked document and drops it
 // from the identity map. Untracked paths are ignored.
+//
+// The entry captures doc.LastSyncedVersion as its BaseVersion BEFORE the
+// DeleteDocument below destroys the row (B7): the server's applyDelete OCC
+// check rejects any base_version != head, so a delete pushed with the default
+// 0 parks as a manufactured conflict forever. The row is still deleted
+// immediately — keeping it alive until push-ack would collide with the
+// sync_documents UNIQUE(workspace, path) constraint on delete-then-recreate.
 func (h *SyncHandler) recordDelete(ctx context.Context, ws, rel string) {
 	doc, err := h.db.GetDocumentByPath(ws, rel)
 	if err != nil || doc == nil {
 		return
 	}
 	if _, err := h.db.EnqueueOutbox(&syncdb.OutboxEntry{
-		DocumentID: doc.DocumentID,
-		Workspace:  ws,
-		EventType:  syncproto.EventDocumentDeleted,
-		Path:       rel,
+		DocumentID:  doc.DocumentID,
+		Workspace:   ws,
+		EventType:   syncproto.EventDocumentDeleted,
+		Path:        rel,
+		BaseVersion: doc.LastSyncedVersion,
 	}); err != nil {
 		h.ulog.Warn("Failed to enqueue sync delete").Err(err).Field("path", rel).Log(ctx)
 		return

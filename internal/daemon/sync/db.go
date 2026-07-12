@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
 	prev_path     TEXT NOT NULL DEFAULT '',
 	content_hash  TEXT NOT NULL DEFAULT '',
 	payload       TEXT NOT NULL DEFAULT '',
+	base_version  INTEGER NOT NULL DEFAULT 0,
 	created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	parked        INTEGER NOT NULL DEFAULT 0,
 	attempts      INTEGER NOT NULL DEFAULT 0,
@@ -125,6 +126,16 @@ type OutboxEntry struct {
 	PrevPath    string // for moved events
 	ContentHash string
 	Payload     string
+
+	// BaseVersion is the server version this change is based on (the doc's
+	// last_synced_version captured at enqueue time). It matters for deleted
+	// events (B7): recordDelete destroys the sync_documents row immediately —
+	// keeping the row alive would break delete-then-recreate on the
+	// UNIQUE(workspace, path) constraint — so the entry itself must carry the
+	// OCC base or every delete of a server-known doc pushes base_version 0 and
+	// parks as a manufactured conflict forever. Updated/moved events resolve
+	// their base from the still-live doc row at drain time instead.
+	BaseVersion int64
 	CreatedAt   time.Time
 
 	// Phase 4 parking state. A parked entry stays queued (visible to
@@ -139,7 +150,7 @@ type OutboxEntry struct {
 
 // outboxColumns is the shared SELECT column list for outbox scanners; the
 // order must match scanOutboxEntry.
-const outboxColumns = `id, document_id, workspace, event_type, path, prev_path, content_hash, payload, created_at, parked, attempts, next_retry_at, park_reason`
+const outboxColumns = `id, document_id, workspace, event_type, path, prev_path, content_hash, payload, base_version, created_at, parked, attempts, next_retry_at, park_reason`
 
 // scanOutboxEntry scans one outbox row selected via outboxColumns. next_retry_at
 // is nullable (an entry only has a retry time once parked); parked is stored as
@@ -149,7 +160,7 @@ func scanOutboxEntry(rows *sql.Rows) (*OutboxEntry, error) {
 	var parked int64
 	var nextRetry sql.NullTime
 	if err := rows.Scan(&e.ID, &e.DocumentID, &e.Workspace, &e.EventType, &e.Path,
-		&e.PrevPath, &e.ContentHash, &e.Payload, &e.CreatedAt,
+		&e.PrevPath, &e.ContentHash, &e.Payload, &e.BaseVersion, &e.CreatedAt,
 		&parked, &e.Attempts, &nextRetry, &e.ParkReason); err != nil {
 		return nil, err
 	}
@@ -226,6 +237,10 @@ func migrateOutbox(db *sql.DB) error {
 		`ALTER TABLE sync_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE sync_outbox ADD COLUMN next_retry_at DATETIME`,
 		`ALTER TABLE sync_outbox ADD COLUMN park_reason TEXT NOT NULL DEFAULT ''`,
+		// B7: OCC base carried on the entry itself. A deleted event's doc row
+		// is destroyed at enqueue time (recordDelete), so the entry is the only
+		// place the last-synced version can survive until push.
+		`ALTER TABLE sync_outbox ADD COLUMN base_version INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil {
@@ -412,9 +427,9 @@ func (d *DB) CountDocuments() (int, error) {
 // EnqueueOutbox appends a pending change to the outbox and returns its id.
 func (d *DB) EnqueueOutbox(e *OutboxEntry) (int64, error) {
 	res, err := d.db.Exec(
-		`INSERT INTO sync_outbox (document_id, workspace, event_type, path, prev_path, content_hash, payload)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		e.DocumentID, e.Workspace, e.EventType, e.Path, e.PrevPath, e.ContentHash, e.Payload)
+		`INSERT INTO sync_outbox (document_id, workspace, event_type, path, prev_path, content_hash, payload, base_version)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.DocumentID, e.Workspace, e.EventType, e.Path, e.PrevPath, e.ContentHash, e.Payload, e.BaseVersion)
 	if err != nil {
 		return 0, fmt.Errorf("failed to enqueue sync outbox entry: %w", err)
 	}
@@ -664,7 +679,11 @@ func (e *OutboxEntry) ToSyncEvent() syncproto.SyncEvent {
 		Path:        e.Path,
 		PrevPath:    e.PrevPath,
 		ContentHash: e.ContentHash,
-		// Content, BaseVersion, and Size are populated by the caller
+		// The enqueue-time OCC base (B7). Non-zero only for deleted events,
+		// whose doc row no longer exists at drain time; DrainOutbox overwrites
+		// or backfills it from the live doc row for updated/moved events.
+		BaseVersion: e.BaseVersion,
+		// Content and Size are populated by the caller
 	}
 }
 

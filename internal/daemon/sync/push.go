@@ -182,6 +182,27 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				}
 			}
 
+			// OCC base for deletes and moves (B7). A deleted entry already
+			// carries the base captured at enqueue time (recordDelete stamps
+			// doc.LastSyncedVersion before destroying the doc row, so the row
+			// is gone by now). Moved entries — and updates converted to
+			// deletes above when the file vanished — resolve at drain time
+			// from the still-live doc row (MoveDocument keeps the row, already
+			// repointed at entry.Path). Without a base the server's
+			// applyDelete/applyMove reject every event against a server-known
+			// doc as a conflict, permanently.
+			if event.Type == syncproto.EventDocumentDeleted ||
+				event.Type == syncproto.EventDocumentMoved {
+				if event.BaseVersion == 0 {
+					if doc, derr := p.db.GetDocumentByPath(p.workspace, entry.Path); derr == nil && doc != nil {
+						event.BaseVersion = doc.LastSyncedVersion
+						if event.DocumentID == "" {
+							event.DocumentID = doc.DocumentID
+						}
+					}
+				}
+			}
+
 			keptEntries = append(keptEntries, entry)
 			keptEvents = append(keptEvents, event)
 		}
@@ -319,6 +340,27 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 			switch result.Status {
 			case syncproto.PushStatusAccepted:
 				idsToDelete = append(idsToDelete, entries[i].ID)
+				// Accepted deletes and moves (reachable since B7 — with
+				// base_version 0 they always conflicted) must not fall into the
+				// content-roll below: a delete's doc row is already gone
+				// client-side (recordDelete), and a move pushes no content, so
+				// MarkDocumentSynced would warn on the missing row / wipe the
+				// merge base with nil bytes. A move only advances the version.
+				if events[i].Type == syncproto.EventDocumentDeleted {
+					successCount++
+					break
+				}
+				if events[i].Type == syncproto.EventDocumentMoved {
+					if result.DocumentID != "" {
+						if err := p.db.SetDocumentVersion(result.DocumentID, result.Version); err != nil {
+							p.log.Warn("failed to update document after move push").
+								Field("path", events[i].Path).
+								Err(err).Log(ctx)
+						}
+					}
+					successCount++
+					break
+				}
 				// Update document metadata if this is a new document
 				if result.DocumentID != "" && events[i].DocumentID == "" {
 					if err := p.db.UpsertDocument(&Document{

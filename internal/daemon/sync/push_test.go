@@ -808,3 +808,274 @@ func TestDrainOutboxRebaseNeverWritesLocalFile(t *testing.T) {
 			entries[0].Payload, entries[0].Parked, entries[0].ParkReason)
 	}
 }
+
+// occDoc is one server-side document head for serveOCCStoreStub.
+type occDoc struct {
+	id      string
+	version int64
+}
+
+// serveOCCStoreStub builds a stateful push stub that enforces the server
+// store's exact OCC semantics for create/delete/move (sync/pkg/store/sqlite.go
+// applyCreate/applyDelete/applyMove): base_version must equal the current head
+// version or the event conflicts; deleting an unknown doc is
+// idempotent-accepted. docs maps wire path -> head; record (optional) sees
+// every pushed event. Requests are serial (DrainOutbox is synchronous), so no
+// locking is needed.
+func serveOCCStoreStub(t *testing.T, docs map[string]*occDoc, record func(ev syncproto.SyncEvent)) *httptest.Server {
+	t.Helper()
+	return servePushStub(t, func(req *syncproto.PushRequest) *syncproto.PushResponse {
+		resp := &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
+		for i, ev := range req.Events {
+			if record != nil {
+				record(ev)
+			}
+			switch ev.Type {
+			case syncproto.EventDocumentCreated:
+				doc := &occDoc{id: fmt.Sprintf("doc-%d", len(docs)+1), version: 1}
+				docs[ev.Path] = doc
+				resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusAccepted, DocumentID: doc.id, Version: doc.version}
+			case syncproto.EventDocumentDeleted:
+				doc, ok := docs[ev.Path]
+				if !ok {
+					// Idempotent: already gone.
+					resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusAccepted, DocumentID: ev.DocumentID}
+					continue
+				}
+				if ev.BaseVersion != doc.version {
+					// Stale delete: edit wins over delete.
+					resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusConflict, DocumentID: doc.id, Version: doc.version}
+					continue
+				}
+				delete(docs, ev.Path)
+				resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusAccepted, DocumentID: doc.id, Version: doc.version + 1}
+			case syncproto.EventDocumentMoved:
+				doc, ok := docs[ev.PrevPath]
+				if !ok {
+					resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusRejected, Error: "unknown document"}
+					continue
+				}
+				if ev.BaseVersion != doc.version {
+					resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusConflict, DocumentID: doc.id, Version: doc.version}
+					continue
+				}
+				delete(docs, ev.PrevPath)
+				doc.version++
+				docs[ev.Path] = doc
+				resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusAccepted, DocumentID: doc.id, Version: doc.version}
+			default:
+				t.Errorf("occ stub: unexpected event type %q", ev.Type)
+			}
+		}
+		return resp
+	})
+}
+
+// TestDrainOutboxDeleteCarriesBaseVersion is the B7 push-side regression, run
+// as the full create -> push-accept -> delete -> push lifecycle against an
+// OCC-faithful fake store: the deleted event must carry the enqueue-time
+// base_version (the doc row is gone by drain time — the entry is the only
+// carrier) and be ACCEPTED. Before the fix every delete of a server-known doc
+// pushed base_version 0 and parked as a conflict permanently.
+func TestDrainOutboxDeleteCarriesBaseVersion(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("short-lived note")
+	notePath := filepath.Join(root, "inbox", "note.md")
+	if err := os.WriteFile(notePath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		Workspace: "default", EventType: syncproto.EventDocumentCreated,
+		Path: "inbox/note.md", ContentHash: sha(content),
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox (created): %v", err)
+	}
+
+	serverDocs := map[string]*occDoc{}
+	var deleteBase atomic.Int64
+	deleteBase.Store(-1)
+	srv := serveOCCStoreStub(t, serverDocs, func(ev syncproto.SyncEvent) {
+		if ev.Type == syncproto.EventDocumentDeleted {
+			deleteBase.Store(ev.BaseVersion)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Leg 1: the create is accepted and the client records the server version.
+	if n, err := pipeline.DrainOutbox(ctx, root); err != nil || n != 1 {
+		t.Fatalf("DrainOutbox (create): n=%d err=%v", n, err)
+	}
+	doc, err := db.GetDocumentByPath("default", "inbox/note.md")
+	if err != nil || doc == nil || doc.LastSyncedVersion == 0 {
+		t.Fatalf("expected synced doc after accepted create, got %+v (err=%v)", doc, err)
+	}
+
+	// Leg 2: the delete, enqueued exactly as the watcher's recordDelete does —
+	// base captured onto the entry, then the doc row destroyed, file removed.
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: doc.DocumentID, Workspace: "default",
+		EventType: syncproto.EventDocumentDeleted, Path: "inbox/note.md",
+		BaseVersion: doc.LastSyncedVersion,
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox (deleted): %v", err)
+	}
+	if err := db.DeleteDocument(doc.DocumentID); err != nil {
+		t.Fatalf("DeleteDocument: %v", err)
+	}
+	if err := os.Remove(notePath); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := pipeline.DrainOutbox(ctx, root); err != nil || n != 1 {
+		t.Fatalf("DrainOutbox (delete): n=%d err=%v — a correct-base delete must be accepted, not parked", n, err)
+	}
+	if got := deleteBase.Load(); got != doc.LastSyncedVersion {
+		t.Fatalf("delete pushed base_version %d, want the last-synced version %d (0 = the B7 bug)", got, doc.LastSyncedVersion)
+	}
+	if _, ok := serverDocs["inbox/note.md"]; ok {
+		t.Fatal("server store still holds the doc — delete did not converge")
+	}
+	if remaining, _ := db.CountOutbox(); remaining != 0 {
+		t.Fatalf("expected empty outbox after accepted delete, got %d entries", remaining)
+	}
+}
+
+// TestDrainOutboxDeleteGenuineConflictParks: when the server head has GENUINELY
+// moved past the client's last-synced version (another origin edited the doc
+// after this client last saw it), the delete must still park with reason
+// "conflict" — edit-wins-over-delete is the intended policy, and B7 must not
+// turn every stale delete into an accepted one.
+func TestDrainOutboxDeleteGenuineConflictParks(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+
+	// Client last saw version 2; the server head is at 5.
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: "doc-1", Workspace: "default",
+		EventType: syncproto.EventDocumentDeleted, Path: "inbox/note.md",
+		BaseVersion: 2,
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+	serverDocs := map[string]*occDoc{"inbox/note.md": {id: "doc-1", version: 5}}
+	srv := serveOCCStoreStub(t, serverDocs, nil)
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	n, err := pipeline.DrainOutbox(ctx, root)
+	if err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("a genuinely stale delete must not ack, got %d", n)
+	}
+
+	// Edit wins over delete: the server doc survives, the entry parks.
+	if _, ok := serverDocs["inbox/note.md"]; !ok {
+		t.Fatal("server doc was deleted despite the stale base (edit-wins-over-delete violated)")
+	}
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected the delete to stay queued, got %d (err=%v)", len(entries), err)
+	}
+	e := entries[0]
+	if !e.Parked || e.ParkReason != "conflict" || e.Attempts != 1 {
+		t.Fatalf("stale delete must park as a conflict: parked=%v reason=%q attempts=%d",
+			e.Parked, e.ParkReason, e.Attempts)
+	}
+	if e.BaseVersion != 2 {
+		t.Fatalf("parked delete must keep its captured base_version 2, got %d", e.BaseVersion)
+	}
+}
+
+// TestDrainOutboxMoveCarriesBaseVersion is the B7 move-side regression: a
+// moved event must push the doc's last-synced version as base_version
+// (resolved at drain time from the doc row, which MoveDocument keeps alive,
+// already repointed at the new path) and be accepted by the OCC store. The
+// accepted move advances the client's last-synced version without wiping the
+// merge base (a move pushes no content).
+func TestDrainOutboxMoveCarriesBaseVersion(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	content := []byte("task body")
+
+	// The doc row as handleNoteEvent leaves it: already at the NEW path
+	// (MoveDocument ran at enqueue time), synced at version 3.
+	if err := db.UpsertDocument(&Document{
+		DocumentID: "doc-1", Workspace: "default", Path: "notes/current/task.md",
+		ContentHash: sha(content), LastSyncedHash: sha(content),
+		LastSyncedVersion: 3, BaseContent: content,
+	}); err != nil {
+		t.Fatalf("UpsertDocument: %v", err)
+	}
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: "doc-1", Workspace: "default",
+		EventType: syncproto.EventDocumentMoved,
+		Path:      "notes/current/task.md", PrevPath: "notes/inbox/task.md",
+		ContentHash: sha(content),
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+
+	serverDocs := map[string]*occDoc{"notes/inbox/task.md": {id: "doc-1", version: 3}}
+	var moveBase atomic.Int64
+	moveBase.Store(-1)
+	srv := serveOCCStoreStub(t, serverDocs, func(ev syncproto.SyncEvent) {
+		if ev.Type == syncproto.EventDocumentMoved {
+			moveBase.Store(ev.BaseVersion)
+		}
+	})
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	n, err := pipeline.DrainOutbox(ctx, root)
+	if err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected the move to be accepted, got %d acks (base 0 = the B7 bug)", n)
+	}
+	if got := moveBase.Load(); got != 3 {
+		t.Fatalf("move pushed base_version %d, want the last-synced version 3", got)
+	}
+	if doc, ok := serverDocs["notes/current/task.md"]; !ok || doc.version != 4 {
+		t.Fatalf("server store not moved to the new path at v4: %+v", serverDocs)
+	}
+	if remaining, _ := db.CountOutbox(); remaining != 0 {
+		t.Fatalf("expected empty outbox after accepted move, got %d", remaining)
+	}
+
+	// Client record: version advanced to the server's post-move head, merge
+	// base and hashes untouched (the move carried no content bytes).
+	doc, err := db.GetDocumentByPath("default", "notes/current/task.md")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocumentByPath: %v", err)
+	}
+	if doc.LastSyncedVersion != 4 {
+		t.Fatalf("expected LastSyncedVersion 4 after accepted move, got %d", doc.LastSyncedVersion)
+	}
+	if string(doc.BaseContent) != string(content) || doc.LastSyncedHash != sha(content) {
+		t.Fatalf("accepted move must not wipe the merge base: hash=%q base=%q", doc.LastSyncedHash, doc.BaseContent)
+	}
+}

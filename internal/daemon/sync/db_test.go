@@ -381,3 +381,64 @@ func TestUpdateOutboxEntryContent(t *testing.T) {
 		t.Fatalf("entry not retargeted: %+v", entries)
 	}
 }
+
+// TestOutboxBaseVersionMigration: a sync.db created before the base_version
+// column existed (pre-B7) gains it on Open via the idempotent ALTER-swallow
+// migration and round-trips the value.
+func TestOutboxBaseVersionMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.db")
+
+	// Hand-create the pre-B7 sync_outbox shape (no base_version).
+	raw, err := sql.Open("sqlite3", "file:"+path)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE sync_outbox (
+		id            INTEGER PRIMARY KEY AUTOINCREMENT,
+		document_id   TEXT NOT NULL DEFAULT '',
+		workspace     TEXT NOT NULL,
+		event_type    TEXT NOT NULL,
+		path          TEXT NOT NULL,
+		prev_path     TEXT NOT NULL DEFAULT '',
+		content_hash  TEXT NOT NULL DEFAULT '',
+		payload       TEXT NOT NULL DEFAULT '',
+		created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		parked        INTEGER NOT NULL DEFAULT 0,
+		attempts      INTEGER NOT NULL DEFAULT 0,
+		next_retry_at DATETIME,
+		park_reason   TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatalf("create old-schema table: %v", err)
+	}
+	if _, err := raw.Exec(
+		`INSERT INTO sync_outbox (workspace, event_type, path) VALUES ('default', ?, 'old.md')`,
+		syncproto.EventDocumentUpdated); err != nil {
+		t.Fatalf("seed old row: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw sqlite: %v", err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open (migrating): %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: "doc-1", Workspace: "default",
+		EventType: syncproto.EventDocumentDeleted, Path: "new.md", BaseVersion: 7,
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox on migrated db: %v", err)
+	}
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("ListOutbox: got %d entries (err=%v)", len(entries), err)
+	}
+	if entries[0].BaseVersion != 0 {
+		t.Fatalf("pre-migration row must default base_version to 0, got %d", entries[0].BaseVersion)
+	}
+	if entries[1].BaseVersion != 7 {
+		t.Fatalf("base_version did not round-trip on migrated db, got %d", entries[1].BaseVersion)
+	}
+}
