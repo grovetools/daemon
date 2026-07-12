@@ -4,8 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	gosync "sync"
 	"testing"
 	"time"
 
@@ -366,6 +372,215 @@ func TestApplyCreateZeroMtimeKeepsWriteTime(t *testing.T) {
 	}
 	if fi.ModTime().Before(before) {
 		t.Fatalf("zero-mtime event must keep the write time, got %v", fi.ModTime())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// C20 regression: 410 Gone + snapshot_required must reach the resync branch.
+// ---------------------------------------------------------------------------
+
+// gcStoreStub is a watermark-faithful pull-side server stub, mirroring
+// sync/pkg/server's exact wire behavior the way push_test.go's
+// serveOCCStoreStub mirrors the OCC store:
+//
+//   - GET /sync/events with cursor < watermark answers 410 Gone with a
+//     decodable PullResponse{snapshot_required:true, cursor, error} body
+//     (handleEvents' C20 contract);
+//   - cursor >= watermark answers 200 with an empty tail at that cursor;
+//   - GET /sync/snapshot serves the manifest (cursor + document heads);
+//   - GET /sync/history/blob serves head content for the resync fetch.
+//
+// pulls records every /sync/events cursor in arrival order.
+type gcStoreStub struct {
+	watermark int64
+	manifest  syncproto.SnapshotManifest
+	contents  map[string][]byte // document_id -> head content
+
+	mu    gosync.Mutex
+	pulls []int64
+}
+
+func (s *gcStoreStub) recordedPulls() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.pulls...)
+}
+
+func serveGCStoreStub(t *testing.T, s *gcStoreStub) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sync/events", func(w http.ResponseWriter, r *http.Request) {
+		cursor, _ := strconv.ParseInt(r.URL.Query().Get("cursor"), 10, 64)
+		s.mu.Lock()
+		s.pulls = append(s.pulls, cursor)
+		s.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if cursor < s.watermark {
+			// The server's exact 410 body shape (handleEvents).
+			w.WriteHeader(http.StatusGone)
+			_ = json.NewEncoder(w).Encode(syncproto.PullResponse{
+				SnapshotRequired: true,
+				Cursor:           cursor,
+				Error:            "cursor predates the event retention window; resync from snapshot",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(syncproto.PullResponse{
+			Events: []syncproto.SyncEvent{}, Cursor: cursor,
+		})
+	})
+	mux.HandleFunc("/sync/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(s.manifest)
+	})
+	mux.HandleFunc("/sync/history/blob", func(w http.ResponseWriter, r *http.Request) {
+		content, ok := s.contents[r.URL.Query().Get("document_id")]
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write(content)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestPullEventsDecodes410SnapshotRequired: the client half of the C20
+// contract. A 410 Gone answer is a protocol response, not a transport error —
+// PullEvents must decode its PullResponse body and surface
+// SnapshotRequired=true (the bug: any non-200 returned an error, so the pull
+// loop's resync branch was unreachable and a below-watermark client spun on
+// "pull failed ... status 410" every backoff forever). Any other non-200
+// stays an error.
+func TestPullEventsDecodes410SnapshotRequired(t *testing.T) {
+	stub := &gcStoreStub{watermark: 5}
+	srv := serveGCStoreStub(t, stub)
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Logger: logging.NewUnifiedLogger("test.pull")})
+
+	resp, err := client.PullEvents(context.Background(), "default", 0, 100, 0)
+	if err != nil {
+		t.Fatalf("PullEvents must decode a 410 body, got error: %v", err)
+	}
+	if !resp.SnapshotRequired {
+		t.Fatalf("expected SnapshotRequired=true from the 410 body, got %+v", resp)
+	}
+
+	// Negative control: every other non-200 remains an error.
+	boom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer boom.Close()
+	client = NewClient(ClientConfig{ServerURL: boom.URL, Logger: logging.NewUnifiedLogger("test.pull")})
+	if _, err := client.PullEvents(context.Background(), "default", 0, 100, 0); err == nil {
+		t.Fatal("PullEvents must still error on non-200/non-410 statuses")
+	}
+}
+
+// TestRunPullLoopSnapshotResyncOn410 is the loop-level regression: a client
+// whose cursor sits below the GC watermark (wiped sync.db → cursor 0) must
+// take RunPullLoop's SnapshotRequired branch — snapshot manifest fetch, head
+// materialization with the manifest's fidelity mtime restored, cursor
+// persisted at the manifest cursor — and then resume tailing FROM that
+// cursor. Exactly one below-watermark pull is allowed: resuming at 0 after
+// the resync (the old code) re-trips the 410 forever.
+func TestRunPullLoopSnapshotResyncOn410(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+
+	content := []byte("---\ntitle: gc\n---\nsurvived the watermark\n")
+	mtime := time.Date(2011, 3, 13, 7, 7, 24, 444444444, time.Local)
+	stub := &gcStoreStub{
+		watermark: 5,
+		manifest: syncproto.SnapshotManifest{
+			Workspace: "default",
+			Cursor:    5,
+			Documents: []syncproto.DocumentSnapshot{{
+				ID: "doc-gc", Path: "inbox/gc-note.md", Version: 3,
+				Hash: sha(content), Size: int64(len(content)), Mtime: mtime,
+			}},
+		},
+		contents: map[string][]byte{"doc-gc": content},
+	}
+	srv := serveGCStoreStub(t, stub)
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Logger: logging.NewUnifiedLogger("test.pull")})
+	p := newTestPullPipeline(t, db)
+	p.client = client
+	p.pollWait = 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- p.RunPullLoop(ctx, root) }()
+
+	// Converged when: file on disk with the manifest mtime, cursor persisted
+	// at the manifest cursor, and the loop has pulled at/above the watermark.
+	filePath := filepath.Join(root, "inbox/gc-note.md")
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		fi, ferr := os.Stat(filePath)
+		cur, _ := db.GetWorkspaceCursor("default")
+		pulls := stub.recordedPulls()
+		if ferr == nil && fi.ModTime().Equal(mtime) && cur == 5 &&
+			len(pulls) >= 2 && pulls[len(pulls)-1] == 5 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunPullLoop did not stop on context cancel")
+	}
+
+	got, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("snapshot resync never materialized the document: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("materialized content = %q, want %q", got, content)
+	}
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(mtime) {
+		t.Fatalf("materialized mtime = %v, want the manifest fidelity mtime %v", fi.ModTime(), mtime)
+	}
+	if cur, _ := db.GetWorkspaceCursor("default"); cur != 5 {
+		t.Fatalf("workspace cursor = %d, want the manifest cursor 5", cur)
+	}
+	doc, err := db.GetDocumentByPath("default", "inbox/gc-note.md")
+	if err != nil || doc == nil {
+		t.Fatalf("document not tracked after resync: %v", err)
+	}
+	if doc.DocumentID != "doc-gc" || doc.LastSyncedVersion != 3 {
+		t.Fatalf("tracked identity = %s v%d, want doc-gc v3", doc.DocumentID, doc.LastSyncedVersion)
+	}
+
+	// Exactly one below-watermark pull: the first (cursor 0, answered 410).
+	// Every pull after the resync must resume at the manifest cursor — a
+	// second below-watermark pull is the endless 410→resync loop.
+	pulls := stub.recordedPulls()
+	if len(pulls) < 2 {
+		t.Fatalf("expected the loop to keep tailing after the resync, got pulls %v", pulls)
+	}
+	below := 0
+	for i, c := range pulls {
+		if c < stub.watermark {
+			below++
+			if i > 0 {
+				t.Fatalf("pull %d used below-watermark cursor %d after the resync (410 spin): %v", i, c, pulls)
+			}
+		}
+	}
+	if below != 1 {
+		t.Fatalf("expected exactly one below-watermark pull, got %d in %v", below, pulls)
+	}
+	if fmt.Sprintf("%d", pulls[0]) != "0" {
+		t.Fatalf("first pull cursor = %d, want the wiped client's 0", pulls[0])
 	}
 }
 

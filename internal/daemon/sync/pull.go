@@ -74,8 +74,9 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, workspaceRoot string) er
 		// Handle snapshot requirement (cursor too old, need resync)
 		if resp.SnapshotRequired {
 			p.log.Info("snapshot required, resyncing").Field("workspace", p.ws.Name).Log(ctx)
-			if err := p.snaphotResync(ctx, workspaceRoot); err != nil {
-				p.log.Error("snapshot resync failed").Field("workspace", p.ws.Name).Err(err).Log(ctx)
+			newCursor, rerr := p.snaphotResync(ctx, workspaceRoot)
+			if rerr != nil {
+				p.log.Error("snapshot resync failed").Field("workspace", p.ws.Name).Err(rerr).Log(ctx)
 				select {
 				case <-time.After(10 * time.Second):
 					continue
@@ -83,8 +84,10 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, workspaceRoot string) er
 					return nil
 				}
 			}
-			// After resync, reset cursor and continue pulling
-			cursor = 0
+			// Resume tailing from the manifest cursor the resync persisted.
+			// Resetting to 0 here would put the very next pull below the GC
+			// watermark again — an endless 410→resync loop, never converging.
+			cursor = newCursor
 			continue
 		}
 
@@ -113,12 +116,14 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, workspaceRoot string) er
 
 // snaphotResync fetches the manifest snapshot and reconciles it with local state.
 // Hash-equal files are adopted in place; divergent files are re-fetched.
-func (p *PullPipeline) snaphotResync(ctx context.Context, workspaceRoot string) error {
+// It returns the manifest cursor it persisted, which the pull loop must adopt
+// as its resume point.
+func (p *PullPipeline) snaphotResync(ctx context.Context, workspaceRoot string) (int64, error) {
 	p.log.Debug("fetching snapshot manifest").Field("workspace", p.ws.Name).Log(ctx)
 
 	manifest, err := p.client.Snapshot(ctx, p.ws.Name)
 	if err != nil {
-		return fmt.Errorf("snapshot fetch failed: %w", err)
+		return 0, fmt.Errorf("snapshot fetch failed: %w", err)
 	}
 
 	p.log.Debug("snapshot received").Field("workspace", p.ws.Name).Field("documents", len(manifest.Documents)).Log(ctx)
@@ -178,10 +183,10 @@ func (p *PullPipeline) snaphotResync(ctx context.Context, workspaceRoot string) 
 
 	// Update the cursor to the manifest's snapshot cursor
 	if err := p.db.UpdateWorkspaceCursor(p.ws.Name, manifest.Cursor); err != nil {
-		return fmt.Errorf("failed to update cursor after snapshot: %w", err)
+		return 0, fmt.Errorf("failed to update cursor after snapshot: %w", err)
 	}
 
-	return nil
+	return manifest.Cursor, nil
 }
 
 // applyEvent applies a single event: creates, updates, moves, or deletes a document.

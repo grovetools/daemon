@@ -324,7 +324,13 @@ func (c *Client) PullEvents(ctx context.Context, workspace string, cursor int64,
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// 410 Gone is a protocol answer, not a transport failure: the cursor
+	// predates the workspace's GC watermark and the body is a decodable
+	// PullResponse carrying snapshot_required=true (C20). Erroring here made
+	// RunPullLoop's resync branch unreachable — a wiped client spun on
+	// "pull failed ... status 410" forever instead of snapshot-resyncing.
+	// Every other non-200 stays an error.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusGone {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("pull request failed with status %d: %s", resp.StatusCode, string(body))
 	}
