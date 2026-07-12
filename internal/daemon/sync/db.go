@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
 	content_hash  TEXT NOT NULL DEFAULT '',
 	payload       TEXT NOT NULL DEFAULT '',
 	base_version  INTEGER NOT NULL DEFAULT 0,
+	mtime         INTEGER NOT NULL DEFAULT 0,
 	created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	parked        INTEGER NOT NULL DEFAULT 0,
 	attempts      INTEGER NOT NULL DEFAULT 0,
@@ -136,7 +137,14 @@ type OutboxEntry struct {
 	// parks as a manufactured conflict forever. Updated/moved events resolve
 	// their base from the still-live doc row at drain time instead.
 	BaseVersion int64
-	CreatedAt   time.Time
+
+	// Mtime is the source file's modification time captured by a stat at
+	// enqueue time (fidelity metadata for the wire event's Mtime field; never
+	// an ordering/OCC input). Zero when the stat failed or the event carries
+	// no file (deletes) — zero rides the wire as "unknown" and replicas keep
+	// today's behavior. Stored as unix nanoseconds (INTEGER, 0 default).
+	Mtime     time.Time
+	CreatedAt time.Time
 
 	// Phase 4 parking state. A parked entry stays queued (visible to
 	// ListOutbox / CountOutbox — a parked entry IS unsynced) but is skipped by
@@ -150,7 +158,7 @@ type OutboxEntry struct {
 
 // outboxColumns is the shared SELECT column list for outbox scanners; the
 // order must match scanOutboxEntry.
-const outboxColumns = `id, document_id, workspace, event_type, path, prev_path, content_hash, payload, base_version, created_at, parked, attempts, next_retry_at, park_reason`
+const outboxColumns = `id, document_id, workspace, event_type, path, prev_path, content_hash, payload, base_version, mtime, created_at, parked, attempts, next_retry_at, park_reason`
 
 // scanOutboxEntry scans one outbox row selected via outboxColumns. next_retry_at
 // is nullable (an entry only has a retry time once parked); parked is stored as
@@ -158,17 +166,37 @@ const outboxColumns = `id, document_id, workspace, event_type, path, prev_path, 
 func scanOutboxEntry(rows *sql.Rows) (*OutboxEntry, error) {
 	var e OutboxEntry
 	var parked int64
+	var mtimeNanos int64
 	var nextRetry sql.NullTime
 	if err := rows.Scan(&e.ID, &e.DocumentID, &e.Workspace, &e.EventType, &e.Path,
-		&e.PrevPath, &e.ContentHash, &e.Payload, &e.BaseVersion, &e.CreatedAt,
+		&e.PrevPath, &e.ContentHash, &e.Payload, &e.BaseVersion, &mtimeNanos, &e.CreatedAt,
 		&parked, &e.Attempts, &nextRetry, &e.ParkReason); err != nil {
 		return nil, err
 	}
 	e.Parked = parked != 0
+	e.Mtime = nanosToMtime(mtimeNanos)
 	if nextRetry.Valid {
 		e.NextRetryAt = nextRetry.Time
 	}
 	return &e, nil
+}
+
+// mtimeToNanos maps a file mtime to its INTEGER unix-nanosecond storage form;
+// the zero time (mtime unknown) maps to 0, never to the 1970 epoch.
+func mtimeToNanos(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+// nanosToMtime is the inverse of mtimeToNanos: 0 means "unknown" and maps back
+// to the zero time (time.Unix(0, 0) would be the 1970 epoch, not zero).
+func nanosToMtime(n int64) time.Time {
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
 }
 
 // WorkspaceState is the per-workspace replication state.
@@ -241,6 +269,9 @@ func migrateOutbox(db *sql.DB) error {
 		// is destroyed at enqueue time (recordDelete), so the entry is the only
 		// place the last-synced version can survive until push.
 		`ALTER TABLE sync_outbox ADD COLUMN base_version INTEGER NOT NULL DEFAULT 0`,
+		// File mtime captured at enqueue (unix nanoseconds; 0 = unknown) so
+		// replicas can restore filesystem timestamps. Fidelity metadata only.
+		`ALTER TABLE sync_outbox ADD COLUMN mtime INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil {
@@ -427,9 +458,9 @@ func (d *DB) CountDocuments() (int, error) {
 // EnqueueOutbox appends a pending change to the outbox and returns its id.
 func (d *DB) EnqueueOutbox(e *OutboxEntry) (int64, error) {
 	res, err := d.db.Exec(
-		`INSERT INTO sync_outbox (document_id, workspace, event_type, path, prev_path, content_hash, payload, base_version)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.DocumentID, e.Workspace, e.EventType, e.Path, e.PrevPath, e.ContentHash, e.Payload, e.BaseVersion)
+		`INSERT INTO sync_outbox (document_id, workspace, event_type, path, prev_path, content_hash, payload, base_version, mtime)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.DocumentID, e.Workspace, e.EventType, e.Path, e.PrevPath, e.ContentHash, e.Payload, e.BaseVersion, mtimeToNanos(e.Mtime))
 	if err != nil {
 		return 0, fmt.Errorf("failed to enqueue sync outbox entry: %w", err)
 	}
@@ -683,6 +714,9 @@ func (e *OutboxEntry) ToSyncEvent() syncproto.SyncEvent {
 		// whose doc row no longer exists at drain time; DrainOutbox overwrites
 		// or backfills it from the live doc row for updated/moved events.
 		BaseVersion: e.BaseVersion,
+		// The enqueue-time file mtime (fidelity metadata; zero = unknown).
+		// DrainOutbox refreshes it from a stat when it re-reads disk content.
+		Mtime: e.Mtime,
 		// Content and Size are populated by the caller
 	}
 }

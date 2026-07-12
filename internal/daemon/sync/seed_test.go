@@ -2,6 +2,7 @@ package sync
 
 import (
 	"testing"
+	"time"
 
 	"github.com/grovetools/core/pkg/syncproto"
 )
@@ -12,7 +13,7 @@ func TestInsertAndEnqueueCreate(t *testing.T) {
 	db := openTestDB(t)
 	content := []byte("# hello\n")
 
-	reason, err := InsertAndEnqueue(db, "default", "inbox/a.md", content)
+	reason, err := InsertAndEnqueue(db, "default", "inbox/a.md", content, time.Time{})
 	if err != nil {
 		t.Fatalf("InsertAndEnqueue: %v", err)
 	}
@@ -49,12 +50,12 @@ func TestInsertAndEnqueueHashEqualNoop(t *testing.T) {
 	db := openTestDB(t)
 	content := []byte("stable body\n")
 
-	if _, err := InsertAndEnqueue(db, "default", "quick/n.md", content); err != nil {
+	if _, err := InsertAndEnqueue(db, "default", "quick/n.md", content, time.Time{}); err != nil {
 		t.Fatalf("first InsertAndEnqueue: %v", err)
 	}
 	first, _ := db.GetDocumentByPath("default", "quick/n.md")
 
-	if _, err := InsertAndEnqueue(db, "default", "quick/n.md", content); err != nil {
+	if _, err := InsertAndEnqueue(db, "default", "quick/n.md", content, time.Time{}); err != nil {
 		t.Fatalf("second InsertAndEnqueue: %v", err)
 	}
 	second, _ := db.GetDocumentByPath("default", "quick/n.md")
@@ -77,12 +78,12 @@ func TestInsertAndEnqueueHashEqualNoop(t *testing.T) {
 func TestInsertAndEnqueueUpdate(t *testing.T) {
 	db := openTestDB(t)
 
-	if _, err := InsertAndEnqueue(db, "default", "quick/n.md", []byte("v1\n")); err != nil {
+	if _, err := InsertAndEnqueue(db, "default", "quick/n.md", []byte("v1\n"), time.Time{}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	orig, _ := db.GetDocumentByPath("default", "quick/n.md")
 
-	if _, err := InsertAndEnqueue(db, "default", "quick/n.md", []byte("v2\n")); err != nil {
+	if _, err := InsertAndEnqueue(db, "default", "quick/n.md", []byte("v2\n"), time.Time{}); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	updated, _ := db.GetDocumentByPath("default", "quick/n.md")
@@ -109,7 +110,7 @@ func TestInsertAndEnqueueQuarantine(t *testing.T) {
 	db := openTestDB(t)
 	secret := []byte("token = github_pat_1234567890123456789012\n")
 
-	reason, err := InsertAndEnqueue(db, "default", "inbox/secret.md", secret)
+	reason, err := InsertAndEnqueue(db, "default", "inbox/secret.md", secret, time.Time{})
 	if err != nil {
 		t.Fatalf("InsertAndEnqueue: %v", err)
 	}
@@ -138,7 +139,7 @@ func TestInsertAndEnqueueQuarantineOverride(t *testing.T) {
 		t.Fatalf("SetQuarantineOverride: %v", err)
 	}
 
-	reason, err := InsertAndEnqueue(db, "default", "inbox/secret.md", secret)
+	reason, err := InsertAndEnqueue(db, "default", "inbox/secret.md", secret, time.Time{})
 	if err != nil {
 		t.Fatalf("InsertAndEnqueue: %v", err)
 	}
@@ -171,7 +172,7 @@ func TestInsertAndEnqueueSkipsDivergedDoc(t *testing.T) {
 	}
 
 	// Even brand-new content (a fresh local edit) must be dropped while diverged.
-	reason, err := InsertAndEnqueue(db, "default", "inbox/n.md", []byte("a newer local edit"))
+	reason, err := InsertAndEnqueue(db, "default", "inbox/n.md", []byte("a newer local edit"), time.Time{})
 	if err != nil {
 		t.Fatalf("InsertAndEnqueue: %v", err)
 	}

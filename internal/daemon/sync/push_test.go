@@ -1536,3 +1536,79 @@ func TestDrainOutboxRejectedParksNotDeleted(t *testing.T) {
 		t.Fatalf("parked rejected entry re-pushed before its retry time, %d pushes", got)
 	}
 }
+
+// TestDrainOutboxCarriesMtime is the client half of the end-to-end mtime
+// round trip: the enqueue-time stat mtime survives the outbox row (sqlite
+// nanosecond round trip), and the pushed wire event carries the file's mtime
+// as of the drain-time disk read — fidelity metadata only, never an OCC
+// input (base_version behavior is untouched).
+func TestDrainOutboxCarriesMtime(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("mtime-carrying body\n")
+	localPath := filepath.Join(root, "inbox", "note.md")
+	if err := os.WriteFile(localPath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Date(2026, 7, 11, 9, 30, 42, 0, time.Local)
+	if err := os.Chtimes(localPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		Workspace: "default", EventType: syncproto.EventDocumentCreated,
+		Path: "inbox/note.md", ContentHash: sha(content), Mtime: mtime,
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+
+	// The outbox row round-trips the enqueue-time mtime exactly.
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("ListOutbox: entries=%d err=%v", len(entries), err)
+	}
+	if !entries[0].Mtime.Equal(mtime) {
+		t.Fatalf("outbox row mtime = %v, want %v", entries[0].Mtime, mtime)
+	}
+
+	var pushed atomic.Pointer[syncproto.SyncEvent]
+	srv := servePushStub(t, func(req *syncproto.PushRequest) *syncproto.PushResponse {
+		resp := &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
+		for i := range req.Events {
+			ev := req.Events[i]
+			pushed.Store(&ev)
+			resp.Results[i] = syncproto.PushResult{
+				Status: syncproto.PushStatusAccepted, DocumentID: "doc-1", Version: 1, Seq: int64(i) + 1,
+			}
+		}
+		return resp
+	})
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+
+	ev := pushed.Load()
+	if ev == nil {
+		t.Fatal("no event pushed")
+	}
+	// The wire event carries the disk file's mtime (drain re-reads content
+	// from disk and refreshes the stat alongside it).
+	if !ev.Mtime.Equal(mtime) {
+		t.Fatalf("pushed event mtime = %v, want %v", ev.Mtime, mtime)
+	}
+	// Never an OCC input: a create still pushes base_version 0.
+	if ev.BaseVersion != 0 {
+		t.Fatalf("mtime must not affect OCC: base_version = %d, want 0", ev.BaseVersion)
+	}
+}

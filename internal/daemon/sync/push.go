@@ -163,6 +163,14 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 					} else {
 						event.Content = content
 						event.Size = int64(len(content))
+						// The pushed bytes are the disk bytes as of NOW, so
+						// refresh the fidelity mtime alongside them (the
+						// enqueue-time stat is stale whenever the file changed
+						// between enqueue and drain). Zero on a stat race —
+						// the entry's enqueue-time mtime then stands.
+						if mtime := statMtime(localPath); !mtime.IsZero() {
+							event.Mtime = mtime
+						}
 					}
 				}
 			}
@@ -725,7 +733,7 @@ func (p *PushPipeline) recordConflictArtifact(ctx context.Context, path, docID s
 	if _, err := os.Stat(conflictFile); err == nil {
 		return // already recorded for this divergence
 	}
-	if err := writeFile(conflictFile, localContent); err != nil {
+	if err := writeFile(conflictFile, localContent, time.Time{}); err != nil {
 		p.log.Warn("failed to write conflict artifact").
 			Field("path", path).Err(err).Log(ctx)
 		return

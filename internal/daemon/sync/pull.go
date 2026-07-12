@@ -162,6 +162,10 @@ func (p *PullPipeline) snaphotResync(ctx context.Context, workspaceRoot string) 
 				Version:     doc.Version,
 				ContentHash: doc.Hash,
 				Content:     content,
+				// The manifest's fidelity mtime, so snapshot hydration (a
+				// satellite's first materialization) restores file timestamps
+				// the same way event replay does. Zero = unknown (old server).
+				Mtime: doc.Mtime,
 			}
 			if localDoc != nil {
 				ev.Type = syncproto.EventDocumentUpdated
@@ -213,9 +217,10 @@ func (p *PullPipeline) applyCreate(ctx context.Context, workspaceRoot string, ev
 		}
 	}
 
-	// Write to disk
+	// Write to disk, restoring the origin's file mtime when the event carries
+	// one (zero = old server/client: keep the write time, as before).
 	filePath := p.joinPath(workspaceRoot, ev.Path)
-	if err := writeFile(filePath, content); err != nil {
+	if err := writeFile(filePath, content, ev.Mtime); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
@@ -273,7 +278,9 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, workspaceRoot string, ev
 	// gets overwritten by the remote version.
 	localHash := hashContent(localContent)
 	if localHash == doc.LastSyncedHash || localHash == ev.ContentHash {
-		if err := writeFile(filePath, content); err != nil {
+		// Fast-forward: disk becomes exactly the remote content, so the
+		// origin's mtime is restored with it (zero mtime = keep write time).
+		if err := writeFile(filePath, content, ev.Mtime); err != nil {
 			return fmt.Errorf("failed to write file: %w", err)
 		}
 		doc.ContentHash = ev.ContentHash
@@ -311,8 +318,10 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, workspaceRoot string, ev
 	// Clean merge: both sides' edits land on disk. The remote head becomes
 	// the merge base / last-synced state; ContentHash tracks the merged bytes
 	// (disk truth — the local edit inside them is still unpushed).
+	// Merged bytes are neither side's file verbatim, so no fidelity mtime
+	// applies — the merge is a genuinely-new local modification (write time).
 	mergedContent := reconstructDocument(merged, frontmatterKeys(localContent), mergedBody)
-	if err := writeFile(filePath, mergedContent); err != nil {
+	if err := writeFile(filePath, mergedContent, time.Time{}); err != nil {
 		return fmt.Errorf("failed to write merged file: %w", err)
 	}
 
@@ -348,6 +357,12 @@ func (p *PullPipeline) applyMove(ctx context.Context, workspaceRoot string, ev *
 
 	if err := moveFile(oldPath, newPath); err != nil {
 		return fmt.Errorf("failed to move file: %w", err)
+	}
+	// Restore the origin's mtime after the rename (a move event carries the
+	// moved file's stat; rename alone preserves only the replica's old mtime).
+	// Best-effort, fidelity only.
+	if !ev.Mtime.IsZero() {
+		_ = os.Chtimes(newPath, ev.Mtime, ev.Mtime)
 	}
 
 	doc.Path = ev.Path
@@ -390,6 +405,7 @@ func (p *PullPipeline) applyDelete(ctx context.Context, workspaceRoot string, ev
 			Path:        ev.Path,
 			ContentHash: hash,
 			Payload:     string(localContent),
+			Mtime:       statMtime(filePath),
 		}
 		return p.db.InsertOutboxEntry(outboxEv)
 	}
@@ -439,7 +455,7 @@ func (p *PullPipeline) recordConflict(ctx context.Context, workspaceRoot, path, 
 
 	// Write conflict artifact: {path}.{uuid}.conflict.md
 	conflictFile := filepath.Join(conflictDir, fmt.Sprintf("%s.%s.conflict.md", path, docID))
-	if err := writeFile(conflictFile, localContent); err != nil {
+	if err := writeFile(conflictFile, localContent, time.Time{}); err != nil {
 		return fmt.Errorf("failed to write conflict artifact: %w", err)
 	}
 

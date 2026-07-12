@@ -279,3 +279,121 @@ func TestApplyUpdateFastForwardsCleanLocal(t *testing.T) {
 		t.Fatalf("doc record not advanced: version=%d hash=%s", doc.LastSyncedVersion, doc.LastSyncedHash)
 	}
 }
+
+// TestApplyCreateRestoresMtime is the replica half of the end-to-end mtime
+// round trip: a created event carrying the origin's file mtime materializes
+// the file with that mtime restored via os.Chtimes (the hydration-burst
+// regression: every replica file used to show the write time).
+func TestApplyCreateRestoresMtime(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	p := newTestPullPipeline(t, db)
+
+	mtime := time.Date(2026, 7, 11, 8, 15, 30, 0, time.Local)
+	content := []byte("---\ntitle: note\n---\nbody\n")
+	ev := &syncproto.SyncEvent{
+		Type: syncproto.EventDocumentCreated, Workspace: "default",
+		DocumentID: "doc-1", Path: "inbox/new.md",
+		Content: content, ContentHash: sha(content), Version: 1,
+		Mtime: mtime,
+	}
+	if err := p.applyEvent(context.Background(), root, ev); err != nil {
+		t.Fatalf("applyEvent: %v", err)
+	}
+
+	fi, err := os.Stat(filepath.Join(root, "inbox/new.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(mtime) {
+		t.Fatalf("replica mtime = %v, want origin mtime %v", fi.ModTime(), mtime)
+	}
+}
+
+// TestApplyUpdateFastForwardRestoresMtime: a clean fast-forward (local file
+// matches the last server-confirmed content) rewrites the file to the remote
+// bytes AND restores the remote's mtime with them.
+func TestApplyUpdateFastForwardRestoresMtime(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	base := []byte("---\ntitle: note\n---\nv1 body\n")
+	seedSyncedDoc(t, db, root, "inbox/note.md", base)
+	p := newTestPullPipeline(t, db)
+
+	mtime := time.Date(2026, 7, 11, 12, 0, 5, 0, time.Local)
+	remote := []byte("---\ntitle: note\n---\nv2 body\n")
+	ev := &syncproto.SyncEvent{
+		Type: syncproto.EventDocumentUpdated, Workspace: "default",
+		DocumentID: "doc-1", Path: "inbox/note.md",
+		Content: remote, ContentHash: sha(remote), Version: 2,
+		Mtime: mtime,
+	}
+	if err := p.applyEvent(context.Background(), root, ev); err != nil {
+		t.Fatalf("applyEvent: %v", err)
+	}
+
+	fi, err := os.Stat(filepath.Join(root, "inbox/note.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(mtime) {
+		t.Fatalf("replica mtime = %v, want origin mtime %v", fi.ModTime(), mtime)
+	}
+}
+
+// TestApplyCreateZeroMtimeKeepsWriteTime is the backward-compatibility gate:
+// an event from a pre-mtime server/client (zero Mtime) must behave exactly as
+// today — the file carries its write time, no Chtimes into the past.
+func TestApplyCreateZeroMtimeKeepsWriteTime(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	p := newTestPullPipeline(t, db)
+
+	before := time.Now().Add(-time.Minute)
+	content := []byte("---\ntitle: legacy\n---\nbody\n")
+	ev := &syncproto.SyncEvent{
+		Type: syncproto.EventDocumentCreated, Workspace: "default",
+		DocumentID: "doc-legacy", Path: "inbox/legacy.md",
+		Content: content, ContentHash: sha(content), Version: 1,
+	}
+	if err := p.applyEvent(context.Background(), root, ev); err != nil {
+		t.Fatalf("applyEvent: %v", err)
+	}
+
+	fi, err := os.Stat(filepath.Join(root, "inbox/legacy.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.ModTime().Before(before) {
+		t.Fatalf("zero-mtime event must keep the write time, got %v", fi.ModTime())
+	}
+}
+
+// TestApplyMoveRestoresMtime: a moved event carrying the origin's mtime
+// restores it on the renamed replica file (a bare rename would keep the
+// replica's old timestamp).
+func TestApplyMoveRestoresMtime(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	base := []byte("---\ntitle: note\n---\nbody\n")
+	seedSyncedDoc(t, db, root, "inbox/old.md", base)
+	p := newTestPullPipeline(t, db)
+
+	mtime := time.Date(2026, 7, 11, 17, 45, 0, 0, time.Local)
+	ev := &syncproto.SyncEvent{
+		Type: syncproto.EventDocumentMoved, Workspace: "default",
+		DocumentID: "doc-1", PrevPath: "inbox/old.md", Path: "inbox/new.md",
+		Version: 2, Mtime: mtime,
+	}
+	if err := p.applyEvent(context.Background(), root, ev); err != nil {
+		t.Fatalf("applyEvent: %v", err)
+	}
+
+	fi, err := os.Stat(filepath.Join(root, "inbox/new.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(mtime) {
+		t.Fatalf("moved replica mtime = %v, want origin mtime %v", fi.ModTime(), mtime)
+	}
+}

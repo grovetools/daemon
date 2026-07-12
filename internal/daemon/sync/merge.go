@@ -247,13 +247,37 @@ func readFile(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-// writeFile writes content to a file, creating directories as needed.
-func writeFile(path string, content []byte) error {
+// writeFile writes content to a file, creating directories as needed. A
+// non-zero mtime is restored onto the written file via os.Chtimes — replica
+// fidelity for the origin's file timestamp (agents' ls/find heuristics, nb's
+// frontmatter-less fallback). A zero mtime (old server/client, or content
+// that never had a source file, e.g. conflict artifacts and merged bytes)
+// keeps the write time, exactly today's behavior. A Chtimes failure is
+// swallowed: mtime is fidelity metadata only and must never fail an apply
+// whose content write already succeeded.
+func writeFile(path string, content []byte, mtime time.Time) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, content, 0o644)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		return err
+	}
+	if !mtime.IsZero() {
+		_ = os.Chtimes(path, mtime, mtime)
+	}
+	return nil
+}
+
+// statMtime returns a path's modification time, or the zero time when the
+// stat fails (missing file, permission race). Capture sites use it so an
+// mtime lookup can never turn into an error: zero simply means "unknown".
+func statMtime(path string) time.Time {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}
+	}
+	return fi.ModTime()
 }
 
 // moveFile renames a file from src to dst.

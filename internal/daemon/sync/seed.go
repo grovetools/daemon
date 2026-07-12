@@ -1,6 +1,8 @@
 package sync
 
 import (
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/grovetools/core/pkg/syncproto"
 )
@@ -25,8 +27,13 @@ import (
 //     idempotent) then EnqueueOutbox (document_created for a genuinely-new
 //     row, document_updated otherwise).
 //
+// mtime is the file's modification time from the caller's stat (both callers
+// already hold a FileInfo alongside the content) — fidelity metadata carried
+// on the outbox row so replicas can restore filesystem timestamps. A zero
+// mtime is fine (stat failed / unknown): it rides the wire as "unknown".
+//
 // Exported because the watcher package imports this sync package.
-func InsertAndEnqueue(db *DB, workspace, rel string, content []byte) (quarantineReason string, err error) {
+func InsertAndEnqueue(db *DB, workspace, rel string, content []byte, mtime time.Time) (quarantineReason string, err error) {
 	hash := hashContent(content)
 
 	doc, err := db.GetDocumentByPath(workspace, rel)
@@ -87,6 +94,7 @@ func InsertAndEnqueue(db *DB, workspace, rel string, content []byte) (quarantine
 		EventType:   eventType,
 		Path:        rel,
 		ContentHash: hash,
+		Mtime:       mtime,
 	}); err != nil {
 		return "", err
 	}

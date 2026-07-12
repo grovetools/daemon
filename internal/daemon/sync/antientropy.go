@@ -202,6 +202,7 @@ func (a *AntiEntropyPass) reconcileDocument(ctx context.Context, docSnap *syncpr
 		EventType:   syncproto.EventDocumentUpdated,
 		Path:        docSnap.Path,
 		ContentHash: localHashHex,
+		Mtime:       statMtime(localPath),
 	})
 	return err
 }
@@ -313,6 +314,7 @@ func (a *AntiEntropyPass) sweepLocalDocuments(ctx context.Context) error {
 			EventType:   eventType,
 			Path:        doc.Path,
 			ContentHash: diskHash,
+			Mtime:       statMtime(localPath),
 		}); err != nil {
 			a.log.Warn("push sweep: failed to enqueue outbox entry").
 				Field("path", doc.Path).Err(err).Log(ctx)
@@ -409,7 +411,7 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 			return nil
 		}
 
-		reason, err := InsertAndEnqueue(a.db, a.workspace, rel, content)
+		reason, err := InsertAndEnqueue(a.db, a.workspace, rel, content, info.ModTime())
 		if err != nil {
 			a.log.Warn("hydration: failed to enqueue file").
 				Field("path", rel).Err(err).Log(ctx)

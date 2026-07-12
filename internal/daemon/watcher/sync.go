@@ -377,7 +377,7 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 	// EnqueueOutbox. The anti-entropy reconcile's walkLocalTree calls the same
 	// helper, so watch and reconcile can never disagree about the doc space or
 	// the quarantine judgement.
-	reason, err := syncdb.InsertAndEnqueue(h.db, watch.workspace, rel, content)
+	reason, err := syncdb.InsertAndEnqueue(h.db, watch.workspace, rel, content, fi.ModTime())
 	if err != nil {
 		h.ulog.Warn("Failed to record sync change").Err(err).Field("path", rel).Log(ctx)
 		return
@@ -491,6 +491,12 @@ func (h *SyncHandler) handleNoteEvent(ctx context.Context, event *models.NoteEve
 		h.ulog.Warn("Failed to move sync document").Err(err).Field("path", newRel).Log(ctx)
 		return
 	}
+	// Carry the moved file's mtime (fidelity metadata; zero when the stat
+	// races the move) so replicas can restore it after their rename.
+	var mtime time.Time
+	if fi, err := os.Stat(event.Path); err == nil {
+		mtime = fi.ModTime()
+	}
 	if _, err := h.db.EnqueueOutbox(&syncdb.OutboxEntry{
 		DocumentID:  doc.DocumentID,
 		Workspace:   newWatch.workspace,
@@ -498,6 +504,7 @@ func (h *SyncHandler) handleNoteEvent(ctx context.Context, event *models.NoteEve
 		Path:        newRel,
 		PrevPath:    prevRel,
 		ContentHash: doc.ContentHash,
+		Mtime:       mtime,
 	}); err != nil {
 		h.ulog.Warn("Failed to enqueue sync move").Err(err).Field("path", newRel).Log(ctx)
 	}
