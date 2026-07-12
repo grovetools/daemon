@@ -785,6 +785,52 @@ func (d *DB) AdoptDocument(workspace, path, documentID string, version int64, ha
 	return nil
 }
 
+// RemapDocument rewrites a document's identity from a locally-minted id to the
+// id the server confirmed for the same path (B8): when a create (or an update
+// under a lost id) lands on a path the server already tracks, the server
+// answers with the EXISTING document id, and the local row — plus every queued
+// outbox entry still carrying the stale id — must adopt it or every subsequent
+// push dangles off an id the server never learned. Same-row UPDATE, so the
+// UNIQUE(workspace, path) constraint is untouched; the PRIMARY KEY constraint
+// still fails if newID is already tracked at another path, which the caller
+// surfaces rather than papering over.
+func (d *DB) RemapDocument(oldID, newID string) error {
+	if oldID == newID {
+		return nil
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin document remap: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE sync_documents SET document_id = ?, updated_at = CURRENT_TIMESTAMP WHERE document_id = ?`,
+		newID, oldID); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("failed to remap sync document %s -> %s: %w", oldID, newID, err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE sync_outbox SET document_id = ? WHERE document_id = ?`,
+		newID, oldID); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("failed to remap outbox entries %s -> %s: %w", oldID, newID, err)
+	}
+	return tx.Commit()
+}
+
+// RetypeOutboxEntry rewrites a single outbox entry's event type in place. Used
+// by the B8 create-conflict adoption: once the local row has adopted the
+// server identity, the queued document_created must re-push as a
+// document_updated (drain resolves base_version and document_id from the live
+// doc row for updates) instead of re-colliding with the occupied path.
+func (d *DB) RetypeOutboxEntry(id int64, eventType string) error {
+	_, err := d.db.Exec(
+		`UPDATE sync_outbox SET event_type = ? WHERE id = ?`, eventType, id)
+	if err != nil {
+		return fmt.Errorf("failed to retype sync outbox entry %d: %w", id, err)
+	}
+	return nil
+}
+
 // MarkDiverged sets the diverged flag on a document (P5, S5): the push-side
 // rebase produced a merged server head that the local file does NOT match, and
 // strict push-only forbids rewriting the file. A diverged doc is frozen from the

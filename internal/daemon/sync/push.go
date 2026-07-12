@@ -25,6 +25,14 @@ const (
 	// conflictBackoffCap bounds the exponential backoff applied to a parked
 	// conflict entry so attempts never stretch past ~10 minutes.
 	conflictBackoffCap = 10 * time.Minute
+
+	// rejectedRetryInterval is the fixed park duration for an entry the server
+	// rejected outright (B8). Rejects used to be silently DELETED "to prevent
+	// spinning", which is how the occupied-path create vanished forever; now
+	// that those cases are structured accepts/conflicts, a reject means a
+	// truly malformed push — park it long and flat so operators can see it on
+	// /api/sync/outbox instead of losing it.
+	rejectedRetryInterval = 1 * time.Hour
 )
 
 // PushConfig holds the configuration for the push pipeline.
@@ -361,6 +369,23 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 					successCount++
 					break
 				}
+				// B8: the server confirmed a DIFFERENT identity than the one
+				// pushed — a create (or a lost-id update) absorbed hash-equal
+				// into the existing doc at that path. Re-map the local row
+				// (and any queued entries) onto the server's id before
+				// rolling sync state; without this, MarkDocumentSynced below
+				// targets an id the local db doesn't hold and the row stays
+				// divorced at version 0.
+				if result.DocumentID != "" && events[i].DocumentID != "" &&
+					events[i].DocumentID != result.DocumentID {
+					if err := p.db.RemapDocument(events[i].DocumentID, result.DocumentID); err != nil {
+						p.log.Warn("failed to adopt server document identity").
+							Field("path", events[i].Path).
+							Field("local_id", events[i].DocumentID).
+							Field("server_id", result.DocumentID).
+							Err(err).Log(ctx)
+					}
+				}
 				// Update document metadata if this is a new document
 				if result.DocumentID != "" && events[i].DocumentID == "" {
 					if err := p.db.UpsertDocument(&Document{
@@ -426,8 +451,16 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				// flags the doc diverged and the entry parks with reason
 				// "diverged" (free-form park_reason, no schema change) so the
 				// user knows to `nb sync adopt`.
+				// Created events run the same machinery (B8): a conflicted
+				// create means the path is live on the server under an id the
+				// client lost track of. The rebase re-maps the local row onto
+				// the server identity, retypes the entry to document_updated,
+				// and — with no common ancestor to merge over — either
+				// composes cleanly or adopts the server head wholesale with
+				// the doc marked diverged (never silent loss).
 				reason := "conflict"
-				if events[i].Type == syncproto.EventDocumentUpdated {
+				if events[i].Type == syncproto.EventDocumentUpdated ||
+					events[i].Type == syncproto.EventDocumentCreated {
 					if _, diverged := p.rebaseConflictedEntry(ctx, workspaceRoot, entries[i], &result); diverged {
 						reason = "diverged"
 						if p.OnDiverged != nil {
@@ -446,8 +479,21 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				p.log.Warn("push rejected").
 					Field("path", events[i].Path).
 					Field("error", result.Error).Log(ctx)
-				// Remove from outbox to prevent spinning
-				idsToDelete = append(idsToDelete, entries[i].ID)
+				// Park with a long flat backoff instead of silently deleting
+				// (B8: the silent delete is how an occupied-path create
+				// vanished forever — those cases are structured
+				// accepts/conflicts now, so a reject means a truly malformed
+				// push that deserves operator visibility on
+				// /api/sync/outbox). Parking counts as progress for the
+				// no-progress guard below, and a parked entry drops out of
+				// ListOutboxDrainable until its retry time, so this cannot
+				// reintroduce the hot-spin regression.
+				if err := p.db.ParkOutbox(entries[i].ID, "rejected", now.Add(rejectedRetryInterval)); err != nil {
+					p.log.Warn("failed to park rejected outbox entry").
+						Field("path", events[i].Path).Err(err).Log(ctx)
+				} else {
+					parkedCount++
+				}
 			}
 		}
 
@@ -515,6 +561,17 @@ func (p *PushPipeline) conflictBackoff(attempts int) time.Duration {
 // fetch, file read) get no artifact; an overlapping merge writes a conflict
 // artifact once per divergence (same format/location as the pull side's).
 //
+// B8 additions: when the server identified the head under a DIFFERENT
+// document id than the local row carries (a create — or an update under a
+// lost id — collided with the live doc at this path), the local row and its
+// queued entries are re-mapped onto the server identity first, and a
+// conflicted document_created is retyped to document_updated after the
+// retarget. When the doc has no common ancestor at all (never synced: version
+// 0, empty base), an overlapping merge cannot resolve by retrying, so the
+// server head is adopted as the merged state wholesale — server content
+// preserved, local file untouched and captured in the conflict artifact, doc
+// marked diverged for `nb sync adopt`.
+//
 // There is NO mid-rebase re-read guard: nothing is written, so there is nothing
 // to guard. A local edit that lands mid-rebase is simply the next local state of
 // a now-diverged doc, held (like every diverged edit) until adopt.
@@ -552,6 +609,23 @@ func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot 
 		return false, false
 	}
 
+	// B8 identity adoption: the server answered with a different document id
+	// than the local row carries — a create (or an update under a lost id)
+	// collided with the live doc at this path. Re-map the local row and every
+	// queued outbox entry onto the server's id before converging content;
+	// pushing under the locally-minted id can never succeed.
+	if doc.DocumentID != docID {
+		if err := p.db.RemapDocument(doc.DocumentID, docID); err != nil {
+			p.log.Warn("rebase: failed to adopt server document identity").
+				Field("path", entry.Path).
+				Field("local_id", doc.DocumentID).
+				Field("server_id", docID).
+				Err(err).Log(ctx)
+			return false, false
+		}
+		doc.DocumentID = docID
+	}
+
 	// Frontmatter merges per-key (LWW-map semantics — never conflicts);
 	// only overlapping body hunks park the document.
 	mergedVals := mergeValues(
@@ -562,11 +636,25 @@ func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot 
 		extractBody(doc.BaseContent),
 		extractBody(localContent),
 		extractBody(serverContent))
-	if !clean {
+	var merged []byte
+	switch {
+	case clean:
+		merged = reconstructDocument(mergedVals, frontmatterKeys(localContent), mergedBody)
+	case doc.LastSyncedVersion == 0 && len(doc.BaseContent) == 0:
+		// No common ancestor (B8: a recreate over an orphaned server doc, or
+		// an edit under a never-synced row). The overlap can never resolve by
+		// retrying — there is no merge base and never will be — so instead of
+		// parking an unresolvable conflict forever, adopt the SERVER HEAD as
+		// the merged state: the server keeps its content, the local file
+		// (untouched, S5) diverges, the local bytes are captured in the
+		// conflict artifact, and the user arbitrates via `nb sync adopt`.
+		// Nothing is lost on either side.
+		p.recordConflictArtifact(ctx, entry.Path, docID, localContent)
+		merged = append([]byte(nil), serverContent...)
+	default:
 		p.recordConflictArtifact(ctx, entry.Path, docID, localContent)
 		return false, false
 	}
-	merged := reconstructDocument(mergedVals, frontmatterKeys(localContent), mergedBody)
 	mergedHash := hashContent(merged)
 
 	// Retarget THIS entry at the merged bytes (carried as Payload): DrainOutbox
@@ -577,6 +665,21 @@ func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot 
 		p.log.Warn("rebase: failed to retarget outbox entry").
 			Field("path", entry.Path).Err(err).Log(ctx)
 		return false, false
+	}
+
+	// A conflicted create has adopted the server identity above, so its
+	// re-push must be a document_updated (drain resolves document_id and
+	// base_version from the now-remapped doc row) — re-pushing it as a create
+	// would just re-collide with the occupied path. When the merged bytes
+	// equal the adopted server head, drain's no-op drop retires the entry
+	// without a round trip.
+	if entry.EventType == syncproto.EventDocumentCreated {
+		if err := p.db.RetypeOutboxEntry(entry.ID, syncproto.EventDocumentUpdated); err != nil {
+			p.log.Warn("rebase: failed to retype created entry to updated").
+				Field("path", entry.Path).Err(err).Log(ctx)
+			return false, false
+		}
+		entry.EventType = syncproto.EventDocumentUpdated
 	}
 
 	// Advance the doc record: the server head becomes the merge base (and

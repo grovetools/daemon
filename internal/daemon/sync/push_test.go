@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -813,18 +814,24 @@ func TestDrainOutboxRebaseNeverWritesLocalFile(t *testing.T) {
 type occDoc struct {
 	id      string
 	version int64
+	hash    string
+	content []byte
 }
 
 // serveOCCStoreStub builds a stateful push stub that enforces the server
-// store's exact OCC semantics for create/delete/move (sync/pkg/store/sqlite.go
-// applyCreate/applyDelete/applyMove): base_version must equal the current head
-// version or the event conflicts; deleting an unknown doc is
-// idempotent-accepted. docs maps wire path -> head; record (optional) sees
-// every pushed event. Requests are serial (DrainOutbox is synchronous), so no
-// locking is needed.
+// store's exact OCC semantics for create/update/delete/move
+// (sync/pkg/store/sqlite.go applyUpsert/applyDelete/applyMove): base_version
+// must equal the current head version or the event conflicts; deleting an
+// unknown doc is idempotent-accepted; a create — or an update under an
+// unknown document id — landing on an OCCUPIED path answers with the existing
+// identity (hash-equal idempotent accept, structured conflict otherwise, B8)
+// instead of a reject. It also serves /sync/history/blob from the current
+// heads so the push-side rebase can shadow-read. docs maps wire path -> head;
+// record (optional) sees every pushed event. Requests are serial (DrainOutbox
+// is synchronous), so no locking is needed.
 func serveOCCStoreStub(t *testing.T, docs map[string]*occDoc, record func(ev syncproto.SyncEvent)) *httptest.Server {
 	t.Helper()
-	return servePushStub(t, func(req *syncproto.PushRequest) *syncproto.PushResponse {
+	apply := func(req *syncproto.PushRequest) *syncproto.PushResponse {
 		resp := &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
 		for i, ev := range req.Events {
 			if record != nil {
@@ -832,8 +839,61 @@ func serveOCCStoreStub(t *testing.T, docs map[string]*occDoc, record func(ev syn
 			}
 			switch ev.Type {
 			case syncproto.EventDocumentCreated:
-				doc := &occDoc{id: fmt.Sprintf("doc-%d", len(docs)+1), version: 1}
+				if doc, ok := docs[ev.Path]; ok {
+					// Occupied path (B8): existing identity, never a reject.
+					if ev.ContentHash == doc.hash {
+						resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusAccepted, DocumentID: doc.id, Version: doc.version}
+					} else {
+						resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusConflict, DocumentID: doc.id, Version: doc.version}
+					}
+					continue
+				}
+				doc := &occDoc{
+					id: fmt.Sprintf("doc-%d", len(docs)+1), version: 1,
+					hash: ev.ContentHash, content: append([]byte(nil), ev.Content...),
+				}
 				docs[ev.Path] = doc
+				resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusAccepted, DocumentID: doc.id, Version: doc.version}
+			case syncproto.EventDocumentUpdated:
+				var doc *occDoc
+				if ev.DocumentID != "" {
+					for _, d := range docs {
+						if d.id == ev.DocumentID {
+							doc = d
+							break
+						}
+					}
+					if doc == nil {
+						// Unknown id at a live path (B8): answer with the
+						// real identity so the client can re-map.
+						if d, ok := docs[ev.Path]; ok {
+							if ev.ContentHash == d.hash {
+								resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusAccepted, DocumentID: d.id, Version: d.version}
+							} else {
+								resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusConflict, DocumentID: d.id, Version: d.version}
+							}
+							continue
+						}
+					}
+				} else if d, ok := docs[ev.Path]; ok {
+					doc = d
+				}
+				if doc == nil {
+					resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusRejected, Error: "unknown document"}
+					continue
+				}
+				if ev.BaseVersion != doc.version {
+					if ev.ContentHash == doc.hash {
+						// Stale base, identical content: absorbed.
+						resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusAccepted, DocumentID: doc.id, Version: doc.version}
+					} else {
+						resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusConflict, DocumentID: doc.id, Version: doc.version}
+					}
+					continue
+				}
+				doc.version++
+				doc.hash = ev.ContentHash
+				doc.content = append([]byte(nil), ev.Content...)
 				resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusAccepted, DocumentID: doc.id, Version: doc.version}
 			case syncproto.EventDocumentDeleted:
 				doc, ok := docs[ev.Path]
@@ -868,7 +928,38 @@ func serveOCCStoreStub(t *testing.T, docs map[string]*occDoc, record func(ev syn
 			}
 		}
 		return resp
-	})
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sync/capabilities":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
+				Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}},
+			})
+		case "/sync/push":
+			w.Header().Set("Content-Type", "application/json")
+			var req syncproto.PushRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode push request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(apply(&req))
+		case "/sync/history/blob":
+			id := r.URL.Query().Get("document_id")
+			var version int64
+			if _, err := fmt.Sscanf(r.URL.Query().Get("version"), "%d", &version); err != nil {
+				t.Errorf("parse blob version: %v", err)
+			}
+			for _, d := range docs {
+				if d.id == id && d.version == version {
+					_, _ = w.Write(d.content)
+					return
+				}
+			}
+			http.Error(w, "version not found", http.StatusNotFound)
+		default:
+			t.Errorf("occ stub: unexpected request %s", r.URL.Path)
+		}
+	}))
 }
 
 // TestDrainOutboxDeleteCarriesBaseVersion is the B7 push-side regression, run
@@ -1077,5 +1168,371 @@ func TestDrainOutboxMoveCarriesBaseVersion(t *testing.T) {
 	}
 	if string(doc.BaseContent) != string(content) || doc.LastSyncedHash != sha(content) {
 		t.Fatalf("accepted move must not wipe the merge base: hash=%q base=%q", doc.LastSyncedHash, doc.BaseContent)
+	}
+}
+
+// seedOrphanRecreate builds the B8 fixture, observed live: the server holds a
+// live doc at the path (serverDocs seeded by the caller) while the client has
+// LOST its record of it — the watcher then recreated the file and minted a
+// fresh local document id. Returns the workspace root.
+func seedOrphanRecreate(t *testing.T, db *DB, localID, eventType string, local []byte) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "inbox", "note.md"), local, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The watcher's InsertAndEnqueue outcome: a fresh row with a minted id,
+	// never synced (version 0, no base), plus the queued event.
+	if err := db.UpsertDocument(&Document{
+		DocumentID: localID, Workspace: "default", Path: "inbox/note.md",
+		ContentHash: sha(local),
+	}); err != nil {
+		t.Fatalf("UpsertDocument: %v", err)
+	}
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: localID, Workspace: "default", EventType: eventType,
+		Path: "inbox/note.md", ContentHash: sha(local),
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+	return root
+}
+
+// TestDrainOutboxCreateAtOrphanedPathHashEqualAdoptsIdentity is the B8
+// hash-equal leg: the recreated file matches the orphaned server doc byte for
+// byte, so the create is absorbed as an idempotent accept carrying the
+// server's identity, and the client re-maps its minted id onto it. Before the
+// fix this was a raw UNIQUE-constraint Rejected and the entry was silently
+// deleted — the path never synced again.
+func TestDrainOutboxCreateAtOrphanedPathHashEqualAdoptsIdentity(t *testing.T) {
+	db := openTestDB(t)
+	content := []byte("---\ntitle: note\n---\nsame on both sides\n")
+	root := seedOrphanRecreate(t, db, "doc-local-2", syncproto.EventDocumentCreated, content)
+
+	serverDocs := map[string]*occDoc{
+		"inbox/note.md": {id: "doc-server-1", version: 1, hash: sha(content), content: content},
+	}
+	srv := serveOCCStoreStub(t, serverDocs, nil)
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	n, err := pipeline.DrainOutbox(ctx, root)
+	if err != nil || n != 1 {
+		t.Fatalf("DrainOutbox: n=%d err=%v — a hash-equal recreate must be absorbed, not rejected", n, err)
+	}
+
+	doc, err := db.GetDocumentByPath("default", "inbox/note.md")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocumentByPath: %v", err)
+	}
+	if doc.DocumentID != "doc-server-1" {
+		t.Fatalf("local row must adopt the server identity, got %q", doc.DocumentID)
+	}
+	if doc.LastSyncedVersion != 1 || doc.LastSyncedHash != sha(content) || string(doc.BaseContent) != string(content) {
+		t.Fatalf("adopted row must be fully synced at the server head: v%d hash=%q", doc.LastSyncedVersion, doc.LastSyncedHash)
+	}
+	if remaining, _ := db.CountOutbox(); remaining != 0 {
+		t.Fatalf("expected empty outbox, got %d", remaining)
+	}
+	if d := serverDocs["inbox/note.md"]; d.version != 1 {
+		t.Fatalf("idempotent absorb must not advance the server head, got v%d", d.version)
+	}
+}
+
+// TestDrainOutboxCreateAtOrphanedPathMergeableConverges is the B8 lifecycle:
+// the recreated file shares its body with the orphaned server doc but carries
+// extra frontmatter. The conflicted create adopts the server identity, the
+// rebase composes cleanly over the empty base, and the retyped
+// document_updated re-push advances the server head with the merged content —
+// full convergence, no operator involvement.
+func TestDrainOutboxCreateAtOrphanedPathMergeableConverges(t *testing.T) {
+	t.Setenv("GROVE_HOME", "")
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	db := openTestDB(t)
+
+	serverHead := []byte("---\ntitle: note\n---\nshared body\n")
+	local := []byte("---\ntitle: note\nstatus: new\n---\nshared body\n")
+	root := seedOrphanRecreate(t, db, "doc-local-2", syncproto.EventDocumentCreated, local)
+
+	serverDocs := map[string]*occDoc{
+		"inbox/note.md": {id: "doc-server-1", version: 1, hash: sha(serverHead), content: serverHead},
+	}
+	srv := serveOCCStoreStub(t, serverDocs, nil)
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{RetryBackoff: 50 * time.Millisecond})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Drain 1: conflict -> adopt identity + clean rebase -> parked for re-push.
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox (conflict pass): %v", err)
+	}
+	doc, err := db.GetDocumentByPath("default", "inbox/note.md")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocumentByPath: %v", err)
+	}
+	if doc.DocumentID != "doc-server-1" {
+		t.Fatalf("local row must adopt the server identity, got %q", doc.DocumentID)
+	}
+	if doc.LastSyncedVersion != 1 || string(doc.BaseContent) != string(serverHead) {
+		t.Fatalf("rebase must roll the merge base to the server head: v%d", doc.LastSyncedVersion)
+	}
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected 1 parked entry, got %d (err=%v)", len(entries), err)
+	}
+	if entries[0].EventType != syncproto.EventDocumentUpdated || entries[0].DocumentID != "doc-server-1" {
+		t.Fatalf("conflicted create must be retyped to an update under the server id, got %q/%q",
+			entries[0].EventType, entries[0].DocumentID)
+	}
+	if !entries[0].Parked {
+		t.Fatal("rebased entry must be parked for the backoff re-push")
+	}
+
+	// Drain 2 (past the backoff): merged content pushes as an update on the
+	// server head — the server version advances and content converges.
+	time.Sleep(120 * time.Millisecond)
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox (re-push pass): %v", err)
+	}
+	if remaining, _ := db.CountOutbox(); remaining != 0 {
+		t.Fatalf("expected empty outbox after convergence, got %d", remaining)
+	}
+	d := serverDocs["inbox/note.md"]
+	if d.id != "doc-server-1" || d.version != 2 {
+		t.Fatalf("server head must advance under the same identity: %+v", d)
+	}
+	merged := string(d.content)
+	if merged != string(local) {
+		// The merge must carry both sides regardless of exact serialization.
+		for _, want := range []string{"status: new", "shared body", "title: note"} {
+			if !strings.Contains(merged, want) {
+				t.Fatalf("merged server head missing %q: %q", want, merged)
+			}
+		}
+	}
+	doc, err = db.GetDocumentByPath("default", "inbox/note.md")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocumentByPath: %v", err)
+	}
+	if doc.LastSyncedVersion != 2 || doc.LastSyncedHash != d.hash {
+		t.Fatalf("client must record the advanced head: v%d hash=%q want v2 %q",
+			doc.LastSyncedVersion, doc.LastSyncedHash, d.hash)
+	}
+	// S5: the workspace file was never written.
+	got, err := os.ReadFile(filepath.Join(root, "inbox", "note.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(local) {
+		t.Fatalf("sync wrote the workspace file (S5 violation): %q", got)
+	}
+}
+
+// TestDrainOutboxOrphanedPathDivergentParksDiverged is the B8 genuine-
+// divergence leg, for both the recreated-file create and the follow-on edit
+// that pushes an update under the lost id: the local and server contents share
+// no common ancestor and their bodies collide, so nothing can merge. The doc
+// adopts the server identity, the server head is preserved (NOT clobbered),
+// the local file stays untouched on disk (S5) and is captured in the conflict
+// artifact, and the doc ends in the parked 'diverged' + `nb sync adopt` flow —
+// never silently dropped.
+func TestDrainOutboxOrphanedPathDivergentParksDiverged(t *testing.T) {
+	for _, eventType := range []string{syncproto.EventDocumentCreated, syncproto.EventDocumentUpdated} {
+		t.Run(eventType, func(t *testing.T) {
+			stateHome := t.TempDir()
+			t.Setenv("GROVE_HOME", "")
+			t.Setenv("XDG_STATE_HOME", stateHome)
+			db := openTestDB(t)
+
+			serverHead := []byte("---\ntitle: note\n---\nSERVER body\n")
+			local := []byte("---\ntitle: note\n---\nLOCAL body\n")
+			root := seedOrphanRecreate(t, db, "doc-local-2", eventType, local)
+
+			serverDocs := map[string]*occDoc{
+				"inbox/note.md": {id: "doc-server-1", version: 1, hash: sha(serverHead), content: serverHead},
+			}
+			srv := serveOCCStoreStub(t, serverDocs, nil)
+			defer srv.Close()
+
+			client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+			handshake(t, client)
+			pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{RetryBackoff: 50 * time.Millisecond})
+			var divergedPath atomic.Value
+			pipeline.OnDiverged = func(workspace, path string) { divergedPath.Store(workspace + "/" + path) }
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+				t.Fatalf("DrainOutbox: %v", err)
+			}
+
+			// The entry is parked 'diverged' — NOT deleted (the pre-fix bug).
+			entries, err := db.ListOutbox("default", 0)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("expected 1 parked entry (not silently dropped), got %d (err=%v)", len(entries), err)
+			}
+			e := entries[0]
+			if !e.Parked || e.ParkReason != "diverged" {
+				t.Fatalf("divergent recreate must park as diverged: parked=%v reason=%q", e.Parked, e.ParkReason)
+			}
+			if e.EventType != syncproto.EventDocumentUpdated || e.DocumentID != "doc-server-1" {
+				t.Fatalf("entry must be an update under the adopted server id, got %q/%q", e.EventType, e.DocumentID)
+			}
+			if e.Payload != string(serverHead) {
+				t.Fatalf("entry must be retargeted at the adopted server head, got %q", e.Payload)
+			}
+
+			// The doc adopted the server identity and state, marked diverged.
+			doc, err := db.GetDocumentByPath("default", "inbox/note.md")
+			if err != nil || doc == nil {
+				t.Fatalf("GetDocumentByPath: %v", err)
+			}
+			if doc.DocumentID != "doc-server-1" || !doc.Diverged {
+				t.Fatalf("doc must adopt the server identity and go diverged: id=%q diverged=%v", doc.DocumentID, doc.Diverged)
+			}
+			if doc.LastSyncedVersion != 1 || string(doc.BaseContent) != string(serverHead) || doc.ContentHash != sha(local) {
+				t.Fatalf("doc must roll to the server head while content_hash tracks disk: %+v", doc)
+			}
+			if got := divergedPath.Load(); got != "default/inbox/note.md" {
+				t.Fatalf("OnDiverged hook not fired for the diverged doc, got %v", got)
+			}
+
+			// The local bytes are preserved twice over: untouched on disk (S5)
+			// and captured in the conflict artifact.
+			got, err := os.ReadFile(filepath.Join(root, "inbox", "note.md"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != string(local) {
+				t.Fatalf("sync wrote the workspace file (S5 violation): %q", got)
+			}
+			artifact := filepath.Join(stateHome, "grove", "sync", "conflicts", "default", "inbox/note.md.doc-server-1.conflict.md")
+			artifactContent, err := os.ReadFile(artifact)
+			if err != nil {
+				t.Fatalf("expected conflict artifact at %s: %v", artifact, err)
+			}
+			if string(artifactContent) != string(local) {
+				t.Fatalf("artifact must hold the local content, got %q", artifactContent)
+			}
+
+			// Drain 2 (past the backoff): the retargeted entry is a no-op
+			// against the adopted head and retires without touching the server
+			// — the server head is preserved, no data loss.
+			time.Sleep(120 * time.Millisecond)
+			if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+				t.Fatalf("DrainOutbox (retire pass): %v", err)
+			}
+			if remaining, _ := db.CountOutbox(); remaining != 0 {
+				t.Fatalf("no-op retargeted entry must retire, got %d entries", remaining)
+			}
+			d := serverDocs["inbox/note.md"]
+			if d.version != 1 || string(d.content) != string(serverHead) {
+				t.Fatalf("server head must be preserved (no clobber): v%d %q", d.version, d.content)
+			}
+
+			// The adopt flow then converges the user's content by explicit
+			// choice: `nb sync adopt` rolls the base (AdoptDocument), the next
+			// sweep/edit re-pushes on the real head, and the server advances.
+			if err := db.AdoptDocument("default", "inbox/note.md", "doc-server-1", 1, sha(serverHead), serverHead); err != nil {
+				t.Fatalf("AdoptDocument: %v", err)
+			}
+			if _, err := db.EnqueueOutbox(&OutboxEntry{
+				DocumentID: "doc-server-1", Workspace: "default",
+				EventType: syncproto.EventDocumentUpdated,
+				Path:      "inbox/note.md", ContentHash: sha(local),
+			}); err != nil {
+				t.Fatalf("EnqueueOutbox (post-adopt): %v", err)
+			}
+			if n, err := pipeline.DrainOutbox(ctx, root); err != nil || n != 1 {
+				t.Fatalf("DrainOutbox (post-adopt): n=%d err=%v", n, err)
+			}
+			d = serverDocs["inbox/note.md"]
+			if d.version != 2 || string(d.content) != string(local) {
+				t.Fatalf("post-adopt push must advance the server head with the local content: v%d %q", d.version, d.content)
+			}
+		})
+	}
+}
+
+// TestDrainOutboxRejectedParksNotDeleted is the B8 disposition regression: a
+// genuinely rejected push must no longer be silently deleted from the outbox —
+// it parks with reason 'rejected' and a long flat backoff, visible to
+// operators, without hot-spinning the drain loop.
+func TestDrainOutboxRejectedParksNotDeleted(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("some content")
+	if err := os.WriteFile(filepath.Join(root, "inbox", "note.md"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: "doc-1", Workspace: "default",
+		EventType: syncproto.EventDocumentUpdated,
+		Path:      "inbox/note.md", ContentHash: sha(content),
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+
+	var pushCount atomic.Int64
+	srv := servePushStub(t, func(req *syncproto.PushRequest) *syncproto.PushResponse {
+		pushCount.Add(1)
+		resp := &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
+		for i := range resp.Results {
+			resp.Results[i] = syncproto.PushResult{Status: syncproto.PushStatusRejected, Error: "malformed"}
+		}
+		return resp
+	})
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	n, err := pipeline.DrainOutbox(ctx, root)
+	if err != nil {
+		t.Fatalf("DrainOutbox: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("a rejected push must not ack, got %d", n)
+	}
+	if got := pushCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 push attempt (no hot spin), got %d", got)
+	}
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("rejected entry must stay in the outbox, got %d (err=%v)", len(entries), err)
+	}
+	e := entries[0]
+	if !e.Parked || e.ParkReason != "rejected" || e.Attempts != 1 {
+		t.Fatalf("rejected entry must park as 'rejected': parked=%v reason=%q attempts=%d", e.Parked, e.ParkReason, e.Attempts)
+	}
+	if until := time.Until(e.NextRetryAt); until < 30*time.Minute {
+		t.Fatalf("rejected entry must park with a long flat backoff, retries in %s", until)
+	}
+
+	// A second drain before the backoff must not re-push the parked entry.
+	if _, err := pipeline.DrainOutbox(ctx, root); err != nil {
+		t.Fatalf("DrainOutbox (second pass): %v", err)
+	}
+	if got := pushCount.Load(); got != 1 {
+		t.Fatalf("parked rejected entry re-pushed before its retry time, %d pushes", got)
 	}
 }
