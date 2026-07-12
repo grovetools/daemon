@@ -21,7 +21,9 @@ import (
 // must survive parking — an entry may not be drained ahead of an earlier
 // still-blocked entry that:
 //
-//	(a) shares its document_id, or
+//	(a) shares its document_id or its path/prev_path (same-path, different-doc
+//	    pairs — e.g. a parked delete of doc A at p followed by a recreate as
+//	    doc B at p — must not invert into create-then-delete server-side), or
 //	(b) is a prefix op (prefix_moved / prefix_deleted) whose path prefix covers
 //	    it, or
 //	(c) — the reverse direction — the candidate is itself a prefix op and an
@@ -88,8 +90,14 @@ func (d *DB) ListOutboxDrainable(workspace string, limit int, now time.Time) ([]
 	}
 
 	isBlocked := func(e *OutboxEntry) bool {
-		// (a) shares the document_id of an earlier blocked entry.
+		// (a) shares the document_id — or the exact path/prev_path — of an
+		// earlier blocked entry. The path half catches same-path pairs with
+		// different document_ids (delete doc A at p, recreate as doc B at p).
 		if e.DocumentID != "" && blockedDocIDs[e.DocumentID] {
+			return true
+		}
+		if (e.Path != "" && blockedPaths[e.Path]) ||
+			(e.PrevPath != "" && blockedPaths[e.PrevPath]) {
 			return true
 		}
 		// (b) falls under an earlier blocked prefix op.

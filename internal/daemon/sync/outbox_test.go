@@ -137,6 +137,44 @@ func TestDrainableBarrierDocID(t *testing.T) {
 	}
 }
 
+// TestDrainableBarrierSamePath (barrier a, path half): a parked delete of doc A
+// at path p blocks a later create of a DIFFERENT document B at the same path —
+// otherwise the create overtakes the delete and the server applies them
+// inverted (create then delete), losing the recreated file. Once the delete is
+// gone, the create flows. Different paths/doc-ids remain unblocked throughout.
+func TestDrainableBarrierSamePath(t *testing.T) {
+	db := openTestDB(t)
+	now := time.Now()
+
+	parkedDelete := enqueue(t, db, "doc-a", syncproto.EventDocumentDeleted, "inbox/p.md", "")
+	recreate := enqueue(t, db, "doc-b", syncproto.EventDocumentCreated, "inbox/p.md", "")
+	unrelated := enqueue(t, db, "doc-c", syncproto.EventDocumentCreated, "inbox/q.md", "")
+
+	if err := db.ParkOutbox(parkedDelete, "conflict", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	got := drainableIDs(t, db, now)
+	if got[parkedDelete] {
+		t.Error("parked delete must not be drained")
+	}
+	if got[recreate] {
+		t.Error("a create at the same path must not overtake the parked delete (different doc ids)")
+	}
+	if !got[unrelated] {
+		t.Error("a different path/doc must keep flowing")
+	}
+
+	// Once the delete has drained, the create at the same path flows.
+	if err := db.DeleteOutbox([]int64{parkedDelete}); err != nil {
+		t.Fatal(err)
+	}
+	got = drainableIDs(t, db, now)
+	if !got[recreate] {
+		t.Error("the create must flow once the earlier same-path delete is gone")
+	}
+}
+
 // TestDrainableBarrierPrefixForward (barrier b): a parked prefix op blocks later
 // entries under its prefix (matched on both path and prev_path), not siblings
 // outside the subtree.
