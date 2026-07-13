@@ -25,6 +25,29 @@ LDFLAGS = -ldflags="\
 -X '$(VERSION_PKG).Branch=$(GIT_BRANCH)' \
 -X '$(VERSION_PKG).BuildDate=$(BUILD_DATE)'"
 
+# --- Cross-compile contract (set by `grove build --target`) ---
+# GROVE_BUILD_OUT redirects output so cross binaries never clobber native bin/.
+# GROVE_TARGET_* are applied only to the final `go build`; codegen prereqs stay
+# native. cgo repo: CC/CXX come from the orchestrator (e.g. zig cc -target ...).
+ifneq ($(strip $(GROVE_BUILD_OUT)),)
+BIN_DIR = $(GROVE_BUILD_OUT)
+endif
+ifneq ($(strip $(GROVE_TARGET_GOOS)),)
+GO_CROSS_ENV = GOOS=$(GROVE_TARGET_GOOS) GOARCH=$(GROVE_TARGET_GOARCH) CGO_ENABLED=1
+ifneq ($(strip $(GROVE_TARGET_CC)),)
+GO_CROSS_ENV += CC="$(GROVE_TARGET_CC)"
+endif
+ifneq ($(strip $(GROVE_TARGET_CXX)),)
+GO_CROSS_ENV += CXX="$(GROVE_TARGET_CXX)"
+endif
+ifneq ($(strip $(GROVE_TARGET_CGO_CFLAGS)),)
+GO_CROSS_ENV += CGO_CFLAGS="$(GROVE_TARGET_CGO_CFLAGS)"
+endif
+ifneq ($(strip $(GROVE_TARGET_CGO_LDFLAGS)),)
+GO_CROSS_ENV += CGO_LDFLAGS="$(GROVE_TARGET_CGO_LDFLAGS)"
+endif
+endif
+
 .PHONY: all build test clean fmt fmt-check vet lint run check dev build-all help
 
 all: build
@@ -32,7 +55,7 @@ all: build
 build:
 	@mkdir -p $(BIN_DIR)
 	@echo "Building $(BINARY_NAME) version $(VERSION)..."
-	@go build $(GO_TAGS) $(LDFLAGS) -o $(BIN_DIR)/$(BINARY_NAME) .
+	@$(GO_CROSS_ENV) go build $(GO_TAGS) $(LDFLAGS) -o $(BIN_DIR)/$(BINARY_NAME) .
 
 test:
 	@echo "Running tests..."
