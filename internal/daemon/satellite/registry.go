@@ -9,53 +9,65 @@
 package satellite
 
 import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+
 	"github.com/grovetools/core/config"
+	grovelogging "github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/paths"
 )
 
-// SatelliteConfig is one entry parsed from the grove config's [satellites.<name>]
-// table. The mapstructure decoder behind config.UnmarshalExtension keys off the
-// `yaml` tag (see core/config/types.go UnmarshalExtension), so the yaml tags are
-// what actually bind config keys to fields; the toml tags document the on-disk
-// TOML shape.
+// SatelliteConfig is one entry in the merged satellite registry. Entries come
+// from two sources, merged per name per field by LoadRegistry:
+//
+//   - the grove config's [satellites.<name>] table (user-authored; may live in
+//     grove.toml or any config-dir fragment). The mapstructure decoder behind
+//     config.UnmarshalExtension keys off the `yaml` tag (see core/config/types.go
+//     UnmarshalExtension), so the yaml tags are what actually bind config keys
+//     to fields; the toml tags document the on-disk TOML shape.
+//   - the CLI-owned provisioning state file $XDG_STATE_HOME/grove/satellites.json
+//     written by `grove satellite up`/`down` (machine-derived; json tags bind).
 type SatelliteConfig struct {
 	// Name is stamped from the [satellites.<name>] map key by LoadRegistry; it
 	// is never read from the config body (that value is the federation Origin,
 	// C6, stable across cattle recreations).
-	Name string `yaml:"-" toml:"-"`
+	Name string `yaml:"-" toml:"-" json:"-"`
 
 	// SSHAddr is the satellite's SSH endpoint as host:port.
-	SSHAddr string `yaml:"ssh_addr" toml:"ssh_addr"`
+	SSHAddr string `yaml:"ssh_addr" toml:"ssh_addr" json:"ssh_addr"`
 
 	// User is the SSH login user on the satellite.
-	User string `yaml:"user" toml:"user"`
+	User string `yaml:"user" toml:"user" json:"user"`
 
 	// HostKey is the pinned host public key in authorized_keys / known_hosts
 	// line format (e.g. "ssh-ed25519 AAAA..."). Registry-seeded by P10's
 	// `grove satellite up` from provision-time output; ConnManager hard-fails if
 	// it is empty or unparseable — pinning is never TOFU (C2).
-	HostKey string `yaml:"host_key" toml:"host_key"`
+	HostKey string `yaml:"host_key" toml:"host_key" json:"host_key"`
 
 	// IdentityFile is an optional path to a private key added as a second auth
 	// method. Empty = agent-only ($SSH_AUTH_SOCK). Private keys never leave the
 	// agent otherwise (C2).
-	IdentityFile string `yaml:"identity_file" toml:"identity_file"`
+	IdentityFile string `yaml:"identity_file" toml:"identity_file" json:"identity_file,omitempty"`
 
 	// SocketPath optionally overrides the remote groved socket path. Empty uses
 	// the default convention (see remoteSocketPath in connmanager.go). P10 can
 	// write the exact value from bootstrap output.
-	SocketPath string `yaml:"socket_path" toml:"socket_path"`
+	SocketPath string `yaml:"socket_path" toml:"socket_path" json:"socket_path,omitempty"`
 
 	// SyncLocalPort, when > 0, has the daemon bind 127.0.0.1:<port> and forward
 	// every accepted connection over the satellite's SSH connection to
 	// SyncRemoteAddr via a direct-tcpip channel (see syncforward.go). This is
 	// the daemon-owned replacement for the manual `ssh -L` sync tunnel. 0 or
 	// absent = feature off.
-	SyncLocalPort int `yaml:"sync_local_port" toml:"sync_local_port"`
+	SyncLocalPort int `yaml:"sync_local_port" toml:"sync_local_port" json:"sync_local_port,omitempty"`
 
 	// SyncRemoteAddr is the loopback address on the satellite that the sync
 	// forward dials (syncd's bind address). Empty defaults to "127.0.0.1:8788"
 	// (see syncRemoteAddr in syncforward.go).
-	SyncRemoteAddr string `yaml:"sync_remote_addr" toml:"sync_remote_addr"`
+	SyncRemoteAddr string `yaml:"sync_remote_addr" toml:"sync_remote_addr" json:"sync_remote_addr,omitempty"`
 
 	// Note: a [satellites.<name>.sync] subtable may appear in the TOML (owned
 	// by the grove CLI side). The mapstructure decode behind LoadRegistry
@@ -86,28 +98,133 @@ func NewRegistry(configs map[string]*SatelliteConfig) *Registry {
 	return reg
 }
 
-// LoadRegistry parses the [satellites.<name>] tables out of the grove config
-// via the existing extension mechanism (mirrors loadNavGroupConfigs' use of
-// cfg.UnmarshalExtension in daemon/internal/daemon/server/server.go). An
-// absent or empty [satellites] section yields an empty registry, NOT an error:
-// satellite-less daemons must boot unchanged.
+// satelliteStateFileName is the CLI-owned provisioning state file under
+// paths.StateDir() (default ~/.local/state/grove). `grove satellite up`
+// upserts an entry per provisioned satellite; `down` removes it.
+const satelliteStateFileName = "satellites.json"
+
+// defaultSatelliteStatePath resolves the state file the same way the grove CLI
+// writes it: $XDG_STATE_HOME/grove/satellites.json (GROVE_HOME/XDG overrides
+// honored via paths.StateDir). Empty when no state home resolves.
+func defaultSatelliteStatePath() string {
+	dir := paths.StateDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, satelliteStateFileName)
+}
+
+// LoadRegistry builds the registry as config ∪ state, merged per satellite
+// name per field:
+//
+//   - [satellites.<name>] tables from the grove config (the existing extension
+//     mechanism, mirrors loadNavGroupConfigs' use of cfg.UnmarshalExtension in
+//     daemon/internal/daemon/server/server.go) carry the user-authored view.
+//   - the grove CLI's provisioning state file (satellites.json under the state
+//     dir) carries the machine-derived view written by `grove satellite up`.
+//
+// Merge rule (mergeSatelliteEntry): churny provisioning fields (ssh_addr,
+// host_key, socket_path, sync_remote_addr) prefer a non-empty STATE value;
+// user-authored fields (user, identity_file, sync_local_port) prefer a
+// non-empty CONFIG value. A satellite present in only one source still yields
+// a complete entry.
+//
+// An absent or empty [satellites] section and an absent state file yield an
+// empty registry, NOT an error: satellite-less daemons must boot unchanged. A
+// corrupt/unreadable state file is a warning, never a boot failure.
 func LoadRegistry(cfg *config.Config) (*Registry, error) {
-	reg := &Registry{byName: make(map[string]*SatelliteConfig)}
-	if cfg == nil {
-		return reg, nil
+	return loadRegistryFromSources(cfg, defaultSatelliteStatePath())
+}
+
+// loadRegistryFromSources is LoadRegistry with an explicit state file path
+// (tests point it at temp dirs).
+func loadRegistryFromSources(cfg *config.Config, statePath string) (*Registry, error) {
+	var fromConfig map[string]SatelliteConfig
+	if cfg != nil {
+		if err := cfg.UnmarshalExtension("satellites", &fromConfig); err != nil {
+			return nil, err
+		}
 	}
 
-	var raw map[string]SatelliteConfig
-	if err := cfg.UnmarshalExtension("satellites", &raw); err != nil {
-		return nil, err
-	}
+	fromState := readSatelliteState(statePath)
 
-	for name, sc := range raw {
+	reg := &Registry{byName: make(map[string]*SatelliteConfig, len(fromConfig)+len(fromState))}
+	for name, sc := range fromConfig {
 		entry := sc
 		entry.Name = name
 		reg.byName[name] = &entry
 	}
+	for name, st := range fromState {
+		if existing, ok := reg.byName[name]; ok {
+			merged := mergeSatelliteEntry(*existing, st)
+			merged.Name = name
+			reg.byName[name] = &merged
+			continue
+		}
+		entry := st
+		entry.Name = name
+		reg.byName[name] = &entry
+	}
 	return reg, nil
+}
+
+// readSatelliteState reads the CLI-owned satellites.json. Absent file (or no
+// resolvable path) is the normal satellite-less/hand-managed case and returns
+// nil silently; any read/parse failure returns nil with a warning — a corrupt
+// state file must not kill daemon startup (the config-only view still loads).
+func readSatelliteState(path string) map[string]SatelliteConfig {
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			grovelogging.NewUnifiedLogger("groved.satellite").
+				Warn("Satellite state file unreadable; loading config-only registry").
+				Field("path", path).Err(err).Log(context.Background())
+		}
+		return nil
+	}
+	var sf struct {
+		Satellites map[string]SatelliteConfig `json:"satellites"`
+	}
+	if err := json.Unmarshal(data, &sf); err != nil {
+		grovelogging.NewUnifiedLogger("groved.satellite").
+			Warn("Satellite state file corrupt; loading config-only registry").
+			Field("path", path).Err(err).Log(context.Background())
+		return nil
+	}
+	return sf.Satellites
+}
+
+// mergeSatelliteEntry merges one satellite's config entry with its state
+// entry. State wins for the machine-derived fields that churn on every VM
+// recreate; config wins for the user-authored fields, with the state's
+// resolved snapshot as the fallback.
+func mergeSatelliteEntry(cfg, state SatelliteConfig) SatelliteConfig {
+	out := cfg
+	if state.SSHAddr != "" {
+		out.SSHAddr = state.SSHAddr
+	}
+	if state.HostKey != "" {
+		out.HostKey = state.HostKey
+	}
+	if state.SocketPath != "" {
+		out.SocketPath = state.SocketPath
+	}
+	if state.SyncRemoteAddr != "" {
+		out.SyncRemoteAddr = state.SyncRemoteAddr
+	}
+	if out.User == "" {
+		out.User = state.User
+	}
+	if out.IdentityFile == "" {
+		out.IdentityFile = state.IdentityFile
+	}
+	if out.SyncLocalPort == 0 {
+		out.SyncLocalPort = state.SyncLocalPort
+	}
+	return out
 }
 
 // Get returns the config for a satellite by name.
