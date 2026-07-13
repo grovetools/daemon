@@ -336,6 +336,133 @@ func (d *DB) ensureOriginID() error {
 	return nil
 }
 
+// GetServerEpoch returns the last-seen server epoch persisted in sync_meta,
+// or "" when no handshake has recorded one yet (first contact, or every
+// handshake so far was against a pre-epoch server).
+func (d *DB) GetServerEpoch() (string, error) {
+	var epoch string
+	err := d.db.QueryRow(`SELECT value FROM sync_meta WHERE key = 'server_epoch'`).Scan(&epoch)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to read server epoch: %w", err)
+	}
+	return epoch, nil
+}
+
+// SetServerEpoch persists the server epoch last seen in a capabilities
+// handshake. CheckServerEpoch compares it against the next handshake's epoch
+// to detect a recreated (fresh, empty) server.
+func (d *DB) SetServerEpoch(epoch string) error {
+	_, err := d.db.Exec(
+		`INSERT INTO sync_meta (key, value) VALUES ('server_epoch', ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, epoch)
+	if err != nil {
+		return fmt.Errorf("failed to persist server epoch: %w", err)
+	}
+	return nil
+}
+
+// ResetForRepush voids a workspace's server-confirmed sync state so the next
+// anti-entropy sweep re-pushes every document as a document_created — the
+// recovery primitive for a recreated (fresh, empty) server, where local
+// "already synced" state points at documents that no longer exist. It
+// returns the number of documents reset.
+//
+// For every NON-diverged document: last_synced_hash/'version are zeroed
+// (sweepLocalDocuments then chooses document_created, and the drain-time
+// no-op guard no longer drops it) while document_id is KEPT — the server's
+// create branch inserts the pushed id fresh, so identities stay stable across
+// the recreate. The workspace's non-diverged outbox entries are deleted
+// (queued/parked UPDATEs against the dead server are obsolete; the sweep
+// re-enqueues from disk) and the pull cursor resets to 0. Diverged documents
+// — and their outbox entries, whose Payload may carry an unpushed merge — are
+// left untouched: they resolve only via explicit `nb sync adopt`.
+func (d *DB) ResetForRepush(workspace string) (int, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin repush reset: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.Exec(
+		`UPDATE sync_documents SET last_synced_hash = '', last_synced_version = 0, updated_at = CURRENT_TIMESTAMP
+		 WHERE workspace = ? AND diverged = 0`, workspace)
+	if err != nil {
+		return 0, fmt.Errorf("failed to reset documents for repush in %s: %w", workspace, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to count repush reset in %s: %w", workspace, err)
+	}
+
+	if _, err := tx.Exec(
+		`DELETE FROM sync_outbox WHERE workspace = ?
+		 AND document_id NOT IN (SELECT document_id FROM sync_documents WHERE workspace = ? AND diverged = 1)`,
+		workspace, workspace); err != nil {
+		return 0, fmt.Errorf("failed to clear outbox for repush in %s: %w", workspace, err)
+	}
+
+	if _, err := tx.Exec(
+		`UPDATE sync_state SET cursor = 0 WHERE workspace = ?`, workspace); err != nil {
+		return 0, fmt.Errorf("failed to reset cursor for repush in %s: %w", workspace, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("failed to commit repush reset for %s: %w", workspace, err)
+	}
+	return int(n), nil
+}
+
+// ResetForRepushAll runs ResetForRepush over every workspace known to
+// sync_documents or sync_state, returning the total documents reset and the
+// workspaces touched.
+func (d *DB) ResetForRepushAll() (int, []string, error) {
+	rows, err := d.db.Query(
+		`SELECT workspace FROM sync_documents
+		 UNION SELECT workspace FROM sync_state ORDER BY workspace`)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to list workspaces for repush: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var workspaces []string
+	for rows.Next() {
+		var ws string
+		if err := rows.Scan(&ws); err != nil {
+			return 0, nil, fmt.Errorf("failed to scan workspace for repush: %w", err)
+		}
+		workspaces = append(workspaces, ws)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+
+	total := 0
+	for _, ws := range workspaces {
+		n, err := d.ResetForRepush(ws)
+		if err != nil {
+			return total, workspaces, err
+		}
+		total += n
+	}
+	return total, workspaces, nil
+}
+
+// ClearDocumentSyncedState zeroes one document's server-confirmed state
+// (last_synced_hash/'version) so the next anti-entropy sweep re-enqueues it
+// as a document_created. The per-document edition of ResetForRepush, used by
+// the push pipeline's unknown-document self-heal.
+func (d *DB) ClearDocumentSyncedState(documentID string) error {
+	if _, err := d.db.Exec(
+		`UPDATE sync_documents SET last_synced_hash = '', last_synced_version = 0, updated_at = CURRENT_TIMESTAMP
+		 WHERE document_id = ?`, documentID); err != nil {
+		return fmt.Errorf("failed to clear synced state for %s: %w", documentID, err)
+	}
+	return nil
+}
+
 // GetDocumentByPath returns the document for (workspace, path), or nil when
 // the path is untracked.
 func (d *DB) GetDocumentByPath(workspace, path string) (*Document, error) {

@@ -137,6 +137,11 @@ type Server struct {
 	// leave it nil and proxy /api/sync/* to the global daemon.
 	syncDB *syncdb.DB
 
+	// syncKick (SetSyncKick) triggers an immediate anti-entropy pass for a
+	// workspace ("" = all) after /api/sync/repush voids synced state. Nil
+	// when sync is not configured; then the hourly tick picks the reset up.
+	syncKick func(workspace string)
+
 	// captureWaiters holds pending GET /api/agents/{id}/capture requests.
 	// The HTTP handler blocks on the channel until groveterm sends the
 	// capture response via POST /api/agents/{id}/capture_response.
@@ -406,6 +411,9 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	// Adopt (P5, S5): user-initiated resolution of a diverged document. The
 	// daemon fetches the server head + rolls the merge base; the CLI writes it.
 	mux.HandleFunc("/api/sync/adopt", unixOnly(s.handleSyncAdopt))
+	// Repush: manual full re-push after a server recreate — voids synced
+	// state (non-diverged docs) and kicks an immediate anti-entropy pass.
+	mux.HandleFunc("/api/sync/repush", unixOnly(s.handleSyncRepush))
 	// Read-only introspection for the dev UI / playground god-view.
 	mux.HandleFunc("/api/sync/documents", unixOnly(s.handleSyncDocuments))
 	mux.HandleFunc("/api/sync/outbox", unixOnly(s.handleSyncOutbox))

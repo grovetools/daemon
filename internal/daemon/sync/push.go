@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/grovetools/core/logging"
@@ -33,6 +34,14 @@ const (
 	// truly malformed push — park it long and flat so operators can see it on
 	// /api/sync/outbox instead of losing it.
 	rejectedRetryInterval = 1 * time.Hour
+
+	// unknownDocSelfHealMaxAttempts caps how many times an "unknown document"
+	// reject self-heals (clear the doc's synced state, drop the entry, let the
+	// sweep re-enqueue a create) before falling back to parking. The reject
+	// means the server holds NEITHER the id NOR the path — the recreated-
+	// server signature — so a create must succeed; the cap is the loop guard
+	// for anything pathological.
+	unknownDocSelfHealMaxAttempts = 2
 )
 
 // PushConfig holds the configuration for the push pipeline.
@@ -498,6 +507,33 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				}
 
 			case syncproto.PushStatusRejected:
+				// Unknown-document self-heal: the server holds neither the
+				// pushed id nor the path — the recreated-server signature (a
+				// fresh, empty DB rejects every UPDATE from a client whose
+				// sync.db says the doc is synced). Parking would strand the
+				// change for the flat backoff and then reject again forever;
+				// instead void this doc's server-confirmed state and drop the
+				// entry, so the next anti-entropy sweep re-enqueues it as a
+				// document_created (which the empty server accepts, preserving
+				// the stable document id). Attempts-capped as a loop guard —
+				// at/over the cap it parks like any other reject.
+				if strings.Contains(result.Error, "unknown document") &&
+					entries[i].Attempts < unknownDocSelfHealMaxAttempts {
+					p.log.Warn("push rejected as unknown document — self-healing for create re-push").
+						Field("path", events[i].Path).
+						Field("document_id", entries[i].DocumentID).
+						Field("attempts", entries[i].Attempts).
+						Field("error", result.Error).Log(ctx)
+					if err := p.selfHealUnknownDocument(entries[i]); err != nil {
+						p.log.Warn("failed to self-heal unknown-document reject; parking").
+							Field("path", events[i].Path).Err(err).Log(ctx)
+					} else {
+						// Deleting the entry is the drain-loop progress signal
+						// (same as an ack); the sweep owns the re-enqueue.
+						idsToDelete = append(idsToDelete, entries[i].ID)
+						break
+					}
+				}
 				p.log.Warn("push rejected").
 					Field("path", events[i].Path).
 					Field("error", result.Error).Log(ctx)
@@ -549,6 +585,29 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 	}
 
 	return successCount, nil
+}
+
+// selfHealUnknownDocument voids the server-confirmed state of the document an
+// "unknown document" reject targeted (last_synced_hash/'version → empty/0),
+// so the next anti-entropy sweep re-enqueues it as a document_created and the
+// drain-time no-op guard cannot drop it. The caller deletes the rejected
+// outbox entry on success. A missing doc row (e.g. the entry was a move whose
+// row was repointed, then deleted) is not an error: with no row there is no
+// stale synced state to void, and the tree walk re-seeds the file if it still
+// exists.
+func (p *PushPipeline) selfHealUnknownDocument(entry *OutboxEntry) error {
+	docID := entry.DocumentID
+	if docID == "" {
+		doc, err := p.db.GetDocumentByPath(p.workspace, entry.Path)
+		if err != nil {
+			return err
+		}
+		if doc == nil {
+			return nil
+		}
+		docID = doc.DocumentID
+	}
+	return p.db.ClearDocumentSyncedState(docID)
 }
 
 // conflictBackoff returns the exponential retry delay for a conflict entry that

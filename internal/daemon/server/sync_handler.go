@@ -33,6 +33,14 @@ func (s *Server) SetSyncDB(db *syncdb.DB) {
 	s.syncDB = db
 }
 
+// SetSyncKick wires the watcher SyncHandler's anti-entropy kick into the
+// server so POST /api/sync/repush can trigger an immediate reconcile pass
+// (workspace-scoped, or all workspaces for ""). Nil-safe: without it the
+// reset still lands and the hourly anti-entropy tick performs the re-push.
+func (s *Server) SetSyncKick(kick func(workspace string)) {
+	s.syncKick = kick
+}
+
 // syncStatusResponse is the GET /api/sync/status payload.
 type syncStatusResponse struct {
 	Enabled           bool                  `json:"enabled"`
@@ -671,4 +679,69 @@ type snapshotDoc struct {
 	ID      string
 	Version int64
 	Hash    string
+}
+
+// handleSyncRepush handles POST /api/sync/repush with optional body
+// {"workspace": "<name>"} (absent/empty = all workspaces). It is the manual
+// edition of the automatic server-epoch recovery: it voids the
+// server-confirmed sync state of every non-diverged document
+// (ResetForRepush — last_synced_* zeroed, document ids kept, obsolete outbox
+// entries dropped, pull cursor reset) and kicks an immediate anti-entropy
+// pass, whose sweep re-pushes the full document set as document_created
+// events. For when a sync server was recreated out-of-band or local state is
+// otherwise suspected stale. Modeled on handleSyncAdopt (unix-only,
+// global-scope forwarded).
+func (s *Server) handleSyncRepush(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Scoped daemons never open sync.db — forward to the global daemon.
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	// The body is optional: absent/empty selects all workspaces.
+	var req struct {
+		Workspace string `json:"workspace"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	var (
+		workspaces []string
+		reset      int
+		err        error
+	)
+	if req.Workspace == "" {
+		reset, workspaces, err = s.syncDB.ResetForRepushAll()
+	} else {
+		reset, err = s.syncDB.ResetForRepush(req.Workspace)
+		workspaces = []string{req.Workspace}
+	}
+	if err != nil {
+		http.Error(w, fmt.Sprintf("repush reset failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if workspaces == nil {
+		workspaces = []string{}
+	}
+
+	// Convert the reset into pushes now rather than at the next hourly tick.
+	if s.syncKick != nil {
+		s.syncKick(req.Workspace)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"workspaces":      workspaces,
+		"documents_reset": reset,
+	})
 }

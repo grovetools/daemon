@@ -256,6 +256,17 @@ func (c *Client) MaxBlobSize() int64 {
 	return 0
 }
 
+// ServerEpoch returns the server's database-lifetime identity from the
+// capabilities handshake, or "" before the handshake / against a pre-epoch
+// server. CheckServerEpoch compares it with the persisted last-seen epoch to
+// detect a recreated server.
+func (c *Client) ServerEpoch() string {
+	if c.caps != nil {
+		return c.caps.ServerEpoch
+	}
+	return ""
+}
+
 // SupportsBlobs reports whether the server supports the blob tier.
 func (c *Client) SupportsBlobs() bool {
 	if c.caps != nil {

@@ -30,6 +30,11 @@ type AntiEntropyPass struct {
 	space         *DocSpace // exclusion + routing policy; drives walkLocalTree
 	log           *logging.UnifiedLogger
 	cfg           AntiEntropyConfig
+
+	// kick wakes RunAntiEntropyLoop for an immediate pass ahead of the
+	// interval ticker (buffered 1: concurrent kicks coalesce). Used by the
+	// manual /api/sync/repush endpoint after it voids synced state.
+	kick chan struct{}
 }
 
 // NewAntiEntropyPass constructs an anti-entropy reconciler. space is the same
@@ -53,6 +58,17 @@ func NewAntiEntropyPass(db *DB, client *Client, workspace, workspaceRoot string,
 		space:         space,
 		log:           log,
 		cfg:           cfg,
+		kick:          make(chan struct{}, 1),
+	}
+}
+
+// Kick requests an immediate anti-entropy pass from RunAntiEntropyLoop,
+// ahead of the interval ticker. Non-blocking; kicks issued while one is
+// already pending coalesce.
+func (a *AntiEntropyPass) Kick() {
+	select {
+	case a.kick <- struct{}{}:
+	default:
 	}
 }
 
@@ -60,6 +76,21 @@ func NewAntiEntropyPass(db *DB, client *Client, workspace, workspaceRoot string,
 // snapshot and diffs against the local filesystem, updating sync state for
 // matching files and enqueueing divergent ones.
 func (a *AntiEntropyPass) Run(ctx context.Context) error {
+	// Server-epoch guard: the shared transport client performs the
+	// capabilities handshake exactly once, at construction, and is never
+	// reconnected — so a server recreated MID-RUN (disposable-VM redeploy)
+	// would go unnoticed until the daemon restarts. Re-handshaking here makes
+	// each reconciliation pass a detection point: an epoch change voids the
+	// local synced state (CheckServerEpoch → ResetForRepush) and the sweep
+	// below immediately re-enqueues the full document set as creates. A
+	// handshake failure is not fatal to the pass — the snapshot fetch below
+	// fails the same way if the server is truly unreachable.
+	if caps, err := a.client.Capabilities(ctx, ""); err == nil {
+		if _, err := CheckServerEpoch(ctx, a.db, caps.ServerEpoch, a.log); err != nil {
+			a.log.Warn("anti-entropy: server epoch check failed").Err(err).Log(ctx)
+		}
+	}
+
 	manifest, err := a.client.Snapshot(ctx, a.workspace)
 	if err != nil {
 		return fmt.Errorf("failed to fetch snapshot for anti-entropy: %w", err)
@@ -486,7 +517,8 @@ func filesPerSec(n int64, elapsed time.Duration) float64 {
 }
 
 // RunAntiEntropyLoop starts a long-running goroutine that periodically runs
-// the anti-entropy pass. It blocks until the context is cancelled.
+// the anti-entropy pass. A Kick triggers an immediate pass ahead of the
+// interval ticker. It blocks until the context is cancelled.
 func (a *AntiEntropyPass) RunAntiEntropyLoop(ctx context.Context) error {
 	ticker := time.NewTicker(a.cfg.Interval)
 	defer ticker.Stop()
@@ -496,10 +528,11 @@ func (a *AntiEntropyPass) RunAntiEntropyLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := a.Run(ctx); err != nil {
-				a.log.Error("anti-entropy pass failed").Err(err).Log(ctx)
-				// Continue polling on error
-			}
+		case <-a.kick:
+		}
+		if err := a.Run(ctx); err != nil {
+			a.log.Error("anti-entropy pass failed").Err(err).Log(ctx)
+			// Continue polling on error
 		}
 	}
 }

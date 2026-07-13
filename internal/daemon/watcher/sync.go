@@ -71,10 +71,14 @@ type SyncHandler struct {
 	timersMu  sync.Mutex
 
 	// Transport state: a shared server client plus per-workspace pipeline
-	// cancel funcs, spawned lazily once workspaces are discovered.
+	// cancel funcs, spawned lazily once workspaces are discovered. aePasses
+	// keeps each workspace's anti-entropy reconciler addressable so the
+	// manual /api/sync/repush endpoint can kick an immediate pass (guarded by
+	// pipelinesMu, same lifecycle as pipelines).
 	client      *syncdb.Client
 	clientMu    sync.RWMutex
 	pipelines   map[string]context.CancelFunc
+	aePasses    map[string]*syncdb.AntiEntropyPass
 	pipelinesMu sync.Mutex
 	baseCtx     context.Context
 }
@@ -103,6 +107,7 @@ func NewSyncHandler(st *store.Store, cfg *config.Config, syncCfg *config.SyncCon
 		timers:       make(map[string]*time.Timer),
 		firstSeen:    make(map[string]time.Time),
 		pipelines:    make(map[string]context.CancelFunc),
+		aePasses:     make(map[string]*syncdb.AntiEntropyPass),
 	}
 }
 
@@ -536,6 +541,17 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 				if err != nil {
 					h.ulog.Debug("sync server not reachable yet").Err(err).StructuredOnly().Log(ctx)
 				} else {
+					// Epoch guard, BEFORE the client goes live: a recreated
+					// server (fresh, empty DB) advertises a new epoch in the
+					// handshake NewClientFromConfig just performed; comparing
+					// it against the persisted last-seen epoch voids the local
+					// synced state so the pipelines started below re-push the
+					// full document set instead of enqueueing UPDATEs the
+					// empty server rejects. (Mid-run recreates are caught by
+					// the same check re-run in each anti-entropy pass.)
+					if _, err := syncdb.CheckServerEpoch(ctx, h.db, client.ServerEpoch(), h.ulog); err != nil {
+						h.ulog.Warn("sync server epoch check failed").Err(err).Log(ctx)
+					}
 					h.clientMu.Lock()
 					h.client = client
 					h.clientMu.Unlock()
@@ -624,6 +640,9 @@ func (h *SyncHandler) ensurePipelines() {
 		// uses (sub is already resolved above), so walk coverage and reconcile
 		// coverage judge the doc space identically.
 		ae := syncdb.NewAntiEntropyPass(h.db, client, name, root, syncdb.NewDocSpace(sub), h.ulog, syncdb.AntiEntropyConfig{})
+		h.pipelinesMu.Lock()
+		h.aePasses[name] = ae
+		h.pipelinesMu.Unlock()
 		go h.runWithRecovery(pctx, name, "anti-entropy", func() error {
 			// One immediate pass (initial reconciliation), then the loop.
 			if err := ae.Run(pctx); err != nil {
@@ -643,6 +662,22 @@ func (h *SyncHandler) ensurePipelines() {
 			Field("workspace", name).
 			Field("pull", sub != nil && sub.Pull).
 			StructuredOnly().Log(pctx)
+	}
+}
+
+// KickAntiEntropy triggers an immediate anti-entropy pass for the named
+// workspace, or for every running workspace when workspace is empty. Wired
+// into the HTTP server (SetSyncKick) so POST /api/sync/repush can convert its
+// state reset into re-pushes without waiting for the hourly tick. A workspace
+// whose transport has not started yet is silently skipped — its initial pass
+// runs at pipeline start anyway.
+func (h *SyncHandler) KickAntiEntropy(workspace string) {
+	h.pipelinesMu.Lock()
+	defer h.pipelinesMu.Unlock()
+	for name, ae := range h.aePasses {
+		if workspace == "" || name == workspace {
+			ae.Kick()
+		}
 	}
 }
 

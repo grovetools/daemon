@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/grovetools/core/pkg/syncproto"
 )
@@ -440,5 +441,138 @@ func TestOutboxBaseVersionMigration(t *testing.T) {
 	}
 	if entries[1].BaseVersion != 7 {
 		t.Fatalf("base_version did not round-trip on migrated db, got %d", entries[1].BaseVersion)
+	}
+}
+
+// TestResetForRepush is the recreated-server recovery primitive: every
+// NON-diverged document's server-confirmed state is voided (last_synced_*
+// zeroed → the sweep re-enqueues it as a create) while its document_id is
+// KEPT (stable identities across the recreate), the workspace's obsolete
+// outbox entries are dropped, and the pull cursor resets — with diverged
+// documents (and their outbox entries, which may carry an unpushed merged
+// payload) left strictly untouched.
+func TestResetForRepush(t *testing.T) {
+	db := openTestDB(t)
+
+	seedDoc := func(id, ws, path string, diverged bool) {
+		t.Helper()
+		if err := db.InsertDocument(&Document{
+			DocumentID: id, Workspace: ws, Path: path,
+			ContentHash:    "hash-" + id,
+			LastSyncedHash: "synced-" + id, LastSyncedVersion: 7,
+			BaseContent: []byte("base"), Diverged: diverged,
+		}); err != nil {
+			t.Fatalf("InsertDocument %s: %v", id, err)
+		}
+	}
+	seedDoc("doc-1", "default", "inbox/a.md", false)
+	seedDoc("doc-2", "default", "inbox/b.md", false)
+	seedDoc("doc-3", "default", "inbox/c.md", true) // diverged: untouched
+	seedDoc("doc-4", "other", "inbox/d.md", false)  // other workspace: untouched
+
+	// Outbox: a parked update against the dead server (obsolete), plus the
+	// diverged doc's entry (must survive — its payload can carry an unpushed
+	// merge) and another workspace's entry (out of scope).
+	staleID, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: "doc-1", Workspace: "default",
+		EventType: syncproto.EventDocumentUpdated, Path: "inbox/a.md",
+	})
+	if err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+	if err := db.ParkOutbox(staleID, "rejected", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("ParkOutbox: %v", err)
+	}
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: "doc-3", Workspace: "default",
+		EventType: syncproto.EventDocumentUpdated, Path: "inbox/c.md",
+		Payload: "merged bytes",
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox (diverged): %v", err)
+	}
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: "doc-4", Workspace: "other",
+		EventType: syncproto.EventDocumentUpdated, Path: "inbox/d.md",
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox (other ws): %v", err)
+	}
+
+	if err := db.SetCursor("default", 42); err != nil {
+		t.Fatalf("SetCursor: %v", err)
+	}
+
+	n, err := db.ResetForRepush("default")
+	if err != nil {
+		t.Fatalf("ResetForRepush: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected 2 documents reset, got %d", n)
+	}
+
+	// Non-diverged docs: last_synced_* voided, document_id preserved.
+	for _, id := range []string{"doc-1", "doc-2"} {
+		doc, err := db.GetDocument(id)
+		if err != nil || doc == nil {
+			t.Fatalf("GetDocument %s: %v", id, err)
+		}
+		if doc.LastSyncedHash != "" || doc.LastSyncedVersion != 0 {
+			t.Fatalf("%s: synced state must be voided, got hash=%q v%d", id, doc.LastSyncedHash, doc.LastSyncedVersion)
+		}
+		if doc.ContentHash != "hash-"+id {
+			t.Fatalf("%s: content_hash must be untouched, got %q", id, doc.ContentHash)
+		}
+	}
+
+	// Diverged doc and the other workspace's doc: fully untouched.
+	for _, id := range []string{"doc-3", "doc-4"} {
+		doc, err := db.GetDocument(id)
+		if err != nil || doc == nil {
+			t.Fatalf("GetDocument %s: %v", id, err)
+		}
+		if doc.LastSyncedHash != "synced-"+id || doc.LastSyncedVersion != 7 {
+			t.Fatalf("%s must be untouched by the reset: hash=%q v%d", id, doc.LastSyncedHash, doc.LastSyncedVersion)
+		}
+	}
+
+	// Outbox: the workspace's non-diverged entry is gone; the diverged doc's
+	// entry and the other workspace's entry survive.
+	entries, err := db.ListOutbox("", 0)
+	if err != nil {
+		t.Fatalf("ListOutbox: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 surviving outbox entries, got %d", len(entries))
+	}
+	for _, e := range entries {
+		if e.DocumentID != "doc-3" && e.DocumentID != "doc-4" {
+			t.Fatalf("unexpected surviving outbox entry for %s", e.DocumentID)
+		}
+	}
+
+	// Cursor reset to 0.
+	st, err := db.GetState("default")
+	if err != nil || st == nil {
+		t.Fatalf("GetState: %v", err)
+	}
+	if st.Cursor != 0 {
+		t.Fatalf("cursor must reset to 0, got %d", st.Cursor)
+	}
+
+	// The all-workspaces variant sweeps the remaining workspace too. (The
+	// idempotent re-touch of default's already-reset rows is fine — the count
+	// is diagnostic, the state is what matters.)
+	_, workspaces, err := db.ResetForRepushAll()
+	if err != nil {
+		t.Fatalf("ResetForRepushAll: %v", err)
+	}
+	if len(workspaces) != 2 {
+		t.Fatalf("expected 2 workspaces, got %v", workspaces)
+	}
+	doc, err := db.GetDocument("doc-4")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocument doc-4: %v", err)
+	}
+	if doc.LastSyncedHash != "" || doc.LastSyncedVersion != 0 {
+		t.Fatalf("doc-4 must be reset by the all-workspaces variant: hash=%q v%d", doc.LastSyncedHash, doc.LastSyncedVersion)
 	}
 }

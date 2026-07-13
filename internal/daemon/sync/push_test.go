@@ -850,8 +850,15 @@ func serveOCCStoreStub(t *testing.T, docs map[string]*occDoc, record func(ev syn
 					}
 					continue
 				}
+				// Mirror applyUpsert's create branch: a pushed document id is
+				// KEPT (stable ids across a server recreate); only an id-less
+				// create mints one.
+				id := ev.DocumentID
+				if id == "" {
+					id = fmt.Sprintf("doc-%d", len(docs)+1)
+				}
 				doc := &occDoc{
-					id: fmt.Sprintf("doc-%d", len(docs)+1), version: 1,
+					id: id, version: 1,
 					hash: ev.ContentHash, content: append([]byte(nil), ev.Content...),
 				}
 				docs[ev.Path] = doc
@@ -1751,5 +1758,167 @@ func TestDrainOutboxDropsHashEqualNoOpCreate(t *testing.T) {
 	}
 	if remaining != 0 {
 		t.Fatalf("expected no-op create to be retired from outbox, found %d entries", remaining)
+	}
+}
+
+// TestDrainOutboxUnknownDocumentSelfHeals is the recreated-server per-entry
+// recovery: an UPDATE rejected as "unknown document" (the server holds
+// neither the id nor the path — the fresh-empty-DB signature) must not park
+// for an hour and then reject forever. Below the attempts cap the pipeline
+// voids the doc's server-confirmed state and drops the entry, so the next
+// anti-entropy sweep re-enqueues a document_created — which then succeeds,
+// preserving the stable document id.
+func TestDrainOutboxUnknownDocumentSelfHeals(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("---\ntitle: note\n---\nsurvives the recreate\n")
+	if err := os.WriteFile(filepath.Join(root, "inbox", "note.md"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A doc the client believes is synced (against the dead server) with a
+	// queued edit.
+	if err := db.InsertDocument(&Document{
+		DocumentID: "doc-stable", Workspace: "default", Path: "inbox/note.md",
+		ContentHash: sha(content), LastSyncedHash: "old-hash", LastSyncedVersion: 9,
+		BaseContent: []byte("old base"),
+	}); err != nil {
+		t.Fatalf("InsertDocument: %v", err)
+	}
+	if _, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: "doc-stable", Workspace: "default",
+		EventType: syncproto.EventDocumentUpdated,
+		Path:      "inbox/note.md", ContentHash: sha(content),
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+
+	// The recreated server: an empty OCC store rejects the update with the
+	// real handler's "unknown document" text and accepts the follow-up create.
+	serverDocs := map[string]*occDoc{}
+	srv := serveOCCStoreStub(t, serverDocs, nil)
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if n, err := pipeline.DrainOutbox(ctx, root); err != nil || n != 0 {
+		t.Fatalf("DrainOutbox: n=%d err=%v", n, err)
+	}
+
+	// Self-heal: entry dropped (not parked), synced state voided, id kept.
+	if remaining, _ := db.CountOutbox(); remaining != 0 {
+		t.Fatalf("self-healed entry must be dropped from the outbox, got %d", remaining)
+	}
+	doc, err := db.GetDocument("doc-stable")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocument: %v", err)
+	}
+	if doc.LastSyncedHash != "" || doc.LastSyncedVersion != 0 {
+		t.Fatalf("synced state must be voided for the create re-push: hash=%q v%d",
+			doc.LastSyncedHash, doc.LastSyncedVersion)
+	}
+
+	// The sweep now re-enqueues a create (LastSyncedHash empty), and the
+	// drain re-populates the empty server under the stable id.
+	ae := newTestAntiEntropy(db, client, root)
+	if err := ae.sweepLocalDocuments(ctx); err != nil {
+		t.Fatalf("sweepLocalDocuments: %v", err)
+	}
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected the sweep to re-enqueue 1 entry, got %d (err=%v)", len(entries), err)
+	}
+	if entries[0].EventType != syncproto.EventDocumentCreated {
+		t.Fatalf("re-enqueued entry must be a create, got %s", entries[0].EventType)
+	}
+	if n, err := pipeline.DrainOutbox(ctx, root); err != nil || n != 1 {
+		t.Fatalf("DrainOutbox (re-push): n=%d err=%v", n, err)
+	}
+	d, ok := serverDocs["inbox/note.md"]
+	if !ok || d.id != "doc-stable" || string(d.content) != string(content) {
+		t.Fatalf("re-pushed create must land under the stable id: %+v", d)
+	}
+}
+
+// TestDrainOutboxUnknownDocumentParksAtAttemptCap is the self-heal loop
+// guard: an entry that has already burned unknownDocSelfHealMaxAttempts park
+// attempts stops self-healing and parks as a plain reject, so a pathological
+// reject cycle cannot ping-pong between self-heal and sweep forever.
+func TestDrainOutboxUnknownDocumentParksAtAttemptCap(t *testing.T) {
+	db := openTestDB(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("capped content")
+	if err := os.WriteFile(filepath.Join(root, "inbox", "note.md"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertDocument(&Document{
+		DocumentID: "doc-capped", Workspace: "default", Path: "inbox/note.md",
+		ContentHash: sha(content), LastSyncedHash: "old-hash", LastSyncedVersion: 4,
+	}); err != nil {
+		t.Fatalf("InsertDocument: %v", err)
+	}
+	id, err := db.EnqueueOutbox(&OutboxEntry{
+		DocumentID: "doc-capped", Workspace: "default",
+		EventType: syncproto.EventDocumentUpdated,
+		Path:      "inbox/note.md", ContentHash: sha(content),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueOutbox: %v", err)
+	}
+	// Burn the self-heal budget: attempts reaches the cap via prior parks
+	// (retry times in the past so the entry stays drainable).
+	for i := 0; i < unknownDocSelfHealMaxAttempts; i++ {
+		if err := db.ParkOutbox(id, "rejected", time.Now().Add(-time.Minute)); err != nil {
+			t.Fatalf("ParkOutbox: %v", err)
+		}
+	}
+
+	srv := servePushStub(t, func(req *syncproto.PushRequest) *syncproto.PushResponse {
+		resp := &syncproto.PushResponse{Results: make([]syncproto.PushResult, len(req.Events))}
+		for i := range resp.Results {
+			resp.Results[i] = syncproto.PushResult{
+				Status: syncproto.PushStatusRejected,
+				Error:  "unknown document doc-capped at inbox/note.md",
+			}
+		}
+		return resp
+	})
+	defer srv.Close()
+
+	client := NewClient(ClientConfig{ServerURL: srv.URL, Token: "t", OriginID: db.OriginID()})
+	handshake(t, client)
+	pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if n, err := pipeline.DrainOutbox(ctx, root); err != nil || n != 0 {
+		t.Fatalf("DrainOutbox: n=%d err=%v", n, err)
+	}
+
+	entries, err := db.ListOutbox("default", 0)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("capped entry must stay in the outbox, got %d (err=%v)", len(entries), err)
+	}
+	e := entries[0]
+	if !e.Parked || e.ParkReason != "rejected" || e.Attempts != unknownDocSelfHealMaxAttempts+1 {
+		t.Fatalf("capped entry must park as rejected: parked=%v reason=%q attempts=%d",
+			e.Parked, e.ParkReason, e.Attempts)
+	}
+	// At the cap the doc's synced state is NOT voided (no silent repush).
+	doc, err := db.GetDocument("doc-capped")
+	if err != nil || doc == nil {
+		t.Fatalf("GetDocument: %v", err)
+	}
+	if doc.LastSyncedHash != "old-hash" || doc.LastSyncedVersion != 4 {
+		t.Fatalf("capped reject must not void synced state: hash=%q v%d", doc.LastSyncedHash, doc.LastSyncedVersion)
 	}
 }
