@@ -173,6 +173,193 @@ func TestRecursiveWatchFlushS1(t *testing.T) {
 	}
 }
 
+// satelliteConfig mirrors the config shape satellite-bootstrap.sh writes on a
+// prebuilt VM: one grove pointing at a (possibly empty) code dir, referencing
+// one centralized notebook definition. No notebooks.rules.
+func satelliteConfig(notebookRoot string) *config.Config {
+	return &config.Config{
+		Groves: map[string]config.GroveSourceConfig{
+			"grovetools": {Path: "/nonexistent/code/grovetools", Notebook: "grovetools"},
+		},
+		Notebooks: &config.NotebooksConfig{
+			Definitions: map[string]*config.Notebook{
+				"grovetools": {RootDir: notebookRoot},
+			},
+		},
+	}
+}
+
+// TestConfiguredPullRootsZeroDiscovery is the empty-~/code satellite case made
+// executable: pull = true subscriptions must resolve their workspace roots
+// from sync.toml + notebook definitions alone — no discovered WorkspaceNode,
+// no notebook tree on disk yet — so ensurePipelines can spawn pull pipelines
+// that materialize the replica from nothing.
+func TestConfiguredPullRootsZeroDiscovery(t *testing.T) {
+	notebookRoot := filepath.Join(t.TempDir(), "notebooks", "grovetools") // does NOT exist
+	syncCfg := &config.SyncConfig{Workspaces: []config.SyncWorkspace{
+		{Name: "grovetools", Pull: true},
+		{Name: "cloud", Pull: true},
+		{Name: "push-only"},                                             // pull=false: excluded
+		{Name: "searcher", Pull: true, Mode: config.SyncModeSearchOnly}, // no replica: excluded
+	}}
+
+	db, err := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatalf("open sync db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	h := NewSyncHandler(nil, satelliteConfig(notebookRoot), syncCfg, db, 50, 500)
+
+	// Zero discovered workspaces: the watch set stays empty (nothing on disk
+	// to watch), which must NOT starve the pull roots below.
+	if paths := h.ComputeWatchPaths(nil); len(paths) != 0 {
+		t.Fatalf("expected no watch paths for a nonexistent tree, got %v", paths)
+	}
+
+	roots := h.configuredPullRoots()
+	want := map[string]string{
+		"grovetools": filepath.Join(notebookRoot, "workspaces", "grovetools"),
+		"cloud":      filepath.Join(notebookRoot, "workspaces", "cloud"),
+	}
+	if len(roots) != len(want) {
+		t.Fatalf("configuredPullRoots = %v, want %v", roots, want)
+	}
+	for name, root := range want {
+		if roots[name] != root {
+			t.Errorf("configuredPullRoots[%q] = %q, want %q", name, roots[name], root)
+		}
+	}
+}
+
+// TestSyntheticNodeNotebookResolution pins the NotebookName preference order:
+// an on-disk workspace root under a definition wins over the grove-referenced
+// notebook; with nothing on disk the grove reference wins; with neither, the
+// node is left for the locator's default fallback chain.
+func TestSyntheticNodeNotebookResolution(t *testing.T) {
+	db, err := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatalf("open sync db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	existingRoot := t.TempDir()
+	cfg := &config.Config{
+		Groves: map[string]config.GroveSourceConfig{
+			"main": {Path: "/nonexistent/code", Notebook: "grove-nb"},
+		},
+		Notebooks: &config.NotebooksConfig{
+			Definitions: map[string]*config.Notebook{
+				"grove-nb": {RootDir: "/nonexistent/notebooks/grove-nb"},
+				"other-nb": {RootDir: existingRoot},
+			},
+		},
+	}
+	h := NewSyncHandler(nil, cfg, nil, db, 50, 500)
+
+	// Nothing on disk: the grove-referenced notebook wins.
+	if node := h.syntheticNodeFor("ws"); node.NotebookName != "grove-nb" {
+		t.Errorf("no dirs on disk: NotebookName = %q, want grove-nb", node.NotebookName)
+	}
+
+	// The workspace root exists under other-nb: existence wins over the grove
+	// reference.
+	if err := os.MkdirAll(filepath.Join(existingRoot, "workspaces", "ws"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if node := h.syntheticNodeFor("ws"); node.NotebookName != "other-nb" {
+		t.Errorf("existing dir: NotebookName = %q, want other-nb", node.NotebookName)
+	}
+
+	// No groves, no definitions: bare node, locator default fallback applies
+	// (builtin centralized default -> still an absolute, usable root).
+	h.cfg = &config.Config{}
+	node := h.syntheticNodeFor("ws")
+	if node.NotebookName != "" {
+		t.Errorf("bare config: NotebookName = %q, want empty", node.NotebookName)
+	}
+	if root := h.nodeWorkspaceRoot(node); root == "" || !filepath.IsAbs(root) {
+		t.Errorf("bare config: nodeWorkspaceRoot = %q, want absolute builtin-default root", root)
+	}
+}
+
+// TestComputeWatchPathsSyntheticPullCoverage: once a pull pipeline has
+// materialized the replica tree, ComputeWatchPaths must cover it via the
+// synthetic (config-derived) path even with zero discovered workspaces — so
+// satellite-side edits are captured and pushed. Also asserts the
+// discovery-driven path is unchanged: a discovered node covers its own
+// subscription (no duplicate/synthetic entries), and a pull=false
+// subscription gains no synthetic watches.
+func TestComputeWatchPathsSyntheticPullCoverage(t *testing.T) {
+	notebookRoot := t.TempDir()
+	wsRoot := filepath.Join(notebookRoot, "workspaces", "pulled")
+	for _, d := range []string{"inbox", "plans"} {
+		if err := os.MkdirAll(filepath.Join(wsRoot, d), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	// A second, push-only workspace tree that exists on disk but must NOT be
+	// picked up synthetically (discovery owns the push side).
+	pushRoot := filepath.Join(notebookRoot, "workspaces", "pushonly")
+	if err := os.MkdirAll(filepath.Join(pushRoot, "inbox"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	syncCfg := &config.SyncConfig{Workspaces: []config.SyncWorkspace{
+		{Name: "pulled", Pull: true},
+		{Name: "pushonly"},
+	}}
+
+	db, err := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatalf("open sync db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	h := NewSyncHandler(nil, satelliteConfig(notebookRoot), syncCfg, db, 50, 500)
+
+	// Zero discovered workspaces: only the pull subscription's tree is watched.
+	paths := h.ComputeWatchPaths(nil)
+	got := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		got[p] = true
+	}
+	for _, want := range []string{wsRoot, filepath.Join(wsRoot, "inbox"), filepath.Join(wsRoot, "plans")} {
+		if !got[want] {
+			t.Errorf("synthetic pull coverage: missing watch for %q (got %v)", want, paths)
+		}
+	}
+	for p := range got {
+		if strings.HasPrefix(p, pushRoot) {
+			t.Errorf("push-only workspace watched synthetically: %q", p)
+		}
+	}
+	w, rel := h.lookupWatch(filepath.Join(wsRoot, "inbox", "note.md"))
+	if w == nil || w.workspace != "pulled" || w.root != wsRoot || rel != "inbox/note.md" {
+		t.Errorf("synthetic watch lookup: got (%+v, %q)", w, rel)
+	}
+
+	// A discovered node for the same subscription covers it: the discovery
+	// path (not the synthetic one) produces the watches, and push-only
+	// workspaces are watched when discovered. NotebookName comes resolved on
+	// discovered nodes, so both workspaces resolve into the same notebook.
+	enriched := []*models.EnrichedWorkspace{
+		{WorkspaceNode: &workspace.WorkspaceNode{Name: "pulled", NotebookName: "grovetools"}},
+		{WorkspaceNode: &workspace.WorkspaceNode{Name: "pushonly", NotebookName: "grovetools"}},
+	}
+	paths = h.ComputeWatchPaths(enriched)
+	got = make(map[string]bool, len(paths))
+	for _, p := range paths {
+		got[p] = true
+	}
+	if !got[wsRoot] || !got[filepath.Join(wsRoot, "inbox")] {
+		t.Errorf("discovered pull workspace lost coverage: %v", paths)
+	}
+	if !got[pushRoot] || !got[filepath.Join(pushRoot, "inbox")] {
+		t.Errorf("discovery-driven push path regressed: %v", paths)
+	}
+}
+
 func TestSyncMatchesEvent(t *testing.T) {
 	h, wsRoot := newTestSyncHandler(t, 50, 500)
 

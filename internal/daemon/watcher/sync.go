@@ -20,6 +20,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -71,7 +72,9 @@ type SyncHandler struct {
 	timersMu  sync.Mutex
 
 	// Transport state: a shared server client plus per-workspace pipeline
-	// cancel funcs, spawned lazily once workspaces are discovered. aePasses
+	// cancel funcs, spawned lazily once a workspace root is known (from the
+	// discovery-driven watch set, or from config alone for pull = true
+	// subscriptions — see ensurePipelines). aePasses
 	// keeps each workspace's anti-entropy reconciler addressable so the
 	// manual /api/sync/repush endpoint can kick an immediate pass (guarded by
 	// pipelinesMu, same lifecycle as pipelines).
@@ -128,6 +131,93 @@ func (h *SyncHandler) subscription(name string) *config.SyncWorkspace {
 		}
 	}
 	return nil
+}
+
+// subscriptionsSnapshot returns a copy of the current subscription list, safe
+// to iterate without holding syncCfgMu.
+func (h *SyncHandler) subscriptionsSnapshot() []config.SyncWorkspace {
+	h.syncCfgMu.RLock()
+	defer h.syncCfgMu.RUnlock()
+	if h.syncCfg == nil {
+		return nil
+	}
+	return slices.Clone(h.syncCfg.Workspaces)
+}
+
+// syntheticNodeFor builds a WorkspaceNode for a subscribed workspace that code
+// discovery did not yield (pure notes satellite: sync.toml subscribes to
+// workspaces whose source trees don't exist under any grove path). A notebook
+// workspace's location is fully determined by config — [notebooks.definitions]
+// root_dir + path templates keyed only on the workspace NAME — so a node
+// carrying just Name + a resolved NotebookName is enough for the locator.
+//
+// NotebookName resolution, in preference order:
+//  1. a notebook definition whose resolved workspace root already exists on
+//     disk (an existing replica or bootstrap-precreated dirs is the strongest
+//     signal of which notebook the workspace belongs to);
+//  2. the notebook referenced by a configured grove (what discovery's
+//     assignNotebookName would have produced for a child of that grove),
+//     groves visited in sorted order for determinism;
+//  3. empty — the locator then falls back to notebooks.rules.default and the
+//     builtin default, exactly as it does for any node without a match.
+func (h *SyncHandler) syntheticNodeFor(name string) *workspace.WorkspaceNode {
+	cfg := h.cfg
+	if cfg != nil && cfg.Notebooks != nil && len(cfg.Notebooks.Definitions) > 0 {
+		for _, defName := range slices.Sorted(maps.Keys(cfg.Notebooks.Definitions)) {
+			node := &workspace.WorkspaceNode{Name: name, NotebookName: defName}
+			if root := h.nodeWorkspaceRoot(node); root != "" {
+				if fi, err := os.Stat(root); err == nil && fi.IsDir() {
+					return node
+				}
+			}
+		}
+	}
+	if cfg != nil && cfg.Notebooks != nil && cfg.Notebooks.Definitions != nil {
+		for _, groveName := range slices.Sorted(maps.Keys(cfg.Groves)) {
+			nb := cfg.Groves[groveName].Notebook
+			if nb == "" {
+				continue
+			}
+			if _, ok := cfg.Notebooks.Definitions[nb]; !ok {
+				continue
+			}
+			return &workspace.WorkspaceNode{Name: name, NotebookName: nb}
+		}
+	}
+	return &workspace.WorkspaceNode{Name: name}
+}
+
+// nodeWorkspaceRoot resolves a node's workspace root purely from config, with
+// no existence requirement (a pull pipeline must be able to materialize a
+// replica into a tree that doesn't exist yet). It mirrors the root derivation
+// computeWorkspaceWatches performs on stat-able trees: the "notes" content dir
+// (parent of the inbox path) run through workspaceRootForDir. Returns "" when
+// the locator fails or resolves a non-absolute path (a local-mode notebook on
+// a synthetic node has no project path to anchor to — nothing to sync into).
+func (h *SyncHandler) nodeWorkspaceRoot(node *workspace.WorkspaceNode) string {
+	notesDir, err := h.locator.GetNotesDir(node, "inbox")
+	if err != nil || !filepath.IsAbs(notesDir) {
+		return ""
+	}
+	return workspaceRootForDir(filepath.Dir(notesDir))
+}
+
+// configuredPullRoots derives workspace -> root for every pull = true
+// subscription directly from sync.toml + notebook definitions, independent of
+// code-workspace discovery. Pull targets are notebook workspaces whose paths
+// are fully config-determined; requiring a .git under a grove path to
+// materialize notes was accidental coupling (the empty-~/code satellite bug).
+func (h *SyncHandler) configuredPullRoots() map[string]string {
+	roots := make(map[string]string)
+	for _, sub := range h.subscriptionsSnapshot() {
+		if !sub.Pull || sub.Mode == config.SyncModeSearchOnly {
+			continue
+		}
+		if root := h.nodeWorkspaceRoot(h.syntheticNodeFor(sub.Name)); root != "" {
+			roots[sub.Name] = root
+		}
+	}
+	return roots
 }
 
 // workspaceRootForDir derives the workspace root a content dir belongs to.
@@ -214,6 +304,7 @@ func computeWorkspaceWatches(sub *config.SyncWorkspace, contentDirs []workspace.
 // (recursively) so the non-recursive fsnotify backend covers the whole tree.
 func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) []string {
 	newWatches := make(map[string]*syncWatch)
+	covered := make(map[string]bool) // subscription names covered by discovery
 
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
@@ -221,7 +312,11 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 			continue
 		}
 		sub := h.subscription(node.Name)
-		if sub == nil || sub.Mode == config.SyncModeSearchOnly {
+		if sub == nil {
+			continue
+		}
+		covered[node.Name] = true
+		if sub.Mode == config.SyncModeSearchOnly {
 			// search-only keeps no local replica — nothing to watch.
 			continue
 		}
@@ -234,6 +329,28 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 		// list; the recursive walk (before pathsMutex — a 15k-dir walk must not
 		// hold the lock) produces the actual watch set.
 		maps.Copy(newWatches, computeWorkspaceWatches(sub, dirs))
+	}
+
+	// Pull subscriptions not covered by code discovery (pure notes satellite:
+	// nothing under any grove path) are still config-locatable: resolve their
+	// content dirs through a synthetic node so the pulled replica's own tree is
+	// watched — VM-side edits get captured and pushed just like on a machine
+	// where discovery works. computeWorkspaceWatches only registers stat-able
+	// dirs, so this is a no-op until the pull pipeline materializes the tree
+	// (the periodic refresh picks it up afterwards).
+	for _, sub := range h.subscriptionsSnapshot() {
+		if covered[sub.Name] || !sub.Pull || sub.Mode == config.SyncModeSearchOnly {
+			continue
+		}
+		node := h.syntheticNodeFor(sub.Name)
+		if h.nodeWorkspaceRoot(node) == "" {
+			continue
+		}
+		dirs, err := h.locator.GetAllContentDirs(node)
+		if err != nil {
+			continue
+		}
+		maps.Copy(newWatches, computeWorkspaceWatches(&sub, dirs))
 	}
 
 	h.pathsMutex.Lock()
@@ -571,7 +688,10 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 }
 
 // ensurePipelines spawns push/pull/anti-entropy loops for any subscribed
-// workspace that has been discovered but has no running transport yet.
+// workspace that has no running transport yet. Workspace roots come from two
+// sources: the discovery-driven watch set (push-side real trees), and — for
+// pull = true subscriptions — direct config resolution, so a pull replica
+// spawns even when code-workspace discovery finds nothing.
 // Idempotent; called on each transport tick and after watch-path updates.
 func (h *SyncHandler) ensurePipelines() {
 	h.clientMu.RLock()
@@ -588,6 +708,18 @@ func (h *SyncHandler) ensurePipelines() {
 		roots[w.workspace] = w.root
 	}
 	h.pathsMutex.RUnlock()
+
+	// Pull subscriptions are config-determined, not discovery-determined:
+	// merge in roots derived from sync.toml + notebook definitions so pull
+	// pipelines spawn even when the watch set is empty (pure notes satellite
+	// with an empty ~/code, or a replica tree that doesn't exist yet — the
+	// pull pipeline creates it). A discovery-derived root wins when both
+	// exist; in a centralized notebook layout they resolve identically.
+	for name, root := range h.configuredPullRoots() {
+		if _, ok := roots[name]; !ok {
+			roots[name] = root
+		}
+	}
 
 	for name, root := range roots {
 		h.pipelinesMu.Lock()
