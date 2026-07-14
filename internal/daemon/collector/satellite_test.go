@@ -315,3 +315,57 @@ func TestReaperLeavesRemoteSessionsAlone(t *testing.T) {
 		}
 	}
 }
+
+// TestSatelliteCollectorPicksUpHotAddedSatellite proves the collector half of
+// the registry hot-reload: Run starts over an EMPTY registry (the always-on
+// global-daemon shape), ConnManager.Reload swaps the SHARED registry's
+// contents in place, and the collector's reconcile tick must spawn a
+// federation loop for the new name — rows land without a daemon restart.
+func TestSatelliteCollectorPicksUpHotAddedSatellite(t *testing.T) {
+	sock := shortTempSock(t)
+	f := newFakeRemote(t, sock)
+	defer f.stop()
+	f.setState([]*models.JobInfo{{ID: "A", Status: "running"}}, nil)
+
+	st := store.New()
+	seedConnected(st, "sat")
+
+	// Empty shared registry; the collector and the ConnManager both hold it.
+	reg := satellite.NewRegistry(nil)
+	cm := satellite.NewConnManager(reg, st)
+
+	c := NewSatelliteCollector(fakeDialer{sock: sock}, reg)
+	c.retryInterval = 40 * time.Millisecond
+	c.snapshotDebounce = 30 * time.Millisecond
+	c.reconcileInterval = 30 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	updates := make(chan store.Update, 32)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case u := <-updates:
+				st.ApplyUpdate(u)
+			}
+		}
+	}()
+	go c.Run(ctx, st, updates)
+
+	// Nothing federates while the registry is empty.
+	time.Sleep(120 * time.Millisecond)
+	if len(satJobIDs(st, "sat")) != 0 {
+		t.Fatal("collector federated rows before the satellite existed in the registry")
+	}
+
+	// Hot-add through the production mutation path (Reload swaps reg in place).
+	cm.Reload(satellite.NewRegistry(map[string]*satellite.SatelliteConfig{
+		"sat": {SSHAddr: "ignored", User: "u"},
+	}))
+
+	if !waitFor(3*time.Second, func() bool { return satJobIDs(st, "sat")["A"] }) {
+		t.Fatal("hot-added satellite never federated (reconcile loop missed the registry change)")
+	}
+}

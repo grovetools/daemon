@@ -126,3 +126,57 @@ func TestSatelliteSnapshotSynthesizesForNewlyAppearedTerminal(t *testing.T) {
 		t.Errorf("job X: got %v, want UpdateJobCancelled", types["X"])
 	}
 }
+
+// TestSatelliteRemovedTombstoneClearsOriginState pins the "removed" status
+// tombstone ConnManager.Reload emits when `grove satellite down` hot-removes
+// a registry entry: the status entry, the origin's federated job/session
+// rows, AND the seen-snapshot baseline marker are all dropped — so a later
+// re-`up` of the same name gets baseline semantics again and its historical
+// terminal jobs fire no synthesized terminal-event burst.
+func TestSatelliteRemovedTombstoneClearsOriginState(t *testing.T) {
+	s := New()
+	ch := s.Subscribe()
+	defer s.Unsubscribe(ch)
+
+	s.ApplyUpdate(Update{
+		Type:    UpdateSatelliteStatus,
+		Source:  "satellite",
+		Payload: &SatelliteStatusPayload{Name: "sat", State: "connected"},
+	})
+	s.ApplyUpdate(Update{
+		Type:   UpdateSatelliteSnapshot,
+		Source: "satellite",
+		Origin: "sat",
+		Payload: &SatelliteSnapshotPayload{
+			Origin:   "sat",
+			Jobs:     []*models.JobInfo{{ID: "A", Status: "running", Origin: "sat"}},
+			Sessions: []*models.Session{{ID: "S", Origin: "sat"}},
+		},
+	})
+	drainTerminalJobUpdates(ch)
+
+	s.ApplyUpdate(Update{
+		Type:    UpdateSatelliteStatus,
+		Source:  "satellite",
+		Payload: &SatelliteStatusPayload{Name: "sat", State: "removed"},
+	})
+
+	if _, ok := s.GetSatelliteStatuses()["sat"]; ok {
+		t.Fatal("removed tombstone left the satellite's status entry in place")
+	}
+	if n := len(s.GetJobs()); n != 0 {
+		t.Fatalf("removed tombstone left %d federated job rows", n)
+	}
+	if n := len(s.GetSessions()); n != 0 {
+		t.Fatalf("removed tombstone left %d federated session rows", n)
+	}
+
+	// Re-`up` of the same name: the first snapshot is a BASELINE again — a
+	// historical completed job must synthesize nothing.
+	applySatJobsSnapshot(s, "sat",
+		&models.JobInfo{ID: "OLD", Status: "completed", Origin: "sat"},
+	)
+	if got := drainTerminalJobUpdates(ch); len(got) != 0 {
+		t.Fatalf("post-removal re-baseline synthesized %d terminal updates, want 0: %+v", len(got), got)
+	}
+}

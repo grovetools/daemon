@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/grovetools/core/logging"
@@ -30,6 +31,13 @@ const (
 	// events into one re-snapshot. SSE is the change signal; the snapshot is the
 	// state transfer (C16).
 	satelliteSnapshotDebounce = 1500 * time.Millisecond
+
+	// satelliteReconcileInterval is how often Run re-reads the registry's name
+	// set and starts/stops per-satellite loops. The registry is shared mutable
+	// state with the ConnManager (its Reload swaps entries in place on `grove
+	// satellite up`/`down`), so this poll is what lets a hot-added satellite
+	// federate — and a hot-removed one stop — without a daemon restart.
+	satelliteReconcileInterval = 5 * time.Second
 )
 
 // SatelliteCollector federates remote jobs/sessions into the laptop Store
@@ -48,8 +56,9 @@ type SatelliteCollector struct {
 	ulog   *logging.UnifiedLogger
 
 	// Tunable timings — fields (not consts) so tests can shrink them.
-	retryInterval    time.Duration
-	snapshotDebounce time.Duration
+	retryInterval     time.Duration
+	snapshotDebounce  time.Duration
+	reconcileInterval time.Duration
 }
 
 // NewSatelliteCollector builds the collector over a socket dialer (the
@@ -57,45 +66,75 @@ type SatelliteCollector struct {
 // here — it arrives via Run, per the Collector interface (C10/E15).
 func NewSatelliteCollector(dialer SocketDialer, reg *satellite.Registry) *SatelliteCollector {
 	return &SatelliteCollector{
-		dialer:           dialer,
-		reg:              reg,
-		ulog:             logging.NewUnifiedLogger("groved.collector.satellite"),
-		retryInterval:    satelliteRetryInterval,
-		snapshotDebounce: satelliteSnapshotDebounce,
+		dialer:            dialer,
+		reg:               reg,
+		ulog:              logging.NewUnifiedLogger("groved.collector.satellite"),
+		retryInterval:     satelliteRetryInterval,
+		snapshotDebounce:  satelliteSnapshotDebounce,
+		reconcileInterval: satelliteReconcileInterval,
 	}
 }
 
 // Name returns the collector's name.
 func (c *SatelliteCollector) Name() string { return "satellite" }
 
-// Run starts one management goroutine per registry satellite and blocks until
-// ctx is cancelled (Collector contract).
+// Run reconciles one management goroutine per registry satellite and blocks
+// until ctx is cancelled (Collector contract). The registry is re-read every
+// reconcileInterval because ConnManager.Reload mutates it in place (satellite
+// hot-reload): a name that appears gets a fresh per-satellite loop, a name
+// that disappears has its loop cancelled. This is why the collector is
+// registered on the global daemon even when the boot registry is empty —
+// Engine.Start iterates collectors exactly once (F19), so a collector that
+// only existed once satellites did could never pick up the first `up`.
 func (c *SatelliteCollector) Run(ctx context.Context, st *store.Store, updates chan<- store.Update) error {
-	names := c.reg.Names()
-	c.ulog.Info("Satellite federation collector started").Field("satellites", len(names)).Log(ctx)
+	c.ulog.Info("Satellite federation collector started").
+		Field("satellites", len(c.reg.Names())).Log(ctx)
 
-	done := make(chan struct{})
-	var running int
-	for _, name := range names {
-		running++
-		go func(name string) {
-			defer func() { done <- struct{}{} }()
-			c.runSatellite(ctx, name, st, updates)
-		}(name)
-	}
+	var wg sync.WaitGroup
+	running := make(map[string]context.CancelFunc)
 
-	for running > 0 {
-		select {
-		case <-ctx.Done():
-			// Per-satellite loops observe ctx too and will exit; drain their
-			// completions so Run doesn't return before they unwind.
-			<-done
-			running--
-		case <-done:
-			running--
+	reconcile := func() {
+		want := make(map[string]struct{})
+		for _, name := range c.reg.Names() {
+			want[name] = struct{}{}
+		}
+		for name, cancel := range running {
+			if _, ok := want[name]; !ok {
+				// Removed from the registry: stop its loop. Row cleanup is not
+				// this loop's job — the ConnManager's "removed" tombstone has
+				// the Store drop the origin's federated rows.
+				cancel()
+				delete(running, name)
+			}
+		}
+		for name := range want {
+			if _, ok := running[name]; ok {
+				continue
+			}
+			sctx, cancel := context.WithCancel(ctx)
+			running[name] = cancel
+			wg.Add(1)
+			go func(name string) {
+				defer wg.Done()
+				c.runSatellite(sctx, name, st, updates)
+			}(name)
 		}
 	}
-	return nil
+
+	reconcile()
+	ticker := time.NewTicker(c.reconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			// Per-satellite loops observe ctx (their contexts are children of
+			// it); wait for them to unwind so Run doesn't return early.
+			wg.Wait()
+			return nil
+		case <-ticker.C:
+			reconcile()
+		}
+	}
 }
 
 // runSatellite owns one satellite's federation loop for the process lifetime.

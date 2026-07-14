@@ -92,6 +92,14 @@ type Server struct {
 	// POST /api/jobs (C3 — the satellite gains no new verb).
 	satelliteCM atomic.Pointer[satellite.ConnManager]
 
+	// satelliteReloadFn re-reads the satellite registry from disk and applies
+	// it to the ConnManager (POST /api/satellites/reload). Wired by groved.go
+	// alongside SetSatelliteConnManager on the global daemon only; nil means
+	// satellites are unavailable here (scoped daemon, or the boot registry
+	// load errored) and the handler 4xxes. atomic for the same early-bind
+	// reason as satelliteCM.
+	satelliteReloadFn atomic.Pointer[func() (*satellite.ReloadSummary, error)]
+
 	// satelliteLeases maps a forwarded job's ID to the LOCAL plan dir the
 	// laptop wrote a .grove-lease.yml into at dispatch (M2 C14). The lease is
 	// removed when the job's federated terminal event arrives (see
@@ -220,6 +228,16 @@ func (s *Server) SetJobRunner(jr *jobrunner.JobRunner) {
 // satellite dispatch unavailable and handleJobs returns 503 for such submits.
 func (s *Server) SetSatelliteConnManager(cm *satellite.ConnManager) {
 	s.satelliteCM.Store(cm)
+}
+
+// SetSatelliteReloader wires the registry hot-reload closure behind
+// POST /api/satellites/reload. groved.go passes a func that re-runs
+// LoadRegistry from disk and hands the result to ConnManager.Reload — the
+// server never touches the config loader itself. Global daemon only.
+func (s *Server) SetSatelliteReloader(fn func() (*satellite.ReloadSummary, error)) {
+	if fn != nil {
+		s.satelliteReloadFn.Store(&fn)
+	}
 }
 
 // SetLogStreamer sets the log streamer for the server.
@@ -458,6 +476,12 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	// C3's direction invariant holds. The mux.HandleFunc count increases here
 	// deliberately for this local read surface.
 	mux.HandleFunc("/api/satellites", s.handleSatellites)
+	// Satellite registry hot-reload (write surface, still laptop-side only —
+	// C3's direction invariant holds; nothing here dials INTO a satellite
+	// beyond what the ConnManager already owns). `grove satellite up`/`down`
+	// POST here as their final step so registry changes apply without an
+	// agent-killing daemon restart.
+	mux.HandleFunc("/api/satellites/reload", s.handleSatellitesReload)
 	// System endpoints
 	mux.HandleFunc("/api/system/info", s.handleSystemInfo)
 	mux.HandleFunc("/api/system/boot", s.handleSystemBoot)
@@ -806,6 +830,37 @@ func (s *Server) handleSatellites(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(statuses)
+}
+
+// handleSatellitesReload handles POST /api/satellites/reload: re-run the
+// registry load from disk (config ∪ state file) and diff-apply it to the
+// ConnManager, so `grove satellite up`/`down` take effect without a daemon
+// restart. The response is the ReloadSummary (added/removed/changed/unchanged
+// by name). 4xx on scoped daemons and when satellites are disabled (the boot
+// registry load errored, so no ConnManager exists to reload into); a
+// load-from-disk failure at reload time is a 500 — the live connections are
+// left untouched in that case.
+func (s *Server) handleSatellitesReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		http.Error(w, "satellite registry reload is global-daemon-only (scoped daemons have no ConnManager)", http.StatusBadRequest)
+		return
+	}
+	fnPtr := s.satelliteReloadFn.Load()
+	if fnPtr == nil {
+		http.Error(w, "satellites disabled on this daemon (registry failed to load at boot; fix the config and restart groved)", http.StatusConflict)
+		return
+	}
+	summary, err := (*fnPtr)()
+	if err != nil {
+		http.Error(w, "reload satellite registry: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(summary)
 }
 
 // handleSessionByID handles session-specific operations (path: /api/sessions/{id}/*).

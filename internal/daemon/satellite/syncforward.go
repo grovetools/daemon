@@ -52,9 +52,9 @@ func (cm *ConnManager) ensureSyncForward(ctx context.Context, cfg *SatelliteConf
 
 	cm.mu.Lock()
 	sc := cm.conns[cfg.Name]
-	if sc == nil || sc.forwardLn != nil {
+	if sc == nil || sc.cfg != cfg || sc.forwardLn != nil {
 		cm.mu.Unlock()
-		return
+		return // already bound, or a stale goroutine (removed/replaced by Reload)
 	}
 	cm.mu.Unlock()
 
@@ -69,9 +69,12 @@ func (cm *ConnManager) ensureSyncForward(ctx context.Context, cfg *SatelliteConf
 
 	cm.mu.Lock()
 	sc = cm.conns[cfg.Name]
-	if sc == nil {
-		sc = &satConn{cfg: cfg}
-		cm.conns[cfg.Name] = sc
+	if sc == nil || sc.cfg != cfg {
+		// Reload tore this satellite down between the bind and here; a
+		// replacement goroutine (if any) owns its own forward now.
+		cm.mu.Unlock()
+		ln.Close()
+		return
 	}
 	sc.forwardLn = ln
 	if sc.forwardConns == nil {
@@ -84,10 +87,13 @@ func (cm *ConnManager) ensureSyncForward(ctx context.Context, cfg *SatelliteConf
 		Field("satellite", cfg.Name).Field("addr", addr).
 		Field("remote", syncRemoteAddr(cfg)).Log(ctx)
 
-	// Teardown: ctx is the satellite goroutine's (== daemon's) lifetime.
+	// Teardown: ctx is the satellite goroutine's lifetime (the daemon's, or
+	// shorter when Reload cancels this one satellite — stopSatellite also
+	// closes the listener directly; closeSyncForward's cfg-identity guard
+	// keeps this watcher from ever touching a successor's fresh forward).
 	go func() {
 		<-ctx.Done()
-		cm.closeSyncForward(cfg.Name)
+		cm.closeSyncForward(cfg)
 	}()
 	go cm.acceptSyncForward(cfg, ln)
 }
@@ -128,26 +134,29 @@ func (cm *ConnManager) forwardSyncConn(cfg *SatelliteConfig, local net.Conn, cli
 		return
 	}
 
-	if !cm.trackForwardConn(cfg.Name, local, true) {
+	if !cm.trackForwardConn(cfg, local, true) {
 		// Forward torn down between Accept and here.
 		remote.Close()
 		local.Close()
 		return
 	}
-	defer cm.trackForwardConn(cfg.Name, local, false)
+	defer cm.trackForwardConn(cfg, local, false)
 
 	pipeBidirectional(local, remote)
 }
 
 // closeSyncForward closes a satellite's sync listener and every active
 // forwarded connection. Idempotent; called on ctx cancellation (daemon
-// shutdown / satellite goroutine teardown).
-func (cm *ConnManager) closeSyncForward(name string) {
+// shutdown / satellite goroutine teardown). The cfg-identity guard matters
+// on the Reload path: the old goroutine's ctx-done watcher fires AFTER
+// stopSatellite may have already installed a successor satConn under the
+// same name, and it must not tear down that successor's fresh forward.
+func (cm *ConnManager) closeSyncForward(cfg *SatelliteConfig) {
 	cm.mu.Lock()
-	sc := cm.conns[name]
+	sc := cm.conns[cfg.Name]
 	var ln net.Listener
 	var conns []net.Conn
-	if sc != nil {
+	if sc != nil && sc.cfg == cfg {
 		ln = sc.forwardLn
 		sc.forwardLn = nil
 		for c := range sc.forwardConns {
@@ -178,12 +187,14 @@ func (cm *ConnManager) currentClient(name string) *ssh.Client {
 
 // trackForwardConn adds/removes a live forwarded connection in the
 // satellite's set so closeSyncForward can tear them down. Returns false when
-// the forward is not (or no longer) active.
-func (cm *ConnManager) trackForwardConn(name string, c net.Conn, add bool) bool {
+// the forward is not (or no longer) active — including when a Reload replaced
+// the satConn under this name (cfg-identity mismatch), so a lingering old
+// forward never leaks a connection into the successor's set.
+func (cm *ConnManager) trackForwardConn(cfg *SatelliteConfig, c net.Conn, add bool) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	sc := cm.conns[name]
-	if sc == nil || sc.forwardConns == nil {
+	sc := cm.conns[cfg.Name]
+	if sc == nil || sc.cfg != cfg || sc.forwardConns == nil {
 		return false
 	}
 	if add {

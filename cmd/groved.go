@@ -376,16 +376,23 @@ func newGrovedStartCmd() *cobra.Command {
 			// path: scoped daemons gain satellite awareness only by talking to the
 			// global daemon. Registered HERE — before eng.Start below — because
 			// Engine.Start iterates the collector slice exactly once (F19), so a
-			// Register after Start is silently dead. The ConnManager is built now
-			// (the Store already exists) so the collector has its dialer; it is
-			// Started later in the watcher stage where cm.Start's goroutines
-			// belong. satCM stays nil (no collector, no ConnManager) on a
-			// satellite-less machine — empty [satellites] → empty registry.
+			// Register after Start is silently dead. That F19 constraint is also
+			// why ConnManager + collector are built even when the boot registry is
+			// EMPTY: the registry hot-reloads via POST /api/satellites/reload
+			// (`grove satellite up`/`down`), and a collector that only existed
+			// once satellites did could never pick up the first `up` without a
+			// daemon restart. Both are cheap and inert with zero entries — no
+			// goroutines beyond the collector's reconcile tick, no sockets. The
+			// ConnManager is built now (the Store already exists) so the
+			// collector has its dialer; it is Started later in the watcher stage
+			// where cm.Start's goroutines belong. satCM stays nil only on scoped
+			// daemons and when the registry fails to LOAD (config error —
+			// satellites disabled until fixed and the daemon restarted).
 			var satCM *satellite.ConnManager
 			if scope == "" {
 				if reg, rerr := satellite.LoadRegistry(cfg); rerr != nil {
 					ulog.Warn("Failed to load satellite registry, satellites disabled").Err(rerr).Log(ctx)
-				} else if len(reg.Names()) > 0 {
+				} else {
 					satCM = satellite.NewConnManager(reg, st)
 					eng.Register(collector.NewSatelliteCollector(satCM, reg))
 					ulog.Info("Satellite federation collector registered").
@@ -426,6 +433,25 @@ func newGrovedStartCmd() *cobra.Command {
 			// forwarded job's terminal federated event (C14).
 			srv.SetSatelliteConnManager(satCM)
 			if satCM != nil {
+				// Registry hot-reload behind POST /api/satellites/reload: re-read
+				// config ∪ state from disk and diff-apply onto the ConnManager.
+				// The closure owns the load so the server package stays ignorant
+				// of the config loader. The config is re-loaded from disk (not
+				// the captured boot cfg) so hand-edited [satellites.<name>]
+				// tables hot-reload too, alongside the CLI-owned satellites.json
+				// that `grove satellite up`/`down` actually write. A load error
+				// leaves the live connections untouched (the handler 500s).
+				srv.SetSatelliteReloader(func() (*satellite.ReloadSummary, error) {
+					freshCfg, cerr := config.LoadDefault()
+					if cerr != nil {
+						return nil, cerr
+					}
+					reg, rerr := satellite.LoadRegistry(freshCfg)
+					if rerr != nil {
+						return nil, rerr
+					}
+					return satCM.Reload(reg), nil
+				})
 				srv.StartSatelliteLeaseReleaser(ctx)
 				// ntfy-primary notification bridge (P10, M2 contract C18): fire
 				// on remote-job terminal events. ntfy is the reliable

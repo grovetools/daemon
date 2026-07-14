@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/grovetools/core/config"
 	grovelogging "github.com/grovetools/core/logging"
@@ -76,7 +77,16 @@ type SatelliteConfig struct {
 }
 
 // Registry holds the parsed satellite configs, keyed by name.
+//
+// It is SHARED MUTABLE state: groved.go constructs one Registry at boot and
+// hands the same pointer to both the ConnManager and the SatelliteCollector,
+// and ConnManager.Reload later swaps its contents in place (replace) so both
+// consumers observe registry changes without a daemon restart. The mutex
+// exists solely for that hot-reload path; entries themselves are treated as
+// immutable once inserted (Reload replaces pointers, never mutates a
+// *SatelliteConfig in place — live goroutines hold captured pointers).
 type Registry struct {
+	mu     sync.RWMutex
 	byName map[string]*SatelliteConfig
 }
 
@@ -229,15 +239,44 @@ func mergeSatelliteEntry(cfg, state SatelliteConfig) SatelliteConfig {
 
 // Get returns the config for a satellite by name.
 func (r *Registry) Get(name string) (*SatelliteConfig, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	sc, ok := r.byName[name]
 	return sc, ok
 }
 
 // Names returns the registry entry names.
 func (r *Registry) Names() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.byName))
 	for name := range r.byName {
 		names = append(names, name)
 	}
 	return names
+}
+
+// snapshot returns a shallow copy of the name→config map. The entry pointers
+// are shared — safe because entries are immutable once inserted (see the
+// Registry doc comment).
+func (r *Registry) snapshot() map[string]*SatelliteConfig {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]*SatelliteConfig, len(r.byName))
+	for name, sc := range r.byName {
+		out[name] = sc
+	}
+	return out
+}
+
+// replace swaps this registry's contents with src's, in place. This is the
+// hot-reload primitive: ConnManager.Reload applies a freshly-loaded registry
+// into the boot-time Registry object so every holder of the original pointer
+// (the collector, the ConnManager itself) sees the new entry set atomically.
+// src is a private, just-built Registry, so reading it unlocked is fine.
+func (r *Registry) replace(src *Registry) {
+	entries := src.snapshot()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byName = entries
 }

@@ -411,8 +411,31 @@ func (s *Store) ApplyUpdate(u Update) {
 	// the latest payload per registry name; the broadcast below then carries it
 	// to SSE subscribers via convertToAPIUpdate. Not persisted — connection
 	// health is live-only and re-emitted on the next dial after a restart.
+	//
+	// State "removed" is a tombstone from ConnManager.Reload (a `grove
+	// satellite down` hot-reload): instead of upserting, drop the status entry
+	// AND every federated job/session row for that origin — the satellite is
+	// gone from the registry, so no future snapshot would ever reconcile them
+	// away. The seen-snapshot baseline marker is cleared too, so a later
+	// re-`up` of the same name gets baseline semantics again (its historical
+	// terminal jobs must not fire a synthesized terminal-event burst).
 	case UpdateSatelliteStatus:
 		if payload, ok := u.Payload.(*SatelliteStatusPayload); ok {
+			if payload.State == "removed" {
+				delete(s.state.Satellites, payload.Name)
+				for k, job := range s.state.Jobs {
+					if job.Origin == payload.Name {
+						delete(s.state.Jobs, k)
+					}
+				}
+				for k, sess := range s.state.Sessions {
+					if sess.Origin == payload.Name {
+						delete(s.state.Sessions, k)
+					}
+				}
+				delete(s.satSeenSnapshot, payload.Name)
+				break
+			}
 			if s.state.Satellites == nil {
 				s.state.Satellites = make(map[string]*SatelliteStatusPayload)
 			}

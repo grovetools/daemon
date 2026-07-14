@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,6 +21,12 @@ const (
 	stateConnected    = "connected"
 	stateBackoff      = "backoff"
 	stateDisconnected = "disconnected"
+
+	// stateRemoved is emitted exactly once when Reload drops a satellite from
+	// the registry. The Store treats it as a tombstone: it deletes the status
+	// entry (and the origin's federated rows) instead of upserting, so `grove
+	// satellite status` stops listing the satellite without a daemon restart.
+	stateRemoved = "removed"
 )
 
 // errKeepaliveLost marks a connection dropped by a failed keepalive or a dead
@@ -33,6 +40,11 @@ type satConn struct {
 	state   string
 	lastErr string
 	since   time.Time
+
+	// cancel stops this satellite's runSatellite goroutine (a per-satellite
+	// child of the Start ctx). Reload uses it to tear down removed/changed
+	// entries without touching the rest.
+	cancel context.CancelFunc
 
 	// Sync-forward state (syncforward.go). forward is the human-readable
 	// status string surfaced through SatelliteStatusPayload.Forward; forwardLn
@@ -55,6 +67,18 @@ type ConnManager struct {
 
 	mu    sync.Mutex
 	conns map[string]*satConn
+
+	// runCtx is the ctx Start was called with; Reload derives per-satellite
+	// contexts from it when starting entries after boot. Nil until Start —
+	// a Reload before Start only swaps the registry (Start spawns from the
+	// registry, so nothing is lost). Guarded by mu.
+	runCtx context.Context
+
+	// reloadMu serializes Reload calls (two concurrent POSTs to the reload
+	// endpoint must not interleave their stop/start sequences). It is NOT mu:
+	// Reload takes mu briefly and repeatedly, and must never hold it across
+	// goroutine teardown.
+	reloadMu sync.Mutex
 
 	// Tunable timings — fields (not consts) so tests can shrink them.
 	dialTimeout       time.Duration
@@ -79,18 +103,160 @@ func NewConnManager(reg *Registry, st *store.Store) *ConnManager {
 }
 
 // Start launches one management goroutine per registry entry. Each runs until
-// ctx is cancelled. Safe to call once; an empty registry launches nothing.
+// ctx is cancelled or Reload drops its entry. Safe to call once; an empty
+// registry launches nothing (the manager stays cheap and inert until a Reload
+// adds entries).
 func (cm *ConnManager) Start(ctx context.Context) {
+	cm.mu.Lock()
+	cm.runCtx = ctx
+	cm.mu.Unlock()
 	for _, name := range cm.registry.Names() {
-		cfg, ok := cm.registry.Get(name)
-		if !ok {
-			continue
+		if cfg, ok := cm.registry.Get(name); ok {
+			cm.startSatellite(cfg)
 		}
-		cm.mu.Lock()
-		cm.conns[name] = &satConn{cfg: cfg, state: stateDisconnected, since: time.Now()}
-		cm.mu.Unlock()
-		go cm.runSatellite(ctx, cfg)
 	}
+}
+
+// startSatellite creates the satConn entry and spawns runSatellite under a
+// per-satellite child context, so Reload can stop this one satellite without
+// disturbing the rest. A start before Start (early-bind: the HTTP socket can
+// accept a reload POST before the watcher stage runs cm.Start) is a no-op —
+// the entry is already in the registry and Start will spawn it.
+func (cm *ConnManager) startSatellite(cfg *SatelliteConfig) {
+	cm.mu.Lock()
+	if cm.runCtx == nil {
+		cm.mu.Unlock()
+		return
+	}
+	sctx, cancel := context.WithCancel(cm.runCtx)
+	cm.conns[cfg.Name] = &satConn{cfg: cfg, state: stateDisconnected, since: time.Now(), cancel: cancel}
+	cm.mu.Unlock()
+	go cm.runSatellite(sctx, cfg)
+}
+
+// stopSatellite tears one satellite down: remove its satConn (so the stale
+// goroutine's setState/setClient calls become no-ops via the cfg-identity
+// guards), cancel its context, and close its client + sync-forward listener
+// so the keepalive and accept loops unwind promptly instead of waiting out a
+// backoff sleep. Idempotent; a never-started name is a clean no-op.
+func (cm *ConnManager) stopSatellite(name string) {
+	cm.mu.Lock()
+	sc := cm.conns[name]
+	delete(cm.conns, name)
+	cm.mu.Unlock()
+	if sc == nil {
+		return
+	}
+	if sc.cancel != nil {
+		sc.cancel()
+	}
+	if sc.client != nil {
+		// Close makes client.Wait return, which unblocks keepalive without
+		// waiting for the next ping tick.
+		sc.client.Close()
+	}
+	if sc.forwardLn != nil {
+		sc.forwardLn.Close()
+	}
+	for c := range sc.forwardConns {
+		c.Close()
+	}
+}
+
+// ReloadSummary reports what a Reload did, by satellite name. It is the JSON
+// body of POST /api/satellites/reload.
+type ReloadSummary struct {
+	Added     []string `json:"added"`
+	Removed   []string `json:"removed"`
+	Changed   []string `json:"changed"`
+	Unchanged []string `json:"unchanged"`
+}
+
+// Reload diffs the freshly-loaded registry against the live one and applies
+// the delta: removed or changed satellites have their goroutine, SSH client,
+// and sync-forward listener torn down (removed ones additionally emit a
+// stateRemoved tombstone so the Store drops their status and federated rows);
+// added or changed satellites get a fresh runSatellite. Unchanged entries —
+// every SatelliteConfig field equal — keep their live connection untouched.
+//
+// "Changed" is whole-struct inequality: every field (ssh_addr, host_key,
+// user, identity_file, socket_path, sync_local_port, sync_remote_addr)
+// shapes the connection, its auth, or its forward, and a reconnect through
+// runSatellite re-derives all of them — including the host-key pin, which
+// stays validate-before-dial (never TOFU, C2).
+//
+// The shared Registry is updated in place (replace) so the collector's
+// reconcile loop sees the same entry set. Safe under concurrent
+// DialSatelliteSocket/HasSatellite: the registry swap is atomic under its
+// own lock, and conns mutations go through cm.mu as everywhere else.
+func (cm *ConnManager) Reload(newReg *Registry) *ReloadSummary {
+	cm.reloadMu.Lock()
+	defer cm.reloadMu.Unlock()
+
+	oldEntries := cm.registry.snapshot()
+	newEntries := newReg.snapshot()
+
+	summary := &ReloadSummary{
+		Added:     []string{},
+		Removed:   []string{},
+		Changed:   []string{},
+		Unchanged: []string{},
+	}
+	for name, ncfg := range newEntries {
+		ocfg, ok := oldEntries[name]
+		switch {
+		case !ok:
+			summary.Added = append(summary.Added, name)
+		case *ocfg != *ncfg:
+			summary.Changed = append(summary.Changed, name)
+		default:
+			summary.Unchanged = append(summary.Unchanged, name)
+		}
+	}
+	for name := range oldEntries {
+		if _, ok := newEntries[name]; !ok {
+			summary.Removed = append(summary.Removed, name)
+		}
+	}
+	sort.Strings(summary.Added)
+	sort.Strings(summary.Removed)
+	sort.Strings(summary.Changed)
+	sort.Strings(summary.Unchanged)
+
+	// Stop BEFORE the registry swap so a concurrent DialSatelliteSocket never
+	// pairs a new registry entry with a stale satConn's client.
+	for _, name := range summary.Removed {
+		cm.stopSatellite(name)
+	}
+	for _, name := range summary.Changed {
+		cm.stopSatellite(name)
+	}
+
+	cm.registry.replace(newReg)
+
+	// Start from the registry's own pointers (not newEntries') so satConn.cfg
+	// identity matches what Get hands out from here on.
+	for _, name := range append(append([]string{}, summary.Added...), summary.Changed...) {
+		if cfg, ok := cm.registry.Get(name); ok {
+			cm.startSatellite(cfg)
+		}
+	}
+
+	// Tombstone the removed satellites' status (see stateRemoved). Emitted
+	// after teardown so the stale goroutine can no longer overwrite it.
+	for _, name := range summary.Removed {
+		if ocfg := oldEntries[name]; ocfg != nil {
+			cm.emitStatus(ocfg, stateRemoved, "", "", time.Now())
+		}
+	}
+
+	cm.ulog.Info("Satellite registry reloaded").
+		Field("added", len(summary.Added)).
+		Field("removed", len(summary.Removed)).
+		Field("changed", len(summary.Changed)).
+		Field("unchanged", len(summary.Unchanged)).
+		Log(context.Background())
+	return summary
 }
 
 // runSatellite owns one satellite's connection for the whole process lifetime:
@@ -133,7 +299,7 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 
 		// Connected: reset backoff and report health.
 		backoff = cm.backoffBase
-		cm.setClient(cfg.Name, client)
+		cm.setClient(cfg, client)
 		cm.setState(cfg, stateConnected, nil)
 		cm.ulog.Info("Satellite connected").
 			Field("satellite", cfg.Name).Field("addr", cfg.SSHAddr).Log(ctx)
@@ -145,7 +311,7 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 		// Block until the connection dies or ctx is cancelled.
 		cm.keepalive(ctx, client)
 
-		cm.setClient(cfg.Name, nil)
+		cm.setClient(cfg, nil)
 		client.Close()
 
 		if ctx.Err() != nil {
@@ -255,19 +421,24 @@ func (cm *ConnManager) DialSatelliteSocket(name string) (net.Conn, error) {
 }
 
 // setClient stores (or clears, on nil) the live ssh.Client for a satellite.
-func (cm *ConnManager) setClient(name string, client *ssh.Client) {
+// The cfg pointer-identity guard makes calls from a stale goroutine (one whose
+// entry Reload already stopped or replaced) silent no-ops — every satConn is
+// created by startSatellite with the exact cfg pointer its goroutine captured,
+// so a mismatch can only mean "this goroutine no longer owns the entry".
+func (cm *ConnManager) setClient(cfg *SatelliteConfig, client *ssh.Client) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	sc := cm.conns[name]
-	if sc == nil {
-		sc = &satConn{}
-		cm.conns[name] = sc
+	sc := cm.conns[cfg.Name]
+	if sc == nil || sc.cfg != cfg {
+		return // stale goroutine (removed/replaced by Reload)
 	}
 	sc.client = client
 }
 
 // setState records a satellite's connection state and emits a satellite_status
 // store update (C17) so the treemux badge and grove status see the transition.
+// Stale-goroutine calls neither mutate nor emit (see setClient) — a removed
+// satellite's tombstone must not be overwritten by its unwinding goroutine.
 func (cm *ConnManager) setState(cfg *SatelliteConfig, state string, err error) {
 	lastErr := ""
 	if err != nil {
@@ -277,9 +448,9 @@ func (cm *ConnManager) setState(cfg *SatelliteConfig, state string, err error) {
 
 	cm.mu.Lock()
 	sc := cm.conns[cfg.Name]
-	if sc == nil {
-		sc = &satConn{cfg: cfg}
-		cm.conns[cfg.Name] = sc
+	if sc == nil || sc.cfg != cfg {
+		cm.mu.Unlock()
+		return // stale goroutine (removed/replaced by Reload)
 	}
 	sc.state = state
 	sc.lastErr = lastErr
@@ -294,12 +465,13 @@ func (cm *ConnManager) setState(cfg *SatelliteConfig, state string, err error) {
 // re-emits satellite_status so /api/satellites and SSE subscribers see it
 // alongside the connection state. Since is left at the connection state's
 // entry time — the Forward field is orthogonal to the state machine.
+// Stale-goroutine calls neither mutate nor emit (see setClient).
 func (cm *ConnManager) setForward(cfg *SatelliteConfig, forward string) {
 	cm.mu.Lock()
 	sc := cm.conns[cfg.Name]
-	if sc == nil {
-		sc = &satConn{cfg: cfg, state: stateDisconnected, since: time.Now()}
-		cm.conns[cfg.Name] = sc
+	if sc == nil || sc.cfg != cfg {
+		cm.mu.Unlock()
+		return // stale goroutine (removed/replaced by Reload)
 	}
 	sc.forward = forward
 	state, lastErr, since := sc.state, sc.lastErr, sc.since
