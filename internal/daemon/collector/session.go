@@ -203,8 +203,16 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				if session.Origin != "" {
 					continue
 				}
-				// Only verify sessions we think are active.
-				if session.Status != "running" && session.Status != "idle" && session.Status != "pending_user" {
+				// Only verify sessions we think are active. "pending" is included
+				// so a session whose agent process died before completing its first
+				// turn (claude exited during startup) still gets reaped instead of
+				// lingering forever. This is safe: a flow-registered intent that has
+				// not spawned yet carries PID 0 AND has no crash-registry record, so
+				// the pid==0 branch below continues without judging it; a
+				// hook-registered session always has a registry record with a real
+				// PID, so a genuinely dead pending session reaps through the normal
+				// seenAlive/deadStrikes guards.
+				if session.Status != "running" && session.Status != "idle" && session.Status != "pending_user" && session.Status != "pending" {
 					continue
 				}
 				activeIDs[session.ID] = struct{}{}

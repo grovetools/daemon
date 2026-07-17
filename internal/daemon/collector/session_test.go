@@ -311,6 +311,88 @@ func TestSessionCollector_ReapsPIDZeroViaRegistry(t *testing.T) {
 	}
 }
 
+// TestSessionCollector_ReapsPendingViaRegistryScoped is the pending-strand
+// regression: a session stuck at Status "pending" (claude exited before
+// completing its first turn) must still be reaped, not linger forever. It
+// exercises the full path a hook-registered pending session takes — PID 0 in
+// the store, real PID (and owning scope) only in the crash-recovery registry —
+// so it also covers the scope gate on registry recovery. Before pending was
+// added to the status gate the collector skipped it every tick.
+func TestSessionCollector_ReapsPendingViaRegistryScoped(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir()) // isolate the global registry
+
+	const ownScope = "/sandbox/worktree-a"
+
+	// A real child gives a genuinely-alive PID we later kill, mirroring a hook-
+	// registered agent that stalled at "pending" and then exited. It must be
+	// alive when the collector starts so startup crash-recovery does not
+	// unregister the record before the liveness loop can recover its PID.
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start child process: %v", err)
+	}
+	pid := cmd.Process.Pid
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	reg, err := sessions.NewFileSystemRegistry()
+	if err != nil {
+		t.Fatalf("NewFileSystemRegistry: %v", err)
+	}
+	sessionID := "pending-strand-scoped"
+	// A hook-registered pending session always has a registry record with a real
+	// PID and its owning scope stamped (the fix in hooks/context.go).
+	if err := reg.Register(sessions.SessionMetadata{
+		SessionID:       sessionID,
+		JobID:           sessionID,
+		ClaudeSessionID: sessionID + "-native",
+		PID:             pid,
+		Scope:           ownScope,
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	st := store.New()
+	oldTime := time.Now().Add(-5 * time.Minute) // past the grace period
+	st.ApplyUpdate(store.Update{
+		Type:   store.UpdateSessions,
+		Source: "test",
+		Payload: []*models.Session{
+			// PID 0 + Status "pending" — the shape a pending strand presents. The
+			// real PID is only discoverable via the registry, gated on scope.
+			{ID: sessionID, PID: 0, Status: "pending", StartedAt: oldTime, LastActivity: oldTime},
+		},
+	})
+
+	c := NewSessionCollector(50*time.Millisecond, ownScope) // collector for OUR scope
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	updates := make(chan store.Update, 100)
+	go func() { _ = c.Run(ctx, st, updates) }()
+
+	// Let the collector recover the scoped PID and observe it alive, then kill it
+	// so subsequent polls read it dead and reap the pending strand.
+	time.Sleep(300 * time.Millisecond)
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case u := <-updates:
+			if u.Type == store.UpdateSessionEnd {
+				if p, ok := u.Payload.(*store.SessionEndPayload); ok && p.JobID == sessionID {
+					return // pending strand reaped via registry-recovered scoped PID
+				}
+			}
+		case <-timeout:
+			t.Fatal("collector did not reap a dead pending session via its registry-recovered scoped PID")
+		}
+	}
+}
+
 // TestSessionCollector_SkipsPIDZeroWithoutRegistry verifies the guard is not
 // over-broad: a PID-0 session with NO registry entry is a genuinely unstarted
 // intent and must be left alone (no PID to judge), not reaped.
