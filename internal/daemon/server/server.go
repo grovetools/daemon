@@ -134,6 +134,13 @@ type Server struct {
 	// boot-goroutine deps above.
 	tuimuxClient atomic.Pointer[tuimux.ApiClient]
 
+	// tuimuxReEnsure re-spawns/reconnects the paired tuimux daemon when the
+	// current client goes stale (its daemon died out from under us). Wired once
+	// at boot from groved when the tuimux binary resolved; handleAgentSpawn
+	// calls it to self-heal a dead client instead of hard-failing. nil when
+	// tuimux is unavailable. Atomic to match the late-wired deps above.
+	tuimuxReEnsure atomic.Pointer[tuimuxReEnsureFn]
+
 	// Memory store + embedder are wired via SetMemoryStore so /api/memory/*
 	// handlers can serve the same instance the MemoryHandler watcher uses.
 	memStore    memory.DocumentStore
@@ -272,6 +279,20 @@ func (s *Server) SetScope(scope string) {
 // proxied to the same tuimux daemon socket (see ListenAndServe).
 func (s *Server) SetTuimuxClient(c *tuimux.ApiClient) {
 	s.tuimuxClient.Store(c)
+}
+
+// tuimuxReEnsureFn re-ensures the paired tuimux daemon and returns a fresh
+// client bound to its socket. Named so it can live in an atomic.Pointer.
+type tuimuxReEnsureFn func() (*tuimux.ApiClient, error)
+
+// SetTuimuxReEnsure wires the hook handleAgentSpawn uses to re-ensure the
+// paired tuimux daemon after its client goes stale. Passing nil clears it.
+func (s *Server) SetTuimuxReEnsure(fn tuimuxReEnsureFn) {
+	if fn == nil {
+		s.tuimuxReEnsure.Store(nil)
+		return
+	}
+	s.tuimuxReEnsure.Store(&fn)
 }
 
 // SetBootStatus publishes the daemon's current boot progress for
@@ -1997,63 +2018,94 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		ptyID, err := tc.CreatePty(
-			wrapper,
-			payload.WorkDir,
-			[]string{"GROVE_PTY=1", "GROVE_TERMINAL=1"},
-			40, 120,
-			map[string]string{
-				"job_id":     payload.JobID,
-				"plan_name":  payload.PlanName,
-				"type":       "agent",
-				"origin":     "agent:" + payload.JobID,
-				"label":      payload.JobTitle,
-				"created_by": "flow",
-			},
-		)
+		createPty := func(c *tuimux.ApiClient) (string, error) {
+			return c.CreatePty(
+				wrapper,
+				payload.WorkDir,
+				[]string{"GROVE_PTY=1", "GROVE_TERMINAL=1"},
+				40, 120,
+				map[string]string{
+					"job_id":     payload.JobID,
+					"plan_name":  payload.PlanName,
+					"type":       "agent",
+					"origin":     "agent:" + payload.JobID,
+					"label":      payload.JobTitle,
+					"created_by": "flow",
+				},
+			)
+		}
+
+		ptyID, err := createPty(tc)
 		if err != nil {
-			_ = os.Remove(wrapper)
-			s.ulog.Error("Failed to create agent PTY session").Err(err).Log(r.Context())
-			http.Error(w, "failed to create agent PTY: "+err.Error(), http.StatusInternalServerError)
+			// The tuimux client is stale — its paired daemon likely died out
+			// from under us (e.g. crashed after boot). Re-ensure the daemon
+			// once and retry the same wrapper before giving up. On any
+			// unrecoverable failure we degrade to the legacy groveterm relay
+			// fallback below rather than hard-failing every spawn for the life
+			// of this groved.
+			s.ulog.Warn("Failed to create agent PTY session; re-ensuring paired tuimux daemon").
+				Err(err).Log(r.Context())
+			if p := s.tuimuxReEnsure.Load(); p != nil {
+				newClient, rerr := (*p)()
+				if rerr != nil || newClient == nil {
+					s.ulog.Error("tuimux re-ensure failed during agent spawn").
+						Err(rerr).Log(r.Context())
+				} else {
+					s.tuimuxClient.Store(newClient)
+					ptyID, err = createPty(newClient)
+					if err != nil {
+						s.ulog.Error("Failed to create agent PTY session after tuimux re-ensure").
+							Err(err).Log(r.Context())
+					} else {
+						s.ulog.Info("Re-ensured paired tuimux daemon and recreated agent PTY").
+							Log(r.Context())
+					}
+				}
+			}
+			if err != nil {
+				_ = os.Remove(wrapper)
+				// Fall through to the legacy relay fallback below.
+			}
+		}
+
+		if err == nil {
+			// Update the session registry with the PTY ID so re-attachment works.
+			if st := s.engine.Store(); st != nil {
+				st.SetSessionPtyID(payload.JobID, ptyID)
+			}
+
+			// Persist PtyID to filesystem registry for restart resilience.
+			if reg, err := sessions.NewFileSystemRegistry(); err == nil {
+				session := s.engine.Store().GetSession(payload.JobID)
+				dirName := payload.JobID
+				if session != nil && session.ClaudeSessionID != "" {
+					dirName = session.ClaudeSessionID
+				}
+				_ = reg.UpdateFields(dirName, func(m *sessions.SessionMetadata) {
+					m.PtyID = ptyID
+				})
+			}
+
+			// Send attach event to groveterm via SSE.
+			attachPayload := &store.AttachAgentPayload{
+				JobID:     payload.JobID,
+				PlanName:  payload.PlanName,
+				JobTitle:  payload.JobTitle,
+				PtyID:     ptyID,
+				WorkDir:   payload.WorkDir,
+				Env:       payload.Env,
+				AutoSplit: payload.AutoSplit,
+			}
+			s.engine.Store().ApplyUpdate(store.Update{
+				Type:    store.UpdateAttachAgentPane,
+				Source:  "api",
+				Payload: attachPayload,
+			})
+
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "attached", "pty_id": ptyID})
 			return
 		}
-
-		// Update the session registry with the PTY ID so re-attachment works.
-		if st := s.engine.Store(); st != nil {
-			st.SetSessionPtyID(payload.JobID, ptyID)
-		}
-
-		// Persist PtyID to filesystem registry for restart resilience.
-		if reg, err := sessions.NewFileSystemRegistry(); err == nil {
-			session := s.engine.Store().GetSession(payload.JobID)
-			dirName := payload.JobID
-			if session != nil && session.ClaudeSessionID != "" {
-				dirName = session.ClaudeSessionID
-			}
-			_ = reg.UpdateFields(dirName, func(m *sessions.SessionMetadata) {
-				m.PtyID = ptyID
-			})
-		}
-
-		// Send attach event to groveterm via SSE.
-		attachPayload := &store.AttachAgentPayload{
-			JobID:     payload.JobID,
-			PlanName:  payload.PlanName,
-			JobTitle:  payload.JobTitle,
-			PtyID:     ptyID,
-			WorkDir:   payload.WorkDir,
-			Env:       payload.Env,
-			AutoSplit: payload.AutoSplit,
-		}
-		s.engine.Store().ApplyUpdate(store.Update{
-			Type:    store.UpdateAttachAgentPane,
-			Source:  "api",
-			Payload: attachPayload,
-		})
-
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "attached", "pty_id": ptyID})
-		return
 	}
 
 	// Fallback: relay spawn request to groveterm (legacy path).

@@ -567,6 +567,13 @@ func newGrovedStartCmd() *cobra.Command {
 							Err(tuimuxErr).Log(ctx)
 						tuimuxClient = nil
 					}
+					// Give the server a hook to re-ensure this scoped tuimux if its
+					// client goes stale (daemon died post-boot), so agent-pane spawns
+					// self-heal instead of hard-failing for the life of this groved.
+					// srv already exists (constructed above before this boot goroutine).
+					srv.SetTuimuxReEnsure(func() (*tuimux.ApiClient, error) {
+						return tuimux.EnsureDaemonWithBinary(tuimuxSock, tuimuxBin)
+					})
 				}
 				// Wire tuimux into the session collector so it can kill out-of-process
 				// PTYs when it detects a dead session PID (daemon-side reaper).
@@ -1386,6 +1393,37 @@ func newGrovedStopCmd() *cobra.Command {
 	}
 }
 
+// probeTuimux reports the liveness of a running daemon's paired tuimux daemon:
+// "ok" (socket answers), "dead" (socket present but not answering within the
+// probe timeout), "missing" (no socket), or "-" (scope can't be mapped to a
+// socket path). A scoped daemon without a .scope sidecar (ExactScope == "" but
+// Scope != "") can't be mapped — ScopedSocketPath("") would wrongly resolve to
+// the shared global socket — so it reports "-".
+func probeTuimux(e daemonEntry) string {
+	if e.Scope != "" && e.ExactScope == "" {
+		return "-"
+	}
+	sock := tuimux.ScopedSocketPath(e.ExactScope)
+	if _, err := os.Stat(sock); err != nil {
+		return "missing"
+	}
+	// Reuse the client's lightest health call (GET /api/ping) but bound it to a
+	// short timeout: a hung daemon must not stall `status`. The client's own
+	// 5s timeout backstops the leaked goroutine after we've already returned.
+	client := tuimux.NewApiClient(sock)
+	done := make(chan error, 1)
+	go func() { done <- client.Ping() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			return "dead"
+		}
+		return "ok"
+	case <-time.After(1 * time.Second):
+		return "dead"
+	}
+}
+
 func newGrovedStatusCmd() *cobra.Command {
 	var prune bool
 	cmd := &cobra.Command{
@@ -1414,10 +1452,10 @@ Exits 0 if at least one running daemon is found; exits 1 if none.`,
 			}
 
 			if len(running) > 0 {
-				fmt.Printf("%-8s  %-32s  %-10s  %s\n", "PID", "SCOPE", "AGE", "SOCKET")
+				fmt.Printf("%-8s  %-32s  %-10s  %-8s  %s\n", "PID", "SCOPE", "AGE", "TUIMUX", "SOCKET")
 				for _, e := range running {
-					fmt.Printf("%-8d  %-32s  %-10s  %s\n",
-						e.PID, displayScope(e.Scope), e.Age, filepath.Base(e.SockPath))
+					fmt.Printf("%-8d  %-32s  %-10s  %-8s  %s\n",
+						e.PID, displayScope(e.Scope), e.Age, probeTuimux(e), filepath.Base(e.SockPath))
 				}
 
 				// Connect-only: don't auto-start the global daemon just to
