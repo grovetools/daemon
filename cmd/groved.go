@@ -175,13 +175,20 @@ func newGrovedHealthCmd() *cobra.Command {
 
 			if chErr == nil {
 				aliveStr := "dead"
-				if chStatus.SignalIsAlive {
+				if !chStatus.SignalEnabled {
+					aliveStr = "disabled (signal not configured)"
+				} else if chStatus.SignalIsAlive {
 					aliveStr = "alive"
+				} else if chStatus.SignalStopped {
+					aliveStr = "stopped"
 				}
 				fmt.Printf("Inbound reader:     %s\n", aliveStr)
 				fmt.Printf("Restart count:      %d\n", chStatus.SignalRestartCount)
 				if chStatus.SignalLastRestart != nil {
 					fmt.Printf("Last restart:       %s\n", chStatus.SignalLastRestart.Format(time.RFC3339))
+				}
+				if chStatus.SignalEnabled && !chStatus.SignalIsAlive && chStatus.SignalLastError != "" {
+					fmt.Printf("Last error:         %s\n", trimStatusError(chStatus.SignalLastError))
 				}
 				fmt.Printf("Route table size:   %d\n", chStatus.ActiveRoutes)
 				fmt.Printf("Registered claws:   %d\n", chStatus.RefCount)
@@ -1423,12 +1430,22 @@ Exits 0 if at least one running daemon is found; exits 1 if none.`,
 					if chStatus, err := client.GetChannelStatus(ctx); err == nil {
 						fmt.Println()
 						fmt.Println("Signal pipeline:")
-						aliveStr := "dead"
-						if chStatus.SignalIsAlive {
-							aliveStr = "alive"
+						if !chStatus.SignalEnabled {
+							fmt.Println("  inbound reader: disabled (signal not configured)")
+						} else if chStatus.SignalIsAlive {
+							fmt.Printf("  inbound reader: alive  restarts: %d  claws: %d\n",
+								chStatus.SignalRestartCount, chStatus.RefCount)
+						} else {
+							state := "dead"
+							if chStatus.SignalStopped {
+								state = "stopped"
+							}
+							fmt.Printf("  inbound reader: %s  restarts: %d  claws: %d\n",
+								state, chStatus.SignalRestartCount, chStatus.RefCount)
+							if chStatus.SignalLastError != "" {
+								fmt.Printf("    last error: %s\n", trimStatusError(chStatus.SignalLastError))
+							}
 						}
-						fmt.Printf("  inbound reader: %s  restarts: %d  claws: %d\n",
-							aliveStr, chStatus.SignalRestartCount, chStatus.RefCount)
 					}
 				}
 			} else {

@@ -159,6 +159,17 @@ func displayScope(scope string) string {
 	return scope
 }
 
+// trimStatusError collapses a channel error to a single status line: newlines
+// become spaces and the result is truncated to keep `groved status` readable.
+func trimStatusError(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " "))
+	const maxLen = 160
+	if len(s) > maxLen {
+		return s[:maxLen-1] + "…"
+	}
+	return s
+}
+
 func newGrovedKillCmd() *cobra.Command {
 	var waitSec int
 	cmd := &cobra.Command{

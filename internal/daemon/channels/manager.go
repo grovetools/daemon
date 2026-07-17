@@ -94,6 +94,11 @@ type Manager struct {
 	recentInboundIdx int
 	recentInboundLen int
 	lastInboundAt    time.Time
+
+	// signalStartErr records why the signal channel failed to start (preflight
+	// failure), for Status() reporting when m.signalChannel stays nil. Guarded
+	// by m.mu; cleared once the channel starts successfully.
+	signalStartErr error
 }
 
 // NewManager creates a new ChannelManager. scope is the daemon's scope
@@ -652,15 +657,21 @@ func (m *Manager) Status() *models.ChannelStatusResponse {
 		SignalCLIRunning: m.isRunning,
 		ActiveRoutes:     len(m.routeTable),
 		RefCount:         len(m.activeSessions),
+		SignalEnabled:    m.signalCfg.Enabled,
 	}
 
 	if m.signalChannel != nil {
 		st := m.signalChannel.Status()
 		resp.SignalIsAlive = st.IsAlive
 		resp.SignalRestartCount = st.RestartCount
+		resp.SignalStopped = st.Stopped
+		resp.SignalLastError = st.LastError
 		if !st.LastRestartAt.IsZero() {
 			resp.SignalLastRestart = &st.LastRestartAt
 		}
+	} else if m.signalStartErr != nil {
+		// Channel never started (preflight failure); surface why.
+		resp.SignalLastError = m.signalStartErr.Error()
 	}
 
 	if !m.lastInboundAt.IsZero() {
@@ -896,12 +907,14 @@ func (m *Manager) startSignalChannel(ctx context.Context) {
 			Field("event", "channel.disabled").Log(ctx)
 		m.mu.Lock()
 		m.isRunning = false
+		m.signalStartErr = err
 		m.mu.Unlock()
 		return
 	}
 
 	m.mu.Lock()
 	m.signalChannel = ch
+	m.signalStartErr = nil
 	close(m.ready) // Signal that we're ready
 	m.mu.Unlock()
 
