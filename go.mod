@@ -76,3 +76,5 @@ require (
 	golang.org/x/time v0.11.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+require golang.org/x/crypto/x509roots/fallback v0.0.0-20260717224146-ff03dafdb03e
