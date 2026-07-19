@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"github.com/grovetools/core/cli"
+	"github.com/grovetools/core/version"
 	"github.com/spf13/cobra"
 )
 
@@ -16,6 +17,18 @@ func init() {
   • Workspace discovery and state tracking
   • Git status monitoring and session collection
   • Event hooks for custom automation`
+
+	// Support --version on the root command (same pattern as grove/flow/nb).
+	// Without it the flag parsed as unknown, so scripts probing a binary's
+	// version got a usage error from a flag every sibling accepts.
+	vInfo := version.GetInfo()
+	rootCmd.Version = vInfo.Version
+	cli.SetVersionTemplate(rootCmd, cli.VersionInfo{
+		Version:   vInfo.Version,
+		Commit:    vInfo.Commit,
+		BuildDate: vInfo.BuildDate,
+		BuildArch: vInfo.Platform,
+	})
 
 	// Add commands
 	rootCmd.AddCommand(newVersionCmd())
