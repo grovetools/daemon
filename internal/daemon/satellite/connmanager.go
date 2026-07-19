@@ -22,6 +22,12 @@ const (
 	stateBackoff      = "backoff"
 	stateDisconnected = "disconnected"
 
+	// stateExecOnly is the steady state of a KindExec satellite: an L0–L1
+	// endpoint (sshd + grove binary, no groved), so there is nothing to dial,
+	// keep alive, or forward. Emitted once by runSatellite with an empty
+	// LastError; the goroutine then idles until ctx cancel or Reload.
+	stateExecOnly = "exec-only"
+
 	// stateRemoved is emitted exactly once when Reload drops a satellite from
 	// the registry. The Store treats it as a tombstone: it deletes the status
 	// entry (and the origin's federated rows) instead of upserting, so `grove
@@ -179,11 +185,14 @@ type ReloadSummary struct {
 // added or changed satellites get a fresh runSatellite. Unchanged entries —
 // every SatelliteConfig field equal — keep their live connection untouched.
 //
-// "Changed" is whole-struct inequality: every field (ssh_addr, host_key,
-// user, identity_file, socket_path, sync_local_port, sync_remote_addr)
-// shapes the connection, its auth, or its forward, and a reconnect through
-// runSatellite re-derives all of them — including the host-key pin, which
-// stays validate-before-dial (never TOFU, C2).
+// "Changed" is whole-struct inequality: every field (kind, ssh_addr,
+// host_key, user, identity_file, socket_path, sync_local_port,
+// sync_remote_addr) shapes the connection, its auth, or its forward, and a
+// restart through runSatellite re-derives all of them — including the
+// host-key pin, which stays validate-before-dial (never TOFU, C2), and the
+// kind axis, so a satellite flipping between exec and full is torn down and
+// respawned into the right mode. (A literal "" ↔ "full" edit also counts as
+// changed — a harmless extra restart, since the two are semantically equal.)
 //
 // The shared Registry is updated in place (replace) so the collector's
 // reconcile loop sees the same entry set. Safe under concurrent
@@ -262,6 +271,16 @@ func (cm *ConnManager) Reload(newReg *Registry) *ReloadSummary {
 // runSatellite owns one satellite's connection for the whole process lifetime:
 // validate-pin → dial → keepalive → backoff-reconnect, forever while ctx lives.
 func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
+	// Exec-only satellites (KindExec) have no groved to dial: report the
+	// explicit exec-only state and idle. Checked before the host-key pin —
+	// the pin only guards dials this goroutine never makes. Reload tears the
+	// goroutine down via ctx if the kind flips back to full.
+	if cfg.IsExec() {
+		cm.setState(cfg, stateExecOnly, nil)
+		<-ctx.Done()
+		return
+	}
+
 	// Validate the pinned host key up front (C2). Empty/unparseable → permanent
 	// hard-fail: no dial, no retry, never TOFU. Only P10 writing a real host_key
 	// can fix it, so spinning a retry loop would be pure noise.
@@ -395,6 +414,11 @@ func (cm *ConnManager) DialSatelliteSocket(name string) (net.Conn, error) {
 	cfg, ok := cm.registry.Get(name)
 	if !ok {
 		return nil, fmt.Errorf("satellite %q not in registry", name)
+	}
+	if cfg.IsExec() {
+		// KindExec endpoints run no groved, so there is no socket to dial —
+		// fail with the reason instead of a generic "not connected".
+		return nil, fmt.Errorf("satellite %q is exec-only (no groved)", name)
 	}
 
 	cm.mu.Lock()

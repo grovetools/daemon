@@ -36,6 +36,15 @@ type SatelliteConfig struct {
 	// C6, stable across cattle recreations).
 	Name string `yaml:"-" toml:"-" json:"-"`
 
+	// Kind selects how much of the satellite stack the daemon engages:
+	// KindFull (or empty — the default) is the L0–L3 shape with a remote groved
+	// the ConnManager dials and keeps healthy; KindExec is L0–L1 only (sshd +
+	// grove binary, no groved, no sync), so the ConnManager never dials it and
+	// reports it as "exec-only". User-authored in config; `grove satellite up`
+	// also writes it into satellites.json state. Use IsExec/EffectiveKind
+	// rather than comparing the raw field — empty means KindFull.
+	Kind string `yaml:"kind" toml:"kind" json:"kind,omitempty"`
+
 	// SSHAddr is the satellite's SSH endpoint as host:port.
 	SSHAddr string `yaml:"ssh_addr" toml:"ssh_addr" json:"ssh_addr"`
 
@@ -74,6 +83,30 @@ type SatelliteConfig struct {
 	// by the grove CLI side). The mapstructure decode behind LoadRegistry
 	// ignores unknown keys, so the daemon tolerates it without a field here —
 	// TestLoadRegistryToleratesSyncSubtable pins that behavior.
+}
+
+// Satellite kinds (the SatelliteConfig.Kind axis).
+const (
+	// KindFull is the default full-stack satellite: remote groved dialed and
+	// health-checked by the ConnManager. An empty Kind means KindFull.
+	KindFull = "full"
+	// KindExec is an sshd-plus-grove-binary endpoint with no groved daemon:
+	// the ConnManager never dials it, never backs off, and never binds a sync
+	// forward — it only reports the entry as exec-only.
+	KindExec = "exec"
+)
+
+// EffectiveKind normalizes Kind: empty means KindFull.
+func (sc *SatelliteConfig) EffectiveKind() string {
+	if sc.Kind == "" {
+		return KindFull
+	}
+	return sc.Kind
+}
+
+// IsExec reports whether this entry is an exec-only (no groved) satellite.
+func (sc *SatelliteConfig) IsExec() bool {
+	return sc.Kind == KindExec
 }
 
 // Registry holds the parsed satellite configs, keyed by name.
@@ -135,7 +168,7 @@ func defaultSatelliteStatePath() string {
 //
 // Merge rule (mergeSatelliteEntry): churny provisioning fields (ssh_addr,
 // host_key, socket_path, sync_remote_addr) prefer a non-empty STATE value;
-// user-authored fields (user, identity_file, sync_local_port) prefer a
+// user-authored fields (user, identity_file, sync_local_port, kind) prefer a
 // non-empty CONFIG value. A satellite present in only one source still yields
 // a complete entry.
 //
@@ -230,6 +263,12 @@ func mergeSatelliteEntry(cfg, state SatelliteConfig) SatelliteConfig {
 	}
 	if out.IdentityFile == "" {
 		out.IdentityFile = state.IdentityFile
+	}
+	if out.Kind == "" {
+		// Kind is user-authored first, but `grove satellite up` also stamps it
+		// into satellites.json — the state snapshot is the fallback, exactly
+		// like user/identity_file. Empty in both sources = KindFull.
+		out.Kind = state.Kind
 	}
 	if out.SyncLocalPort == 0 {
 		out.SyncLocalPort = state.SyncLocalPort

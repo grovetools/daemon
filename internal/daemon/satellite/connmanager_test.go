@@ -513,6 +513,51 @@ func TestPinnedKeyTypeNegotiated(t *testing.T) {
 	waitState(t, st, "sat", stateConnected, 5*time.Second)
 }
 
+// TestExecKindSatellite: a kind=exec entry (L0–L1: sshd + grove binary, no
+// groved) must never be dialed — no SSH endpoint exists in this test, and no
+// backoff may appear. The ConnManager reports the explicit "exec-only" state
+// with an empty LastError, and DialSatelliteSocket fails with the exec-only
+// reason instead of a generic "not connected".
+func TestExecKindSatellite(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	reg := &Registry{byName: map[string]*SatelliteConfig{
+		"vm": {
+			Name:    "vm",
+			SSHAddr: "203.0.113.9:22", // never dialed: TEST-NET addr, no server
+			User:    "grovedev",
+			Kind:    KindExec,
+			// No HostKey on purpose: exec entries skip the pin validation the
+			// dial path requires, so its absence must not disable the entry.
+		},
+	}}
+
+	st := store.New()
+	cm := newTestConnManager(reg, st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cm.Start(ctx)
+
+	waitState(t, st, "vm", stateExecOnly, 2*time.Second)
+	s := st.GetSatelliteStatuses()["vm"]
+	if s.LastError != "" {
+		t.Fatalf("exec-only status must carry an empty LastError, got %q", s.LastError)
+	}
+
+	if !cm.HasSatellite("vm") {
+		t.Fatal("exec satellite must still be registered (dispatch checks HasSatellite)")
+	}
+	if _, err := cm.DialSatelliteSocket("vm"); err == nil || !strings.Contains(err.Error(), "exec-only (no groved)") {
+		t.Fatalf("DialSatelliteSocket on exec satellite: err = %v, want exec-only reason", err)
+	}
+
+	// The goroutine idles: no backoff/disconnected transition may follow.
+	time.Sleep(100 * time.Millisecond)
+	if s := st.GetSatelliteStatuses()["vm"]; s == nil || s.State != stateExecOnly {
+		t.Fatalf("exec satellite left the exec-only state: %+v", s)
+	}
+}
+
 // TestEmptyAgentDoesNotPoisonAuth (B6 regression): a reachable SSH agent with
 // zero identities (fresh macOS login) must contribute no auth method —
 // otherwise its empty publickey attempt exhausts the server's method

@@ -186,6 +186,44 @@ func TestLoadRegistryMergesStateFile(t *testing.T) {
 	}
 }
 
+// TestMergeSatelliteEntryKind pins kind's merge precedence: user-authored
+// config wins when set, the CLI-stamped state value is the fallback (the
+// user/identity_file pattern), and empty in both stays empty (= KindFull via
+// EffectiveKind, so the daemon-side default never overrides a state value).
+func TestMergeSatelliteEntryKind(t *testing.T) {
+	cases := []struct {
+		name       string
+		cfg, state string
+		want       string
+	}{
+		{"config wins over state", KindFull, KindExec, KindFull},
+		{"state fills empty config", "", KindExec, KindExec},
+		{"config-only", KindExec, "", KindExec},
+		{"empty both stays empty", "", "", ""},
+	}
+	for _, tc := range cases {
+		got := mergeSatelliteEntry(
+			SatelliteConfig{Kind: tc.cfg},
+			SatelliteConfig{Kind: tc.state},
+		)
+		if got.Kind != tc.want {
+			t.Errorf("%s: Kind = %q, want %q", tc.name, got.Kind, tc.want)
+		}
+	}
+
+	// Normalization helpers: empty means full.
+	empty := &SatelliteConfig{}
+	if empty.EffectiveKind() != KindFull || empty.IsExec() {
+		t.Errorf("empty kind: EffectiveKind=%q IsExec=%v, want %q/false",
+			empty.EffectiveKind(), empty.IsExec(), KindFull)
+	}
+	exec := &SatelliteConfig{Kind: KindExec}
+	if exec.EffectiveKind() != KindExec || !exec.IsExec() {
+		t.Errorf("exec kind: EffectiveKind=%q IsExec=%v, want %q/true",
+			exec.EffectiveKind(), exec.IsExec(), KindExec)
+	}
+}
+
 // TestLoadRegistryStateOnly: with no [satellites] config section at all, the
 // state file alone still yields a complete registry (a nil config too).
 func TestLoadRegistryStateOnly(t *testing.T) {

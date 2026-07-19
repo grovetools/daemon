@@ -236,6 +236,65 @@ func TestReloadHostKeyChangeReconnects(t *testing.T) {
 	waitState(t, st, "sat", stateConnected, 5*time.Second)
 }
 
+// TestReloadKindFlip: flipping kind between full and exec is a config change
+// (whole-struct diff), so Reload must tear down and respawn the satellite into
+// the right mode both ways: connected → exec-only (SSH client dropped, dial
+// refused with the exec-only reason) and exec-only → connected (a real pinned
+// dial resumes).
+func TestReloadKindFlip(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	hostSigner, _ := genSigner(t)
+	_, clientPriv := genSigner(t)
+	idFile := writeIdentity(t, clientPriv)
+
+	remoteSock := shortTempSocket(t)
+	serveCannedUnixHTTP(t, remoteSock, "pong")
+	ts := newTestServer(t, hostSigner, remoteSock)
+
+	mkReg := func(kind string) *Registry {
+		return NewRegistry(map[string]*SatelliteConfig{
+			"sat": {
+				SSHAddr:      ts.addr(),
+				User:         "grovedev",
+				HostKey:      authorizedKeyLine(hostSigner),
+				IdentityFile: idFile,
+				SocketPath:   remoteSock,
+				Kind:         kind,
+			},
+		})
+	}
+
+	st := store.New()
+	cm := newTestConnManager(mkReg(""), st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cm.Start(ctx)
+	waitState(t, st, "sat", stateConnected, 5*time.Second)
+
+	// full → exec: reported changed, connection torn down, dial refused.
+	summary := cm.Reload(mkReg(KindExec))
+	assertSummary(t, summary, []string{}, []string{}, []string{"sat"}, []string{})
+	waitState(t, st, "sat", stateExecOnly, 5*time.Second)
+	cm.mu.Lock()
+	client := cm.conns["sat"].client
+	cm.mu.Unlock()
+	if client != nil {
+		t.Fatal("exec-only satellite still holds a live ssh.Client after the flip")
+	}
+	if _, err := cm.DialSatelliteSocket("sat"); err == nil || !strings.Contains(err.Error(), "exec-only (no groved)") {
+		t.Fatalf("DialSatelliteSocket after flip to exec: err = %v, want exec-only reason", err)
+	}
+
+	// exec → full: reported changed again, a fresh pinned dial reconnects.
+	summary = cm.Reload(mkReg(""))
+	assertSummary(t, summary, []string{}, []string{}, []string{"sat"}, []string{})
+	waitState(t, st, "sat", stateConnected, 5*time.Second)
+	if _, err := cm.DialSatelliteSocket("sat"); err != nil {
+		t.Fatalf("DialSatelliteSocket after flip back to full: %v", err)
+	}
+}
+
 // TestReloadUnchangedKeepsConnection: an identical registry (fresh pointers,
 // equal values — exactly what re-running LoadRegistry yields) must leave the
 // live connection completely untouched: same satConn, same ssh.Client, no
