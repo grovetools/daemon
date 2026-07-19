@@ -299,3 +299,73 @@ func TestLoadRegistryToleratesCorruptStateFile(t *testing.T) {
 		t.Fatalf("registry names = %v, want 1", reg.Names())
 	}
 }
+
+// TestLoadRegistryIgnoresSubtableOnlyTables pins the fix for the ghost rows
+// `grove satellite down` used to leave behind. The CLI keeps its own
+// [satellites.<name>.infra] / .provision / .sync subtables, whose keys the
+// mapstructure decode drops — so a table carrying ONLY those decodes to an
+// all-zero SatelliteConfig. Turning that into a registry entry made the
+// ConnManager dial a satellite that no longer exists, hard-fail on the absent
+// pinned host_key, and freeze a "disconnected" status row forever.
+func TestLoadRegistryIgnoresSubtableOnlyTables(t *testing.T) {
+	isolateStateHome(t)
+	cfg := &config.Config{
+		Extensions: map[string]interface{}{
+			"satellites": map[string]interface{}{
+				// Residue of a destroyed satellite: CLI subtables only.
+				"tartdemo": map[string]interface{}{
+					"infra": map[string]interface{}{"target": "tart"},
+					"sync":  map[string]interface{}{"workspaces": []interface{}{"cloud"}},
+				},
+				// A real, hand-declared satellite alongside it.
+				"real": map[string]interface{}{
+					"ssh_addr": "203.0.113.5:22",
+					"host_key": "ssh-ed25519 AAAA",
+					"infra":    map[string]interface{}{"target": "gcp"},
+				},
+			},
+		},
+	}
+
+	reg, err := LoadRegistry(cfg)
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	if sc, ok := reg.Get("tartdemo"); ok {
+		t.Errorf("subtable-only table conjured a registry entry: %+v", sc)
+	}
+	if _, ok := reg.Get("real"); !ok {
+		t.Error("a table declaring transport fields must still yield an entry")
+	}
+}
+
+// TestLoadRegistrySubtableOnlyTableStillMergesState: the guard is config-half
+// only. A satellite whose config table carries just an [.infra] subtable but
+// which IS present in the CLI state file stays a real entry — that is the
+// normal provisioned shape, and the infra block only becomes residue once
+// `down` has removed the state half.
+func TestLoadRegistrySubtableOnlyTableStillMergesState(t *testing.T) {
+	statePath := isolateStateHome(t)
+	writeStateFile(t, statePath, `{"satellites":{"tartdemo":{"ssh_addr":"192.168.64.2:22","user":"admin","host_key":"ssh-ed25519 AAAA","kind":"exec"}}}`)
+	cfg := &config.Config{
+		Extensions: map[string]interface{}{
+			"satellites": map[string]interface{}{
+				"tartdemo": map[string]interface{}{
+					"infra": map[string]interface{}{"target": "tart"},
+				},
+			},
+		},
+	}
+
+	reg, err := LoadRegistry(cfg)
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	sc, ok := reg.Get("tartdemo")
+	if !ok {
+		t.Fatal("provisioned satellite dropped by the subtable-only guard")
+	}
+	if sc.SSHAddr != "192.168.64.2:22" || !sc.IsExec() {
+		t.Errorf("state half not merged through: %+v", sc)
+	}
+}

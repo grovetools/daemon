@@ -193,6 +193,9 @@ func loadRegistryFromSources(cfg *config.Config, statePath string) (*Registry, e
 
 	reg := &Registry{byName: make(map[string]*SatelliteConfig, len(fromConfig)+len(fromState))}
 	for name, sc := range fromConfig {
+		if !declaresSatellite(sc) {
+			continue
+		}
 		entry := sc
 		entry.Name = name
 		reg.byName[name] = &entry
@@ -209,6 +212,19 @@ func loadRegistryFromSources(cfg *config.Config, statePath string) (*Registry, e
 		reg.byName[name] = &entry
 	}
 	return reg, nil
+}
+
+// declaresSatellite reports whether a config-half [satellites.<name>] table
+// actually declares a satellite. The grove CLI owns several subtables under
+// the same name ([satellites.<name>.infra], .provision, .sync) whose keys the
+// mapstructure decode drops as unknown, so a table carrying ONLY those decodes
+// to an all-zero SatelliteConfig. Such a table must not conjure a registry
+// entry: the ConnManager would dial it, hard-fail on the missing pinned
+// host_key, and leave a permanent "disconnected" status row for a satellite
+// that no longer exists (the residue `grove satellite down` leaves behind).
+// The state half is unaffected — it is merged in below regardless.
+func declaresSatellite(sc SatelliteConfig) bool {
+	return sc != SatelliteConfig{}
 }
 
 // readSatelliteState reads the CLI-owned satellites.json. Absent file (or no
