@@ -177,6 +177,19 @@ func (s *Store) GetPlans(planDir string) []*orchestration.Plan {
 	return s.state.Plans[planDir]
 }
 
+// GetPlanIndexSnapshot returns a detached portfolio snapshot suitable for an
+// HTTP reconciliation response.
+func (s *Store) GetPlanIndexSnapshot() *models.PlanIndexSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.state.PlanIndex == nil {
+		return &models.PlanIndexSnapshot{Plans: []models.PlanSummary{}}
+	}
+	out := *s.state.PlanIndex
+	out.Plans = append([]models.PlanSummary(nil), s.state.PlanIndex.Plans...)
+	return &out
+}
+
 // ApplyUpdate modifies the state and notifies subscribers.
 func (s *Store) ApplyUpdate(u Update) {
 	s.mu.Lock()
@@ -392,6 +405,40 @@ func (s *Store) ApplyUpdate(u Update) {
 		if plansMap, ok := u.Payload.(map[string][]*orchestration.Plan); ok {
 			for dir, plans := range plansMap {
 				s.state.Plans[dir] = plans
+			}
+		}
+
+	case UpdatePlanIndexSnapshot:
+		if incoming, ok := u.Payload.(*models.PlanIndexSnapshot); ok && incoming != nil {
+			previous := make(map[string]models.PlanSummary)
+			var revision uint64
+			if s.state.PlanIndex != nil {
+				revision = s.state.PlanIndex.Revision
+				for _, summary := range s.state.PlanIndex.Plans {
+					previous[summary.PlanDir] = summary
+				}
+			}
+			revision++
+			plans := append([]models.PlanSummary(nil), incoming.Plans...)
+			s.state.PlanIndex = &models.PlanIndexSnapshot{
+				Revision: revision, ScannedAt: incoming.ScannedAt, Plans: plans,
+			}
+			seen := make(map[string]struct{}, len(plans))
+			for _, summary := range plans {
+				seen[summary.PlanDir] = struct{}{}
+			}
+			removed := make([]string, 0)
+			for dir := range previous {
+				if _, exists := seen[dir]; !exists {
+					removed = append(removed, dir)
+				}
+			}
+			// Subscribers consume deltas, while the durable store retains the full
+			// snapshot. Every scan advances revision, making dropped frames visible.
+			u.Type = UpdatePlanIndexDelta
+			u.Payload = &models.PlanIndexDelta{
+				Revision: revision, ScannedAt: incoming.ScannedAt,
+				Upserts: plans, Removed: removed,
 			}
 		}
 

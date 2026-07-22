@@ -19,7 +19,8 @@ type State struct {
 	// plansDir. Populated by the flow watcher so TUI clients can fetch
 	// plan lists over the socket instead of hammering the filesystem
 	// every tick.
-	Plans map[string][]*orchestration.Plan `json:"plans,omitempty"`
+	Plans     map[string][]*orchestration.Plan `json:"plans,omitempty"`
+	PlanIndex *models.PlanIndexSnapshot        `json:"plan_index,omitempty"`
 
 	// WorkflowRuns aggregates subagent/workflow lifecycle events into
 	// per-run snapshots, keyed by workflow run ID (the wf_* directory
@@ -97,7 +98,9 @@ const (
 
 	// Plans update — full replacement of the cached plan list for one or
 	// more plansDir keys. Payload is map[string][]*orchestration.Plan.
-	UpdatePlans UpdateType = "plans"
+	UpdatePlans             UpdateType = "plans"
+	UpdatePlanIndexSnapshot UpdateType = "plan_index_snapshot"
+	UpdatePlanIndexDelta    UpdateType = "plan_index"
 
 	// Memory index mutation — broadcast after the memory watcher upserts or
 	// deletes a document. Payload is MemoryIndexPayload. The TUI uses this

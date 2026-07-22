@@ -380,6 +380,7 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/workspaces/", s.handleWorkspaceSubpath)
 	mux.HandleFunc("/api/workspaces", s.handleGetWorkspaces)
 	mux.HandleFunc("/api/plans", s.handleGetPlans)
+	mux.HandleFunc("/api/plan-index", s.handleGetPlanIndex)
 	// Session endpoints - order matters! Most specific routes first.
 	mux.HandleFunc("/api/sessions/intent", s.handleSessionIntent)
 	mux.HandleFunc("/api/sessions/confirm", s.handleSessionConfirm)
@@ -800,6 +801,19 @@ func (s *Server) handlePostTestReport(w http.ResponseWriter, r *http.Request, wo
 // handleGetPlans returns the cached list of fully-parsed plans for a
 // given plansDir as JSON. The browser TUI uses this to avoid scanning
 // every plan's yaml frontmatter on its own refresh tick.
+func (s *Server) handleGetPlanIndex(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.engine.Store().GetPlanIndexSnapshot())
+}
+
 func (s *Server) handleGetPlans(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1740,16 +1754,17 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	state := s.engine.Store().Get()
 	themePayload := theming.CurrentPayload()
 	boot := s.bootStatus.Load()
-	if len(state.Workspaces) > 0 || themePayload != nil || (boot != nil && !boot.Done) {
+	if len(state.Workspaces) > 0 || state.PlanIndex != nil || themePayload != nil || (boot != nil && !boot.Done) {
 		workspaces := make([]*models.EnrichedWorkspace, 0, len(state.Workspaces))
 		for _, ws := range state.Workspaces {
 			workspaces = append(workspaces, ws)
 		}
 		initialUpdate := &apiStateUpdate{
-			Workspaces: workspaces,
-			UpdateType: "initial",
-			Theme:      themePayload,
-			BootPhase:  boot,
+			Workspaces:        workspaces,
+			UpdateType:        "initial",
+			Theme:             themePayload,
+			BootPhase:         boot,
+			PlanIndexSnapshot: state.PlanIndex,
 		}
 		if data, err := json.Marshal(initialUpdate); err == nil {
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
@@ -2299,7 +2314,9 @@ type apiStateUpdate struct {
 	// BootPhase mirrors StateUpdate.BootPhase so "boot_phase" SSE events carry
 	// the typed status in its own field, not the generic Payload. Nil on every
 	// other update type (omitempty keeps it off the wire).
-	BootPhase *coredaemon.BootStatus `json:"boot_phase,omitempty"`
+	BootPhase         *coredaemon.BootStatus    `json:"boot_phase,omitempty"`
+	PlanIndex         *models.PlanIndexDelta    `json:"plan_index,omitempty"`
+	PlanIndexSnapshot *models.PlanIndexSnapshot `json:"plan_index_snapshot,omitempty"`
 }
 
 // convertToAPIUpdate converts internal store.Update to the public API format.
@@ -2340,6 +2357,10 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			UpdateType: "sessions",
 			Source:     u.Source,
 			Scanned:    u.Scanned,
+		}
+	case store.UpdatePlanIndexDelta:
+		if delta, ok := u.Payload.(*models.PlanIndexDelta); ok {
+			return &apiStateUpdate{UpdateType: "plan_index", Source: u.Source, Scanned: u.Scanned, PlanIndex: delta}
 		}
 	case store.UpdateFocus:
 		return &apiStateUpdate{

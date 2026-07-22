@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -12,7 +13,10 @@ import (
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
+	coreplan "github.com/grovetools/core/pkg/plan"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/pkg/worktreeregistry"
+	corestate "github.com/grovetools/core/state"
 	"github.com/grovetools/core/util/frontmatter"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/enrichment"
@@ -205,6 +209,20 @@ func (h *FlowHandler) OnStart(ctx context.Context) {
 	// before any filesystem event arrives. The PlanCollector still
 	// handles aggregated PlanStats; this populates the deep cache.
 	h.triggerRefresh()
+	// fsnotify is an acceleration path, not a completeness guarantee. Periodic
+	// reconciliation repairs missed/coalesced events and advances freshness.
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.triggerRefresh()
+			}
+		}
+	}()
 }
 
 // triggerRefresh debounces plan stats re-scan to avoid excessive work.
@@ -252,6 +270,15 @@ func (h *FlowHandler) triggerRefresh() {
 		// Walking every watched plansDir keeps this work out of TUI
 		// clients, and the debounce above limits how often we do it.
 		plansByDir := make(map[string][]*orchestration.Plan)
+		scanAt := time.Now()
+		var summaries []models.PlanSummary
+		registryEntries, _ := worktreeregistry.ListAll()
+		registryByPlan := make(map[string]*worktreeregistry.Entry)
+		for _, entry := range registryEntries {
+			if entry != nil && entry.Plan != "" && !entry.IsArchived() {
+				registryByPlan[entry.Plan] = entry
+			}
+		}
 		h.pathsMutex.RLock()
 		seen := make(map[string]struct{})
 		for _, wsNode := range h.watchedPaths {
@@ -269,6 +296,7 @@ func (h *FlowHandler) triggerRefresh() {
 				continue
 			}
 			plans := make([]*orchestration.Plan, 0, len(entries))
+			selectedPlan, _ := corestate.GetString(wsNode.Path, coreplan.StateKey)
 			for _, entry := range entries {
 				if !entry.IsDir() {
 					continue
@@ -276,6 +304,7 @@ func (h *FlowHandler) triggerRefresh() {
 				planPath := filepath.Join(plansDir, entry.Name())
 				if p, err := orchestration.LoadPlan(planPath); err == nil {
 					plans = append(plans, p)
+					summaries = append(summaries, summarizePlan(p, plansDir, wsNode.Path, selectedPlan, registryByPlan[p.Name], state.Sessions, scanAt))
 				}
 			}
 			plansByDir[plansDir] = plans
@@ -290,5 +319,54 @@ func (h *FlowHandler) triggerRefresh() {
 				Payload: plansByDir,
 			})
 		}
+		sort.Slice(summaries, func(i, j int) bool { return summaries[i].PlanDir < summaries[j].PlanDir })
+		h.store.ApplyUpdate(store.Update{
+			Type: store.UpdatePlanIndexSnapshot, Source: "flow_watcher", Scanned: len(summaries),
+			Payload: &models.PlanIndexSnapshot{ScannedAt: scanAt, Plans: summaries},
+		})
 	})
+}
+
+func summarizePlan(p *orchestration.Plan, plansDir, workspaceRoot, selectedPlan string, registry *worktreeregistry.Entry, sessions map[string]*models.Session, scannedAt time.Time) models.PlanSummary {
+	lifecycle := "live"
+	worktree := ""
+	var repos []string
+	if p.Config != nil {
+		worktree = p.Config.Worktree
+		repos = append(repos, p.Config.Repos...)
+		switch p.Config.Status {
+		case "hold", "review", "finished":
+			lifecycle = p.Config.Status
+		}
+	}
+	anchor := ""
+	if registry != nil {
+		if len(repos) == 0 {
+			repos = append(repos, registry.Repos...)
+		}
+		anchor = registry.AnchorOverride
+		if anchor == "" {
+			anchor = registry.Owner
+		}
+	}
+	counts := make(map[string]int)
+	for _, job := range p.Jobs {
+		counts[string(job.Status)]++
+	}
+	running := 0
+	for _, session := range sessions {
+		if session != nil && session.PlanName == p.Name && session.EndedAt == nil {
+			running++
+		}
+	}
+	updatedAt := scannedAt
+	if info, err := os.Stat(p.Directory); err == nil {
+		updatedAt = info.ModTime()
+	}
+	return models.PlanSummary{
+		PlanDir: p.Directory, PlanName: p.Name, WorkspaceRoot: workspaceRoot,
+		PlansDir: plansDir, Lifecycle: lifecycle, Selected: selectedPlan == p.Name,
+		Worktree: worktree, Anchor: anchor, Repositories: repos, JobCounts: counts,
+		RunningSessions: running, UpdatedAt: updatedAt, ScannedAt: scannedAt,
+	}
 }
