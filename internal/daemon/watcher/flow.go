@@ -273,12 +273,6 @@ func (h *FlowHandler) triggerRefresh() {
 		scanAt := time.Now()
 		var summaries []models.PlanSummary
 		registryEntries, _ := worktreeregistry.ListAll()
-		registryByPlan := make(map[string]*worktreeregistry.Entry)
-		for _, entry := range registryEntries {
-			if entry != nil && entry.Plan != "" && !entry.IsArchived() {
-				registryByPlan[entry.Plan] = entry
-			}
-		}
 		h.pathsMutex.RLock()
 		seen := make(map[string]struct{})
 		for _, wsNode := range h.watchedPaths {
@@ -299,7 +293,7 @@ func (h *FlowHandler) triggerRefresh() {
 				if !indexedPlan.archived {
 					plans = append(plans, p)
 				}
-				summary := summarizePlan(p, plansDir, wsNode.Path, selectedPlan, registryByPlan[p.Name], state.Sessions, scanAt)
+				summary := summarizePlan(p, plansDir, wsNode.Path, selectedPlan, state.Sessions, scanAt)
 				summary.Archived = indexedPlan.archived
 				if indexedPlan.archived {
 					summary.Lifecycle = "finished"
@@ -310,6 +304,7 @@ func (h *FlowHandler) triggerRefresh() {
 			plansByDir[plansDir] = plans
 		}
 		h.pathsMutex.RUnlock()
+		summaries = applyQualifiedPlanBindings(summaries, registryEntries)
 
 		if len(plansByDir) > 0 {
 			h.store.ApplyUpdate(store.Update{
@@ -357,7 +352,7 @@ func loadIndexedPlans(plansDir string) []indexedPlanEntry {
 	return indexed
 }
 
-func summarizePlan(p *orchestration.Plan, plansDir, workspaceRoot, selectedPlan string, registry *worktreeregistry.Entry, sessions map[string]*models.Session, scannedAt time.Time) models.PlanSummary {
+func summarizePlan(p *orchestration.Plan, plansDir, workspaceRoot, selectedPlan string, sessions map[string]*models.Session, scannedAt time.Time) models.PlanSummary {
 	lifecycle := "live"
 	worktree := ""
 	var repos []string
@@ -367,16 +362,6 @@ func summarizePlan(p *orchestration.Plan, plansDir, workspaceRoot, selectedPlan 
 		switch p.Config.Status {
 		case "hold", "review", "finished":
 			lifecycle = p.Config.Status
-		}
-	}
-	anchor := ""
-	if registry != nil {
-		if len(repos) == 0 {
-			repos = append(repos, registry.Repos...)
-		}
-		anchor = registry.AnchorOverride
-		if anchor == "" {
-			anchor = registry.Owner
 		}
 	}
 	counts := make(map[string]int)
@@ -396,7 +381,52 @@ func summarizePlan(p *orchestration.Plan, plansDir, workspaceRoot, selectedPlan 
 	return models.PlanSummary{
 		PlanDir: p.Directory, PlanName: p.Name, WorkspaceRoot: workspaceRoot,
 		PlansDir: plansDir, Lifecycle: lifecycle, Selected: selectedPlan == p.Name,
-		Worktree: worktree, Anchor: anchor, Repositories: repos, JobCounts: counts,
+		Worktree: worktree, Repositories: repos, JobCounts: counts,
 		RunningSessions: running, UpdatedAt: updatedAt, ScannedAt: scannedAt,
 	}
+}
+
+// applyQualifiedPlanBindings enriches summaries from the one canonical
+// registry-backed resolver. Bare plan names are deliberately never used as a
+// join key: duplicate slugs in different notebook workspaces must retain their
+// own container association.
+func applyQualifiedPlanBindings(summaries []models.PlanSummary, entries []*worktreeregistry.Entry) []models.PlanSummary {
+	requests := make([]coreplan.BindingRequest, 0, len(summaries))
+	for _, summary := range summaries {
+		requests = append(requests, coreplan.BindingRequest{
+			PlanDir:            summary.PlanDir,
+			WorkspaceRoot:      summary.WorkspaceRoot,
+			ConfiguredWorktree: summary.Worktree,
+			Archived:           summary.Archived,
+		})
+	}
+	return applyResolvedPlanBindings(summaries, entries, coreplan.ResolvePlanBindings(requests))
+}
+
+func applyResolvedPlanBindings(summaries []models.PlanSummary, entries []*worktreeregistry.Entry, bindings map[string]coreplan.PlanBinding) []models.PlanSummary {
+	entriesByPath := make(map[string]*worktreeregistry.Entry, len(entries))
+	for _, entry := range entries {
+		if entry != nil {
+			entriesByPath[filepath.Clean(entry.AbsPath)] = entry
+		}
+	}
+	for i := range summaries {
+		binding := bindings[coreplan.NewPlanKey(summaries[i].PlanDir).String()]
+		if !binding.Valid() {
+			continue
+		}
+		summaries[i].WorktreePath = binding.ContainerPath
+		entry := entriesByPath[filepath.Clean(binding.ContainerPath)]
+		if entry == nil {
+			continue
+		}
+		if len(summaries[i].Repositories) == 0 {
+			summaries[i].Repositories = append([]string(nil), entry.Repos...)
+		}
+		summaries[i].Anchor = entry.AnchorOverride
+		if summaries[i].Anchor == "" {
+			summaries[i].Anchor = entry.Owner
+		}
+	}
+	return summaries
 }

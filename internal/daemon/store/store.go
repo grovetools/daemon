@@ -9,6 +9,7 @@ import (
 	grovelogging "github.com/grovetools/core/logging"
 	coredaemon "github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/flow/pkg/orchestration"
 )
@@ -195,8 +196,8 @@ func (s *Store) ApplyUpdate(u Update) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Per-job terminal updates synthesized from a satellite snapshot diff (B1);
-	// broadcast after u itself, below.
+	// Follow-up updates derived atomically from this state transition (workspace
+	// lifecycle deltas and satellite terminal events); broadcast after u below.
 	var synthesized []Update
 
 	switch u.Type {
@@ -440,6 +441,17 @@ func (s *Store) ApplyUpdate(u Update) {
 				Revision: revision, ScannedAt: incoming.ScannedAt,
 				Upserts: plans, Removed: removed,
 			}
+
+			// The plan index carries the canonical qualified plan↔container binding.
+			// Project lifecycle onto only the discovered members of that exact
+			// container, never by a bare plan or worktree name. This makes
+			// hold/unhold visible to Nav on the same SSE turn while preserving
+			// same-named plans and worktrees in other workspaces.
+			if deltas := s.applyPlanLifecycleToWorkspaces(plans); len(deltas) > 0 {
+				synthesized = append(synthesized, Update{
+					Type: UpdateWorkspacesDelta, Source: u.Source, Scanned: len(deltas), Payload: deltas,
+				})
+			}
 		}
 
 	// Workflow/subagent lifecycle events (hooks + journal watcher).
@@ -565,10 +577,9 @@ func (s *Store) ApplyUpdate(u Update) {
 			// Non-blocking send to prevent slow clients from stalling the daemon
 		}
 	}
-	// Broadcast the snapshot-diff terminal updates (B1) after the snapshot
-	// itself so subscribers observe state-then-transition ordering. These go
-	// straight to broadcast — never back through the apply switch above — so
-	// job rows are not double-written.
+	// Broadcast derived updates after their source transition so subscribers
+	// observe state-then-delta ordering. These go straight to broadcast because
+	// their state mutations were already applied under this lock.
 	for _, su := range synthesized {
 		for ch := range s.subscribers {
 			select {
@@ -577,6 +588,58 @@ func (s *Store) ApplyUpdate(u Update) {
 			}
 		}
 	}
+}
+
+// applyPlanLifecycleToWorkspaces projects the plan index's canonical qualified
+// binding onto discovered member worktrees. It must be called with s.mu held.
+func (s *Store) applyPlanLifecycleToWorkspaces(plans []models.PlanSummary) []*models.WorkspaceDelta {
+	type association struct {
+		planName, planDir, status string
+	}
+	byWorktreeRoot := make(map[string]association, len(plans))
+	for _, summary := range plans {
+		root, err := pathutil.NormalizeForLookup(summary.WorktreePath)
+		if err != nil || summary.WorktreePath == "" {
+			continue
+		}
+		status := summary.Lifecycle
+		if status == "live" {
+			status = ""
+		}
+		byWorktreeRoot[root] = association{summary.PlanName, summary.PlanDir, status}
+	}
+
+	var deltas []*models.WorkspaceDelta
+	for path, ws := range s.state.Workspaces {
+		if ws == nil || ws.WorkspaceNode == nil || !ws.IsWorktree() {
+			continue
+		}
+		root, ok := workspace.WorktreeRootForPath(ws.Path)
+		if !ok {
+			continue
+		}
+		normalizedRoot, err := pathutil.NormalizeForLookup(root)
+		if err != nil {
+			continue
+		}
+		associated, ok := byWorktreeRoot[normalizedRoot]
+		if !ok {
+			continue
+		}
+		var stats models.PlanStats
+		if ws.PlanStats != nil {
+			stats = *ws.PlanStats
+		}
+		if stats.AssociatedPlan == associated.planName && stats.AssociatedPlanDir == associated.planDir && stats.PlanStatus == associated.status {
+			continue
+		}
+		stats.AssociatedPlan = associated.planName
+		stats.AssociatedPlanDir = associated.planDir
+		stats.PlanStatus = associated.status
+		ws.PlanStats = &stats
+		deltas = append(deltas, &models.WorkspaceDelta{Path: path, PlanStats: &stats})
+	}
+	return deltas
 }
 
 // terminalJobUpdateType maps a federated job's terminal status to the per-job
