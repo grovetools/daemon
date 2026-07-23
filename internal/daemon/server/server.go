@@ -1736,6 +1736,12 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
+	// A live state stream is a real daemon client even though it is not a
+	// terminal WebSocket. Keep auto-started scoped daemons alive for the full
+	// HTTP stream lifetime.
+	releaseLease := s.terminalHub.AcquireClientLease()
+	defer releaseLease()
+
 	// Subscribe to store updates
 	ch := s.engine.Store().Subscribe()
 	defer s.engine.Store().Unsubscribe(ch)
