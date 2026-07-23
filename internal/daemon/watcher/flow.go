@@ -77,7 +77,9 @@ func (h *FlowHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 			continue
 		}
 
-		addWatchRecursive(plansDir, node, newWatches)
+		// Centralized notebook workspaces can be reached through aliases. Register
+		// the resolved root because fsnotify reports target-path events on Darwin.
+		addWatchRecursive(resolveFlowWatchPath(plansDir), node, newWatches)
 	}
 
 	h.pathsMutex.Lock()
@@ -96,15 +98,27 @@ func (h *FlowHandler) MatchesEvent(event fsnotify.Event) bool {
 		return false
 	}
 
+	eventPath := resolveFlowWatchPath(event.Name)
 	h.pathsMutex.RLock()
 	defer h.pathsMutex.RUnlock()
 
 	for watchedPath := range h.watchedPaths {
-		if event.Name == watchedPath || strings.HasPrefix(event.Name, watchedPath+string(filepath.Separator)) {
+		if eventPath == watchedPath || strings.HasPrefix(eventPath, watchedPath+string(filepath.Separator)) {
 			return true
 		}
 	}
 	return false
+}
+
+// resolveFlowWatchPath returns the stable filesystem spelling fsnotify uses.
+func resolveFlowWatchPath(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	return filepath.Clean(path)
 }
 
 // HandleEvents triggers a debounced plan stats refresh when plan files change.

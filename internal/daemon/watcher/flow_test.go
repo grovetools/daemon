@@ -6,8 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/models"
 	coreplan "github.com/grovetools/core/pkg/plan"
+	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/pkg/worktreeregistry"
 	"github.com/grovetools/flow/pkg/orchestration"
 )
@@ -23,6 +26,50 @@ func writeIndexedPlan(t *testing.T, dir string) {
 	if err := os.WriteFile(filepath.Join(dir, "01-job.md"), []byte("---\nid: job\ntitle: job\ntype: oneshot\nstatus: pending\n---\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestFlowHandlerResolvesNotebookAliasForRuntimeEvents(t *testing.T) {
+	notebookRoot := t.TempDir()
+	realWorkspace := filepath.Join(notebookRoot, "workspaces", "fixture-repo")
+	plansDir := filepath.Join(realWorkspace, "plans")
+	planDir := filepath.Join(plansDir, "hold-plan")
+	writeIndexedPlan(t, planDir)
+
+	aliasWorkspace := filepath.Join(notebookRoot, "workspaces", "hold-plan")
+	if err := os.Symlink(realWorkspace, aliasWorkspace); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Notebooks: &config.NotebooksConfig{
+		Definitions: map[string]*config.Notebook{"test": {
+			RootDir: notebookRoot, PlansPathTemplate: "workspaces/{{ .Workspace.Name }}/plans",
+		}},
+		Rules: &config.NotebookRules{Default: "test"},
+	}}
+	h := NewFlowHandler(nil, cfg, 1)
+	node := &workspace.WorkspaceNode{Name: "hold-plan", Path: t.TempDir(), Kind: workspace.KindEcosystemRoot, NotebookName: "test"}
+
+	paths := h.ComputeWatchPaths([]*models.EnrichedWorkspace{{WorkspaceNode: node}})
+	realPlansDir := resolveFlowWatchPath(plansDir)
+	if !containsPath(paths, realPlansDir) {
+		t.Fatalf("watch paths do not contain resolved plans dir %q: %v", realPlansDir, paths)
+	}
+	realConfig := filepath.Join(planDir, ".grove-plan.yml")
+	if !h.MatchesEvent(fsnotify.Event{Name: realConfig, Op: fsnotify.Write}) {
+		t.Fatalf("resolved target event %q did not match alias-derived watch set", realConfig)
+	}
+	aliasConfig := filepath.Join(aliasWorkspace, "plans", "hold-plan", ".grove-plan.yml")
+	if !h.MatchesEvent(fsnotify.Event{Name: aliasConfig, Op: fsnotify.Write}) {
+		t.Fatalf("alias event %q did not match resolved watch set", aliasConfig)
+	}
+}
+
+func containsPath(paths []string, want string) bool {
+	for _, path := range paths {
+		if path == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSummarizePlanCarriesHoldAndUnholdLifecycle(t *testing.T) {
