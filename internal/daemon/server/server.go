@@ -417,6 +417,9 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	// Job management endpoints
 	mux.HandleFunc("/api/jobs/", s.handleJobByID)
 	mux.HandleFunc("/api/jobs", s.handleJobs)
+	// Bounded artifact return. The guest-local job route publishes files;
+	// this laptop-only route forwards over the pinned satellite transport.
+	mux.HandleFunc("/api/satellite-artifacts/fetch", s.handleSatelliteArtifactFetch)
 	// Channel management endpoints
 	mux.HandleFunc("/api/channels/send", s.handleChannelSend)
 	mux.HandleFunc("/api/channels/status", s.handleChannelStatus)
@@ -2793,7 +2796,11 @@ func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 	}
 	jobID := parts[0]
 
-	// Route sub-paths: /api/jobs/{id}/logs and /api/jobs/{id}/logs/stream
+	// Route sub-paths: /api/jobs/{id}/logs, /logs/stream, and /artifacts.
+	if len(parts) == 2 && parts[1] == "artifacts" {
+		s.handleJobArtifacts(w, r, jobID)
+		return
+	}
 	if len(parts) >= 2 && parts[1] == "logs" {
 		if len(parts) >= 3 && parts[2] == "stream" {
 			s.handleStreamJobLogs(w, r, jobID)
