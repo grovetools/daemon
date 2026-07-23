@@ -1,10 +1,13 @@
 package enrichment
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/pkg/worktreeregistry"
 )
 
 // TestResolvePerNodePlanStats_SiblingsGetOwnActivePlan is the HUD wrong-plan
@@ -13,6 +16,43 @@ import (
 // job counts. The prior implementation handed both siblings the same *PlanStats
 // pointer and stamped ActivePlan only on the first-discovered sibling, so the
 // first sibling's plan leaked onto all of them.
+func TestPlanStatusForNodeUsesExactRegistryAssociation(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	plansDir := t.TempDir()
+	planDir := filepath.Join(plansDir, "same")
+	if err := os.MkdirAll(planDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(planDir, ".grove-plan.yml"), []byte("status: hold\nworktree: same\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	heldPath := filepath.Join(t.TempDir(), "same")
+	unrelatedPath := filepath.Join(t.TempDir(), "same")
+	if err := os.MkdirAll(heldPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(unrelatedPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := worktreeregistry.Save(&worktreeregistry.Entry{AbsPath: heldPath, Plan: "same"}); err != nil {
+		t.Fatal(err)
+	}
+
+	held := &workspace.WorkspaceNode{Path: heldPath, Kind: workspace.KindEcosystemWorktree}
+	unrelated := &workspace.WorkspaceNode{Path: unrelatedPath, Kind: workspace.KindEcosystemWorktree}
+	parent := &workspace.WorkspaceNode{Path: filepath.Dir(heldPath), Kind: workspace.KindEcosystemRoot}
+	if got := planStatusForNode(plansDir, held); got != "hold" {
+		t.Fatalf("held status=%q", got)
+	}
+	if got := planStatusForNode(plansDir, unrelated); got != "" {
+		t.Fatalf("unrelated same-name worktree inherited status %q", got)
+	}
+	if got := planStatusForNode(plansDir, parent); got != "" {
+		t.Fatalf("parent inherited held status %q", got)
+	}
+}
+
 func TestResolvePerNodePlanStats_SiblingsGetOwnActivePlan(t *testing.T) {
 	const sharedPlansDir = "/nb/project/plans"
 

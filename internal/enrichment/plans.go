@@ -34,13 +34,32 @@ func FetchPlanStatsMap() (map[string]*models.PlanStats, error) {
 	}
 	locator := workspace.NewNotebookLocator(coreCfg)
 
+	nodes := provider.All()
 	statsByPath := resolvePerNodePlanStats(
-		provider.All(),
+		nodes,
 		func(node *workspace.WorkspaceNode) (string, error) { return locator.GetPlansDir(node) },
 		countPlanStats,
 		func(node *workspace.WorkspaceNode) string { return getActivePlanForPath(node, locator) },
 		planStatusForNode,
 	)
+	// PlanStatus is meaningful only with an explicit registry association.
+	// Stamp that qualified identity separately from ActivePlan, whose legacy
+	// state fallback is intentionally broader.
+	for _, node := range nodes {
+		if node == nil || !node.IsWorktree() {
+			continue
+		}
+		planName, ok := worktreeregistry.PlanForPath(node.Path)
+		if !ok {
+			continue
+		}
+		if stats := statsByPath[node.Path]; stats != nil {
+			stats.AssociatedPlan = planName
+			if plansDir, err := locator.GetPlansDir(node); err == nil {
+				stats.AssociatedPlanDir = filepath.Join(plansDir, planName)
+			}
+		}
+	}
 
 	return statsByPath, nil
 }
@@ -108,48 +127,30 @@ func countPlanStats(plansRootDir string) *models.PlanStats {
 	return stats
 }
 
-// planStatusForNode returns the status of the plan whose worktree matches this
-// node (empty for non-worktree nodes or when no plan claims the worktree). It is
-// per-node because the same plans dir serves many sibling worktrees.
+// planStatusForNode reads only the plan explicitly associated with this exact
+// worktree container in the registry. It never infers ownership from a shared
+// worktree name or from the parent workspace's aggregate plan stats.
 func planStatusForNode(plansRootDir string, node *workspace.WorkspaceNode) string {
-	if !node.IsWorktree() {
+	if node == nil || !node.IsWorktree() {
 		return ""
 	}
-	worktreeName := node.GetWorktreeName()
-	if worktreeName == "" {
+	planName, ok := worktreeregistry.PlanForPath(node.Path)
+	if !ok {
 		return ""
 	}
-
-	entries, err := os.ReadDir(plansRootDir)
-	if err != nil {
-		return ""
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
-			continue
-		}
-		configPath := filepath.Join(plansRootDir, entry.Name(), "config.yml")
-		configData, err := os.ReadFile(configPath) //nolint:gosec // G304: path from known plan directory
+	planDir := filepath.Join(plansRootDir, planName)
+	for _, filename := range []string{".grove-plan.yml", "config.yml"} {
+		configData, err := os.ReadFile(filepath.Join(planDir, filename)) //nolint:gosec // qualified registry plan under known plans root
 		if err != nil {
 			continue
 		}
-		content := string(configData)
-
-		var planWorktree, planStatus string
-		for _, line := range strings.Split(content, "\n") {
-			if strings.HasPrefix(line, "worktree:") {
-				if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
-					planWorktree = strings.TrimSpace(parts[1])
+		for _, line := range strings.Split(string(configData), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "status:") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					return strings.TrimSpace(parts[1])
 				}
 			}
-			if strings.HasPrefix(line, "status:") {
-				if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
-					planStatus = strings.TrimSpace(parts[1])
-				}
-			}
-		}
-		if planWorktree != "" && planWorktree == worktreeName {
-			return planStatus
 		}
 	}
 	return ""

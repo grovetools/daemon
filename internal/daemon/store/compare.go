@@ -53,7 +53,9 @@ func PlanStatsEqual(a, b *models.PlanStats) bool {
 		a.Todo == b.Todo &&
 		a.Hold == b.Hold &&
 		a.Abandoned == b.Abandoned &&
-		a.PlanStatus == b.PlanStatus
+		a.PlanStatus == b.PlanStatus &&
+		a.AssociatedPlan == b.AssociatedPlan &&
+		a.AssociatedPlanDir == b.AssociatedPlanDir
 }
 
 // NoteCountsEqual returns true if two NoteCounts values are equivalent.
