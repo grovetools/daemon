@@ -155,7 +155,11 @@ type Server struct {
 	// syncKick (SetSyncKick) triggers an immediate anti-entropy pass for a
 	// workspace ("" = all) after /api/sync/repush voids synced state. Nil
 	// when sync is not configured; then the hourly tick picks the reset up.
-	syncKick func(workspace string)
+	syncKick             func(workspace string)
+	syncBeginMaintenance func(context.Context) error
+	syncEndMaintenance   func()
+	maintenanceMu        sync.RWMutex
+	maintenanceTargets   map[string]bool
 
 	// captureWaiters holds pending GET /api/agents/{id}/capture requests.
 	// The HTTP handler blocks on the channel until groveterm sends the
@@ -200,10 +204,11 @@ func New(autoShutdown bool) *Server {
 		IdleTimeout:    2 * time.Minute,
 	}
 	return &Server{
-		ulog:            logging.NewUnifiedLogger("groved.server"),
-		captureWaiters:  make(map[string]chan string),
-		terminalHub:     hub.NewHub(hubCfg),
-		satelliteLeases: make(map[string]string),
+		ulog:               logging.NewUnifiedLogger("groved.server"),
+		captureWaiters:     make(map[string]chan string),
+		terminalHub:        hub.NewHub(hubCfg),
+		satelliteLeases:    make(map[string]string),
+		maintenanceTargets: make(map[string]bool),
 	}
 }
 
@@ -450,6 +455,9 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	// Adopt (P5, S5): user-initiated resolution of a diverged document. The
 	// daemon fetches the server head + rolls the merge base; the CLI writes it.
 	mux.HandleFunc("/api/sync/adopt", unixOnly(s.handleSyncAdopt))
+	mux.HandleFunc("/api/sync/incoming", unixOnly(s.handleSyncIncoming))
+	mux.HandleFunc("/api/sync/escrow", unixOnly(s.handleSyncEscrow))
+	mux.HandleFunc("/api/sync/maintenance", unixOnly(s.handleSyncMaintenance))
 	// Repush: manual full re-push after a server recreate — voids synced
 	// state (non-diverged docs) and kicks an immediate anti-entropy pass.
 	mux.HandleFunc("/api/sync/repush", unixOnly(s.handleSyncRepush))
@@ -2666,6 +2674,12 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+func (s *Server) isMaintenanceTarget(target string) bool {
+	s.maintenanceMu.RLock()
+	defer s.maintenanceMu.RUnlock()
+	return s.maintenanceTargets[target]
+}
+
 // handleJobs handles POST (submit) and GET (list) for /api/jobs.
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 	jr := s.jobRunner.Load()
@@ -2696,6 +2710,13 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 
 		// Check for unknown fields in the JSON
 		warnings := s.checkJobSubmitWarnings(bodyBytes)
+
+		// Destructive record-return maintenance rejects new local work on a
+		// guest (target "") and new dispatch to a named satellite on the laptop.
+		if s.isMaintenanceTarget(req.Satellite) {
+			http.Error(w, "job dispatch rejected: record-return maintenance is draining this target", http.StatusLocked)
+			return
+		}
 
 		// Satellite routing (M2 C1/C3/C10): a Satellite-tagged submit is
 		// forwarded to that satellite's own POST /api/jobs over the SSH

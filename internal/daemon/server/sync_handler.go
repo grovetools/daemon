@@ -41,6 +41,14 @@ func (s *Server) SetSyncKick(kick func(workspace string)) {
 	s.syncKick = kick
 }
 
+// SetSyncMaintenance wires the watcher-owned synchronous drain. The server
+// owns dispatch rejection and active-job checks; the watcher owns debounce,
+// reconcile, and outbox flushing.
+func (s *Server) SetSyncMaintenance(begin func(context.Context) error, end func()) {
+	s.syncBeginMaintenance = begin
+	s.syncEndMaintenance = end
+}
+
 // syncStatusResponse is the GET /api/sync/status payload.
 type syncStatusResponse struct {
 	Enabled           bool                  `json:"enabled"`
@@ -679,6 +687,230 @@ type snapshotDoc struct {
 	ID      string
 	Version int64
 	Hash    string
+}
+
+type syncIncomingResponse struct {
+	Manifest       syncdb.ReturnManifest `json:"manifest"`
+	Clean          bool                  `json:"clean"`
+	EscrowPath     string                `json:"escrow_path,omitempty"`
+	EscrowVerified bool                  `json:"escrow_verified"`
+}
+
+func requestedReturnWorkspaces(r *http.Request) ([]string, error) {
+	raw := r.URL.Query().Get("workspaces")
+	var out []string
+	for _, name := range strings.Split(raw, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			out = append(out, name)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("an explicit non-empty workspaces list is required")
+	}
+	return out, nil
+}
+
+func (s *Server) currentReturnManifest(ctx context.Context, workspaces []string) (syncdb.ReturnManifest, error) {
+	client, err := s.historyClient(ctx)
+	if err != nil {
+		return syncdb.ReturnManifest{}, err
+	}
+	return syncdb.BuildReturnManifest(ctx, client, s.syncDB, workspaces)
+}
+
+func returnEscrowDir(satellite string) (string, error) {
+	if satellite == "" || filepath.Base(satellite) != satellite {
+		return "", fmt.Errorf("a valid satellite name is required")
+	}
+	return filepath.Join(paths.StateDir(), "satellites", satellite, "record-return"), nil
+}
+
+func findVerifiedReturnEscrow(dir, generation string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].IsDir() {
+			continue
+		}
+		p := filepath.Join(dir, entries[i].Name())
+		if syncdb.VerifyReturnEscrow(p, generation) == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// handleSyncIncoming is read-only: it compares server heads against laptop
+// tracked state and never writes notebook files.
+func (s *Server) handleSyncIncoming(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	workspaces, err := requestedReturnWorkspaces(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	m, err := s.currentReturnManifest(r.Context(), workspaces)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("incoming manifest failed: %v", err), http.StatusBadGateway)
+		return
+	}
+	resp := syncIncomingResponse{Manifest: m, Clean: len(m.Operations) == 0}
+	if dir, derr := returnEscrowDir(r.URL.Query().Get("satellite")); derr == nil {
+		resp.EscrowPath = findVerifiedReturnEscrow(dir, m.Generation)
+		resp.EscrowVerified = resp.EscrowPath != ""
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleSyncEscrow accepts a reviewed manifest, recomputes it against current
+// local/server state (stale review refusal), then durably writes verified head
+// content under the laptop satellite state directory.
+func (s *Server) handleSyncEscrow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDB == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Satellite string                `json:"satellite"`
+		Manifest  syncdb.ReturnManifest `json:"manifest"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if err := req.Manifest.Validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	current, err := s.currentReturnManifest(r.Context(), req.Manifest.Workspaces)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if err := syncdb.ValidateReviewedManifest(req.Manifest, current); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	dir, err := returnEscrowDir(req.Satellite)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	client, err := s.historyClient(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	path, err := syncdb.WriteReturnEscrow(r.Context(), client, req.Manifest, dir)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("escrow failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"path": path, "generation": req.Manifest.Generation, "verified": true})
+}
+
+func nonTerminalJob(status string) bool {
+	switch status {
+	case "completed", "failed", "cancelled", "abandoned", "error", "stopped":
+		return false
+	}
+	return true
+}
+
+// handleSyncMaintenance establishes the destructive drain barrier. A named
+// target blocks laptop dispatch; target "" blocks guest-local submits.
+func (s *Server) handleSyncMaintenance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	var req struct {
+		Action string `json:"action"`
+		Target string `json:"target"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	switch req.Action {
+	case "enter":
+		s.maintenanceMu.Lock()
+		s.maintenanceTargets[req.Target] = true
+		s.maintenanceMu.Unlock()
+		active := 0
+		if s.engine != nil {
+			for _, j := range s.engine.Store().GetJobs() {
+				if req.Target == "" {
+					if j.Origin == "" && nonTerminalJob(j.Status) {
+						active++
+					}
+				} else if j.Origin == req.Target && nonTerminalJob(j.Status) {
+					active++
+				}
+			}
+		}
+		if active > 0 {
+			http.Error(w, fmt.Sprintf("%d managed job(s) are still active", active), http.StatusConflict)
+			return
+		}
+		if s.syncBeginMaintenance == nil {
+			http.Error(w, "sync drain is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if err := s.syncBeginMaintenance(r.Context()); err != nil {
+			http.Error(w, fmt.Sprintf("sync drain failed: %v", err), http.StatusConflict)
+			return
+		}
+	case "leave":
+		s.maintenanceMu.Lock()
+		delete(s.maintenanceTargets, req.Target)
+		s.maintenanceMu.Unlock()
+		if s.syncEndMaintenance != nil {
+			s.syncEndMaintenance()
+		}
+	case "status":
+	default:
+		http.Error(w, "action must be enter, status, or leave", http.StatusBadRequest)
+		return
+	}
+	pending, parked, diverged := 0, 0, 0
+	if s.syncDB != nil {
+		pending, _ = s.syncDB.CountOutbox()
+		parked, _ = s.syncDB.CountOutboxParked()
+		diverged, _ = s.syncDB.CountDocumentsDiverged()
+	}
+	s.maintenanceMu.RLock()
+	draining := s.maintenanceTargets[req.Target]
+	s.maintenanceMu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"draining": draining, "outbox_pending": pending, "outbox_parked": parked, "documents_diverged": diverged})
 }
 
 // handleSyncRepush handles POST /api/sync/repush with optional body

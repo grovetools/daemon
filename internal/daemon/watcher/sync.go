@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -84,6 +85,8 @@ type SyncHandler struct {
 	aePasses    map[string]*syncdb.AntiEntropyPass
 	pipelinesMu sync.Mutex
 	baseCtx     context.Context
+	maintenance atomic.Bool
+	drainMu     sync.Mutex
 }
 
 // NewSyncHandler creates a SyncHandler. Callers gate construction on sync
@@ -425,6 +428,12 @@ func (h *SyncHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 // silence flushes, but a path continuously written for maxWaitMs flushes
 // anyway so the outbox never starves.
 func (h *SyncHandler) scheduleFlush(absPath string) {
+	// During destructive maintenance, capture changes immediately rather than
+	// leaving a debounce timer that could make a final pending-state check lie.
+	if h.maintenance.Load() {
+		go h.flush(context.Background(), absPath)
+		return
+	}
 	h.timersMu.Lock()
 	defer h.timersMu.Unlock()
 
@@ -796,6 +805,73 @@ func (h *SyncHandler) ensurePipelines() {
 			StructuredOnly().Log(pctx)
 	}
 }
+
+// BeginMaintenance flushes debounce, reconcile, and push state synchronously.
+// New filesystem events are captured immediately until EndMaintenance. A
+// non-zero pending/parked/diverged result is dirty, never a successful drain.
+func (h *SyncHandler) BeginMaintenance(ctx context.Context) error {
+	h.drainMu.Lock()
+	defer h.drainMu.Unlock()
+	h.maintenance.Store(true)
+
+	h.timersMu.Lock()
+	paths := make([]string, 0, len(h.timers))
+	for path, timer := range h.timers {
+		timer.Stop()
+		paths = append(paths, path)
+	}
+	h.timers = make(map[string]*time.Timer)
+	h.firstSeen = make(map[string]time.Time)
+	h.timersMu.Unlock()
+	for _, path := range paths {
+		h.flush(ctx, path)
+	}
+
+	h.clientMu.RLock()
+	client := h.client
+	h.clientMu.RUnlock()
+	if client == nil {
+		return fmt.Errorf("sync server disconnected")
+	}
+	roots := make(map[string]string)
+	h.pathsMutex.RLock()
+	for _, w := range h.watchedPaths {
+		roots[w.workspace] = w.root
+	}
+	h.pathsMutex.RUnlock()
+	for name, root := range h.configuredPullRoots() {
+		if _, ok := roots[name]; !ok {
+			roots[name] = root
+		}
+	}
+
+	h.pipelinesMu.Lock()
+	passes := make(map[string]*syncdb.AntiEntropyPass, len(h.aePasses))
+	for n, p := range h.aePasses {
+		passes[n] = p
+	}
+	h.pipelinesMu.Unlock()
+	for name, root := range roots {
+		if ae := passes[name]; ae != nil {
+			if err := ae.Run(ctx); err != nil {
+				return fmt.Errorf("reconcile %s: %w", name, err)
+			}
+		}
+		push := syncdb.NewPushPipeline(h.db, client, name, h.ulog, syncdb.PushConfig{})
+		for {
+			n, err := push.DrainOutbox(ctx, root)
+			if err != nil {
+				return fmt.Errorf("flush outbox %s: %w", name, err)
+			}
+			if n == 0 {
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func (h *SyncHandler) EndMaintenance() { h.maintenance.Store(false) }
 
 // KickAntiEntropy triggers an immediate anti-entropy pass for the named
 // workspace, or for every running workspace when workspace is empty. Wired
