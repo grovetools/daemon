@@ -114,7 +114,12 @@ func BuildReturnManifest(ctx context.Context, client *Client, db *DB, workspaces
 			m.Operations = append(m.Operations, op)
 		}
 		for _, d := range local {
-			if !seen[d.DocumentID] {
+			if !seen[d.DocumentID] && d.LastSyncedVersion > 0 {
+				// A version-zero row was never acknowledged by the server. Its
+				// absence from the server snapshot is therefore not an incoming
+				// deletion. This commonly occurs when a laptop file is archived
+				// before its original identity first syncs: the archived path is
+				// present under a new identity while the stale original row remains.
 				m.Operations = append(m.Operations, ReturnOperation{Type: "delete", Workspace: name, DocumentID: d.DocumentID, Path: d.Path, BaseHash: d.ContentHash})
 			}
 		}

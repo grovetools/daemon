@@ -46,7 +46,7 @@ func TestReturnManifestRepresentsCreateUpdateMoveDelete(t *testing.T) {
 	db := openTestDB(t)
 	old := []byte("old")
 	same := []byte("same")
-	for _, d := range []*Document{{DocumentID: "update", Workspace: "ws", Path: "u.md", ContentHash: hash(old)}, {DocumentID: "move", Workspace: "ws", Path: "before.md", ContentHash: hash(old)}, {DocumentID: "delete", Workspace: "ws", Path: "gone.md", ContentHash: hash(old)}, {DocumentID: "same", Workspace: "ws", Path: "same.md", ContentHash: hash(same)}} {
+	for _, d := range []*Document{{DocumentID: "update", Workspace: "ws", Path: "u.md", ContentHash: hash(old)}, {DocumentID: "move", Workspace: "ws", Path: "before.md", ContentHash: hash(old)}, {DocumentID: "delete", Workspace: "ws", Path: "gone.md", ContentHash: hash(old), LastSyncedVersion: 1}, {DocumentID: "same", Workspace: "ws", Path: "same.md", ContentHash: hash(same)}} {
 		if err := db.UpsertDocument(d); err != nil {
 			t.Fatal(err)
 		}
@@ -74,6 +74,21 @@ func TestReturnManifestRepresentsCreateUpdateMoveDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+func TestReturnManifestIgnoresServerAbsenceForNeverSyncedLocalIdentity(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.UpsertDocument(&Document{DocumentID: "stale", Workspace: "ws", Path: "plans/old/a.md", ContentHash: hash([]byte("body")), LastSyncedVersion: 0}); err != nil {
+		t.Fatal(err)
+	}
+	c := returnTestClient(t, "epoch-1", map[string]syncproto.SnapshotManifest{"ws": {Workspace: "ws", Cursor: 1}}, nil)
+	m, err := BuildReturnManifest(context.Background(), c, db, []string{"ws"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Operations) != 0 {
+		t.Fatalf("never-synced local identity produced incoming operations: %+v", m.Operations)
+	}
+}
+
 func TestReturnManifestLocalAndServerChangesInvalidateGeneration(t *testing.T) {
 	db := openTestDB(t)
 	body := []byte("head")
