@@ -84,8 +84,33 @@ func (h *FlowHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 	}
 
 	h.pathsMutex.Lock()
+	previous := h.watchedPaths
 	h.watchedPaths = newWatches
 	h.pathsMutex.Unlock()
+
+	// Watch-registration boundary: a live daemon log must be able to prove
+	// which plan directories the flow handler asked to cover. The set only
+	// changes when plans/workspaces appear or disappear, so info is quiet.
+	var added, removed []string
+	for p := range newWatches {
+		if _, ok := previous[p]; !ok {
+			added = append(added, p)
+		}
+	}
+	for p := range previous {
+		if _, ok := newWatches[p]; !ok {
+			removed = append(removed, p)
+		}
+	}
+	if len(added) > 0 || len(removed) > 0 {
+		sort.Strings(added)
+		sort.Strings(removed)
+		h.ulog.Info("Flow watch set changed").
+			Field("watched", len(newWatches)).
+			Field("added", strings.Join(added, ",")).
+			Field("removed", strings.Join(removed, ",")).
+			Log(context.Background())
+	}
 
 	paths := make([]string, 0, len(newWatches))
 	for p := range newWatches {
@@ -134,6 +159,12 @@ func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 		if (filepath.Base(event.Name) == ".grove-plan.yml" || filepath.Base(event.Name) == "config.yml") &&
 			(event.Op&fsnotify.Write != 0 || event.Op&fsnotify.Create != 0 || event.Op&fsnotify.Rename != 0) {
 			lifecycleChanged = true
+			// Event-match boundary: plan-config mutations are the hold/unhold
+			// delivery proof and are rare, so log each one at info.
+			h.ulog.Info("Plan lifecycle event received").
+				Field("path", event.Name).
+				Field("op", event.Op.String()).
+				Log(ctx)
 		}
 		if !strings.HasSuffix(event.Name, ".md") {
 			continue

@@ -128,6 +128,15 @@ func (w *UnifiedWatcher) Start(ctx context.Context) {
 		case <-batchTicker.C:
 			if len(eventBuffer) > 0 {
 				w.dispatch(ctx, eventBuffer)
+				// A directory created inside a watched path (e.g. `flow plan
+				// init` under a plans dir) is invisible to fsnotify until it is
+				// added as its own watch. Recompute immediately instead of
+				// waiting for the periodic refresh, so a config write that
+				// follows the creation within the refresh interval still
+				// delivers.
+				if containsDirCreate(eventBuffer) {
+					w.refreshWatches()
+				}
 				eventBuffer = nil
 			}
 		case <-refreshTicker.C:
@@ -199,6 +208,9 @@ func (w *UnifiedWatcher) refreshWatches() {
 				w.ulog.Debug("Failed to remove watch").Err(err).Field("path", p).Log(ctx)
 			}
 			delete(w.watchCounts, p)
+			// Watch-registration boundary: add/remove transitions are rare and
+			// are the evidence a live log needs to prove fsnotify coverage.
+			w.ulog.Info("Watch removed").Field("path", p).Log(ctx)
 		}
 	}
 
@@ -207,15 +219,31 @@ func (w *UnifiedWatcher) refreshWatches() {
 		if w.watchCounts[p] == 0 {
 			// Skip paths that don't exist on disk
 			if _, err := os.Stat(p); err != nil {
+				w.ulog.Debug("Skipping watch for missing path").Err(err).Field("path", p).Log(ctx)
 				continue
 			}
 			if err := w.fsWatcher.Add(p); err != nil {
-				w.ulog.Debug("Failed to watch path").Err(err).Field("path", p).Log(ctx)
+				w.ulog.Warn("Failed to watch path").Err(err).Field("path", p).Log(ctx)
 			} else {
 				w.watchCounts[p] = count
+				w.ulog.Info("Watch added").Field("path", p).Log(ctx)
 			}
 		} else {
 			w.watchCounts[p] = count
 		}
 	}
+}
+
+// containsDirCreate reports whether any batched event created a directory that
+// still exists — the signal that the watch set may need to grow mid-interval.
+func containsDirCreate(events []fsnotify.Event) bool {
+	for _, event := range events {
+		if event.Op&fsnotify.Create == 0 {
+			continue
+		}
+		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
 }

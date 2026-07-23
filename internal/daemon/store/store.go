@@ -611,9 +611,15 @@ func (s *Store) applyPlanLifecycleToWorkspaces(plans []models.PlanSummary) []*mo
 
 	var deltas []*models.WorkspaceDelta
 	for path, ws := range s.state.Workspaces {
-		if ws == nil || ws.WorkspaceNode == nil || !ws.IsWorktree() {
+		if ws == nil || ws.WorkspaceNode == nil {
 			continue
 		}
+		// Membership is structural, never kind-based: a member checkout inside
+		// a bound container (<owner>/.grove-worktrees/<plan>/<repo>) has no
+		// grove.yml and discovers as NonGroveRepo, so IsWorktree() is false —
+		// yet that leaf is exactly the row Nav renders for the plan.
+		// WorktreeRootForPath returns false for anything outside a container,
+		// which keeps parent and standalone workspaces untouched.
 		root, ok := workspace.WorktreeRootForPath(ws.Path)
 		if !ok {
 			continue

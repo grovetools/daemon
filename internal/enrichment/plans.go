@@ -46,7 +46,7 @@ func FetchPlanStatsMap() (map[string]*models.PlanStats, error) {
 	// Stamp that qualified identity separately from ActivePlan, whose legacy
 	// state fallback is intentionally broader.
 	for _, node := range nodes {
-		if node == nil || !node.IsWorktree() {
+		if node == nil {
 			continue
 		}
 		planName, ok := registeredPlanForNode(node)
@@ -131,7 +131,7 @@ func countPlanStats(plansRootDir string) *models.PlanStats {
 // worktree container in the registry. It never infers ownership from a shared
 // worktree name or from the parent workspace's aggregate plan stats.
 func planStatusForNode(plansRootDir string, node *workspace.WorkspaceNode) string {
-	if node == nil || !node.IsWorktree() {
+	if node == nil {
 		return ""
 	}
 	planName, ok := registeredPlanForNode(node)
@@ -159,8 +159,12 @@ func planStatusForNode(plansRootDir string, node *workspace.WorkspaceNode) strin
 // registeredPlanForNode resolves registry ownership at the canonical worktree
 // container root. Discovery nodes inside a synthetic container point at member
 // repo checkouts, while the registry intentionally keys the container itself.
+// Membership is structural, not kind-based: member checkouts without a
+// grove.yml discover as NonGroveRepo (IsWorktree() == false) but still belong
+// to their registered container; anything outside a container fails
+// WorktreeRootForPath and resolves to no plan, exactly as before.
 func registeredPlanForNode(node *workspace.WorkspaceNode) (string, bool) {
-	if node == nil || !node.IsWorktree() {
+	if node == nil {
 		return "", false
 	}
 	root, ok := workspace.WorktreeRootForPath(node.Path)
