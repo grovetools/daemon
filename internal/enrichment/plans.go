@@ -55,7 +55,9 @@ func FetchPlanStatsMap() (map[string]*models.PlanStats, error) {
 		}
 		if stats := statsByPath[node.Path]; stats != nil {
 			stats.AssociatedPlan = planName
-			if plansDir, err := locator.GetPlansDir(node); err == nil {
+			if planDir := associatedPlanDirForNode(node); planDir != "" {
+				stats.AssociatedPlanDir = planDir
+			} else if plansDir, err := locator.GetPlansDir(node); err == nil {
 				stats.AssociatedPlanDir = filepath.Join(plansDir, planName)
 			}
 		}
@@ -127,6 +129,29 @@ func countPlanStats(plansRootDir string) *models.PlanStats {
 	return stats
 }
 
+// associatedPlanDirForNode derives the qualified plan directory for a node's
+// registered plan through the canonical registry resolver (plan.ResolveTarget
+// on the worktree container root), NOT by joining this node's own plans dir
+// with the plan name: a node resolved from a container path can carry a plans
+// dir qualified by the container basename, which is wrong for standalone-repo
+// containers (the plan name would masquerade as the workspace name). Returns
+// "" when the node is not inside a registered container or the resolver
+// cannot derive a plan dir.
+func associatedPlanDirForNode(node *workspace.WorkspaceNode) string {
+	if node == nil {
+		return ""
+	}
+	root, ok := workspace.WorktreeRootForPath(node.Path)
+	if !ok {
+		return ""
+	}
+	target, err := plan.ResolveTarget(root)
+	if err != nil || target == nil {
+		return ""
+	}
+	return target.PlanDir
+}
+
 // planStatusForNode reads only the plan explicitly associated with this exact
 // worktree container in the registry. It never infers ownership from a shared
 // worktree name or from the parent workspace's aggregate plan stats.
@@ -138,7 +163,10 @@ func planStatusForNode(plansRootDir string, node *workspace.WorkspaceNode) strin
 	if !ok {
 		return ""
 	}
-	planDir := filepath.Join(plansRootDir, planName)
+	planDir := associatedPlanDirForNode(node)
+	if planDir == "" {
+		planDir = filepath.Join(plansRootDir, planName)
+	}
 	for _, filename := range []string{".grove-plan.yml", "config.yml"} {
 		configData, err := os.ReadFile(filepath.Join(planDir, filename)) //nolint:gosec // qualified registry plan under known plans root
 		if err != nil {

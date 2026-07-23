@@ -119,3 +119,55 @@ func TestResolvePerNodePlanStats_SiblingsGetOwnActivePlan(t *testing.T) {
 		t.Error("siblings share the SAME *PlanStats pointer — per-node stamps would collide")
 	}
 }
+
+// TestAssociatedPlanDirUsesCanonicalRegistryResolver pins the enrichment-side
+// derivation to core's canonical registry resolver: for a standalone-repo
+// container the plan dir is qualified by the OWNER workspace (where flow plan
+// init created it), not by joining this node's own plans dir with the plan
+// name (which would qualify by the container basename — the plan name itself).
+func TestAssociatedPlanDirUsesCanonicalRegistryResolver(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	owner := filepath.Join(root, "alpha-repo")
+	if err := os.MkdirAll(filepath.Join(owner, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	container := filepath.Join(owner, ".grove-worktrees", "alpha-view")
+	if err := os.MkdirAll(filepath.Join(container, ".grove"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(container, "grove.toml"), []byte("workspaces = [\"*\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := "branch: alpha-view\nplan: alpha-view\nowner: " + owner + "\necosystem: true\n"
+	if err := os.WriteFile(filepath.Join(container, ".grove", "workspace"), []byte(marker), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := worktreeregistry.Save(&worktreeregistry.Entry{AbsPath: container, Owner: owner, Plan: "alpha-view"}); err != nil {
+		t.Fatal(err)
+	}
+
+	planDir := filepath.Join(home, ".grove", "notebooks", "nb", "workspaces", "alpha-repo", "plans", "alpha-view")
+	if err := os.MkdirAll(planDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(planDir, ".grove-plan.yml"), []byte("status: hold\nworktree: alpha-view\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	node := &workspace.WorkspaceNode{Path: filepath.Join(container, "alpha-repo"), Kind: workspace.KindEcosystemSubProjectWorktree}
+	if got := associatedPlanDirForNode(node); got != planDir {
+		t.Fatalf("associatedPlanDirForNode = %q, want %q", got, planDir)
+	}
+	// The status read must go through the canonical plan dir, not the
+	// (deliberately bogus) plans root the caller derived for this node.
+	if got := planStatusForNode(filepath.Join(root, "not-a-plans-root"), node); got != "hold" {
+		t.Fatalf("planStatusForNode = %q, want hold", got)
+	}
+}
