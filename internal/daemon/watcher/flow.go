@@ -291,21 +291,21 @@ func (h *FlowHandler) triggerRefresh() {
 			}
 			seen[plansDir] = struct{}{}
 
-			entries, err := os.ReadDir(plansDir)
-			if err != nil {
-				continue
-			}
-			plans := make([]*orchestration.Plan, 0, len(entries))
+			indexed := loadIndexedPlans(plansDir)
+			plans := make([]*orchestration.Plan, 0, len(indexed))
 			selectedPlan, _ := corestate.GetString(wsNode.Path, coreplan.StateKey)
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					continue
-				}
-				planPath := filepath.Join(plansDir, entry.Name())
-				if p, err := orchestration.LoadPlan(planPath); err == nil {
+			for _, indexedPlan := range indexed {
+				p := indexedPlan.plan
+				if !indexedPlan.archived {
 					plans = append(plans, p)
-					summaries = append(summaries, summarizePlan(p, plansDir, wsNode.Path, selectedPlan, registryByPlan[p.Name], state.Sessions, scanAt))
 				}
+				summary := summarizePlan(p, plansDir, wsNode.Path, selectedPlan, registryByPlan[p.Name], state.Sessions, scanAt)
+				summary.Archived = indexedPlan.archived
+				if indexedPlan.archived {
+					summary.Lifecycle = "finished"
+					summary.Selected = false
+				}
+				summaries = append(summaries, summary)
 			}
 			plansByDir[plansDir] = plans
 		}
@@ -325,6 +325,36 @@ func (h *FlowHandler) triggerRefresh() {
 			Payload: &models.PlanIndexSnapshot{ScannedAt: scanAt, Plans: summaries},
 		})
 	})
+}
+
+type indexedPlanEntry struct {
+	plan     *orchestration.Plan
+	archived bool
+}
+
+// loadIndexedPlans recognizes only direct live plan directories and direct
+// children of the archive container. Hidden organizational directories are
+// never themselves plans, and archived plans remain separately identifiable
+// as read-only rows in daemon clients.
+func loadIndexedPlans(plansDir string) []indexedPlanEntry {
+	var indexed []indexedPlanEntry
+	loadChildren := func(parent string, archived bool) {
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			if p, err := orchestration.LoadPlan(filepath.Join(parent, entry.Name())); err == nil {
+				indexed = append(indexed, indexedPlanEntry{plan: p, archived: archived})
+			}
+		}
+	}
+	loadChildren(plansDir, false)
+	loadChildren(filepath.Join(plansDir, ".archive"), true)
+	return indexed
 }
 
 func summarizePlan(p *orchestration.Plan, plansDir, workspaceRoot, selectedPlan string, registry *worktreeregistry.Entry, sessions map[string]*models.Session, scannedAt time.Time) models.PlanSummary {

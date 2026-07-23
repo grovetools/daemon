@@ -27,23 +27,27 @@ func TestPlanStatusForNodeUsesExactRegistryAssociation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	heldPath := filepath.Join(t.TempDir(), "same")
-	unrelatedPath := filepath.Join(t.TempDir(), "same")
+	owner := t.TempDir()
+	heldRoot := filepath.Join(owner, ".grove-worktrees", "same")
+	heldPath := filepath.Join(heldRoot, "member-repo")
+	unrelatedPath := filepath.Join(owner, ".grove-worktrees", "unrelated", "member-repo")
 	if err := os.MkdirAll(heldPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(unrelatedPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := worktreeregistry.Save(&worktreeregistry.Entry{AbsPath: heldPath, Plan: "same"}); err != nil {
+	if err := worktreeregistry.Save(&worktreeregistry.Entry{AbsPath: heldRoot, Plan: "same"}); err != nil {
 		t.Fatal(err)
 	}
 
-	held := &workspace.WorkspaceNode{Path: heldPath, Kind: workspace.KindEcosystemWorktree}
-	unrelated := &workspace.WorkspaceNode{Path: unrelatedPath, Kind: workspace.KindEcosystemWorktree}
-	parent := &workspace.WorkspaceNode{Path: filepath.Dir(heldPath), Kind: workspace.KindEcosystemRoot}
+	// Daemon discovery reports member checkouts as worktree nodes, but registry
+	// ownership is attached to their synthetic container root.
+	held := &workspace.WorkspaceNode{Path: heldPath, Kind: workspace.KindEcosystemSubProjectWorktree}
+	unrelated := &workspace.WorkspaceNode{Path: unrelatedPath, Kind: workspace.KindEcosystemSubProjectWorktree}
+	parent := &workspace.WorkspaceNode{Path: owner, Kind: workspace.KindEcosystemRoot}
 	if got := planStatusForNode(plansDir, held); got != "hold" {
-		t.Fatalf("held status=%q", got)
+		t.Fatalf("held member status=%q", got)
 	}
 	if got := planStatusForNode(plansDir, unrelated); got != "" {
 		t.Fatalf("unrelated same-name worktree inherited status %q", got)

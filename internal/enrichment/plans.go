@@ -49,7 +49,7 @@ func FetchPlanStatsMap() (map[string]*models.PlanStats, error) {
 		if node == nil || !node.IsWorktree() {
 			continue
 		}
-		planName, ok := worktreeregistry.PlanForPath(node.Path)
+		planName, ok := registeredPlanForNode(node)
 		if !ok {
 			continue
 		}
@@ -134,7 +134,7 @@ func planStatusForNode(plansRootDir string, node *workspace.WorkspaceNode) strin
 	if node == nil || !node.IsWorktree() {
 		return ""
 	}
-	planName, ok := worktreeregistry.PlanForPath(node.Path)
+	planName, ok := registeredPlanForNode(node)
 	if !ok {
 		return ""
 	}
@@ -154,6 +154,20 @@ func planStatusForNode(plansRootDir string, node *workspace.WorkspaceNode) strin
 		}
 	}
 	return ""
+}
+
+// registeredPlanForNode resolves registry ownership at the canonical worktree
+// container root. Discovery nodes inside a synthetic container point at member
+// repo checkouts, while the registry intentionally keys the container itself.
+func registeredPlanForNode(node *workspace.WorkspaceNode) (string, bool) {
+	if node == nil || !node.IsWorktree() {
+		return "", false
+	}
+	root, ok := workspace.WorktreeRootForPath(node.Path)
+	if !ok {
+		return "", false
+	}
+	return worktreeregistry.PlanForPath(root)
 }
 
 // processPlanCounts scans a single plan directory and aggregates node-independent
