@@ -39,6 +39,7 @@ type FlowHandler struct {
 	// Debounce timer for plan stats refresh
 	refreshTimer *time.Timer
 	refreshMu    sync.Mutex
+	refreshRunMu sync.Mutex
 	debounceMs   int
 }
 
@@ -127,8 +128,13 @@ func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 	h.ulog.Debug("Plan file changes detected").Field("count", len(events)).Log(ctx)
 
 	var discoveredJobs []*models.JobInfo
+	lifecycleChanged := false
 
 	for _, event := range events {
+		if (filepath.Base(event.Name) == ".grove-plan.yml" || filepath.Base(event.Name) == "config.yml") &&
+			(event.Op&fsnotify.Write != 0 || event.Op&fsnotify.Create != 0 || event.Op&fsnotify.Rename != 0) {
+			lifecycleChanged = true
+		}
 		if !strings.HasSuffix(event.Name, ".md") {
 			continue
 		}
@@ -202,7 +208,14 @@ func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 		})
 	}
 
-	h.triggerRefresh()
+	if lifecycleChanged {
+		// Plan lifecycle edges are state transitions, not eventually-consistent
+		// enrichment. A debounced rescan can collapse hold→unhold into one live
+		// snapshot, so publish each observed config mutation synchronously.
+		h.triggerLifecycleRefresh()
+	} else {
+		h.triggerRefresh()
+	}
 	return nil
 }
 
@@ -248,91 +261,108 @@ func (h *FlowHandler) triggerRefresh() {
 		h.refreshTimer.Stop()
 	}
 
-	h.refreshTimer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
-		ctx := context.Background()
-		h.ulog.Debug("Refreshing plan stats after file change").Log(ctx)
+	h.refreshTimer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, h.refresh)
+}
 
-		planStats, err := enrichment.FetchPlanStatsMap()
-		if err != nil {
-			h.ulog.Error("Failed to fetch plan stats").Err(err).Log(ctx)
-			return
-		}
+// triggerLifecycleRefresh cancels a pending eventually-consistent refresh and
+// publishes this observed plan-config transition before HandleEvents returns.
+func (h *FlowHandler) triggerLifecycleRefresh() {
+	h.refreshMu.Lock()
+	if h.refreshTimer != nil {
+		h.refreshTimer.Stop()
+		h.refreshTimer = nil
+	}
+	h.refreshMu.Unlock()
+	h.refresh()
+}
 
-		state := h.store.Get()
-		var deltas []*models.WorkspaceDelta
-		for k, v := range state.Workspaces {
-			if stats, ok := planStats[k]; ok {
-				if !store.PlanStatsEqual(v.PlanStats, stats) {
-					deltas = append(deltas, &models.WorkspaceDelta{
-						Path:      k,
-						PlanStats: stats,
-					})
-				}
+func (h *FlowHandler) refresh() {
+	h.refreshRunMu.Lock()
+	defer h.refreshRunMu.Unlock()
+
+	ctx := context.Background()
+	h.ulog.Debug("Refreshing plan stats after file change").Log(ctx)
+
+	planStats, err := enrichment.FetchPlanStatsMap()
+	if err != nil {
+		h.ulog.Error("Failed to fetch plan stats").Err(err).Log(ctx)
+		return
+	}
+
+	state := h.store.Get()
+	var deltas []*models.WorkspaceDelta
+	for k, v := range state.Workspaces {
+		if stats, ok := planStats[k]; ok {
+			if !store.PlanStatsEqual(v.PlanStats, stats) {
+				deltas = append(deltas, &models.WorkspaceDelta{
+					Path:      k,
+					PlanStats: stats,
+				})
 			}
 		}
+	}
 
-		if len(deltas) > 0 {
-			h.store.ApplyUpdate(store.Update{
-				Type:    store.UpdateWorkspacesDelta,
-				Source:  "flow_watcher",
-				Scanned: len(deltas),
-				Payload: deltas,
-			})
-		}
-
-		// Refresh the deep plan cache the browser reads from.
-		// Walking every watched plansDir keeps this work out of TUI
-		// clients, and the debounce above limits how often we do it.
-		plansByDir := make(map[string][]*orchestration.Plan)
-		scanAt := time.Now()
-		var summaries []models.PlanSummary
-		registryEntries, _ := worktreeregistry.ListAll()
-		h.pathsMutex.RLock()
-		seen := make(map[string]struct{})
-		for _, wsNode := range h.watchedPaths {
-			plansDir, err := h.locator.GetPlansDir(wsNode)
-			if err != nil || plansDir == "" {
-				continue
-			}
-			if _, dup := seen[plansDir]; dup {
-				continue
-			}
-			seen[plansDir] = struct{}{}
-
-			indexed := loadIndexedPlans(plansDir)
-			plans := make([]*orchestration.Plan, 0, len(indexed))
-			selectedPlan, _ := corestate.GetString(wsNode.Path, coreplan.StateKey)
-			for _, indexedPlan := range indexed {
-				p := indexedPlan.plan
-				if !indexedPlan.archived {
-					plans = append(plans, p)
-				}
-				summary := summarizePlan(p, plansDir, wsNode.Path, selectedPlan, state.Sessions, scanAt)
-				summary.Archived = indexedPlan.archived
-				if indexedPlan.archived {
-					summary.Lifecycle = "finished"
-					summary.Selected = false
-				}
-				summaries = append(summaries, summary)
-			}
-			plansByDir[plansDir] = plans
-		}
-		h.pathsMutex.RUnlock()
-		summaries = applyQualifiedPlanBindings(summaries, registryEntries)
-
-		if len(plansByDir) > 0 {
-			h.store.ApplyUpdate(store.Update{
-				Type:    store.UpdatePlans,
-				Source:  "flow_watcher",
-				Scanned: len(plansByDir),
-				Payload: plansByDir,
-			})
-		}
-		sort.Slice(summaries, func(i, j int) bool { return summaries[i].PlanDir < summaries[j].PlanDir })
+	if len(deltas) > 0 {
 		h.store.ApplyUpdate(store.Update{
-			Type: store.UpdatePlanIndexSnapshot, Source: "flow_watcher", Scanned: len(summaries),
-			Payload: &models.PlanIndexSnapshot{ScannedAt: scanAt, Plans: summaries},
+			Type:    store.UpdateWorkspacesDelta,
+			Source:  "flow_watcher",
+			Scanned: len(deltas),
+			Payload: deltas,
 		})
+	}
+
+	// Refresh the deep plan cache the browser reads from.
+	// Walking every watched plansDir keeps this work out of TUI
+	// clients, and the debounce above limits how often we do it.
+	plansByDir := make(map[string][]*orchestration.Plan)
+	scanAt := time.Now()
+	var summaries []models.PlanSummary
+	registryEntries, _ := worktreeregistry.ListAll()
+	h.pathsMutex.RLock()
+	seen := make(map[string]struct{})
+	for _, wsNode := range h.watchedPaths {
+		plansDir, err := h.locator.GetPlansDir(wsNode)
+		if err != nil || plansDir == "" {
+			continue
+		}
+		if _, dup := seen[plansDir]; dup {
+			continue
+		}
+		seen[plansDir] = struct{}{}
+
+		indexed := loadIndexedPlans(plansDir)
+		plans := make([]*orchestration.Plan, 0, len(indexed))
+		selectedPlan, _ := corestate.GetString(wsNode.Path, coreplan.StateKey)
+		for _, indexedPlan := range indexed {
+			p := indexedPlan.plan
+			if !indexedPlan.archived {
+				plans = append(plans, p)
+			}
+			summary := summarizePlan(p, plansDir, wsNode.Path, selectedPlan, state.Sessions, scanAt)
+			summary.Archived = indexedPlan.archived
+			if indexedPlan.archived {
+				summary.Lifecycle = "finished"
+				summary.Selected = false
+			}
+			summaries = append(summaries, summary)
+		}
+		plansByDir[plansDir] = plans
+	}
+	h.pathsMutex.RUnlock()
+	summaries = applyQualifiedPlanBindings(summaries, registryEntries)
+
+	if len(plansByDir) > 0 {
+		h.store.ApplyUpdate(store.Update{
+			Type:    store.UpdatePlans,
+			Source:  "flow_watcher",
+			Scanned: len(plansByDir),
+			Payload: plansByDir,
+		})
+	}
+	sort.Slice(summaries, func(i, j int) bool { return summaries[i].PlanDir < summaries[j].PlanDir })
+	h.store.ApplyUpdate(store.Update{
+		Type: store.UpdatePlanIndexSnapshot, Source: "flow_watcher", Scanned: len(summaries),
+		Payload: &models.PlanIndexSnapshot{ScannedAt: scanAt, Plans: summaries},
 	})
 }
 
