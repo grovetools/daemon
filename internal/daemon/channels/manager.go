@@ -320,22 +320,29 @@ func (m *Manager) CleanupOrphans(ctx context.Context) (int, error) {
 
 // Stop shuts down the channel manager and signal-cli.
 func (m *Manager) Stop(ctx context.Context) {
+	// Detach mutable resources while holding the manager lock, then perform
+	// cancellation, channel shutdown, and persistence without it. saveRoutes
+	// takes m.mu to snapshot routeTable; calling it while m.mu was held
+	// self-deadlocked every daemon shutdown after channel-state persistence was
+	// introduced.
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	cancel := m.cancel
+	signalChannel := m.signalChannel
+	haChannel := m.haChannel
+	m.cancel = nil
+	m.signalChannel = nil
+	m.haChannel = nil
+	m.isRunning = false
+	m.mu.Unlock()
 
-	if m.cancel != nil {
-		m.cancel()
+	if cancel != nil {
+		cancel()
 	}
-
-	if m.signalChannel != nil {
-		_ = m.signalChannel.Stop(ctx)
-		m.signalChannel = nil
-		m.isRunning = false
+	if signalChannel != nil {
+		_ = signalChannel.Stop(ctx)
 	}
-
-	if m.haChannel != nil {
-		_ = m.haChannel.Stop(ctx)
-		m.haChannel = nil
+	if haChannel != nil {
+		_ = haChannel.Stop(ctx)
 	}
 
 	m.saveRoutes()
