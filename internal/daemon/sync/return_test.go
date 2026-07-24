@@ -74,6 +74,7 @@ func TestReturnManifestRepresentsCreateUpdateMoveDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
 func TestReturnManifestIgnoresServerAbsenceForNeverSyncedLocalIdentity(t *testing.T) {
 	db := openTestDB(t)
 	if err := db.UpsertDocument(&Document{DocumentID: "stale", Workspace: "ws", Path: "plans/old/a.md", ContentHash: hash([]byte("body")), LastSyncedVersion: 0}); err != nil {
@@ -109,6 +110,7 @@ func TestReturnManifestLocalAndServerChangesInvalidateGeneration(t *testing.T) {
 		t.Fatal("server epoch change did not change generation")
 	}
 }
+
 func TestReviewedReturnManifestStaleRefusal(t *testing.T) {
 	db := openTestDB(t)
 	body := []byte("head")
@@ -139,7 +141,7 @@ func TestReturnEscrowDurableHashVerification(t *testing.T) {
 	}
 	b, _ := os.ReadFile(path)
 	b = []byte(strings.Replace(string(b), "Z3Vlc3Qgb25seQ==", "dGFtcGVyZWQ=", 1))
-	_ = os.WriteFile(path, b, 0600)
+	_ = os.WriteFile(path, b, 0o600)
 	if err = VerifyReturnEscrow(path, m.Generation); err == nil {
 		t.Fatal("tampered escrow verified")
 	}

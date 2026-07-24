@@ -148,12 +148,14 @@ func compactStrings(in []string) []string {
 	}
 	return out
 }
+
 func manifestHash(m ReturnManifest) string {
 	m.ManifestSHA256 = ""
 	b, _ := json.Marshal(m)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
+
 func ValidateReviewedManifest(reviewed, current ReturnManifest) error {
 	if err := reviewed.Validate(); err != nil {
 		return err
