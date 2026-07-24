@@ -11,6 +11,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/grovetools/core/config"
+	coregit "github.com/grovetools/core/git"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	coreplan "github.com/grovetools/core/pkg/plan"
@@ -381,6 +382,7 @@ func (h *FlowHandler) refresh() {
 	}
 	h.pathsMutex.RUnlock()
 	summaries = applyQualifiedPlanBindings(summaries, registryEntries)
+	summaries = applyCachedPlanGit(summaries, state.Workspaces)
 
 	if len(plansByDir) > 0 {
 		h.store.ApplyUpdate(store.Update{
@@ -430,9 +432,11 @@ func loadIndexedPlans(plansDir string) []indexedPlanEntry {
 func summarizePlan(p *orchestration.Plan, plansDir, workspaceRoot, selectedPlan string, sessions map[string]*models.Session, scannedAt time.Time) models.PlanSummary {
 	lifecycle := "live"
 	worktree := ""
+	notes := ""
 	var repos []string
 	if p.Config != nil {
 		worktree = p.Config.Worktree
+		notes = p.Config.Notes
 		repos = append(repos, p.Config.Repos...)
 		switch p.Config.Status {
 		case "hold", "review", "finished":
@@ -456,7 +460,7 @@ func summarizePlan(p *orchestration.Plan, plansDir, workspaceRoot, selectedPlan 
 	return models.PlanSummary{
 		PlanDir: p.Directory, PlanName: p.Name, WorkspaceRoot: workspaceRoot,
 		PlansDir: plansDir, Lifecycle: lifecycle, Selected: selectedPlan == p.Name,
-		Worktree: worktree, Repositories: repos, JobCounts: counts,
+		Worktree: worktree, Repositories: repos, Notes: notes, JobCounts: counts,
 		RunningSessions: running, UpdatedAt: updatedAt, ScannedAt: scannedAt,
 	}
 }
@@ -478,6 +482,53 @@ func applyQualifiedPlanBindings(summaries []models.PlanSummary, entries []*workt
 	return applyResolvedPlanBindings(summaries, entries, coreplan.ResolvePlanBindings(requests))
 }
 
+// applyCachedPlanGit projects only already-collected daemon status into cheap
+// rows. It never invokes Git. Ecosystem rows aggregate their declared member
+// checkouts; selected-row detail remains the only live Git path in Flow.
+func applyCachedPlanGit(summaries []models.PlanSummary, workspaces map[string]*models.EnrichedWorkspace) []models.PlanSummary {
+	byPath := make(map[string]*coregit.StatusInfo, len(workspaces))
+	for path, workspace := range workspaces {
+		if workspace == nil || workspace.GitStatus == nil || workspace.GitStatus.StatusInfo == nil {
+			continue
+		}
+		byPath[filepath.Clean(path)] = workspace.GitStatus.StatusInfo
+		if workspace.WorkspaceNode != nil {
+			byPath[filepath.Clean(workspace.Path)] = workspace.GitStatus.StatusInfo
+		}
+	}
+	for i := range summaries {
+		if summaries[i].WorktreePath == "" {
+			continue
+		}
+		paths := []string{summaries[i].WorktreePath}
+		if len(summaries[i].Repositories) > 0 {
+			paths = paths[:0]
+			for _, repo := range summaries[i].Repositories {
+				paths = append(paths, filepath.Join(summaries[i].WorktreePath, repo))
+			}
+		}
+		aggregate := &coregit.StatusInfo{}
+		found := false
+		for _, path := range paths {
+			status := byPath[filepath.Clean(path)]
+			if status == nil {
+				continue
+			}
+			found = true
+			aggregate.IsDirty = aggregate.IsDirty || status.IsDirty
+			aggregate.ModifiedCount += status.ModifiedCount
+			aggregate.UntrackedCount += status.UntrackedCount
+			aggregate.StagedCount += status.StagedCount
+			aggregate.AheadCount += status.AheadMainCount
+			aggregate.BehindCount += status.BehindMainCount
+		}
+		if found {
+			summaries[i].GitStatus = aggregate
+		}
+	}
+	return summaries
+}
+
 func applyResolvedPlanBindings(summaries []models.PlanSummary, entries []*worktreeregistry.Entry, bindings map[string]coreplan.PlanBinding) []models.PlanSummary {
 	entriesByPath := make(map[string]*worktreeregistry.Entry, len(entries))
 	for _, entry := range entries {
@@ -487,6 +538,9 @@ func applyResolvedPlanBindings(summaries []models.PlanSummary, entries []*worktr
 	}
 	for i := range summaries {
 		binding := bindings[coreplan.NewPlanKey(summaries[i].PlanDir).String()]
+		summaries[i].BindingHealth = string(binding.Health)
+		summaries[i].BindingReason = binding.Reason
+		summaries[i].RegistryID = binding.RegistryID
 		if !binding.Valid() {
 			continue
 		}

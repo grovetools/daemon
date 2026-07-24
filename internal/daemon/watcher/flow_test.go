@@ -10,6 +10,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/grovetools/core/config"
+	coregit "github.com/grovetools/core/git"
 	"github.com/grovetools/core/pkg/models"
 	coreplan "github.com/grovetools/core/pkg/plan"
 	"github.com/grovetools/core/pkg/workspace"
@@ -260,16 +261,29 @@ func TestApplyResolvedPlanBindingsKeepsDuplicateSlugsQualified(t *testing.T) {
 		{AbsPath: rootB, Owner: "/repos/b", Repos: []string{"repo-b"}},
 	}
 	bindings := map[string]coreplan.PlanBinding{
-		planA: {Key: coreplan.NewPlanKey(planA), Health: coreplan.BindingValid, ContainerPath: rootA},
-		planB: {Key: coreplan.NewPlanKey(planB), Health: coreplan.BindingValid, ContainerPath: rootB},
+		planA: {Key: coreplan.NewPlanKey(planA), Health: coreplan.BindingValid, ContainerPath: rootA, RegistryID: "a"},
+		planB: {Key: coreplan.NewPlanKey(planB), Health: coreplan.BindingValid, ContainerPath: rootB, RegistryID: "b"},
 	}
 
 	got := applyResolvedPlanBindings(summaries, entries, bindings)
-	if got[0].WorktreePath != rootA || got[0].Anchor != "/repos/a" || len(got[0].Repositories) != 1 || got[0].Repositories[0] != "repo-a" {
+	if got[0].WorktreePath != rootA || got[0].BindingHealth != string(coreplan.BindingValid) || got[0].RegistryID != "a" || got[0].Anchor != "/repos/a" || len(got[0].Repositories) != 1 || got[0].Repositories[0] != "repo-a" {
 		t.Fatalf("plan A binding=%+v", got[0])
 	}
-	if got[1].WorktreePath != rootB || got[1].Anchor != "/repos/b" || len(got[1].Repositories) != 1 || got[1].Repositories[0] != "repo-b" {
+	if got[1].WorktreePath != rootB || got[1].BindingHealth != string(coreplan.BindingValid) || got[1].RegistryID != "b" || got[1].Anchor != "/repos/b" || len(got[1].Repositories) != 1 || got[1].Repositories[0] != "repo-b" {
 		t.Fatalf("plan B binding=%+v", got[1])
+	}
+}
+
+func TestApplyCachedPlanGitAggregatesWithoutLiveFetch(t *testing.T) {
+	container := "/containers/plan"
+	summaries := []models.PlanSummary{{PlanDir: "/plans/plan", WorktreePath: container, Repositories: []string{"a", "b"}}}
+	workspaces := map[string]*models.EnrichedWorkspace{
+		filepath.Join(container, "a"): {GitStatus: &coregit.ExtendedGitStatus{StatusInfo: &coregit.StatusInfo{IsDirty: true, AheadMainCount: 2}}},
+		filepath.Join(container, "b"): {GitStatus: &coregit.ExtendedGitStatus{StatusInfo: &coregit.StatusInfo{BehindMainCount: 3}}},
+	}
+	got := applyCachedPlanGit(summaries, workspaces)
+	if got[0].GitStatus == nil || !got[0].GitStatus.IsDirty || got[0].GitStatus.AheadCount != 2 || got[0].GitStatus.BehindCount != 3 {
+		t.Fatalf("cached aggregate=%+v", got[0].GitStatus)
 	}
 }
 
