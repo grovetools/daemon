@@ -741,7 +741,12 @@ type indexedPlanEntry struct {
 // children of the archive container. Hidden organizational directories are
 // never themselves plans, and archived plans remain separately identifiable
 // as read-only rows in daemon clients.
+//
+// Loading is lenient: one malformed or half-written job file must degrade to
+// a row with fewer jobs, never to the plan silently vanishing from the index
+// (the pilot's burst-insert plans were dropped exactly that way).
 func loadIndexedPlans(plansDir string) []indexedPlanEntry {
+	ulog := logging.NewUnifiedLogger("groved.watcher.flow")
 	var indexed []indexedPlanEntry
 	loadChildren := func(parent string, archived bool) {
 		entries, err := os.ReadDir(parent)
@@ -752,7 +757,14 @@ func loadIndexedPlans(plansDir string) []indexedPlanEntry {
 			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 				continue
 			}
-			if p, err := orchestration.LoadPlan(filepath.Join(parent, entry.Name())); err == nil {
+			p, problems := orchestration.LoadPlanLenient(filepath.Join(parent, entry.Name()))
+			for _, problem := range problems {
+				ulog.Debug("Plan indexed with degraded jobs").
+					Field("plan_dir", filepath.Join(parent, entry.Name())).
+					Err(problem).
+					Log(context.Background())
+			}
+			if p != nil {
 				indexed = append(indexed, indexedPlanEntry{plan: p, archived: archived})
 			}
 		}

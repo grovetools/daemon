@@ -246,6 +246,16 @@ func newGrovedStartCmd() *cobra.Command {
 			autoShutdown, _ := cmd.Flags().GetBool("auto-shutdown")
 			pairPID, _ := cmd.Flags().GetInt("pair-with-pid")
 			readyFd, _ := cmd.Flags().GetInt("ready-fd")
+			// The inherited readiness fd arrives without CLOEXEC (the parent
+			// passed it deliberately). Mark it now, before any boot step can
+			// spawn a child: a long-lived child (the scoped tuimux daemon)
+			// otherwise inherits a duplicate of the pipe's write end, and the
+			// parent's readiness Read never sees EOF even after our own
+			// OnReady close — every auto-start client then burns its full
+			// handshake timeout while the socket sits bound and idle.
+			if readyFd > 0 {
+				syscall.CloseOnExec(readyFd)
+			}
 
 			// Start pprof if requested
 			if port, _ := cmd.Flags().GetInt("pprof-port"); port > 0 {
