@@ -36,6 +36,9 @@ type State struct {
 	// back to claude session ID), then agent ID.
 	AdhocSubagents map[string]map[string]*models.Subagent `json:"adhoc_subagents,omitempty"`
 
+	// Subjobs is the durable materialized report lifecycle index.
+	Subjobs map[string]*models.SubjobState `json:"subjobs,omitempty"`
+
 	// Satellites holds the latest connection-health status per satellite,
 	// keyed by registry name. Written by the satellite ConnManager
 	// (daemon/internal/daemon/satellite) via UpdateSatelliteStatus and read by
@@ -173,6 +176,10 @@ const (
 	// Like the snapshot it mints no run rows and is never persisted — bash
 	// liveness is ephemeral and TTL-bounded.
 	UpdateWorkflowBashStarted UpdateType = "workflow_bash_started"
+
+	// Pi Flow subjob report lifecycle updates.
+	UpdateSubjobReportReady UpdateType = "subjob_report_ready"
+	UpdateSubjobJoined      UpdateType = "subjob_joined"
 
 	// Build queue lifecycle update types for the daemon's machine-wide
 	// build scheduler (buildqueue). Each maps to a DISTINCT SSE

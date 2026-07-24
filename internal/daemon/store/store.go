@@ -47,6 +47,7 @@ func New() *Store {
 			Plans:          make(map[string][]*orchestration.Plan),
 			WorkflowRuns:   make(map[string]*models.WorkflowRunState),
 			AdhocSubagents: make(map[string]map[string]*models.Subagent),
+			Subjobs:        make(map[string]*models.SubjobState),
 			Satellites:     make(map[string]*SatelliteStatusPayload),
 		},
 		subscribers:       make(map[chan Update]struct{}),
@@ -58,6 +59,7 @@ func New() *Store {
 	}
 	s.loadPersistedResults()
 	s.loadPersistedWorkflowEvents()
+	s.loadPersistedSubjobs()
 	return s
 }
 
@@ -490,6 +492,11 @@ func (s *Store) ApplyUpdate(u Update) {
 			// bash_started kinds by a case-local return in applyWorkflowEvent
 			// (both are ephemeral and never journaled).
 			s.applyWorkflowEvent(payload, true)
+		}
+
+	case UpdateSubjobReportReady, UpdateSubjobJoined:
+		if event, ok := u.Payload.(*models.SubjobEvent); ok {
+			s.applySubjobEvent(event)
 		}
 
 	// Satellite connection-health transition from the ConnManager (C17). Record

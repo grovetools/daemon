@@ -410,6 +410,8 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	// reachable via the unauthenticated localhost TCP listener).
 	mux.HandleFunc("/api/workflows/event", unixOnly(s.handleWorkflowEvent))
 	mux.HandleFunc("/api/workflows", unixOnly(s.handleGetWorkflows))
+	mux.HandleFunc("/api/subjobs/event", unixOnly(s.handleSubjobEvent))
+	mux.HandleFunc("/api/subjobs", unixOnly(s.handleGetSubjobs))
 	// Aggregated workspace log streaming
 	mux.HandleFunc("/api/logs/stream", s.handleStreamWorkspaceLogs)
 	// Environment management endpoints
@@ -2535,6 +2537,9 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
+
+	case store.UpdateSubjobReportReady, store.UpdateSubjobJoined:
+		return &apiStateUpdate{UpdateType: string(u.Type), Source: u.Source, Payload: u.Payload}
 
 	// Build queue lifecycle updates — distinct update_type strings (the
 	// job_*/workflow_* pattern). Per-job build output never passes through
