@@ -548,7 +548,7 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 		if _, cached := h.dirCache[plansDir]; cached && !all && !affected {
 			continue
 		}
-		h.dirCache[plansDir] = scanPlansDir(plansDir, targets[plansDir].Path, scanAt)
+		h.dirCache[plansDir] = scanPlansDir(plansDir, planWorkspaceRoot(targets[plansDir]), scanAt)
 		rescanned++
 	}
 	for dir := range h.dirCache {
@@ -568,7 +568,7 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 		if result == nil {
 			continue
 		}
-		selectedPlan, _ := corestate.GetString(wsNode.Path, coreplan.StateKey)
+		selectedPlan, _ := corestate.GetString(planWorkspaceRoot(wsNode), coreplan.StateKey)
 		for _, base := range result.summaries {
 			row := base
 			row.RunningSessions = countRunningSessions(state.Sessions, row.PlanName)
@@ -695,6 +695,26 @@ func (h *FlowHandler) refreshPlanStats(ctx context.Context, seq uint64) {
 			Payload: deltas,
 		})
 	}
+}
+
+// planWorkspaceRoot returns the canonical owner identity for plan rows. Many
+// ecosystem members resolve to the same centralized plans directory, so the
+// map's representative node is intentionally arbitrary; row identity must
+// still be the parent ecosystem rather than whichever child won iteration.
+func planWorkspaceRoot(node *workspace.WorkspaceNode) string {
+	if node == nil {
+		return ""
+	}
+	if node.RootEcosystemPath != "" {
+		return node.RootEcosystemPath
+	}
+	if node.Kind == workspace.KindEcosystemRoot {
+		return node.Path
+	}
+	if node.IsWorktree() && node.ParentProjectPath != "" {
+		return node.ParentProjectPath
+	}
+	return node.Path
 }
 
 // scanPlansDir reads one plans directory from disk into its cacheable base

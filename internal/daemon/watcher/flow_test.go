@@ -32,6 +32,28 @@ func writeIndexedPlan(t *testing.T, dir string) {
 	}
 }
 
+func TestPlanWorkspaceRootUsesParentEcosystemForMember(t *testing.T) {
+	ecosystemRoot := filepath.Join(t.TempDir(), "grovetools")
+	member := &workspace.WorkspaceNode{
+		Name: "eval-framework", Path: filepath.Join(ecosystemRoot, "eval"),
+		Kind: workspace.KindEcosystemSubProject, RootEcosystemPath: ecosystemRoot,
+	}
+	if got := planWorkspaceRoot(member); got != ecosystemRoot {
+		t.Fatalf("plan workspace root = %q, want parent ecosystem %q", got, ecosystemRoot)
+	}
+}
+
+func TestPlanWorkspaceRootUsesOwnerForStandaloneWorktree(t *testing.T) {
+	owner := filepath.Join(t.TempDir(), "repo")
+	worktree := &workspace.WorkspaceNode{
+		Name: "feature", Path: filepath.Join(owner, ".grove-worktrees", "feature"),
+		Kind: workspace.KindStandaloneProjectWorktree, ParentProjectPath: owner,
+	}
+	if got := planWorkspaceRoot(worktree); got != owner {
+		t.Fatalf("plan workspace root = %q, want owner %q", got, owner)
+	}
+}
+
 func TestFlowHandlerResolvesNotebookAliasForRuntimeEvents(t *testing.T) {
 	notebookRoot := t.TempDir()
 	realWorkspace := filepath.Join(notebookRoot, "workspaces", "fixture-repo")
