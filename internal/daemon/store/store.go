@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -412,18 +413,15 @@ func (s *Store) ApplyUpdate(u Update) {
 	case UpdatePlanIndexSnapshot:
 		if incoming, ok := u.Payload.(*models.PlanIndexSnapshot); ok && incoming != nil {
 			previous := make(map[string]models.PlanSummary)
+			hadIndex := s.state.PlanIndex != nil
 			var revision uint64
-			if s.state.PlanIndex != nil {
+			if hadIndex {
 				revision = s.state.PlanIndex.Revision
 				for _, summary := range s.state.PlanIndex.Plans {
 					previous[summary.PlanDir] = summary
 				}
 			}
-			revision++
 			plans := append([]models.PlanSummary(nil), incoming.Plans...)
-			s.state.PlanIndex = &models.PlanIndexSnapshot{
-				Revision: revision, ScannedAt: incoming.ScannedAt, Plans: plans,
-			}
 			seen := make(map[string]struct{}, len(plans))
 			for _, summary := range plans {
 				seen[summary.PlanDir] = struct{}{}
@@ -434,12 +432,40 @@ func (s *Store) ApplyUpdate(u Update) {
 					removed = append(removed, dir)
 				}
 			}
+			// Deltas carry only rows that materially changed since the stored
+			// snapshot; re-scans that observe an identical portfolio must not
+			// spend a revision or an SSE frame per subscriber. The very first
+			// snapshot is the reconnect/boot baseline and always publishes,
+			// even when empty.
+			var upserts []models.PlanSummary
+			if hadIndex {
+				for _, summary := range plans {
+					prev, exists := previous[summary.PlanDir]
+					if !exists || !planSummaryEquivalent(prev, summary) {
+						upserts = append(upserts, summary)
+					}
+				}
+				if len(upserts) == 0 && len(removed) == 0 {
+					// Freshness still advances for /api/plan-index consumers;
+					// the revision and the wire stay quiet.
+					s.state.PlanIndex.ScannedAt = incoming.ScannedAt
+					s.state.PlanIndex.Plans = plans
+					return
+				}
+			} else {
+				upserts = plans
+			}
+			revision++
+			s.state.PlanIndex = &models.PlanIndexSnapshot{
+				Revision: revision, ScannedAt: incoming.ScannedAt, Plans: plans,
+			}
 			// Subscribers consume deltas, while the durable store retains the full
-			// snapshot. Every scan advances revision, making dropped frames visible.
+			// snapshot. Every published scan advances revision, making dropped
+			// frames visible.
 			u.Type = UpdatePlanIndexDelta
 			u.Payload = &models.PlanIndexDelta{
 				Revision: revision, ScannedAt: incoming.ScannedAt,
-				Upserts: plans, Removed: removed,
+				Upserts: upserts, Removed: removed,
 			}
 
 			// The plan index carries the canonical qualified plan↔container binding.
@@ -588,6 +614,18 @@ func (s *Store) ApplyUpdate(u Update) {
 			}
 		}
 	}
+}
+
+// planSummaryEquivalent reports whether two rows carry the same material
+// state. ScannedAt is bookkeeping (every rescan restamps it), so it is
+// excluded; UpdatedAt is real data (directory mtime) and compares by instant.
+func planSummaryEquivalent(a, b models.PlanSummary) bool {
+	if !a.UpdatedAt.Equal(b.UpdatedAt) {
+		return false
+	}
+	a.ScannedAt, b.ScannedAt = time.Time{}, time.Time{}
+	a.UpdatedAt, b.UpdatedAt = time.Time{}, time.Time{}
+	return reflect.DeepEqual(a, b)
 }
 
 // applyPlanLifecycleToWorkspaces projects the plan index's canonical qualified

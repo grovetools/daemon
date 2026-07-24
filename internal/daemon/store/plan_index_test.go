@@ -42,6 +42,96 @@ func TestPlanIndexSnapshotMaterializesRevisionedDelta(t *testing.T) {
 	}
 }
 
+// TestPlanIndexIdenticalRescanIsSuppressed pins the incremental-delta
+// contract: a rescan that observes a materially identical portfolio must not
+// spend a revision or an SSE frame, while the stored snapshot's freshness
+// (ScannedAt) still advances for /api/plan-index consumers.
+func TestPlanIndexIdenticalRescanIsSuppressed(t *testing.T) {
+	s := New()
+	ch := s.Subscribe()
+	defer s.Unsubscribe(ch)
+	now := time.Now()
+
+	rows := func(scannedAt time.Time) []models.PlanSummary {
+		return []models.PlanSummary{
+			{PlanDir: "/plans/a", PlanName: "a", Lifecycle: "live", ScannedAt: scannedAt},
+			{PlanDir: "/plans/b", PlanName: "b", Lifecycle: "hold", ScannedAt: scannedAt},
+		}
+	}
+
+	s.ApplyUpdate(Update{Type: UpdatePlanIndexSnapshot, Source: "test", Payload: &models.PlanIndexSnapshot{
+		ScannedAt: now, Plans: rows(now),
+	}})
+	if first := <-ch; first.Type != UpdatePlanIndexDelta {
+		t.Fatalf("first broadcast type=%q", first.Type)
+	}
+
+	later := now.Add(time.Minute)
+	s.ApplyUpdate(Update{Type: UpdatePlanIndexSnapshot, Source: "test", Payload: &models.PlanIndexSnapshot{
+		ScannedAt: later, Plans: rows(later),
+	}})
+	select {
+	case update := <-ch:
+		t.Fatalf("identical rescan broadcast %q: %+v", update.Type, update.Payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+	snap := s.GetPlanIndexSnapshot()
+	if snap.Revision != 1 {
+		t.Fatalf("identical rescan bumped revision to %d", snap.Revision)
+	}
+	if !snap.ScannedAt.Equal(later) {
+		t.Fatalf("suppressed rescan did not advance freshness: %v", snap.ScannedAt)
+	}
+}
+
+// TestPlanIndexDeltaCarriesOnlyChangedRows pins the sparse-upsert contract:
+// after the baseline snapshot, deltas name only the rows that materially
+// changed plus explicit removals — never the full portfolio.
+func TestPlanIndexDeltaCarriesOnlyChangedRows(t *testing.T) {
+	s := New()
+	ch := s.Subscribe()
+	defer s.Unsubscribe(ch)
+	now := time.Now()
+
+	s.ApplyUpdate(Update{Type: UpdatePlanIndexSnapshot, Source: "test", Payload: &models.PlanIndexSnapshot{
+		ScannedAt: now, Plans: []models.PlanSummary{
+			{PlanDir: "/plans/a", PlanName: "a", Lifecycle: "live"},
+			{PlanDir: "/plans/b", PlanName: "b", Lifecycle: "live"},
+		},
+	}})
+	baseline := (<-ch).Payload.(*models.PlanIndexDelta)
+	if len(baseline.Upserts) != 2 {
+		t.Fatalf("baseline upserts=%d", len(baseline.Upserts))
+	}
+
+	s.ApplyUpdate(Update{Type: UpdatePlanIndexSnapshot, Source: "test", Payload: &models.PlanIndexSnapshot{
+		ScannedAt: now.Add(time.Minute), Plans: []models.PlanSummary{
+			{PlanDir: "/plans/a", PlanName: "a", Lifecycle: "hold"},
+			{PlanDir: "/plans/b", PlanName: "b", Lifecycle: "live"},
+		},
+	}})
+	delta := (<-ch).Payload.(*models.PlanIndexDelta)
+	if delta.Revision != 2 || len(delta.Upserts) != 1 || delta.Upserts[0].PlanDir != "/plans/a" || delta.Upserts[0].Lifecycle != "hold" {
+		t.Fatalf("changed-row delta=%+v", delta)
+	}
+	if len(delta.Removed) != 0 {
+		t.Fatalf("unexpected removals: %+v", delta.Removed)
+	}
+	if snap := s.GetPlanIndexSnapshot(); len(snap.Plans) != 2 {
+		t.Fatalf("stored snapshot rows=%d", len(snap.Plans))
+	}
+
+	s.ApplyUpdate(Update{Type: UpdatePlanIndexSnapshot, Source: "test", Payload: &models.PlanIndexSnapshot{
+		ScannedAt: now.Add(2 * time.Minute), Plans: []models.PlanSummary{
+			{PlanDir: "/plans/b", PlanName: "b", Lifecycle: "live"},
+		},
+	}})
+	removal := (<-ch).Payload.(*models.PlanIndexDelta)
+	if removal.Revision != 3 || len(removal.Upserts) != 0 || len(removal.Removed) != 1 || removal.Removed[0] != "/plans/a" {
+		t.Fatalf("removal delta=%+v", removal)
+	}
+}
+
 func TestPlanIndexLifecycleEmitsQualifiedWorkspaceDeltas(t *testing.T) {
 	s := New()
 	ch := s.Subscribe()

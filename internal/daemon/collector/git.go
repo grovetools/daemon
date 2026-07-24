@@ -199,15 +199,23 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 			if time.Since(lastFullScan) < backgroundScanInterval {
 				return // Skip this tick
 			}
-			lastFullScan = time.Now()
 			for _, ws := range state.Workspaces {
 				toScan = append(toScan, ws)
 			}
+			// A scan of nothing must not consume the background budget: on cold
+			// start workspace discovery often lands after the first tick, and
+			// stamping lastFullScan here would leave every plan-index row
+			// without cached git status for a full backgroundScanInterval.
+			if len(toScan) > 0 {
+				lastFullScan = time.Now()
+			}
 		} else if time.Since(lastFullScan) >= backgroundScanInterval {
 			// Focus is set but it's time for a periodic full scan
-			lastFullScan = time.Now()
 			for _, ws := range state.Workspaces {
 				toScan = append(toScan, ws)
+			}
+			if len(toScan) > 0 {
+				lastFullScan = time.Now()
 			}
 		} else {
 			// Focused scan: only focused workspaces. Select via the same
@@ -244,7 +252,11 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		for _, ws := range state.Workspaces {
 			toScan = append(toScan, ws)
 		}
-		lastFullScan = time.Now()
+		// See scan(): an empty pass (pre-discovery cold start) must not spend
+		// the background budget, or the first real scan waits ~5 minutes.
+		if len(toScan) > 0 {
+			lastFullScan = time.Now()
+		}
 		scanWorkspaces(toScan)
 	}
 

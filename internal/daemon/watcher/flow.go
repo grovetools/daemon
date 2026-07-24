@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -37,11 +38,43 @@ type FlowHandler struct {
 	watchedPaths map[string]*workspace.WorkspaceNode
 	pathsMutex   sync.RWMutex
 
-	// Debounce timer for plan stats refresh
-	refreshTimer *time.Timer
-	refreshMu    sync.Mutex
-	refreshRunMu sync.Mutex
-	debounceMs   int
+	// Debounce timer + accumulated scope for the next refresh (guarded by
+	// refreshMu). pendingAll forces a full disk rescan; pendingDirs holds the
+	// plans directories fsnotify implicated since the last run. A trigger with
+	// neither set is an overlay-only pass: it re-projects cached rows through
+	// the current bindings/git/session state without touching plan files.
+	refreshTimer    *time.Timer
+	refreshDeadline time.Time
+	refreshMu       sync.Mutex
+	pendingAll      bool
+	pendingDirs     map[string]struct{}
+	refreshRunMu    sync.Mutex
+	debounceMs      int
+
+	// Per-plansDir scan results, so event-scoped refreshes only re-read the
+	// affected directory instead of the whole portfolio. Guarded by
+	// refreshRunMu (only touched inside runRefresh).
+	dirCache map[string]*dirScanResult
+
+	// Aggregated-PlanStats pass bookkeeping. The stats leg runs a full
+	// workspace discovery, so it executes on its own goroutine with
+	// trailing-run coalescing — never under refreshRunMu, where it would
+	// delay synchronous lifecycle publishes behind disk discovery.
+	statsMu      sync.Mutex
+	statsRunning bool
+	statsQueued  bool
+	// scanSeq increments on every index publish; the async stats pass uses it
+	// as a fence so results read from disk before a newer publish are
+	// discarded instead of clobbering fresher lifecycle state.
+	scanSeq atomic.Uint64
+}
+
+// dirScanResult is the disk-derived portion of one plans directory's rows.
+// Selected/RunningSessions/bindings/git are overlays recomputed on every
+// publish from live store state, so cached entries never pin them stale.
+type dirScanResult struct {
+	plans     []*orchestration.Plan
+	summaries []models.PlanSummary
 }
 
 // NewFlowHandler creates a new FlowHandler instance.
@@ -155,16 +188,28 @@ func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 
 	var discoveredJobs []*models.JobInfo
 	lifecycleChanged := false
+	affectedDirs := h.affectedPlansDirs(events)
 
 	for _, event := range events {
 		if (filepath.Base(event.Name) == ".grove-plan.yml" || filepath.Base(event.Name) == "config.yml") &&
-			(event.Op&fsnotify.Write != 0 || event.Op&fsnotify.Create != 0 || event.Op&fsnotify.Rename != 0) {
+			(event.Op&fsnotify.Write != 0 || event.Op&fsnotify.Create != 0 || event.Op&fsnotify.Rename != 0 || event.Op&fsnotify.Remove != 0) {
 			lifecycleChanged = true
 			// Event-match boundary: plan-config mutations are the hold/unhold
 			// delivery proof and are rare, so log each one at info.
 			h.ulog.Info("Plan lifecycle event received").
 				Field("path", event.Name).
 				Field("op", event.Op.String()).
+				Log(ctx)
+		}
+		// A directory created directly under a plans dir is a new plan being
+		// born (`flow plan init`, plan copy). Its config write happens before
+		// fsnotify can watch the new directory, so this bare dir-create is the
+		// ONLY signal we get — treat it as a lifecycle edge rather than
+		// letting the new row wait out the enrichment debounce.
+		if event.Op&fsnotify.Create != 0 && !lifecycleChanged && h.isDirectPlanDirCreate(event.Name) {
+			lifecycleChanged = true
+			h.ulog.Info("Plan directory created").
+				Field("path", event.Name).
 				Log(ctx)
 		}
 		if !strings.HasSuffix(event.Name, ".md") {
@@ -244,15 +289,73 @@ func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 		// Plan lifecycle edges are state transitions, not eventually-consistent
 		// enrichment. A debounced rescan can collapse hold→unhold into one live
 		// snapshot, so publish each observed config mutation synchronously.
-		h.triggerLifecycleRefresh()
+		h.triggerLifecycleRefresh(affectedDirs)
 	} else {
-		h.triggerRefresh()
+		h.scheduleRefresh(affectedDirs, false, time.Duration(h.debounceMs)*time.Millisecond)
 	}
 	return nil
 }
 
+// isDirectPlanDirCreate reports whether path is a just-created directory that
+// sits immediately under a watched plans directory (or its .archive
+// container) — i.e. a new plan row, not organizational churn deeper inside an
+// existing plan.
+func (h *FlowHandler) isDirectPlanDirCreate(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	if strings.HasPrefix(filepath.Base(path), ".") {
+		return false
+	}
+	parent := resolveFlowWatchPath(filepath.Dir(path))
+	if filepath.Base(parent) == ".archive" {
+		parent = filepath.Dir(parent)
+	}
+
+	h.pathsMutex.RLock()
+	defer h.pathsMutex.RUnlock()
+	seen := make(map[string]struct{})
+	for _, wsNode := range h.watchedPaths {
+		plansDir, err := h.locator.GetPlansDir(wsNode)
+		if err != nil || plansDir == "" {
+			continue
+		}
+		if _, dup := seen[plansDir]; dup {
+			continue
+		}
+		seen[plansDir] = struct{}{}
+		if parent == resolveFlowWatchPath(plansDir) {
+			return true
+		}
+	}
+	return false
+}
+
+// affectedPlansDirs maps event paths back to the plans directories they touch,
+// so the follow-up refresh only re-reads those directories from disk.
+func (h *FlowHandler) affectedPlansDirs(events []fsnotify.Event) map[string]struct{} {
+	dirs := make(map[string]struct{})
+	h.pathsMutex.RLock()
+	defer h.pathsMutex.RUnlock()
+	for _, event := range events {
+		eventPath := resolveFlowWatchPath(event.Name)
+		for watchedPath, wsNode := range h.watchedPaths {
+			if eventPath != watchedPath && !strings.HasPrefix(eventPath, watchedPath+string(filepath.Separator)) {
+				continue
+			}
+			if plansDir, err := h.locator.GetPlansDir(wsNode); err == nil && plansDir != "" {
+				dirs[plansDir] = struct{}{}
+			}
+			break
+		}
+	}
+	return dirs
+}
+
 func (h *FlowHandler) HandleStoreUpdate(update store.Update) {
-	if update.Type == store.UpdateConfigReload {
+	switch update.Type {
+	case store.UpdateConfigReload:
 		newCfg, err := config.LoadDefault()
 		if err != nil {
 			h.ulog.Error("Failed to reload config").Err(err).Log(context.Background())
@@ -260,14 +363,51 @@ func (h *FlowHandler) HandleStoreUpdate(update store.Update) {
 		}
 		h.cfg = newCfg
 		h.locator = workspace.NewNotebookLocator(newCfg)
+
+	case store.UpdateWorkspaces:
+		// Workspace discovery just (re)populated the watch set — this is the
+		// cold-start edge. Without it the first populated index build waits for
+		// the 5-minute reconciliation ticker or a coincidental plan-file event:
+		// OnStart's refresh usually fires before discovery completes and finds
+		// no plans directories at all. The UnifiedWatcher recomputes watch
+		// paths before broadcasting this update to handlers, so a short
+		// coalescing delay is all that's needed.
+		h.scheduleRefresh(nil, true, workspaceRefreshDelay)
+
+	case store.UpdateWorkspacesDelta:
+		// Git enrichment landing in the store is what fills the cheap cached
+		// git column on rows (applyCachedPlanGit). Re-project cached rows
+		// through the fresh state; the store suppresses no-change broadcasts,
+		// so quiet deltas cost one in-memory pass and no SSE traffic. The flow
+		// watcher's own PlanStats deltas carry no GitStatus and cannot loop.
+		if deltas, ok := update.Payload.([]*models.WorkspaceDelta); ok {
+			for _, delta := range deltas {
+				if delta != nil && delta.GitStatus != nil {
+					h.scheduleRefresh(nil, false, time.Duration(h.debounceMs)*time.Millisecond)
+					break
+				}
+			}
+		}
 	}
 }
+
+// workspaceRefreshDelay coalesces bursts of workspace-set changes while still
+// making the first populated snapshot land promptly after discovery.
+const workspaceRefreshDelay = 250 * time.Millisecond
 
 func (h *FlowHandler) OnStart(ctx context.Context) {
 	// Kick off a first refresh so /api/plans has a snapshot to serve
 	// before any filesystem event arrives. The PlanCollector still
 	// handles aggregated PlanStats; this populates the deep cache.
-	h.triggerRefresh()
+	// When workspace discovery already ran (restart, late registration) the
+	// watch set is populated and there is no reason to sit out the full
+	// debounce; otherwise the UpdateWorkspaces edge in HandleStoreUpdate is
+	// what delivers the first populated snapshot.
+	if h.store != nil && len(h.store.GetWorkspaces()) > 0 {
+		h.scheduleRefresh(nil, true, workspaceRefreshDelay)
+	} else {
+		h.triggerRefresh()
+	}
 	// fsnotify is an acceleration path, not a completeness guarantee. Periodic
 	// reconciliation repairs missed/coalesced events and advances freshness.
 	go func() {
@@ -284,40 +424,253 @@ func (h *FlowHandler) OnStart(ctx context.Context) {
 	}()
 }
 
-// triggerRefresh debounces plan stats re-scan to avoid excessive work.
+// triggerRefresh schedules a full debounced rescan of every plans directory.
 func (h *FlowHandler) triggerRefresh() {
+	h.scheduleRefresh(nil, true, time.Duration(h.debounceMs)*time.Millisecond)
+}
+
+// scheduleRefresh merges the requested scope into the pending set and (re)arms
+// the debounce timer. all=true forces every plans directory to rescan; dirs
+// scopes the disk work to the named plans directories; neither means an
+// overlay-only re-projection of cached rows.
+func (h *FlowHandler) scheduleRefresh(dirs map[string]struct{}, all bool, delay time.Duration) {
 	h.refreshMu.Lock()
 	defer h.refreshMu.Unlock()
 
-	if h.refreshTimer != nil {
-		h.refreshTimer.Stop()
+	if all {
+		h.pendingAll = true
+	}
+	for dir := range dirs {
+		if h.pendingDirs == nil {
+			h.pendingDirs = make(map[string]struct{})
+		}
+		h.pendingDirs[dir] = struct{}{}
 	}
 
-	h.refreshTimer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, h.refresh)
+	// Earliest-deadline coalescing: the scope above is already merged, so a
+	// slower trigger must never push out an armed faster one (e.g. a git
+	// delta's 2s debounce arriving after the 250ms cold-start edge). This
+	// also bounds storm latency — a steady event stream fires at most one
+	// debounce interval after its first event instead of deferring forever.
+	deadline := time.Now().Add(delay)
+	if h.refreshTimer != nil {
+		if !h.refreshDeadline.After(deadline) {
+			return
+		}
+		h.refreshTimer.Stop()
+	}
+	h.refreshDeadline = deadline
+	h.refreshTimer = time.AfterFunc(delay, h.refresh)
 }
 
-// triggerLifecycleRefresh cancels a pending eventually-consistent refresh and
-// publishes this observed plan-config transition before HandleEvents returns.
-func (h *FlowHandler) triggerLifecycleRefresh() {
+// takePendingScope drains the accumulated refresh scope and cancels any armed
+// timer, merging extra scope from a synchronous (lifecycle) caller.
+func (h *FlowHandler) takePendingScope(extra map[string]struct{}) (bool, map[string]struct{}) {
 	h.refreshMu.Lock()
+	defer h.refreshMu.Unlock()
 	if h.refreshTimer != nil {
 		h.refreshTimer.Stop()
 		h.refreshTimer = nil
 	}
-	h.refreshMu.Unlock()
-	h.refresh()
+	all := h.pendingAll
+	dirs := h.pendingDirs
+	h.pendingAll = false
+	h.pendingDirs = nil
+	for dir := range extra {
+		if dirs == nil {
+			dirs = make(map[string]struct{})
+		}
+		dirs[dir] = struct{}{}
+	}
+	return all, dirs
 }
 
+// triggerLifecycleRefresh cancels a pending eventually-consistent refresh and
+// publishes this observed plan-config transition before HandleEvents returns.
+func (h *FlowHandler) triggerLifecycleRefresh(dirs map[string]struct{}) {
+	all, merged := h.takePendingScope(dirs)
+	h.runRefresh(all, merged)
+}
+
+// refresh is the debounce-timer callback: drain the pending scope and run.
 func (h *FlowHandler) refresh() {
+	all, dirs := h.takePendingScope(nil)
+	h.runRefresh(all, dirs)
+}
+
+// runRefresh rebuilds and publishes the plan index, then updates the
+// aggregated PlanStats enrichment. Ordering is deliberate: the row projection
+// is built from cheap per-directory scans and already-collected daemon state,
+// and is published BEFORE the PlanStats pass, whose full workspace discovery
+// is the expensive leg and must never gate first-row availability.
+func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 	h.refreshRunMu.Lock()
 	defer h.refreshRunMu.Unlock()
 
 	ctx := context.Background()
-	h.ulog.Debug("Refreshing plan stats after file change").Log(ctx)
+	start := time.Now()
 
+	state := h.store.Get()
+
+	// Snapshot the watch set into unique plansDir -> workspace node targets.
+	h.pathsMutex.RLock()
+	targets := make(map[string]*workspace.WorkspaceNode)
+	for _, wsNode := range h.watchedPaths {
+		plansDir, err := h.locator.GetPlansDir(wsNode)
+		if err != nil || plansDir == "" {
+			continue
+		}
+		if _, dup := targets[plansDir]; !dup {
+			targets[plansDir] = wsNode
+		}
+	}
+	h.pathsMutex.RUnlock()
+
+	// Boot ordering: before workspace discovery has populated the store there
+	// is nothing to index yet. Publishing the empty snapshot here would be a
+	// lie ("scanned, zero plans") that a genuinely empty portfolio later can't
+	// be distinguished from; the UpdateWorkspaces edge re-triggers us.
+	if len(targets) == 0 && len(state.Workspaces) == 0 {
+		h.ulog.Debug("Skipping plan index refresh before workspace discovery").Log(ctx)
+		return
+	}
+
+	if h.dirCache == nil {
+		h.dirCache = make(map[string]*dirScanResult)
+	}
+
+	// Rescan only what the scope implicates (plus cache misses); reuse the
+	// cached disk scan for everything else.
+	scanAt := time.Now()
+	rescanned := 0
+	for plansDir := range targets {
+		_, affected := scopeDirs[plansDir]
+		if _, cached := h.dirCache[plansDir]; cached && !all && !affected {
+			continue
+		}
+		h.dirCache[plansDir] = scanPlansDir(plansDir, targets[plansDir].Path, scanAt)
+		rescanned++
+	}
+	for dir := range h.dirCache {
+		if _, ok := targets[dir]; !ok {
+			delete(h.dirCache, dir)
+		}
+	}
+	scanDone := time.Now()
+
+	// Merge cached scans and re-apply the live overlays (selection, running
+	// sessions, registry bindings, cached git) from current store state.
+	plansByDir := make(map[string][]*orchestration.Plan, len(targets))
+	var summaries []models.PlanSummary
+	registryEntries, _ := worktreeregistry.ListAll()
+	for plansDir, wsNode := range targets {
+		result := h.dirCache[plansDir]
+		if result == nil {
+			continue
+		}
+		selectedPlan, _ := corestate.GetString(wsNode.Path, coreplan.StateKey)
+		for _, base := range result.summaries {
+			row := base
+			row.RunningSessions = countRunningSessions(state.Sessions, row.PlanName)
+			if !row.Archived {
+				row.Selected = selectedPlan == row.PlanName
+			}
+			summaries = append(summaries, row)
+		}
+		plansByDir[plansDir] = result.plans
+	}
+	summaries = applyQualifiedPlanBindings(summaries, registryEntries)
+	summaries = applyCachedPlanGit(summaries, state.Workspaces)
+
+	if len(plansByDir) > 0 {
+		h.store.ApplyUpdate(store.Update{
+			Type:    store.UpdatePlans,
+			Source:  "flow_watcher",
+			Scanned: len(plansByDir),
+			Payload: plansByDir,
+		})
+	}
+	sort.Slice(summaries, func(i, j int) bool { return summaries[i].PlanDir < summaries[j].PlanDir })
+	h.store.ApplyUpdate(store.Update{
+		Type: store.UpdatePlanIndexSnapshot, Source: "flow_watcher", Scanned: len(summaries),
+		Payload: &models.PlanIndexSnapshot{ScannedAt: scanAt, Plans: summaries},
+	})
+	publishDone := time.Now()
+	h.scanSeq.Add(1)
+
+	// Aggregated PlanStats enrichment. Overlay-only passes changed nothing on
+	// disk, so the expensive discovery-backed recount is skipped for them.
+	// The pass runs asynchronously: it needs a full workspace discovery, and
+	// holding refreshRunMu for that would queue the next synchronous
+	// lifecycle publish behind disk-walking.
+	if all || rescanned > 0 || len(scopeDirs) > 0 {
+		h.kickPlanStats()
+	}
+
+	elapsed := time.Since(start)
+	entry := h.ulog.Debug("Plan index refresh")
+	if elapsed > time.Second {
+		entry = h.ulog.Info("Slow plan index refresh")
+	}
+	entry.Field("rows", len(summaries)).
+		Field("dirs", len(targets)).
+		Field("rescanned", rescanned).
+		Field("full", all).
+		Field("scan_ms", scanDone.Sub(start).Milliseconds()).
+		Field("publish_ms", publishDone.Sub(scanDone).Milliseconds()).
+		Field("total_ms", elapsed.Milliseconds()).
+		Log(ctx)
+}
+
+// kickPlanStats starts (or queues onto) the async aggregated-PlanStats pass.
+// At most one pass runs at a time; kicks during a run coalesce into exactly
+// one trailing run, which re-reads disk and so converges on the final state.
+func (h *FlowHandler) kickPlanStats() {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+	if h.statsRunning {
+		h.statsQueued = true
+		return
+	}
+	h.statsRunning = true
+	go h.planStatsLoop()
+}
+
+func (h *FlowHandler) planStatsLoop() {
+	ctx := context.Background()
+	for {
+		seq := h.scanSeq.Load()
+		h.refreshPlanStats(ctx, seq)
+		h.statsMu.Lock()
+		if h.statsQueued {
+			h.statsQueued = false
+			h.statsMu.Unlock()
+			continue
+		}
+		if h.scanSeq.Load() != seq {
+			// An index publish raced this pass; rerun so the emitted stats
+			// can never lag the last published lifecycle state.
+			h.statsMu.Unlock()
+			continue
+		}
+		h.statsRunning = false
+		h.statsMu.Unlock()
+		return
+	}
+}
+
+// refreshPlanStats recomputes the aggregated per-workspace PlanStats. This is
+// the discovery-backed enrichment leg; it runs off the refresh mutex so its
+// cost never delays row publishes. seq fences staleness: results computed
+// from disk state older than the latest index publish are discarded (the
+// trailing loop run recomputes them).
+func (h *FlowHandler) refreshPlanStats(ctx context.Context, seq uint64) {
 	planStats, err := enrichment.FetchPlanStatsMap()
 	if err != nil {
 		h.ulog.Error("Failed to fetch plan stats").Err(err).Log(ctx)
+		return
+	}
+	if h.scanSeq.Load() != seq {
 		return
 	}
 
@@ -342,61 +695,41 @@ func (h *FlowHandler) refresh() {
 			Payload: deltas,
 		})
 	}
+}
 
-	// Refresh the deep plan cache the browser reads from.
-	// Walking every watched plansDir keeps this work out of TUI
-	// clients, and the debounce above limits how often we do it.
-	plansByDir := make(map[string][]*orchestration.Plan)
-	scanAt := time.Now()
-	var summaries []models.PlanSummary
-	registryEntries, _ := worktreeregistry.ListAll()
-	h.pathsMutex.RLock()
-	seen := make(map[string]struct{})
-	for _, wsNode := range h.watchedPaths {
-		plansDir, err := h.locator.GetPlansDir(wsNode)
-		if err != nil || plansDir == "" {
-			continue
+// scanPlansDir reads one plans directory from disk into its cacheable base
+// rows. Live overlays (Selected, RunningSessions, bindings, git) are
+// deliberately NOT stamped here — runRefresh re-applies them on every publish
+// so cached entries can never pin them stale.
+func scanPlansDir(plansDir, workspaceRoot string, scanAt time.Time) *dirScanResult {
+	indexed := loadIndexedPlans(plansDir)
+	result := &dirScanResult{plans: make([]*orchestration.Plan, 0, len(indexed))}
+	for _, indexedPlan := range indexed {
+		p := indexedPlan.plan
+		if !indexedPlan.archived {
+			result.plans = append(result.plans, p)
 		}
-		if _, dup := seen[plansDir]; dup {
-			continue
+		summary := summarizePlan(p, plansDir, workspaceRoot, "", nil, scanAt)
+		summary.Archived = indexedPlan.archived
+		if indexedPlan.archived {
+			summary.Lifecycle = "finished"
+			summary.Selected = false
 		}
-		seen[plansDir] = struct{}{}
-
-		indexed := loadIndexedPlans(plansDir)
-		plans := make([]*orchestration.Plan, 0, len(indexed))
-		selectedPlan, _ := corestate.GetString(wsNode.Path, coreplan.StateKey)
-		for _, indexedPlan := range indexed {
-			p := indexedPlan.plan
-			if !indexedPlan.archived {
-				plans = append(plans, p)
-			}
-			summary := summarizePlan(p, plansDir, wsNode.Path, selectedPlan, state.Sessions, scanAt)
-			summary.Archived = indexedPlan.archived
-			if indexedPlan.archived {
-				summary.Lifecycle = "finished"
-				summary.Selected = false
-			}
-			summaries = append(summaries, summary)
-		}
-		plansByDir[plansDir] = plans
+		result.summaries = append(result.summaries, summary)
 	}
-	h.pathsMutex.RUnlock()
-	summaries = applyQualifiedPlanBindings(summaries, registryEntries)
-	summaries = applyCachedPlanGit(summaries, state.Workspaces)
+	return result
+}
 
-	if len(plansByDir) > 0 {
-		h.store.ApplyUpdate(store.Update{
-			Type:    store.UpdatePlans,
-			Source:  "flow_watcher",
-			Scanned: len(plansByDir),
-			Payload: plansByDir,
-		})
+// countRunningSessions mirrors summarizePlan's live-session overlay for rows
+// merged from the per-directory cache.
+func countRunningSessions(sessions map[string]*models.Session, planName string) int {
+	running := 0
+	for _, session := range sessions {
+		if session != nil && session.PlanName == planName && session.EndedAt == nil {
+			running++
+		}
 	}
-	sort.Slice(summaries, func(i, j int) bool { return summaries[i].PlanDir < summaries[j].PlanDir })
-	h.store.ApplyUpdate(store.Update{
-		Type: store.UpdatePlanIndexSnapshot, Source: "flow_watcher", Scanned: len(summaries),
-		Payload: &models.PlanIndexSnapshot{ScannedAt: scanAt, Plans: summaries},
-	})
+	return running
 }
 
 type indexedPlanEntry struct {
