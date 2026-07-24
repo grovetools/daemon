@@ -75,6 +75,12 @@ type Server struct {
 	logStreamer       *logstreamer.LogStreamer
 	workspaceStreamer *logstreamer.WorkspaceStreamer
 
+	// Nav mutations are read-modify-write operations on one sessions.yml.
+	// Serialize all HTTP mutation endpoints so concurrent treemux/nav clients
+	// cannot both load the same old snapshot and have the later rename erase
+	// the earlier edit.
+	navBindingsMu sync.Mutex
+
 	// Late-wired dependencies. Under --ready-at=bind the socket binds and the
 	// server starts accepting BEFORE these are set (they're wired from the
 	// background boot goroutine), so a handler can race their assignment.
@@ -3337,19 +3343,26 @@ func (s *Server) handleNavBindings(w http.ResponseWriter, r *http.Request) {
 
 	bindings := s.engine.Store().GetNavBindings()
 	if bindings == nil {
-		// Load from disk if not yet in store
-		var err error
-		bindings, err = navbindings.Load(navbindings.DefaultPath())
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to load nav bindings: %v", err), http.StatusInternalServerError)
-			return
+		// Serialize the lazy disk fill with mutation handlers. Without this, a
+		// startup GET could load the old file, a PUT could publish the new one,
+		// and then the GET could install its stale snapshot in the store.
+		s.navBindingsMu.Lock()
+		bindings = s.engine.Store().GetNavBindings()
+		if bindings == nil {
+			var err error
+			bindings, err = navbindings.Load(navbindings.DefaultPath())
+			if err != nil {
+				s.navBindingsMu.Unlock()
+				http.Error(w, fmt.Sprintf("failed to load nav bindings: %v", err), http.StatusInternalServerError)
+				return
+			}
+			s.engine.Store().ApplyUpdate(store.Update{
+				Type:    store.UpdateNavBindings,
+				Source:  "api",
+				Payload: bindings,
+			})
 		}
-		// Cache in store
-		s.engine.Store().ApplyUpdate(store.Update{
-			Type:    store.UpdateNavBindings,
-			Source:  "api",
-			Payload: bindings,
-		})
+		s.navBindingsMu.Unlock()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3394,6 +3407,9 @@ func (s *Server) handleNavGroup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+
+	s.navBindingsMu.Lock()
+	defer s.navBindingsMu.Unlock()
 
 	// Load current state twice: once as the pre-mutation snapshot (prev) so
 	// the validator can tolerate pre-existing rule-3 conflicts, and once as
@@ -3474,6 +3490,9 @@ func (s *Server) handleNavLockedKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.navBindingsMu.Lock()
+	defer s.navBindingsMu.Unlock()
+
 	sessionsPath := navbindings.DefaultPath()
 	file, err := navbindings.Load(sessionsPath)
 	if err != nil {
@@ -3523,6 +3542,9 @@ func (s *Server) handleNavLastAccessedGroup(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+
+	s.navBindingsMu.Lock()
+	defer s.navBindingsMu.Unlock()
 
 	sessionsPath := navbindings.DefaultPath()
 	file, err := navbindings.Load(sessionsPath)
