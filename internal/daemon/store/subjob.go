@@ -25,10 +25,10 @@ func (s *Store) applySubjobEvent(ev *models.SubjobEvent) {
 	key := subjobKey(ev.PlanKey, ev.ChildJobID)
 	old := s.state.Subjobs[key]
 	if old != nil {
-		// A joined tombstone never regresses from a delayed ready frame. Digest
-		// replacement requires a future explicit reconciliation proof rather
-		// than trusting an otherwise indistinguishable producer retry.
-		if old.State == models.SubjobJoined && ev.Kind == models.SubjobReportReady {
+		// A joined tombstone never regresses from a delayed ready frame for the
+		// same report. A different digest is a new report generation derived by
+		// Flow from canonical disk state and may begin a fresh lifecycle.
+		if old.State == models.SubjobJoined && ev.Kind == models.SubjobReportReady && old.ReportSHA256 == ev.ReportSHA256 {
 			return
 		}
 		if old.ReportSHA256 == ev.ReportSHA256 && old.State == ev.Kind {

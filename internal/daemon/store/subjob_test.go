@@ -9,6 +9,7 @@ import (
 )
 
 func TestSubjobFoldIsMonotonicAndSnapshotIsDefensive(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
 	s := New()
 	planKey, digest := strings.Repeat("a", 64), strings.Repeat("b", 64)
 	ready := &models.SubjobEvent{SchemaVersion: 1, Kind: models.SubjobReportReady, PlanKey: planKey, ParentJobID: "parent", ChildJobID: "child", ReportSHA256: digest, Timestamp: time.Now().UTC()}
@@ -26,5 +27,31 @@ func TestSubjobFoldIsMonotonicAndSnapshotIsDefensive(t *testing.T) {
 	}
 	if len(s.GetSubjobSnapshot(planKey, "other").Reports) != 0 {
 		t.Fatal("snapshot leaked another parent's child")
+	}
+
+	// A canonically derived report with a new digest starts a new lifecycle.
+	newDigest := strings.Repeat("c", 64)
+	s.ApplyUpdate(Update{Type: UpdateSubjobReportReady, Payload: &models.SubjobEvent{
+		SchemaVersion: 1, Kind: models.SubjobReportReady, PlanKey: planKey,
+		ParentJobID: "parent", ChildJobID: "child", ReportSHA256: newDigest, Timestamp: time.Now().UTC(),
+	}})
+	if got := s.GetSubjobSnapshot(planKey, "parent").Reports["child"]; got.State != models.SubjobReportReady || got.ReportSHA256 != newDigest {
+		t.Fatalf("new report generation not accepted: %+v", got)
+	}
+}
+
+func TestSubjobStatePersistsAcrossStoreRecreation(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	planKey, digest := strings.Repeat("d", 64), strings.Repeat("e", 64)
+	s := New()
+	s.ApplyUpdate(Update{Type: UpdateSubjobReportReady, Payload: &models.SubjobEvent{
+		SchemaVersion: 1, Kind: models.SubjobReportReady, PlanKey: planKey,
+		ParentJobID: "parent", ChildJobID: "child", ReportSHA256: digest, Timestamp: time.Now().UTC(),
+	}})
+
+	reloaded := New()
+	got := reloaded.GetSubjobSnapshot(planKey, "parent").Reports["child"]
+	if got == nil || got.State != models.SubjobReportReady || got.ReportSHA256 != digest {
+		t.Fatalf("reloaded state = %+v", got)
 	}
 }
