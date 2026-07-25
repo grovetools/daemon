@@ -62,16 +62,20 @@ func TestSanitizeJobInfoForcesOrigin(t *testing.T) {
 // routing identifiers zeroed and Origin forced.
 func TestSanitizeSessionZeroesMuxRouting(t *testing.T) {
 	s := &models.Session{
-		ID:         "s1",
-		JobTitle:   "\x1b[1mbold\x1b[0m",
-		PtyID:      "local-pty-42",
-		TmuxTarget: "grove:1.2",
-		Origin:     "spoofed",
+		ID:          "s1",
+		JobTitle:    "\x1b[1mbold\x1b[0m",
+		ParentJobID: "parent\njob",
+		PtyID:       "local-pty-42",
+		TmuxTarget:  "grove:1.2",
+		Origin:      "spoofed",
 	}
 	SanitizeSession(s, "sat")
 
 	if s.JobTitle != "bold" {
 		t.Errorf("JobTitle not sanitized: %q", s.JobTitle)
+	}
+	if s.ParentJobID != "parentjob" {
+		t.Errorf("ParentJobID not sanitized: %q", s.ParentJobID)
 	}
 	if s.PtyID != "" {
 		t.Errorf("PtyID must be zeroed on remote session, got %q", s.PtyID)

@@ -41,6 +41,27 @@ func seedSession(t *testing.T, s *Store, jobID, claudeSessionID string) {
 	})
 }
 
+func TestSessionIntentPropagatesParentJobID(t *testing.T) {
+	s := newTestStore(t)
+	s.ApplyUpdate(Update{
+		Type:   UpdateSessionIntent,
+		Source: "test",
+		Payload: &SessionIntentPayload{
+			JobID:       "child-job",
+			ParentJobID: "parent-job",
+			Provider:    "pi",
+		},
+	})
+
+	got := s.GetSession("child-job")
+	if got == nil {
+		t.Fatal("session was not created")
+	}
+	if got.ParentJobID != "parent-job" {
+		t.Errorf("ParentJobID = %q, want parent-job", got.ParentJobID)
+	}
+}
+
 func wfUpdate(ev models.WorkflowEvent, extra ...func(*WorkflowEventPayload)) Update {
 	updateType, ok := UpdateTypeForWorkflowKind(ev.Kind)
 	if !ok {

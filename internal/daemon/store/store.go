@@ -725,6 +725,7 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload) {
 		LastActivity:     time.Now(),
 		PlanName:         payload.PlanName,
 		JobTitle:         payload.Title,
+		ParentJobID:      payload.ParentJobID,
 		JobFilePath:      payload.JobFilePath,
 		Channels:         payload.Channels,
 		Autonomous:       payload.Autonomous,

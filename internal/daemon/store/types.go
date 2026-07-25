@@ -265,6 +265,7 @@ type SkillSyncPayload struct {
 // SessionIntentPayload contains data for pre-registering a session.
 type SessionIntentPayload struct {
 	JobID       string `json:"job_id"`
+	ParentJobID string `json:"parent_job_id,omitempty"`
 	Provider    string `json:"provider"`
 	JobFilePath string `json:"job_file_path"`
 	PlanName    string `json:"plan_name"`

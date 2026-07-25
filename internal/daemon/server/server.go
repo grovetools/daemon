@@ -1695,6 +1695,7 @@ func (s *Server) persistConfirmedSessionToRegistry(c *store.SessionConfirmationP
 	if sess := s.engine.Store().GetSession(c.JobID); sess != nil {
 		md.PlanName = sess.PlanName
 		md.JobTitle = sess.JobTitle
+		md.ParentJobID = sess.ParentJobID
 		md.WorkingDirectory = sess.WorkingDirectory
 		md.JobFilePath = sess.JobFilePath
 		md.PtyID = sess.PtyID

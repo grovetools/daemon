@@ -110,6 +110,7 @@ func SanitizeSession(s *models.Session, origin string) *models.Session {
 	s.PlanDirectory = stripCtl(s.PlanDirectory)
 	s.JobTitle = stripCtl(s.JobTitle)
 	s.JobFilePath = stripCtl(s.JobFilePath)
+	s.ParentJobID = stripCtl(s.ParentJobID)
 	s.ClaudeSessionID = stripCtl(s.ClaudeSessionID)
 	s.Provider = stripCtl(s.Provider)
 	s.TranscriptPath = stripCtl(s.TranscriptPath)
