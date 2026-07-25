@@ -946,6 +946,79 @@ func (d *DB) AdoptDocument(workspace, path, documentID string, version int64, ha
 	return nil
 }
 
+// PendingReturnPush reports the first adopted path that still has an unpushed
+// local change queued, or "" when the batch is clear to apply. Adopting past
+// an unpushed push would drop the user's local lines from the hub, so the
+// apply boundary refuses — the same policy handleSyncAdopt applies to a single
+// document. It is what makes ReconcileReturnEscrow's outbox purge safe: by the
+// time reconcile runs, the only queued events for these paths are echoes of
+// the writes the apply itself just made.
+func (d *DB) PendingReturnPush(m ReturnManifest) (string, error) {
+	for _, op := range m.Operations {
+		var n int
+		if err := d.db.QueryRow(
+			`SELECT COUNT(*) FROM sync_outbox
+			 WHERE document_id = ? OR (workspace = ? AND (path = ? OR (? != '' AND path = ?)))`,
+			op.DocumentID, op.Workspace, op.Path, op.PreviousPath, op.PreviousPath).Scan(&n); err != nil {
+			return "", fmt.Errorf("failed to count outbox for %s/%s: %w", op.Workspace, op.Path, err)
+		}
+		if n > 0 {
+			return op.Workspace + "/" + op.Path, nil
+		}
+	}
+	return "", nil
+}
+
+// ReconcileReturnEscrow atomically advances the laptop identity map to an
+// explicitly adopted, hash-verified server generation. It also removes stale
+// queued events for each adopted identity/path so the watcher cannot echo the
+// pre-adoption operation back to the server. Callers must have cleared
+// PendingReturnPush first, so this purge can only discard the apply's own
+// echoes and never an unpushed user edit.
+func (d *DB) ReconcileReturnEscrow(e ReturnEscrow) error {
+	if err := e.Manifest.Validate(); err != nil {
+		return err
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, op := range e.Manifest.Operations {
+		if _, err = tx.Exec(`DELETE FROM sync_outbox WHERE document_id = ? OR (workspace = ? AND (path = ? OR path = ?))`,
+			op.DocumentID, op.Workspace, op.Path, op.PreviousPath); err != nil {
+			return fmt.Errorf("clear adopted outbox for %s: %w", op.DocumentID, err)
+		}
+		if op.Type == "delete" {
+			if _, err = tx.Exec(`DELETE FROM sync_documents WHERE document_id = ?`, op.DocumentID); err != nil {
+				return fmt.Errorf("delete adopted identity %s: %w", op.DocumentID, err)
+			}
+			continue
+		}
+		content, ok := e.Content[op.DocumentID]
+		if !ok {
+			return fmt.Errorf("adopted content missing for %s", op.DocumentID)
+		}
+		// A watcher event racing the filesystem commit may have minted a fresh
+		// local identity for the adopted destination. The server identity wins.
+		if _, err = tx.Exec(`DELETE FROM sync_documents WHERE workspace = ? AND path = ? AND document_id != ?`, op.Workspace, op.Path, op.DocumentID); err != nil {
+			return fmt.Errorf("clear raced local identity at %s/%s: %w", op.Workspace, op.Path, err)
+		}
+		_, err = tx.Exec(`INSERT INTO sync_documents
+			(document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+			ON CONFLICT(document_id) DO UPDATE SET workspace=excluded.workspace, path=excluded.path,
+			content_hash=excluded.content_hash, last_synced_hash=excluded.last_synced_hash,
+			last_synced_version=excluded.last_synced_version, base_content=excluded.base_content,
+			diverged=0, updated_at=CURRENT_TIMESTAMP`, op.DocumentID, op.Workspace, op.Path,
+			op.HeadHash, op.HeadHash, op.HeadVersion, content)
+		if err != nil {
+			return fmt.Errorf("adopt identity %s: %w", op.DocumentID, err)
+		}
+	}
+	return tx.Commit()
+}
+
 // RemapDocument rewrites a document's identity from a locally-minted id to the
 // id the server confirmed for the same path (B8): when a create (or an update
 // under a lost id) lands on a path the server already tracks, the server

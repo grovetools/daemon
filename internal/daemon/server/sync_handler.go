@@ -41,6 +41,12 @@ func (s *Server) SetSyncKick(kick func(workspace string)) {
 	s.syncKick = kick
 }
 
+// SetSyncWorkspaceRoots wires configured notebook-root resolution into the
+// explicit batch-apply endpoint.
+func (s *Server) SetSyncWorkspaceRoots(resolve func([]string) (map[string]string, error)) {
+	s.syncWorkspaceRoots = resolve
+}
+
 // SetSyncMaintenance wires the watcher-owned synchronous drain. The server
 // owns dispatch rejection and active-job checks; the watcher owns debounce,
 // reconcile, and outbox flushing.
@@ -830,6 +836,121 @@ func (s *Server) handleSyncEscrow(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"path": path, "generation": req.Manifest.Generation, "verified": true})
+}
+
+type syncApplyResult struct {
+	Schema     string                   `json:"schema"`
+	Generation string                   `json:"generation"`
+	EscrowPath string                   `json:"escrow_path,omitempty"`
+	Counts     syncdb.ReturnApplyCounts `json:"counts"`
+	Outcome    string                   `json:"outcome"`
+}
+
+// handleSyncApply is the user-authorized laptop write boundary. It rechecks
+// the reviewed generation, writes and verifies its durable escrow, validates
+// and stages the whole filesystem batch, then advances sync identity state.
+func (s *Server) handleSyncApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDB == nil || s.syncWorkspaceRoots == nil {
+		http.Error(w, "sync apply is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Satellite string                `json:"satellite"`
+		Manifest  syncdb.ReturnManifest `json:"manifest"`
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if _, err := returnEscrowDir(req.Satellite); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := req.Manifest.Validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	current, err := s.currentReturnManifest(r.Context(), req.Manifest.Workspaces)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("cannot recheck incoming generation: %v", err), http.StatusBadGateway)
+		return
+	}
+	if err = syncdb.ValidateReviewedManifest(req.Manifest, current); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	result := syncApplyResult{Schema: "grove.record-return-apply/v1", Generation: current.Generation, Outcome: "clean"}
+	if len(current.Operations) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+		return
+	}
+	// Refuse to adopt past an unpushed local change, mirroring handleSyncAdopt:
+	// the adopted server head would otherwise overwrite lines the hub has never
+	// seen. The local hash preconditions cannot catch this on their own — the
+	// manifest's base_hash tracks the watcher-updated content hash, so a
+	// locally-edited-but-unpushed file still matches.
+	if pending, pendErr := s.syncDB.PendingReturnPush(current); pendErr != nil {
+		http.Error(w, fmt.Sprintf("outbox lookup failed: %v", pendErr), http.StatusInternalServerError)
+		return
+	} else if pending != "" {
+		http.Error(w, fmt.Sprintf("a pending push exists for %s; wait for it to drain before applying", pending), http.StatusConflict)
+		return
+	}
+	roots, err := s.syncWorkspaceRoots(current.Workspaces)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	dir, _ := returnEscrowDir(req.Satellite)
+	client, err := s.historyClient(r.Context())
+	if err != nil {
+		http.Error(w, fmt.Sprintf("sync server unavailable: %v", err), http.StatusBadGateway)
+		return
+	}
+	escrowPath, err := syncdb.WriteReturnEscrow(r.Context(), client, current, dir)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("escrow failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	// Escrow creation may fetch several blobs. Recheck once more after it so a
+	// server generation change or disconnect during that window fails before
+	// the first notebook mutation. The verified escrow remains recoverable.
+	final, err := s.currentReturnManifest(r.Context(), current.Workspaces)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("cannot recheck incoming generation (verified escrow retained at %s): %v", escrowPath, err), http.StatusBadGateway)
+		return
+	}
+	if err = syncdb.ValidateReviewedManifest(current, final); err != nil {
+		http.Error(w, fmt.Sprintf("%v (verified escrow retained at %s)", err, escrowPath), http.StatusConflict)
+		return
+	}
+	counts, err := syncdb.ApplyReturnEscrow(escrowPath, current.Generation, syncdb.ReturnApplyOptions{
+		WorkspaceRoots: roots,
+		Reconcile:      s.syncDB.ReconcileReturnEscrow,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("apply failed (verified escrow retained at %s): %v", escrowPath, err), http.StatusConflict)
+		return
+	}
+	for _, ws := range current.Workspaces {
+		if s.syncKick != nil {
+			s.syncKick(ws)
+		}
+	}
+	result.EscrowPath, result.Counts, result.Outcome = escrowPath, counts, "applied"
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 func nonTerminalJob(status string) bool {

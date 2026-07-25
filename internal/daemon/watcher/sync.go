@@ -205,6 +205,35 @@ func (h *SyncHandler) nodeWorkspaceRoot(node *workspace.WorkspaceNode) string {
 	return workspaceRootForDir(filepath.Dir(notesDir))
 }
 
+// WorkspaceRoots resolves explicitly selected subscribed workspaces to their
+// configured laptop notebook roots. It is used by the user-authorized incoming
+// apply boundary; unlike configuredPullRoots it includes push-only laptop
+// subscriptions and never invents a wildcard/default selection.
+func (h *SyncHandler) WorkspaceRoots(names []string) (map[string]string, error) {
+	roots := make(map[string]string, len(names))
+	h.pathsMutex.RLock()
+	for _, w := range h.watchedPaths {
+		for _, name := range names {
+			if w.workspace == name {
+				roots[name] = w.root
+			}
+		}
+	}
+	h.pathsMutex.RUnlock()
+	for _, name := range names {
+		if h.subscription(name) == nil {
+			return nil, fmt.Errorf("workspace %q is not a sync subscription", name)
+		}
+		if roots[name] == "" {
+			roots[name] = h.nodeWorkspaceRoot(h.syntheticNodeFor(name))
+		}
+		if roots[name] == "" {
+			return nil, fmt.Errorf("cannot resolve configured laptop root for workspace %q", name)
+		}
+	}
+	return roots, nil
+}
+
 // configuredPullRoots derives workspace -> root for every pull = true
 // subscription directly from sync.toml + notebook definitions, independent of
 // code-workspace discovery. Pull targets are notebook workspaces whose paths

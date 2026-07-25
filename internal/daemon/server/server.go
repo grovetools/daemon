@@ -162,6 +162,7 @@ type Server struct {
 	// workspace ("" = all) after /api/sync/repush voids synced state. Nil
 	// when sync is not configured; then the hourly tick picks the reset up.
 	syncKick             func(workspace string)
+	syncWorkspaceRoots   func([]string) (map[string]string, error)
 	syncBeginMaintenance func(context.Context) error
 	syncEndMaintenance   func()
 	maintenanceMu        sync.RWMutex
@@ -469,6 +470,7 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/sync/adopt", unixOnly(s.handleSyncAdopt))
 	mux.HandleFunc("/api/sync/incoming", unixOnly(s.handleSyncIncoming))
 	mux.HandleFunc("/api/sync/escrow", unixOnly(s.handleSyncEscrow))
+	mux.HandleFunc("/api/sync/apply", unixOnly(s.handleSyncApply))
 	mux.HandleFunc("/api/sync/maintenance", unixOnly(s.handleSyncMaintenance))
 	// Repush: manual full re-push after a server recreate — voids synced
 	// state (non-diverged docs) and kicks an immediate anti-entropy pass.

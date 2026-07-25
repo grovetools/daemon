@@ -1078,6 +1078,7 @@ func newGrovedStartCmd() *cobra.Command {
 								unifiedWatcher.Register(syncHandler)
 								srv.SetSyncDB(syncDB)
 								srv.SetSyncKick(syncHandler.KickAntiEntropy)
+								srv.SetSyncWorkspaceRoots(syncHandler.WorkspaceRoots)
 								srv.SetSyncMaintenance(syncHandler.BeginMaintenance, syncHandler.EndMaintenance)
 								ulog.Info("Sync handler registered with unified watcher").
 									Field("workspaces", len(syncCfg.Workspaces)).
