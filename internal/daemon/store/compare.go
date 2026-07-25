@@ -36,6 +36,30 @@ func GitStatusEqual(a, b *git.ExtendedGitStatus) bool {
 		sa.HasUpstream == sb.HasUpstream
 }
 
+// FileDataEqual returns true if two per-file change snapshots (ChangedFiles +
+// BlobHashes) are equivalent. GitStatusEqual only compares coarse status, so an
+// edit to an already-modified file (numstat/blob content moved, counts didn't)
+// is invisible to it — the git delta emitters compare per-file data with this
+// to avoid suppressing such content-only changes for focused repos. Order-
+// sensitive on the file list: GetChangedFiles output is stable, and a spurious
+// mismatch just emits one extra delta.
+func FileDataEqual(aFiles []git.FileStatus, aHashes map[string]string, bFiles []git.FileStatus, bHashes map[string]string) bool {
+	if len(aFiles) != len(bFiles) || len(aHashes) != len(bHashes) {
+		return false
+	}
+	for i := range aFiles {
+		if aFiles[i] != bFiles[i] {
+			return false
+		}
+	}
+	for k, v := range aHashes {
+		if bHashes[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 // PlanStatsEqual returns true if two PlanStats values are equivalent.
 func PlanStatsEqual(a, b *models.PlanStats) bool {
 	if a == nil && b == nil {

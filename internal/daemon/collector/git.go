@@ -68,8 +68,17 @@ func dynamicInterval(count int, baseInterval time.Duration) time.Duration {
 
 // GitStatusCollector updates git status for all workspaces.
 type GitStatusCollector struct {
-	interval time.Duration
-	refresh  chan chan struct{}
+	interval     time.Duration
+	refresh      chan chan struct{}
+	refreshPaths chan pathRefreshRequest
+}
+
+// pathRefreshRequest asks the Run loop for a synchronous scoped scan of just
+// the given workspace paths. The reply channel is buffered so the loop never
+// blocks on a caller that gave up (ctx canceled).
+type pathRefreshRequest struct {
+	paths []string
+	reply chan []*models.EnrichedWorkspace
 }
 
 // NewGitStatusCollector creates a new GitStatusCollector with the specified interval.
@@ -79,8 +88,9 @@ func NewGitStatusCollector(interval time.Duration) *GitStatusCollector {
 		interval = 10 * time.Second
 	}
 	return &GitStatusCollector{
-		interval: interval,
-		refresh:  make(chan chan struct{}),
+		interval:     interval,
+		refresh:      make(chan chan struct{}),
+		refreshPaths: make(chan pathRefreshRequest),
 	}
 }
 
@@ -97,6 +107,26 @@ func (c *GitStatusCollector) Refresh(ctx context.Context) error {
 		}
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// RefreshPaths triggers a synchronous scoped scan of just the given workspace
+// paths and returns their fresh enriched workspaces. Unknown paths are
+// silently skipped. Per-file data is computed for every requested path
+// regardless of focus registration — the request is proof the user is looking.
+// The scan also emits a normal git-source delta so SSE subscribers converge.
+func (c *GitStatusCollector) RefreshPaths(ctx context.Context, paths []string) ([]*models.EnrichedWorkspace, error) {
+	req := pathRefreshRequest{paths: paths, reply: make(chan []*models.EnrichedWorkspace, 1)}
+	select {
+	case c.refreshPaths <- req:
+		select {
+		case fresh := <-req.reply:
+			return fresh, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -143,30 +173,42 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				}
 				coarseChanged := !store.GitStatusEqual(ws.GitStatus, status)
 				focused := st.IsFocused(ws.Path)
+				// Granular per-file data is computed ONLY for focused repos
+				// (git-viewer panels / nav) — never on the 5-min background
+				// sweep — to bound git cost. It runs on EVERY focused scan, not
+				// just coarse changes: an edit to an already-modified file moves
+				// numstat/blob content while the coarse counts stay equal, so the
+				// per-file comparison below is the only way to see it.
+				// Best-effort: a fetch error just leaves the file-level fields
+				// nil and the coarse status stands.
+				var files []git.FileStatus
+				var hashes map[string]string
+				if focused {
+					files, hashes = focusedFileData(ws.Path)
+				}
 				// Backfill: a focused repo whose coarse status is unchanged still
-				// needs its per-file data computed the FIRST time it becomes
+				// needs its per-file data emitted the FIRST time it becomes
 				// focused. The daemon boots / rescans with the focus set empty, so
 				// ChangedFiles starts nil; without this, a stable focused repo
 				// never gets per-file data (the coarse-changed gate alone never
 				// fires) and the git-viewer cache-misses forever, falling back to
-				// live git in the TUI. Emit when the coarse status changed OR a
-				// focused repo is missing its per-file cache. Gate on the computed
-				// flag, not ChangedFiles == nil: a clean repo's file list is nil, so
-				// the nil test would re-run focusedFileData every tick.
+				// live git in the TUI. Gate on the computed flag, not
+				// ChangedFiles == nil: a clean repo's file list is nil, so the nil
+				// test would re-emit every tick.
 				needsFileBackfill := focused && !ws.ChangedFilesComputed
-				if !coarseChanged && !needsFileBackfill {
+				// Content-only change: coarse status equal but the per-file
+				// snapshot moved (see FileDataEqual).
+				fileDataChanged := focused && ws.ChangedFilesComputed &&
+					!store.FileDataEqual(ws.ChangedFiles, ws.BlobHashes, files, hashes)
+				if !coarseChanged && !needsFileBackfill && !fileDataChanged {
 					return
 				}
 				delta := &models.WorkspaceDelta{
 					Path:      ws.Path,
 					GitStatus: status,
 				}
-				// Granular per-file data is computed ONLY for focused repos
-				// (git-viewer panels / nav) — never on the 5-min background
-				// sweep — to bound git cost. Best-effort: a fetch error just
-				// leaves the file-level fields nil and the coarse status stands.
 				if focused {
-					delta.ChangedFiles, delta.BlobHashes = focusedFileData(ws.Path)
+					delta.ChangedFiles, delta.BlobHashes = files, hashes
 					computed := true
 					delta.ChangedFilesComputed = &computed
 				}
@@ -260,6 +302,71 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		scanWorkspaces(toScan)
 	}
 
+	// scanPaths synchronously scans just the requested workspace paths (the
+	// scoped /api/refresh form) and returns their fresh enriched workspaces.
+	// Per-file data is always computed — the request is proof the user is
+	// looking, regardless of focus registration. Results are ALSO emitted as a
+	// normal git-source delta so SSE subscribers converge, but the return value
+	// is never suppressed via GitStatusEqual: the response must always carry
+	// current state.
+	scanPaths := func(reqPaths []string) []*models.EnrichedWorkspace {
+		resolved := st.ResolveWorkspacePaths(reqPaths)
+		if len(resolved) == 0 {
+			return nil
+		}
+
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, gitWorkers)
+		var mu sync.Mutex
+		var deltas []*models.WorkspaceDelta
+		fresh := make([]*models.EnrichedWorkspace, 0, len(resolved))
+
+		for _, ws := range resolved {
+			wg.Add(1)
+			go func(ws *models.EnrichedWorkspace) {
+				defer wg.Done()
+				sem <- struct{}{}        // Acquire
+				defer func() { <-sem }() // Release
+
+				status, err := git.GetExtendedStatus(ws.Path)
+				if err != nil {
+					return
+				}
+				files, hashes := focusedFileData(ws.Path)
+				computed := true
+				delta := &models.WorkspaceDelta{
+					Path:                 ws.Path,
+					GitStatus:            status,
+					ChangedFiles:         files,
+					BlobHashes:           hashes,
+					ChangedFilesComputed: &computed,
+				}
+				// Shallow copy for the response so the store's stored value (a
+				// shared pointer) isn't mutated outside ApplyUpdate.
+				out := *ws
+				out.GitStatus = status
+				out.ChangedFiles = files
+				out.BlobHashes = hashes
+				out.ChangedFilesComputed = true
+				mu.Lock()
+				deltas = append(deltas, delta)
+				fresh = append(fresh, &out)
+				mu.Unlock()
+			}(ws)
+		}
+		wg.Wait()
+
+		if len(deltas) > 0 {
+			updates <- store.Update{
+				Type:    store.UpdateWorkspacesDelta,
+				Source:  "git",
+				Scanned: len(resolved),
+				Payload: deltas,
+			}
+		}
+		return fresh
+	}
+
 	// Wait for workspaces to be populated first
 	time.Sleep(1 * time.Second)
 	fullScan()
@@ -273,6 +380,8 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		case replyCh := <-c.refresh:
 			fullScan()
 			close(replyCh)
+		case req := <-c.refreshPaths:
+			req.reply <- scanPaths(req.paths)
 		}
 	}
 }

@@ -18,9 +18,10 @@ import (
 )
 
 // GitHandler implements DomainHandler for subsecond-fresh git status. It watches
-// the git internals (HEAD, index, refs/heads, refs/remotes) of the focused
-// workspace set and, on a debounced filesystem event, re-runs GetExtendedStatus
-// for just that one workspace, emitting a WorkspaceDelta through the store.
+// the git internals (HEAD, index, refs/heads, refs/remotes, the HEAD reflog,
+// packed-refs) of the focused workspace set and, on a debounced filesystem
+// event, re-runs GetExtendedStatus for just that one workspace, emitting a
+// WorkspaceDelta through the store.
 //
 // It complements (does not replace) the timer-driven GitStatusCollector, which
 // remains the background fallback for unfocused workspaces. Watching only the
@@ -29,9 +30,12 @@ type GitHandler struct {
 	store *store.Store
 	ulog  *logging.UnifiedLogger
 
-	// watchedPaths maps each watched git-internal path to the WorkspaceNode it
-	// belongs to, so an incoming event can be routed back to a workspace.
-	watchedPaths map[string]*workspace.WorkspaceNode
+	// watchedPaths maps each watched git-internal path to the WorkspaceNodes it
+	// routes to, so an incoming event can be routed back to workspaces.
+	// Commondir paths (refs, packed-refs, logs) are shared across all worktrees
+	// of one repo, so one event may fan out to several focused worktrees —
+	// each needs its own rescan (branch/ahead-behind state is per-worktree).
+	watchedPaths map[string][]*workspace.WorkspaceNode
 	pathsMutex   sync.RWMutex
 
 	// knownPaths is the set of workspace paths seen in the last UpdateWorkspaces,
@@ -66,7 +70,7 @@ func NewGitHandler(st *store.Store, debounceMs int) *GitHandler {
 	return &GitHandler{
 		store:        st,
 		ulog:         logging.NewUnifiedLogger("groved.watcher.git"),
-		watchedPaths: make(map[string]*workspace.WorkspaceNode),
+		watchedPaths: make(map[string][]*workspace.WorkspaceNode),
 		knownPaths:   make(map[string]bool),
 		failedPaths:  make(map[string]bool),
 		timers:       make(map[string]*time.Timer),
@@ -81,17 +85,18 @@ func (h *GitHandler) Name() string {
 // ComputeWatchPaths returns the git-internal paths to watch for the focused
 // workspace set only. For each focused workspace it resolves the gitdir and
 // commondir (handling linked-worktree indirection) and watches HEAD, index,
-// refs/heads, and refs/remotes when present on disk.
+// refs/heads, refs/remotes, the HEAD reflog, and packed-refs when present on
+// disk.
 func (h *GitHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) []string {
 	ctx := context.Background()
-	newWatches := make(map[string]*workspace.WorkspaceNode)
+	newWatches := make(map[string][]*workspace.WorkspaceNode)
 
 	addIfExists := func(p string, node *workspace.WorkspaceNode) {
 		if p == "" {
 			return
 		}
 		if _, err := os.Stat(p); err == nil {
-			newWatches[p] = node
+			newWatches[p] = append(newWatches[p], node)
 		}
 	}
 
@@ -125,6 +130,20 @@ func (h *GitHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) [
 		addIfExists(filepath.Join(gitDir, "index"), node)
 		addIfExists(filepath.Join(commonDir, "refs", "heads"), node)
 		addIfExists(filepath.Join(commonDir, "refs", "remotes"), node)
+		// The HEAD reflog moves on every HEAD mutation (commit, reset, merge,
+		// rebase, checkout) even when the refs are packed, so it covers
+		// packed-ref and slash-named-branch updates the loose-ref watches miss.
+		// Before the first reflog entry exists, watch the logs directory so its
+		// creation is seen.
+		logsHead := filepath.Join(commonDir, "logs", "HEAD")
+		if _, err := os.Stat(logsHead); err == nil {
+			newWatches[logsHead] = append(newWatches[logsHead], node)
+		} else {
+			addIfExists(filepath.Join(commonDir, "logs"), node)
+		}
+		// packed-refs covers git gc / pack-refs advancing branches with no
+		// loose-ref event.
+		addIfExists(filepath.Join(commonDir, "packed-refs"), node)
 	}
 
 	h.pathsMutex.Lock()
@@ -181,11 +200,20 @@ func (h *GitHandler) HandleEvents(ctx context.Context, events []fsnotify.Event) 
 	touched := make(map[string]*workspace.WorkspaceNode)
 	h.pathsMutex.RLock()
 	for _, event := range events {
-		for watched, node := range h.watchedPaths {
-			if node == nil {
+		// Lock files (e.g. packed-refs.lock, refs/heads/<branch>.lock) churn on
+		// every git operation before the real ref moves; scanning on them would
+		// feed back into git's own activity for no fresh state.
+		if strings.HasSuffix(event.Name, ".lock") {
+			continue
+		}
+		for watched, nodes := range h.watchedPaths {
+			if event.Name != watched && !strings.HasPrefix(event.Name, watched+string(filepath.Separator)) {
 				continue
 			}
-			if event.Name == watched || strings.HasPrefix(event.Name, watched+string(filepath.Separator)) {
+			for _, node := range nodes {
+				if node == nil {
+					continue
+				}
 				touched[node.Path] = node
 			}
 		}
@@ -234,16 +262,29 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		return
 	}
 
-	// Compare against the currently stored status to suppress no-op updates —
-	// but never suppress when a focused repo is still missing its per-file cache,
-	// so a fsnotify event on a repo whose coarse status didn't change (or whose
-	// per-file data was never backfilled) still populates ChangedFiles for the
-	// git-viewer cache. Mirrors the collector's backfill gate.
+	// Granular per-file data is computed ONLY for focused repos to bound git
+	// cost; the watcher only ever fires for the focused watched set, but guard
+	// explicitly to mirror the collector. Best-effort: a fetch error leaves the
+	// file-level fields nil and the coarse status stands.
 	focused := h.store.IsFocused(node.Path)
+	var files []git.FileStatus
+	var hashes map[string]string
+	if focused {
+		files, hashes = focusedFileData(node.Path)
+	}
+
+	// Compare against the currently stored status to suppress no-op updates —
+	// but never suppress when a focused repo is still missing its per-file
+	// cache (backfill), or when the per-file snapshot moved while the coarse
+	// status stayed equal (an edit to an already-modified file changes
+	// numstat/blob content but not the counts GitStatusEqual sees). Mirrors
+	// the collector's gates.
 	state := h.store.Get()
 	if current, ok := state.Workspaces[node.Path]; ok {
 		needsFileBackfill := focused && !current.ChangedFilesComputed
-		if store.GitStatusEqual(current.GitStatus, status) && !needsFileBackfill {
+		fileDataChanged := focused && current.ChangedFilesComputed &&
+			!store.FileDataEqual(current.ChangedFiles, current.BlobHashes, files, hashes)
+		if store.GitStatusEqual(current.GitStatus, status) && !needsFileBackfill && !fileDataChanged {
 			h.ulog.Debug("git watcher: scan no-op (status unchanged)").Field("path", node.Path).Log(ctx)
 			return
 		}
@@ -258,12 +299,8 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		Log(ctx)
 
 	delta := &models.WorkspaceDelta{Path: node.Path, GitStatus: status}
-	// Granular per-file data is computed ONLY for focused repos to bound git
-	// cost; the watcher only ever fires for the focused watched set, but guard
-	// explicitly to mirror the collector. Best-effort: a fetch error leaves the
-	// file-level fields nil and the coarse status stands.
 	if focused {
-		delta.ChangedFiles, delta.BlobHashes = focusedFileData(node.Path)
+		delta.ChangedFiles, delta.BlobHashes = files, hashes
 		computed := true
 		delta.ChangedFilesComputed = &computed
 	}

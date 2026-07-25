@@ -2702,18 +2702,49 @@ func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleRefresh triggers an immediate re-scan of all refreshable collectors.
-// This is synchronous: it blocks until the scan completes, so the caller can
-// immediately fetch fresh data after receiving the 200 OK response.
+// handleRefresh triggers an immediate re-scan. This is synchronous: it blocks
+// until the scan completes, so the caller can immediately fetch fresh data
+// after receiving the 200 OK response.
+//
+// With no body (or empty paths), all refreshable collectors do a full re-scan.
+// With a JSON body {"paths": [...]}, only those workspaces are git-scanned
+// (unknown paths silently skipped) and the fresh enriched workspaces are
+// returned as a JSON array — the scoped verify-on-reveal path, bounded to a
+// few hundred ms for a handful of repos.
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.engine != nil {
-		s.engine.Refresh(r.Context())
+	var req struct {
+		Paths []string `json:"paths"`
 	}
-	w.WriteHeader(http.StatusOK)
+	// Tolerate the historical bodyless POST: a decode error (io.EOF on an
+	// empty body included) just means "full refresh".
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	if len(req.Paths) == 0 {
+		if s.engine != nil {
+			s.engine.Refresh(r.Context())
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if s.engine == nil {
+		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	fresh, err := s.engine.RefreshPaths(r.Context(), req.Paths)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if fresh == nil {
+		fresh = []*models.EnrichedWorkspace{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(fresh)
 }
 
 func (s *Server) isMaintenanceTarget(target string) bool {

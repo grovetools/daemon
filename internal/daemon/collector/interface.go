@@ -4,6 +4,7 @@ package collector
 import (
 	"context"
 
+	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
 )
 
@@ -22,4 +23,12 @@ type Collector interface {
 // synchronous, on-demand refresh triggers (e.g. from the /api/refresh endpoint).
 type Refreshable interface {
 	Refresh(ctx context.Context) error
+}
+
+// PathRefreshable is an optional interface for collectors that support a
+// synchronous, scoped re-scan of specific workspace paths (the /api/refresh
+// {"paths": [...]} form), returning the fresh enriched workspaces so the
+// caller can respond with current state without waiting for SSE delivery.
+type PathRefreshable interface {
+	RefreshPaths(ctx context.Context, paths []string) ([]*models.EnrichedWorkspace, error)
 }

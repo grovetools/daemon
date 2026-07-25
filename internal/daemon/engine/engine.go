@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/store"
 )
@@ -80,6 +81,18 @@ func (e *Engine) Refresh(ctx context.Context) {
 		}
 	}
 	wg.Wait()
+}
+
+// RefreshPaths runs a synchronous scoped git re-scan of just the given
+// workspace paths on the first PathRefreshable collector, returning the fresh
+// enriched workspaces. Returns nil, nil when no collector supports it.
+func (e *Engine) RefreshPaths(ctx context.Context, paths []string) ([]*models.EnrichedWorkspace, error) {
+	for _, c := range e.collectors {
+		if pr, ok := c.(collector.PathRefreshable); ok {
+			return pr.RefreshPaths(ctx, paths)
+		}
+	}
+	return nil, nil
 }
 
 // Store returns the engine's state store.

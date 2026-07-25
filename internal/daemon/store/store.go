@@ -301,15 +301,24 @@ func (s *Store) ApplyUpdate(u Update) {
 				if d.GitStatus != nil {
 					ws.GitStatus = d.GitStatus
 				}
-				if d.ChangedFiles != nil {
-					ws.ChangedFiles = d.ChangedFiles
-				}
-				if d.BlobHashes != nil {
-					ws.BlobHashes = d.BlobHashes
-				}
-				// *bool: only git deltas set this, so non-git deltas can't reset it.
+				// *bool: only the git delta builders set ChangedFilesComputed, and
+				// they always populate ChangedFiles/BlobHashes alongside it — so
+				// when it is present, apply all three unconditionally. A nil-guard
+				// per field would keep stale per-file data forever once a repo
+				// goes clean (fresh scan yields nil files), making the per-file
+				// suppression comparison mismatch on every tick. Non-git deltas
+				// leave all three nil and can't touch the cached data.
 				if d.ChangedFilesComputed != nil {
+					ws.ChangedFiles = d.ChangedFiles
+					ws.BlobHashes = d.BlobHashes
 					ws.ChangedFilesComputed = *d.ChangedFilesComputed
+				} else {
+					if d.ChangedFiles != nil {
+						ws.ChangedFiles = d.ChangedFiles
+					}
+					if d.BlobHashes != nil {
+						ws.BlobHashes = d.BlobHashes
+					}
 				}
 				if d.NoteCounts != nil {
 					ws.NoteCounts = d.NoteCounts
@@ -1180,6 +1189,32 @@ func (s *Store) GetFocus() map[string]struct{} {
 		}
 	}
 	return result
+}
+
+// ResolveWorkspacePaths maps request paths onto the store's known workspaces
+// using the same normalization as the focus set (see normFocusPath), so the
+// scoped /api/refresh accepts the same path spellings clients already push as
+// focus. Unknown paths are silently skipped; duplicates resolve once.
+func (s *Store) ResolveWorkspacePaths(paths []string) []*models.EnrichedWorkspace {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	byNorm := make(map[string]*models.EnrichedWorkspace, len(s.state.Workspaces))
+	for _, ws := range s.state.Workspaces {
+		byNorm[normFocusPath(ws.Path)] = ws
+	}
+	seen := make(map[string]struct{}, len(paths))
+	resolved := make([]*models.EnrichedWorkspace, 0, len(paths))
+	for _, p := range paths {
+		key := normFocusPath(p)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		if ws, ok := byNorm[key]; ok {
+			resolved = append(resolved, ws)
+		}
+	}
+	return resolved
 }
 
 // IsFocused returns true if the given path is focused by any source. The lookup
