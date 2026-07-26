@@ -99,6 +99,36 @@ func TestUpdateJobsDiscovered_StateTransitions(t *testing.T) {
 	}
 }
 
+func TestFocusLeaseExpiresAndRenewalExtendsIt(t *testing.T) {
+	s := New()
+	now := time.Unix(1000, 0)
+	s.now = func() time.Time { return now }
+
+	s.SetFocusTTL("viewer", []string{"/repo"}, time.Minute)
+	if !s.IsFocused("/repo") {
+		t.Fatal("new focus lease not visible")
+	}
+	now = now.Add(30 * time.Second)
+	s.SetFocusTTL("viewer", []string{"/repo"}, time.Minute)
+	now = now.Add(45 * time.Second)
+	if !s.IsFocused("/repo") {
+		t.Fatal("renewed focus lease expired at its original deadline")
+	}
+	now = now.Add(16 * time.Second)
+	if s.IsFocused("/repo") || len(s.GetFocus()) != 0 {
+		t.Fatal("expired focus lease remained active")
+	}
+}
+
+func TestFocusEmptyPathsClearSource(t *testing.T) {
+	s := New()
+	s.SetFocus("viewer", []string{"/repo"})
+	s.SetFocus("viewer", nil)
+	if s.IsFocused("/repo") {
+		t.Fatal("empty focus update did not clear source")
+	}
+}
+
 func TestStore_PubSub_SingleSubscriber(t *testing.T) {
 	s := New()
 	sub := s.Subscribe()

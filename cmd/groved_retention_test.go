@@ -70,6 +70,47 @@ func TestLogFileExpired(t *testing.T) {
 	}
 }
 
+func TestApplyDefaultDaemonMemoryLimit(t *testing.T) {
+	var set int64
+	if !applyDefaultDaemonMemoryLimit(func(string) string { return "" }, func(v int64) int64 { set = v; return 0 }) {
+		t.Fatal("unset GOMEMLIMIT did not apply default")
+	}
+	if set != defaultDaemonMemoryLimit {
+		t.Fatalf("memory limit=%d want=%d", set, defaultDaemonMemoryLimit)
+	}
+	set = 0
+	if applyDefaultDaemonMemoryLimit(func(string) string { return "off" }, func(v int64) int64 { set = v; return 0 }) || set != 0 {
+		t.Fatal("explicit GOMEMLIMIT was overridden")
+	}
+}
+
+func TestRotateOversizedLogsCopyTruncatesActiveFile(t *testing.T) {
+	dir := t.TempDir()
+	active := filepath.Join(dir, "system-2026-07-01.log")
+	content := []byte("0123456789")
+	if err := os.WriteFile(active, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := rotateOversizedLogs(dir, 5, time.Unix(1000, 0))
+	if err != nil || rotated != 1 {
+		t.Fatalf("rotateOversizedLogs=(%d,%v), want (1,nil)", rotated, err)
+	}
+	if info, err := os.Stat(active); err != nil || info.Size() != 0 {
+		t.Fatalf("active log not truncated: info=%v err=%v", info, err)
+	}
+	parts, err := filepath.Glob(filepath.Join(dir, "system-2026-07-01-part-*.log"))
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("parts=%v err=%v", parts, err)
+	}
+	if got, err := os.ReadFile(parts[0]); err != nil || string(got) != string(content) {
+		t.Fatalf("archive=%q err=%v", got, err)
+	}
+	rotated, err = rotateOversizedLogs(dir, 5, time.Unix(1001, 0))
+	if err != nil || rotated != 0 {
+		t.Fatalf("part file was recursively rotated: (%d,%v)", rotated, err)
+	}
+}
+
 func TestSweepOldLogs(t *testing.T) {
 	now := mustDate(t, "2026-07-01").Add(10 * time.Hour)
 	dir := t.TempDir()

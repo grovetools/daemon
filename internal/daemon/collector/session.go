@@ -39,12 +39,11 @@ const (
 	// runningTokenRefreshInterval (flow/pkg/tui/status/token_pane.go).
 	liveTokenRefreshInterval = 4 * time.Second
 
-	// transcriptResolveRetryInterval is the negative-cache window for non-claude
-	// transcript resolution: a session whose transcript could not be resolved is
-	// not re-resolved more often than this, so a transcript-less live session
-	// (e.g. opencode before its plugin registers one) never hammers the resolver
-	// on every refresh tick.
-	transcriptResolveRetryInterval = 30 * time.Second
+	// Transcript resolution failures back off exponentially, then become
+	// permanent for this registration. A registration change clears the state.
+	transcriptResolveInitialBackoff = 30 * time.Second
+	transcriptResolveMaxBackoff     = 10 * time.Minute
+	transcriptResolveMaxFailures    = 5
 
 	// bashChildTTL bounds how long a live background bash job stays shown (F6).
 	// Background bash has no reliable per-job completion hook: background_tasks[]
@@ -68,12 +67,13 @@ type liveTokenSummary struct {
 	cost    float64
 	ctxSize int64
 	model   string
-	// resolvedTranscript caches the transcript path found by
-	// aglogsession.Resolve for a non-claude session that registered without one;
-	// lastResolveAttempt is the matching negative cache (see
-	// transcriptResolveRetryInterval).
+	// Resolution state is scoped to registrationKey. Failures back off and
+	// eventually become permanent until that key changes.
 	resolvedTranscript string
-	lastResolveAttempt time.Time
+	registrationKey    string
+	resolveFailures    int
+	nextResolveAttempt time.Time
+	resolvePermanent   bool
 }
 
 // pidLiveness is per-session reaper bookkeeping carried across poll ticks.
@@ -111,6 +111,9 @@ type SessionCollector struct {
 	// lastTokenRefresh throttles the live-token pass to liveTokenRefreshInterval,
 	// decoupling expensive transcript parsing from the 2s liveness tick.
 	lastTokenRefresh time.Time
+	// Injectable seams keep backoff tests deterministic and avoid global scans.
+	now               func() time.Time
+	resolveTranscript func(string) (path, provider string, err error)
 }
 
 // NewSessionCollector creates a new SessionCollector.
@@ -126,6 +129,14 @@ func NewSessionCollector(interval time.Duration, scope string) *SessionCollector
 		scope:      scope,
 		liveness:   make(map[string]*pidLiveness),
 		tokenCache: make(map[string]liveTokenSummary),
+		now:        time.Now,
+		resolveTranscript: func(spec string) (string, string, error) {
+			info, err := aglogsession.Resolve(spec)
+			if err != nil {
+				return "", "", err
+			}
+			return info.LogFilePath, info.Provider, nil
+		},
 	}
 }
 
@@ -429,12 +440,13 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 			continue
 		}
 		live[s.ID] = struct{}{}
+		cached := c.ensureTokenRegistration(s)
 
 		// The transcript we expect to summarize: the registered path, else the
 		// path a previous refresh resolved for a non-claude session.
 		knownPath := s.TranscriptPath
 		if knownPath == "" {
-			knownPath = c.tokenCache[s.ID].resolvedTranscript
+			knownPath = cached.resolvedTranscript
 		}
 		mtime := transcriptMtime(knownPath)
 		if cached, ok := c.tokenCache[s.ID]; ok && !mtime.IsZero() && mtime.Equal(cached.mtime) {
@@ -444,7 +456,7 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 
 		summary, usedPath, err := c.summarizeLiveSession(s)
 		if err != nil {
-			if !errors.Is(err, errResolveThrottled) {
+			if !errors.Is(err, errResolveThrottled) && !errors.Is(err, errResolvePermanent) {
 				c.ulog.Debug("Failed to summarize live token usage").
 					Field("job_id", s.ID).
 					Field("provider", s.Provider).
@@ -475,8 +487,8 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 			model = summary.ModelBreakdown[0].Model
 		}
 
-		// Re-read after summarizeLiveSession: it stores resolution state
-		// (resolvedTranscript/lastResolveAttempt) that the new entry must keep.
+		// Re-read after summarizeLiveSession: it stores resolution/backoff state
+		// that the new entry must keep.
 		prev, existed := c.tokenCache[s.ID]
 		entry := liveTokenSummary{
 			mtime:              mtime,
@@ -485,7 +497,10 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 			ctxSize:            summary.ContextSize,
 			model:              model,
 			resolvedTranscript: prev.resolvedTranscript,
-			lastResolveAttempt: prev.lastResolveAttempt,
+			registrationKey:    prev.registrationKey,
+			resolveFailures:    prev.resolveFailures,
+			nextResolveAttempt: prev.nextResolveAttempt,
+			resolvePermanent:   prev.resolvePermanent,
 		}
 		c.tokenCache[s.ID] = entry
 		// Skip the broadcast when only the mtime moved but the numbers held.
@@ -563,10 +578,38 @@ func (c *SessionCollector) refreshLiveChildren(st *store.Store, activeSessions [
 	}
 }
 
-// errResolveThrottled marks a non-claude session whose transcript resolution
-// failed recently enough that this refresh skips it (negative cache) — an
-// expected wait state, not a failure worth logging every tick.
-var errResolveThrottled = errors.New("transcript resolution throttled")
+// Resolution wait states are expected and suppressed from per-tick logs.
+var (
+	errResolveThrottled = errors.New("transcript resolution throttled")
+	errResolvePermanent = errors.New("transcript permanently unresolvable for this registration")
+)
+
+func transcriptRegistrationKey(s *models.Session) string {
+	return strings.Join([]string{s.Provider, s.TranscriptPath, s.ClaudeSessionID, s.PlanDirectory, s.JobFilePath}, "\x00")
+}
+
+// ensureTokenRegistration resets all transcript-resolution state when the
+// daemon receives changed registration metadata for the same job ID.
+func (c *SessionCollector) ensureTokenRegistration(s *models.Session) liveTokenSummary {
+	key := transcriptRegistrationKey(s)
+	cached, ok := c.tokenCache[s.ID]
+	if !ok || cached.registrationKey != key {
+		cached = liveTokenSummary{registrationKey: key}
+		c.tokenCache[s.ID] = cached
+	}
+	return cached
+}
+
+func transcriptResolveBackoff(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	d := transcriptResolveInitialBackoff
+	for i := 1; i < failures && d < transcriptResolveMaxBackoff; i++ {
+		d *= 2
+	}
+	return min(d, transcriptResolveMaxBackoff)
+}
 
 // summarizeLiveSession computes one live session's usage summary, branched on
 // provider. Claude sessions go through slug-dir discovery (subagent-inclusive,
@@ -585,26 +628,38 @@ func (c *SessionCollector) summarizeLiveSession(s *models.Session) (usage.Summar
 	provider := s.Provider
 	path := s.TranscriptPath
 	if path == "" {
-		cached := c.tokenCache[s.ID]
+		cached := c.ensureTokenRegistration(s)
 		path = cached.resolvedTranscript
 		if path == "" {
-			if time.Since(cached.lastResolveAttempt) < transcriptResolveRetryInterval {
+			if cached.resolvePermanent {
+				return usage.Summary{}, "", errResolvePermanent
+			}
+			now := c.now()
+			if now.Before(cached.nextResolveAttempt) {
 				return usage.Summary{}, "", errResolveThrottled
 			}
-			cached.lastResolveAttempt = time.Now()
-			c.tokenCache[s.ID] = cached
-			info, err := aglogsession.Resolve(s.ID)
+			resolvedPath, resolvedProvider, err := c.resolveTranscript(s.ID)
+			if err == nil && resolvedPath == "" {
+				err = errors.New("session resolved without a transcript path")
+			}
 			if err != nil {
+				cached.resolveFailures++
+				if cached.resolveFailures >= transcriptResolveMaxFailures {
+					cached.resolvePermanent = true
+				} else {
+					cached.nextResolveAttempt = now.Add(transcriptResolveBackoff(cached.resolveFailures))
+				}
+				c.tokenCache[s.ID] = cached
 				return usage.Summary{}, "", err
 			}
-			if info.LogFilePath == "" {
-				return usage.Summary{}, "", errors.New("session resolved without a transcript path")
-			}
-			path = info.LogFilePath
-			if info.Provider != "" {
-				provider = info.Provider
+			path = resolvedPath
+			if resolvedProvider != "" {
+				provider = resolvedProvider
 			}
 			cached.resolvedTranscript = path
+			cached.resolveFailures = 0
+			cached.nextResolveAttempt = time.Time{}
+			cached.resolvePermanent = false
 			c.tokenCache[s.ID] = cached
 		}
 	}

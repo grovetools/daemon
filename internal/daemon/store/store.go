@@ -21,7 +21,8 @@ type Store struct {
 	mu                sync.RWMutex
 	state             *State
 	subscribers       map[chan Update]struct{}
-	focus             map[string]map[string]struct{} // [source][path] focused workspace paths for priority scanning
+	focus             map[string]focusRegistration // source-owned focus paths with a bounded lease
+	now               func() time.Time
 	persister         *Persister
 	workflowPersister *workflowPersister
 	pendingRestore    persistedState // Loaded from disk, applied when workspaces arrive
@@ -51,7 +52,8 @@ func New() *Store {
 			Satellites:     make(map[string]*SatelliteStatusPayload),
 		},
 		subscribers:       make(map[chan Update]struct{}),
-		focus:             make(map[string]map[string]struct{}),
+		focus:             make(map[string]focusRegistration),
+		now:               time.Now,
 		satSeenSnapshot:   make(map[string]struct{}),
 		persister:         newPersister(),
 		workflowPersister: newWorkflowPersister(),
@@ -1131,44 +1133,71 @@ func normFocusPath(p string) string {
 	return strings.ToLower(p)
 }
 
-// SetFocus replaces the set of focused workspace paths for a single source.
-// Each source (e.g. "nav", "treemux_git") owns its own path set; multiple
-// sources are aggregated across IsFocused/GetFocus so they don't clobber each
-// other. Focused workspaces get priority scanning by collectors. Paths are
-// normalized (see normFocusPath) so lookups are case/symlink-insensitive.
+const defaultFocusTTL = 5 * time.Minute
+
+type focusRegistration struct {
+	paths     map[string]struct{}
+	expiresAt time.Time
+}
+
+// SetFocus replaces a source's focused paths with the default bounded lease.
+// Existing clients keep the same API, but must periodically re-assert visibility;
+// abandoned focus no longer leaves the daemon on its fast polling path forever.
 func (s *Store) SetFocus(source string, paths []string) {
+	s.SetFocusTTL(source, paths, defaultFocusTTL)
+}
+
+// SetFocusTTL replaces a source's focused paths with a bounded lease. Empty
+// paths clear immediately; non-positive or overlong TTLs use the five-minute
+// daemon maximum.
+func (s *Store) SetFocusTTL(source string, paths []string, ttl time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(paths) == 0 {
 		delete(s.focus, source)
 	} else {
+		if ttl <= 0 || ttl > defaultFocusTTL {
+			ttl = defaultFocusTTL
+		}
 		set := make(map[string]struct{}, len(paths))
 		for _, p := range paths {
 			set[normFocusPath(p)] = struct{}{}
 		}
-		s.focus[source] = set
+		s.focus[source] = focusRegistration{paths: set, expiresAt: s.now().Add(ttl)}
 	}
+	s.broadcastFocusLocked()
+}
 
-	// Aggregate the full focus set across all sources for the broadcast payload.
-	seen := make(map[string]struct{})
-	agg := make([]string, 0)
-	for _, set := range s.focus {
-		for p := range set {
-			if _, dup := seen[p]; dup {
-				continue
-			}
-			seen[p] = struct{}{}
-			agg = append(agg, p)
+// pruneExpiredFocusLocked removes expired source leases. The caller holds s.mu.
+func (s *Store) pruneExpiredFocusLocked() bool {
+	now := s.now()
+	changed := false
+	for source, reg := range s.focus {
+		if !now.Before(reg.expiresAt) {
+			delete(s.focus, source)
+			changed = true
 		}
 	}
+	return changed
+}
 
-	// Broadcast focus change to subscribers
-	update := Update{
-		Type:    UpdateFocus,
-		Source:  "client",
-		Scanned: len(agg),
-		Payload: agg,
+func (s *Store) aggregateFocusLocked() map[string]struct{} {
+	result := make(map[string]struct{})
+	for _, reg := range s.focus {
+		for p := range reg.paths {
+			result[p] = struct{}{}
+		}
 	}
+	return result
+}
+
+func (s *Store) broadcastFocusLocked() {
+	aggSet := s.aggregateFocusLocked()
+	agg := make([]string, 0, len(aggSet))
+	for p := range aggSet {
+		agg = append(agg, p)
+	}
+	update := Update{Type: UpdateFocus, Source: "client", Scanned: len(agg), Payload: agg}
 	for ch := range s.subscribers {
 		select {
 		case ch <- update:
@@ -1177,18 +1206,14 @@ func (s *Store) SetFocus(source string, paths []string) {
 	}
 }
 
-// GetFocus returns the aggregated set of focused workspace paths across all sources.
+// GetFocus returns the aggregated, non-expired focused workspace paths.
 func (s *Store) GetFocus() map[string]struct{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	// Return a copy aggregated across all sources.
-	result := make(map[string]struct{})
-	for _, set := range s.focus {
-		for p := range set {
-			result[p] = struct{}{}
-		}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pruneExpiredFocusLocked() {
+		s.broadcastFocusLocked()
 	}
-	return result
+	return s.aggregateFocusLocked()
 }
 
 // ResolveWorkspacePaths maps request paths onto the store's known workspaces
@@ -1223,10 +1248,13 @@ func (s *Store) ResolveWorkspacePaths(paths []string) []*models.EnrichedWorkspac
 // ws.Path can no longer make a focused repo miss its per-file enrichment.
 func (s *Store) IsFocused(path string) bool {
 	key := normFocusPath(path)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, set := range s.focus {
-		if _, ok := set[key]; ok {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pruneExpiredFocusLocked() {
+		s.broadcastFocusLocked()
+	}
+	for _, reg := range s.focus {
+		if _, ok := reg.paths[key]; ok {
 			return true
 		}
 	}

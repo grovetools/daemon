@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -206,16 +207,34 @@ func newGrovedHealthCmd() *cobra.Command {
 	}
 }
 
+const defaultDaemonMemoryLimit = int64(2 << 30) // 2 GiB allocation-spike backstop
+
+func applyDefaultDaemonMemoryLimit(getenv func(string) string, setLimit func(int64) int64) bool {
+	if strings.TrimSpace(getenv("GOMEMLIMIT")) != "" {
+		return false
+	}
+	setLimit(defaultDaemonMemoryLimit)
+	return true
+}
+
 func newGrovedStartCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start the daemon",
 		Long:  "Start the grove daemon in foreground mode.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Bound heap high-water retention unless the operator supplied an
+			// explicit GOMEMLIMIT (including "off"). This mitigates transcript
+			// allocation spikes; it is not a substitute for collector throttling.
+			memoryLimitDefaulted := applyDefaultDaemonMemoryLimit(os.Getenv, debug.SetMemoryLimit)
+
 			// Route all daemon logs to central system log
 			grovelogging.SetGlobalScope(grovelogging.ScopeSystem)
 
 			ulog := grovelogging.NewUnifiedLogger("groved.main")
+			if memoryLimitDefaulted {
+				ulog.Info("Applied default daemon memory limit").Field("bytes", defaultDaemonMemoryLimit).Log(cmd.Context())
+			}
 
 			// Resolve scope (--scope flag > current working directory). An empty
 			// scope preserves the legacy global socket/pidfile, so existing dev
@@ -1182,41 +1201,112 @@ func newGrovedStartCmd() *cobra.Command {
 	return cmd
 }
 
-// runLogRetentionJanitor sweeps the grove logs directory (system logs plus the
-// per-workspace subtree) on start and every 24h, deleting dated *.log files
-// older than retentionDays (logging.FileSinkConfig.RetentionDays, default 14).
-// One Info summary per sweep that deleted anything (event=log.retention_sweep);
-// Debug when there was nothing to delete.
+const (
+	maxActiveLogBytes = int64(256 << 20) // 256 MiB per active dated log
+	logSizeCheckEvery = 5 * time.Minute
+)
+
+// runLogRetentionJanitor owns daemon-side log hygiene: daily age retention plus
+// a frequent copy-truncate size backstop. Copy-truncate preserves the active
+// logger fd, unlike renaming the live file (which would strand tailers/writers).
 func runLogRetentionJanitor(ctx context.Context, ulog *grovelogging.UnifiedLogger, retentionDays int) {
 	logsDir := filepath.Join(paths.StateDir(), "logs")
-	sweep := func() {
+	retentionSweep := func() {
 		deleted, freed, err := sweepOldLogs(logsDir, retentionDays, time.Now())
 		entry := ulog.Debug("Log retention sweep: nothing to delete")
 		if deleted > 0 {
 			entry = ulog.Info("Log retention sweep").Field("event", "log.retention_sweep")
 		}
-		entry = entry.
-			Field("deleted", deleted).
-			Field("freed_bytes", freed).
-			Field("retention_days", retentionDays).
-			Field("dir", logsDir)
+		entry = entry.Field("deleted", deleted).Field("freed_bytes", freed).
+			Field("retention_days", retentionDays).Field("dir", logsDir)
 		if err != nil {
 			entry = entry.Err(err)
 		}
 		entry.Log(ctx)
 	}
+	sizeSweep := func() {
+		rotated, err := rotateOversizedLogs(logsDir, maxActiveLogBytes, time.Now())
+		if rotated > 0 || err != nil {
+			entry := ulog.Info("Rotated oversized active logs").Field("event", "log.size_rotation").
+				Field("rotated", rotated).Field("max_bytes", maxActiveLogBytes).Field("dir", logsDir)
+			if err != nil {
+				entry = entry.Err(err)
+			}
+			entry.Log(ctx)
+		}
+	}
 
-	sweep()
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
+	retentionSweep()
+	sizeSweep()
+	retentionTicker := time.NewTicker(24 * time.Hour)
+	sizeTicker := time.NewTicker(logSizeCheckEvery)
+	defer retentionTicker.Stop()
+	defer sizeTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			sweep()
+		case <-retentionTicker.C:
+			retentionSweep()
+		case <-sizeTicker.C:
+			sizeSweep()
 		}
 	}
+}
+
+// rotateOversizedLogs archives and truncates active *.log files over maxBytes.
+// Existing part files are ignored. Best-effort walking mirrors sweepOldLogs.
+func rotateOversizedLogs(logsDir string, maxBytes int64, now time.Time) (rotated int, firstErr error) {
+	if maxBytes <= 0 {
+		return 0, nil
+	}
+	if _, err := os.Stat(logsDir); err != nil {
+		return 0, nil
+	}
+	_ = filepath.WalkDir(logsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".log") || strings.Contains(d.Name(), "-part-") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || info.Size() <= maxBytes {
+			return nil
+		}
+		base := strings.TrimSuffix(path, ".log")
+		archive := fmt.Sprintf("%s-part-%s.log", base, now.Format("20060102T150405.000000000"))
+		src, err := os.Open(path)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil
+		}
+		dst, err := os.OpenFile(archive, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, err = io.CopyN(dst, src, info.Size())
+		}
+		_ = src.Close()
+		if dst != nil {
+			if syncErr := dst.Sync(); err == nil {
+				err = syncErr
+			}
+			if closeErr := dst.Close(); err == nil {
+				err = closeErr
+			}
+		}
+		if err == nil {
+			err = os.Truncate(path, 0)
+		}
+		if err != nil {
+			_ = os.Remove(archive)
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil
+		}
+		rotated++
+		return nil
+	})
+	return rotated, firstErr
 }
 
 // sweepOldLogs walks logsDir recursively and deletes every *.log file that

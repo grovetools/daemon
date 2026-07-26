@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -206,6 +207,56 @@ func writeCodexTranscript(t *testing.T, path, model string) {
 // branch: claude sessions summarize via slug-dir discovery, non-claude
 // sessions via the provider-routed single-transcript summarizer — and the
 // extracted model rides the SessionTokenUpdate into the store.
+func TestTranscriptResolutionBackoffBecomesPermanentAndResets(t *testing.T) {
+	now := time.Unix(1000, 0)
+	calls := 0
+	c := NewSessionCollector(2*time.Second, "")
+	c.now = func() time.Time { return now }
+	c.resolveTranscript = func(string) (string, string, error) {
+		calls++
+		return "", "", os.ErrNotExist
+	}
+	s := &models.Session{ID: "missing-pi", Provider: "pi", Status: "running", PlanDirectory: "/plan/a"}
+
+	for failure := 1; failure <= transcriptResolveMaxFailures; failure++ {
+		_, _, err := c.summarizeLiveSession(s)
+		if err == nil || calls != failure {
+			t.Fatalf("failure %d: err=%v calls=%d", failure, err, calls)
+		}
+		_, _, retryErr := c.summarizeLiveSession(s)
+		if failure == transcriptResolveMaxFailures {
+			if !errors.Is(retryErr, errResolvePermanent) {
+				t.Fatalf("after max failures err=%v, want permanent", retryErr)
+			}
+		} else {
+			if !errors.Is(retryErr, errResolveThrottled) {
+				t.Fatalf("failure %d immediate retry err=%v, want throttled", failure, retryErr)
+			}
+			now = now.Add(transcriptResolveBackoff(failure))
+		}
+		if calls != failure {
+			t.Fatalf("wait-state retry called resolver: calls=%d want=%d", calls, failure)
+		}
+	}
+
+	// New registration metadata for the same job clears permanent failure and
+	// permits an immediate fresh attempt.
+	s.PlanDirectory = "/plan/b"
+	_, _, _ = c.summarizeLiveSession(s)
+	if calls != transcriptResolveMaxFailures+1 {
+		t.Fatalf("registration change did not reset resolution: calls=%d", calls)
+	}
+}
+
+func TestTranscriptResolveBackoffCaps(t *testing.T) {
+	if got := transcriptResolveBackoff(1); got != 30*time.Second {
+		t.Fatalf("first backoff=%s", got)
+	}
+	if got := transcriptResolveBackoff(99); got != transcriptResolveMaxBackoff {
+		t.Fatalf("capped backoff=%s, want %s", got, transcriptResolveMaxBackoff)
+	}
+}
+
 func TestSummarizeLiveSession_ProviderBranch(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", root)

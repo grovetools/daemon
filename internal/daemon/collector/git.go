@@ -16,9 +16,14 @@ import (
 // Uses half of CPU cores (min 2, max 8) to stay unobtrusive.
 var gitWorkers = max(min(runtime.NumCPU()/2, 8), 2)
 
-// backgroundScanInterval is how often to scan non-focused workspaces.
-// Uses a long interval since CLI commands trigger /api/refresh on demand.
-const backgroundScanInterval = 5 * time.Minute
+const (
+	// backgroundScanInterval is how often to scan non-focused workspaces.
+	backgroundScanInterval = 5 * time.Minute
+	// Focus must never invert into near-continuous polling for small sets.
+	focusedScanFloor = 5 * time.Second
+	// Repeated verify-on-reveal refreshes reuse the just-computed snapshot.
+	pathRefreshCooldown = 5 * time.Second
+)
 
 // maxFocusedChangedFiles caps how many changed files a focused repo may have
 // before the daemon skips computing per-file blob hashes for it. A huge change
@@ -51,14 +56,23 @@ func focusedFileData(repoPath string) ([]git.FileStatus, map[string]string) {
 	return files, hashes
 }
 
+func shouldComputeFocusedFileData(focused, alreadyComputed bool, oldStatus, newStatus *git.ExtendedGitStatus) bool {
+	return focused && (!alreadyComputed || !store.GitStatusEqual(oldStatus, newStatus))
+}
+
+func pathRefreshDue(last map[string]time.Time, path string, now time.Time) bool {
+	previous, ok := last[path]
+	return !ok || now.Sub(previous) >= pathRefreshCooldown
+}
+
 // dynamicInterval returns a scan interval based on workspace count.
 // Fewer workspaces = faster scanning since it's cheaper.
 func dynamicInterval(count int, baseInterval time.Duration) time.Duration {
 	switch {
 	case count <= 5:
-		return max(baseInterval/4, 1*time.Second) // 4x faster, min 1s
+		return max(baseInterval/4, focusedScanFloor)
 	case count <= 15:
-		return max(baseInterval/2, 2*time.Second) // 2x faster, min 2s
+		return max(baseInterval/2, focusedScanFloor)
 	case count <= 30:
 		return baseInterval // Normal speed
 	default:
@@ -137,7 +151,7 @@ func (c *GitStatusCollector) Name() string { return "git" }
 func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates chan<- store.Update) error {
 	ulog := logging.NewUnifiedLogger("groved.collector.git")
 	var lastFullScan time.Time
-	var lastFocusCount int
+	lastPathScan := make(map[string]time.Time)
 	currentInterval := c.interval
 	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
@@ -173,19 +187,6 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				}
 				coarseChanged := !store.GitStatusEqual(ws.GitStatus, status)
 				focused := st.IsFocused(ws.Path)
-				// Granular per-file data is computed ONLY for focused repos
-				// (git-viewer panels / nav) — never on the 5-min background
-				// sweep — to bound git cost. It runs on EVERY focused scan, not
-				// just coarse changes: an edit to an already-modified file moves
-				// numstat/blob content while the coarse counts stay equal, so the
-				// per-file comparison below is the only way to see it.
-				// Best-effort: a fetch error just leaves the file-level fields
-				// nil and the coarse status stands.
-				var files []git.FileStatus
-				var hashes map[string]string
-				if focused {
-					files, hashes = focusedFileData(ws.Path)
-				}
 				// Backfill: a focused repo whose coarse status is unchanged still
 				// needs its per-file data emitted the FIRST time it becomes
 				// focused. The daemon boots / rescans with the focus set empty, so
@@ -196,12 +197,16 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				// ChangedFiles == nil: a clean repo's file list is nil, so the nil
 				// test would re-emit every tick.
 				needsFileBackfill := focused && !ws.ChangedFilesComputed
-				// Content-only change: coarse status equal but the per-file
-				// snapshot moved (see FileDataEqual).
-				fileDataChanged := focused && ws.ChangedFilesComputed &&
-					!store.FileDataEqual(ws.ChangedFiles, ws.BlobHashes, files, hashes)
-				if !coarseChanged && !needsFileBackfill && !fileDataChanged {
+				if !coarseChanged && !needsFileBackfill {
 					return
+				}
+				// The coarse status is the focused-data fingerprint. Only pay the
+				// changed-file/blob pass when that fingerprint moved or the first
+				// focused snapshot needs backfilling.
+				var files []git.FileStatus
+				var hashes map[string]string
+				if shouldComputeFocusedFileData(focused, ws.ChangedFilesComputed, ws.GitStatus, status) {
+					files, hashes = focusedFileData(ws.Path)
 				}
 				delta := &models.WorkspaceDelta{
 					Path:      ws.Path,
@@ -280,10 +285,9 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 			focusCount = len(state.Workspaces)
 		}
 		newInterval := dynamicInterval(focusCount, c.interval)
-		if newInterval != currentInterval && focusCount != lastFocusCount {
+		if newInterval != currentInterval {
 			currentInterval = newInterval
 			ticker.Reset(currentInterval)
-			lastFocusCount = focusCount
 		}
 	}
 
@@ -320,8 +324,15 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		var mu sync.Mutex
 		var deltas []*models.WorkspaceDelta
 		fresh := make([]*models.EnrichedWorkspace, 0, len(resolved))
+		var completedPaths []string
+		now := time.Now()
 
 		for _, ws := range resolved {
+			if !pathRefreshDue(lastPathScan, ws.Path, now) {
+				out := *ws
+				fresh = append(fresh, &out)
+				continue
+			}
 			wg.Add(1)
 			go func(ws *models.EnrichedWorkspace) {
 				defer wg.Done()
@@ -351,10 +362,14 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				mu.Lock()
 				deltas = append(deltas, delta)
 				fresh = append(fresh, &out)
+				completedPaths = append(completedPaths, ws.Path)
 				mu.Unlock()
 			}(ws)
 		}
 		wg.Wait()
+		for _, path := range completedPaths {
+			lastPathScan[path] = now
+		}
 
 		if len(deltas) > 0 {
 			updates <- store.Update{

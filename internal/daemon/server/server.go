@@ -2673,8 +2673,9 @@ func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		var req struct {
-			Source string   `json:"source"`
-			Paths  []string `json:"paths"`
+			Source     string   `json:"source"`
+			Paths      []string `json:"paths"`
+			TTLSeconds int      `json:"ttl_seconds,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -2683,8 +2684,8 @@ func (s *Server) handleFocus(w http.ResponseWriter, r *http.Request) {
 		if req.Source == "" {
 			req.Source = "default"
 		}
-		s.engine.Store().SetFocus(req.Source, req.Paths)
-		s.ulog.Debug("Focus updated").Field("source", req.Source).Field("count", len(req.Paths)).Log(r.Context())
+		s.engine.Store().SetFocusTTL(req.Source, req.Paths, time.Duration(req.TTLSeconds)*time.Second)
+		s.ulog.Debug("Focus updated").Field("source", req.Source).Field("count", len(req.Paths)).Field("ttl_seconds", req.TTLSeconds).Log(r.Context())
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]int{"focused": len(req.Paths)})
 

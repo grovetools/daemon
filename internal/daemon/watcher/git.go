@@ -262,32 +262,22 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		return
 	}
 
-	// Granular per-file data is computed ONLY for focused repos to bound git
-	// cost; the watcher only ever fires for the focused watched set, but guard
-	// explicitly to mirror the collector. Best-effort: a fetch error leaves the
-	// file-level fields nil and the coarse status stands.
 	focused := h.store.IsFocused(node.Path)
+	state := h.store.Get()
+	current, exists := state.Workspaces[node.Path]
+	coarseChanged := !exists || !store.GitStatusEqual(current.GitStatus, status)
+	needsFileBackfill := focused && (!exists || !current.ChangedFilesComputed)
+	if !coarseChanged && !needsFileBackfill {
+		h.ulog.Debug("git watcher: scan no-op (status unchanged)").Field("path", node.Path).Log(ctx)
+		return
+	}
+
+	// Treat coarse status as the focused-data fingerprint. The expensive
+	// changed-file/blob pass only runs when it moved or needs first-focus fill.
 	var files []git.FileStatus
 	var hashes map[string]string
 	if focused {
 		files, hashes = focusedFileData(node.Path)
-	}
-
-	// Compare against the currently stored status to suppress no-op updates —
-	// but never suppress when a focused repo is still missing its per-file
-	// cache (backfill), or when the per-file snapshot moved while the coarse
-	// status stayed equal (an edit to an already-modified file changes
-	// numstat/blob content but not the counts GitStatusEqual sees). Mirrors
-	// the collector's gates.
-	state := h.store.Get()
-	if current, ok := state.Workspaces[node.Path]; ok {
-		needsFileBackfill := focused && !current.ChangedFilesComputed
-		fileDataChanged := focused && current.ChangedFilesComputed &&
-			!store.FileDataEqual(current.ChangedFiles, current.BlobHashes, files, hashes)
-		if store.GitStatusEqual(current.GitStatus, status) && !needsFileBackfill && !fileDataChanged {
-			h.ulog.Debug("git watcher: scan no-op (status unchanged)").Field("path", node.Path).Log(ctx)
-			return
-		}
 	}
 
 	h.ulog.Info("git watcher: emitting delta").
