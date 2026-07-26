@@ -3415,11 +3415,7 @@ func (s *Server) handleNavConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	groupConfigs := s.loadNavGroupConfigs()
-	cfg := models.NavConfig{Groups: make(map[string]models.NavGroupConfig, len(groupConfigs))}
-	for name, gc := range groupConfigs {
-		cfg.Groups[name] = models.NavGroupConfig{Prefix: gc.Prefix}
-	}
+	cfg := s.loadNavConfig()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(cfg)
@@ -3607,34 +3603,43 @@ func (s *Server) handleNavLastAccessedGroup(w http.ResponseWriter, r *http.Reque
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
 }
 
-// loadNavGroupConfigs reads the grove config to get group prefix configurations for validation.
-func (s *Server) loadNavGroupConfigs() map[string]navbindings.GroupConfig {
-	result := make(map[string]navbindings.GroupConfig)
+// loadNavConfig reads the static nav configuration exposed to clients.
+func (s *Server) loadNavConfig() models.NavConfig {
+	result := models.NavConfig{Groups: make(map[string]models.NavGroupConfig)}
 
 	cfg, err := config.LoadDefault()
 	if err != nil {
 		return result
 	}
 
-	// Extract nav config from the grove config
 	var navCfg struct {
-		Prefix string `toml:"prefix" yaml:"prefix"`
-		Groups map[string]struct {
+		Prefix        string   `toml:"prefix" yaml:"prefix"`
+		AvailableKeys []string `toml:"available_keys" yaml:"available_keys"`
+		Groups        map[string]struct {
 			Prefix string `toml:"prefix" yaml:"prefix"`
 		} `toml:"groups" yaml:"groups"`
 	}
 	_ = cfg.UnmarshalExtension("nav", &navCfg)
 
-	if navCfg.Prefix != "" {
-		result["default"] = navbindings.GroupConfig{Prefix: navCfg.Prefix}
-	} else {
-		result["default"] = navbindings.GroupConfig{Prefix: "<prefix>"}
+	defaultPrefix := navCfg.Prefix
+	if defaultPrefix == "" {
+		defaultPrefix = "<prefix>"
 	}
-
+	result.Groups["default"] = models.NavGroupConfig{Prefix: defaultPrefix}
+	result.AvailableKeys = append([]string(nil), navCfg.AvailableKeys...)
 	for name, g := range navCfg.Groups {
-		result[name] = navbindings.GroupConfig{Prefix: g.Prefix}
+		result.Groups[name] = models.NavGroupConfig{Prefix: g.Prefix}
 	}
+	return result
+}
 
+// loadNavGroupConfigs projects the public config into the validation shape.
+func (s *Server) loadNavGroupConfigs() map[string]navbindings.GroupConfig {
+	cfg := s.loadNavConfig()
+	result := make(map[string]navbindings.GroupConfig, len(cfg.Groups))
+	for name, group := range cfg.Groups {
+		result[name] = navbindings.GroupConfig{Prefix: group.Prefix}
+	}
 	return result
 }
 
