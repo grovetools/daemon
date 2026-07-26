@@ -91,12 +91,7 @@ func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger
 
 	var discoveredJobs []*models.JobInfo
 
-	// Build a lookup map from workspace name -> node for worktree resolution
-	allNodes := provider.All()
-	nodesByName := make(map[string]*workspace.WorkspaceNode, len(allNodes))
-	for _, n := range allNodes {
-		nodesByName[n.Name] = n
-	}
+	index := newWorktreeIndex(provider.All())
 
 	for _, scannedDir := range scannedDirs {
 		plansRootDir := scannedDir.Path
@@ -161,17 +156,18 @@ func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger
 					}
 				}
 
-				// Resolve workspace: if frontmatter specifies a worktree, try to find
-				// the matching workspace node for accurate WorkDir
-				jobWorkDir := ownerWorkDir
-				jobRepo := ownerRepo
-				jobBranch := ""
-				if meta.Worktree != "" {
-					jobBranch = meta.Worktree
-					if wtNode, ok := nodesByName[meta.Worktree]; ok {
-						jobWorkDir = wtNode.Path
-						jobRepo = wtNode.Name
-					}
+				// Resolve workspace: if frontmatter specifies a worktree, find
+				// the matching workspace node for an accurate WorkDir. The
+				// lookup is constrained to the plan owner's own ecosystem —
+				// see worktreeIndex.resolve.
+				jobWorkDir, jobRepo, jobBranch, outcome := jobWorkspace(
+					index, scannedDir.Owner, meta.Worktree, ownerWorkDir, ownerRepo)
+				if outcome == worktreeAmbiguous {
+					ulog.Warn("Ambiguous worktree name in job frontmatter; keeping owner-derived workspace").
+						Field("job_path", jobPath).
+						Field("worktree", meta.Worktree).
+						Field("owner", ownerWorkDir).
+						Log(ctx)
 				}
 
 				job := &models.JobInfo{
