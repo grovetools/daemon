@@ -56,6 +56,10 @@ func focusedFileData(repoPath string) ([]git.FileStatus, map[string]string) {
 	return files, hashes
 }
 
+// shouldComputeFocusedFileData decides whether the timer collector pays for the
+// changed-file + blob-hash pass on this tick. It is intentionally coarse (see
+// the call site): the watcher, not the ticker, is what guarantees content-only
+// edits are seen promptly.
 func shouldComputeFocusedFileData(focused, alreadyComputed bool, oldStatus, newStatus *git.ExtendedGitStatus) bool {
 	return focused && (!alreadyComputed || !store.GitStatusEqual(oldStatus, newStatus))
 }
@@ -200,9 +204,16 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				if !coarseChanged && !needsFileBackfill {
 					return
 				}
-				// The coarse status is the focused-data fingerprint. Only pay the
-				// changed-file/blob pass when that fingerprint moved or the first
-				// focused snapshot needs backfilling.
+				// On the TIMER path the coarse status is used as the focused-data
+				// fingerprint: only pay the changed-file/blob pass when it moved
+				// or the first focused snapshot needs backfilling, so a focus set
+				// that is quiet costs one `git status` per tick instead of a
+				// changed-file + batch-hash pass per repo per tick. This is a
+				// deliberate freshness trade: content-only edits (untracked files,
+				// re-edits of an already-modified line, binary files — all invisible
+				// to GitStatusEqual) are NOT caught here. The event-driven watcher
+				// owns that guarantee and recomputes per-file data unconditionally
+				// (see watcher.scanAndEmit), as does the scoped /api/refresh path.
 				var files []git.FileStatus
 				var hashes map[string]string
 				if shouldComputeFocusedFileData(focused, ws.ChangedFilesComputed, ws.GitStatus, status) {
@@ -308,11 +319,14 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 
 	// scanPaths synchronously scans just the requested workspace paths (the
 	// scoped /api/refresh form) and returns their fresh enriched workspaces.
-	// Per-file data is always computed — the request is proof the user is
-	// looking, regardless of focus registration. Results are ALSO emitted as a
-	// normal git-source delta so SSE subscribers converge, but the return value
-	// is never suppressed via GitStatusEqual: the response must always carry
-	// current state.
+	// A path that was scanned less than pathRefreshCooldown ago is served from
+	// the store's just-computed snapshot instead of being rescanned, so a burst
+	// of verify-on-reveal refreshes costs one git pass; every path that IS
+	// scanned computes per-file data unconditionally — the request is proof the
+	// user is looking, regardless of focus registration. Scanned results are
+	// ALSO emitted as a normal git-source delta so SSE subscribers converge, and
+	// the return value is never suppressed via GitStatusEqual: the response
+	// always carries current state.
 	scanPaths := func(reqPaths []string) []*models.EnrichedWorkspace {
 		resolved := st.ResolveWorkspacePaths(reqPaths)
 		if len(resolved) == 0 {

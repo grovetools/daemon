@@ -201,3 +201,148 @@ func TestGitHandlerNewWorktreeImmediateScan(t *testing.T) {
 		}
 	}
 }
+
+// primeStore records the repo's CURRENT coarse status and per-file data in the
+// store, exactly as a collector scan would, so a following watcher scan starts
+// from a fully-backfilled snapshot.
+func primeStore(t *testing.T, st *store.Store, repo string) (*git.ExtendedGitStatus, map[string]string) {
+	t.Helper()
+	status, err := git.GetExtendedStatus(repo)
+	if err != nil {
+		t.Fatalf("initial status: %v", err)
+	}
+	files, hashes := focusedFileData(repo)
+	computed := true
+	st.ApplyUpdate(store.Update{
+		Type:   store.UpdateWorkspacesDelta,
+		Source: "test",
+		Payload: []*models.WorkspaceDelta{{
+			Path:                 repo,
+			GitStatus:            status,
+			ChangedFiles:         files,
+			BlobHashes:           hashes,
+			ChangedFilesComputed: &computed,
+		}},
+	})
+	return status, hashes
+}
+
+// waitForWatcherDelta returns the first git_watcher workspaces_delta for repo,
+// or nil if none arrives before the deadline.
+func waitForWatcherDelta(sub chan store.Update, repo string, within time.Duration) *models.WorkspaceDelta {
+	deadline := time.After(within)
+	for {
+		select {
+		case update := <-sub:
+			if update.Type != store.UpdateWorkspacesDelta || update.Source != "git_watcher" {
+				continue
+			}
+			deltas, ok := update.Payload.([]*models.WorkspaceDelta)
+			if !ok {
+				continue
+			}
+			for _, d := range deltas {
+				if d.Path == repo {
+					return d
+				}
+			}
+		case <-deadline:
+			return nil
+		}
+	}
+}
+
+// TestGitHandlerEmitsDeltaForContentOnlyChange is the regression guard for the
+// per-file suppression fix (291d3fb): a content-only edit — here rewriting an
+// UNTRACKED file, whose numstat is always 0 and whose presence keeps every
+// coarse count identical — must still recompute per-file data and emit a delta
+// from the watcher path. Gating the changed-file/blob pass on GitStatusEqual
+// makes such edits invisible, leaving git-viewer's review state keyed on stale
+// blob hashes (an edited file keeps rendering as reviewed).
+func TestGitHandlerEmitsDeltaForContentOnlyChange(t *testing.T) {
+	repo := gitInitRepo(t)
+	untracked := filepath.Join(repo, "u.txt")
+	if err := os.WriteFile(untracked, []byte("before"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	st := store.New()
+	seedWorkspace(t, st, repo)
+	before, beforeHashes := primeStore(t, st, repo)
+	if beforeHashes["u.txt"] == "" {
+		t.Fatalf("expected a primed blob hash for the untracked file, got %v", beforeHashes)
+	}
+
+	// Same length, same file count, same (zero) numstat: nothing GitStatusEqual
+	// looks at moves, only the bytes on disk.
+	if err := os.WriteFile(untracked, []byte("after!"), 0o644); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	after, err := git.GetExtendedStatus(repo)
+	if err != nil {
+		t.Fatalf("status after edit: %v", err)
+	}
+	if !store.GitStatusEqual(before, after) {
+		t.Fatalf("test precondition broken: coarse status moved (%+v vs %+v)", before.StatusInfo, after.StatusInfo)
+	}
+
+	h := NewGitHandler(st, 20)
+	_ = h.ComputeWatchPaths(st.GetWorkspaces())
+
+	sub := st.Subscribe()
+	defer st.Unsubscribe(sub)
+
+	indexPath := filepath.Join(repo, ".git", "index")
+	if err := h.HandleEvents(context.Background(), []fsnotify.Event{{Name: indexPath, Op: fsnotify.Write}}); err != nil {
+		t.Fatalf("HandleEvents: %v", err)
+	}
+
+	delta := waitForWatcherDelta(sub, repo, 2*time.Second)
+	if delta == nil {
+		t.Fatal("no git_watcher delta for a content-only change (coarse-status gate suppressed it)")
+	}
+	if delta.ChangedFilesComputed == nil || !*delta.ChangedFilesComputed {
+		t.Fatalf("expected per-file data to be computed, got %+v", delta.ChangedFilesComputed)
+	}
+	found := false
+	for _, f := range delta.ChangedFiles {
+		if f.Path == "u.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected u.txt in ChangedFiles, got %+v", delta.ChangedFiles)
+	}
+	if got := delta.BlobHashes["u.txt"]; got == "" || got == beforeHashes["u.txt"] {
+		t.Fatalf("expected a fresh blob hash for u.txt, got %q (was %q)", got, beforeHashes["u.txt"])
+	}
+}
+
+// TestGitHandlerSuppressesTrueNoOp proves the suppression that remains is the
+// safe one: an event that moved neither the coarse status nor the per-file
+// snapshot emits nothing, so noisy fs churn still can't storm subscribers.
+func TestGitHandlerSuppressesTrueNoOp(t *testing.T) {
+	repo := gitInitRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "u.txt"), []byte("stable"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	st := store.New()
+	seedWorkspace(t, st, repo)
+	primeStore(t, st, repo)
+
+	h := NewGitHandler(st, 20)
+	_ = h.ComputeWatchPaths(st.GetWorkspaces())
+
+	sub := st.Subscribe()
+	defer st.Unsubscribe(sub)
+
+	indexPath := filepath.Join(repo, ".git", "index")
+	if err := h.HandleEvents(context.Background(), []fsnotify.Event{{Name: indexPath, Op: fsnotify.Write}}); err != nil {
+		t.Fatalf("HandleEvents: %v", err)
+	}
+
+	if delta := waitForWatcherDelta(sub, repo, 500*time.Millisecond); delta != nil {
+		t.Fatalf("expected no delta for an unchanged repo, got %+v", delta)
+	}
+}

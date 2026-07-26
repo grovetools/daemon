@@ -262,25 +262,44 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		return
 	}
 
+	// A watcher scan only runs because a filesystem event already fired for this
+	// repo, so per-file data is ALWAYS recomputed for focused repos — the coarse
+	// status is NOT a valid fingerprint for it here. GitStatusEqual sees only
+	// branch / ahead-behind / file counts / numstat totals: editing an untracked
+	// file, re-editing an already-modified line, or touching any binary file
+	// (numstat reports 0 for both) leaves it equal while the file contents — and
+	// the blob hashes git-viewer's review state keys on — moved. Gating the
+	// changed-file/blob pass on the coarse status here is exactly the bug 291d3fb
+	// fixed ("edits to already-modified files were previously invisible"): the
+	// consumer would keep stale blob hashes and keep rendering an edited file as
+	// reviewed. The timer-driven collector keeps that fingerprint gate because it
+	// must survive tick storms across the whole focus set; the watcher is already
+	// debounced per workspace, so this pass runs at most once per event burst.
+	// Best-effort: a git error leaves the file-level fields nil and the coarse
+	// status stands.
 	focused := h.store.IsFocused(node.Path)
-	state := h.store.Get()
-	current, exists := state.Workspaces[node.Path]
-	coarseChanged := !exists || !store.GitStatusEqual(current.GitStatus, status)
-	needsFileBackfill := focused && (!exists || !current.ChangedFilesComputed)
-	if !coarseChanged && !needsFileBackfill {
-		h.ulog.Debug("git watcher: scan no-op (status unchanged)").Field("path", node.Path).Log(ctx)
-		return
-	}
-
-	// Treat coarse status as the focused-data fingerprint. The expensive
-	// changed-file/blob pass only runs when it moved or needs first-focus fill.
 	var files []git.FileStatus
 	var hashes map[string]string
 	if focused {
 		files, hashes = focusedFileData(node.Path)
 	}
 
-	h.ulog.Info("git watcher: emitting delta").
+	// Suppress only genuine no-ops — an fs event that moved nothing observable.
+	// Safe because the per-file comparison below sees content (blob hashes), so
+	// no content change can be suppressed by it. Never suppress when a focused
+	// repo is still missing its per-file cache (backfill).
+	state := h.store.Get()
+	if current, ok := state.Workspaces[node.Path]; ok {
+		needsFileBackfill := focused && !current.ChangedFilesComputed
+		fileDataChanged := focused && current.ChangedFilesComputed &&
+			!store.FileDataEqual(current.ChangedFiles, current.BlobHashes, files, hashes)
+		if store.GitStatusEqual(current.GitStatus, status) && !needsFileBackfill && !fileDataChanged {
+			h.ulog.Debug("git watcher: scan no-op (status unchanged)").Field("path", node.Path).Log(ctx)
+			return
+		}
+	}
+
+	h.ulog.Debug("git watcher: emitting delta").
 		Field("path", node.Path).
 		Field("branch", status.Branch).
 		Field("dirty", status.IsDirty).
@@ -357,7 +376,7 @@ func (h *GitHandler) HandleStoreUpdate(update store.Update) {
 		if h.store.IsFocused(path) {
 			// New, focused workspace: scan immediately in a goroutine so we never
 			// block the watcher's store-subscription loop.
-			h.ulog.Info("git watcher: new focused workspace, immediate scan").Field("path", path).Log(context.Background())
+			h.ulog.Debug("git watcher: new focused workspace, immediate scan").Field("path", path).Log(context.Background())
 			go h.scanAndEmit(node)
 		}
 	}
