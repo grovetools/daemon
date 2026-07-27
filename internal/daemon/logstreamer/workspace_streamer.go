@@ -23,6 +23,15 @@ type WorkspaceStreamer struct {
 	activeTailers map[string]context.CancelFunc // workspace path -> cancel
 	logChan       chan logutil.TailedLine
 	mu            sync.RWMutex
+
+	// ecoMap is the workspace-path -> RootEcosystemPath projection used by
+	// ecosystem-scoped filters. It is refreshed on the tailer sync tick and on
+	// subscribe rather than per line: rebuilding it inside the aggregator meant
+	// one store snapshot plus a several-hundred-entry map allocation for EVERY
+	// tailed log line, under the write lock, whether or not any subscriber was
+	// ecosystem-scoped. Workspace->ecosystem membership changes on the order of
+	// minutes, so tick-level freshness is more than the filter needs.
+	ecoMap map[string]string
 }
 
 // NewWorkspaceStreamer creates a new aggregated workspace log streamer.
@@ -37,6 +46,7 @@ func NewWorkspaceStreamer(st *store.Store, capacity int) *WorkspaceStreamer {
 		subscribers:   make(map[chan logutil.TailedLine]models.LogStreamOptions),
 		activeTailers: make(map[string]context.CancelFunc),
 		logChan:       make(chan logutil.TailedLine, 256),
+		ecoMap:        make(map[string]string),
 	}
 }
 
@@ -70,6 +80,9 @@ func (ws *WorkspaceStreamer) Subscribe(opts models.LogStreamOptions) ([]logutil.
 	ch := make(chan logutil.TailedLine, 100)
 	ws.subscribers[ch] = opts
 
+	// A client subscribing right after a workspace appeared must not replay
+	// against a stale ecosystem projection.
+	ws.refreshEcoMapLocked()
 	replay := ws.replayLocked(opts)
 	return replay, ch
 }
@@ -102,9 +115,8 @@ func (ws *WorkspaceStreamer) runAggregator(ctx context.Context) {
 				ws.bufferFull = true
 			}
 
-			ecoMap := ws.buildEcoMap()
 			for ch, opts := range ws.subscribers {
-				if matchesFilter(line, opts, ecoMap) {
+				if matchesFilter(line, opts, ws.ecoMap) {
 					select {
 					case ch <- line:
 					default:
@@ -139,6 +151,10 @@ func (ws *WorkspaceStreamer) syncTailers(ctx context.Context) {
 
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+
+	// This tick is the streamer's one regular observation of the workspace
+	// list, so it also refreshes the ecosystem projection the filters read.
+	ws.refreshEcoMapLocked()
 
 	// Build set of current workspace paths.
 	currentPaths := make(map[string]bool, len(workspaces)+1)
@@ -197,7 +213,7 @@ func (ws *WorkspaceStreamer) syncTailers(ctx context.Context) {
 
 // replayLocked returns historical lines matching the filter. Must be called with ws.mu held.
 func (ws *WorkspaceStreamer) replayLocked(opts models.LogStreamOptions) []logutil.TailedLine {
-	ecoMap := ws.buildEcoMap()
+	ecoMap := ws.ecoMap
 	maxReplay := opts.Replay
 	if maxReplay <= 0 {
 		maxReplay = 100
@@ -229,9 +245,11 @@ func (ws *WorkspaceStreamer) replayLocked(opts models.LogStreamOptions) []loguti
 	return matched
 }
 
-// buildEcoMap returns a workspace-path -> RootEcosystemPath mapping from the store.
-// Must be called with ws.mu held (or from within a locked section).
-func (ws *WorkspaceStreamer) buildEcoMap() map[string]string {
+// refreshEcoMapLocked rebuilds the cached workspace-path -> RootEcosystemPath
+// mapping from the store. Must be called with ws.mu held for writing. The map
+// is replaced rather than mutated so readers holding the previous value (the
+// aggregator's broadcast loop) can never observe a half-built map.
+func (ws *WorkspaceStreamer) refreshEcoMapLocked() {
 	workspaces := ws.store.GetWorkspaces()
 	m := make(map[string]string, len(workspaces))
 	for _, ews := range workspaces {
@@ -239,7 +257,7 @@ func (ws *WorkspaceStreamer) buildEcoMap() map[string]string {
 			m[ews.Path] = ews.RootEcosystemPath
 		}
 	}
-	return m
+	ws.ecoMap = m
 }
 
 // levelSeverity maps log level strings to numeric severity for >= comparison.
