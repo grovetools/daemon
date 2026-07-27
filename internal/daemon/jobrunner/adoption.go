@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/flow/pkg/orchestration"
 	tuimux "github.com/grovetools/tuimux/api/client"
@@ -29,9 +30,11 @@ type statusFileContent struct {
 
 // AdoptRunningAgents scans persisted job state for "running" agents and attempts to
 // adopt those that are still alive. For each running job, it:
-// 1. Checks if the PID is still alive via kill(pid, 0)
-// 2. If alive, spawns a poller to detect when it exits
-// 3. If dead or no .status file, marks it as failed
+//  1. Resolves whether an agent process is alive — live PTY, session-registry
+//     PID, then job.PID (see jobAgentAlive)
+//  2. If alive, spawns a poller to detect when it exits
+//  3. If not, reconciles from the durable .status file, or records the
+//     non-terminal "orphaned" when the agent left no exit behind
 func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 	if jr.persister == nil {
 		return
@@ -40,7 +43,9 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 	// Load all persisted jobs
 	jobs := jr.persister.Load()
 	adopted := 0
-	failed := 0
+	// Counts jobs whose agent was not found alive. They land on a terminal
+	// status only when a .status file says so; otherwise they are orphaned.
+	reconciled := 0
 
 	// Health-gate the out-of-process PTY list BEFORE any fail decision. PTYs
 	// now live in the standalone tuimux daemon; an adopted interactive job is
@@ -49,6 +54,9 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 	// fail live sessions, so we retry a few times and, if it still fails, set
 	// tuimuxAvailable=false and fall back to the PID-only path (fail-open).
 	livePtys := map[string]bool{}
+	// Same list indexed by the job_id tag: a live PTY carrying this job's id is
+	// the most direct evidence its agent survived the restart.
+	livePtyJobs := map[string]bool{}
 	var liveMetas []tuimuxpty.SessionMetadata
 	tuimuxAvailable := false
 	if jr.tuimuxClient != nil {
@@ -58,6 +66,9 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 				liveMetas = metas
 				for _, m := range metas {
 					livePtys[m.ID] = true
+					if jobID := m.Tags["job_id"]; jobID != "" {
+						livePtyJobs[jobID] = true
+					}
 				}
 				tuimuxAvailable = true
 				break
@@ -126,7 +137,7 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 					Source:  "adoption",
 					Payload: job,
 				})
-				failed++
+				reconciled++
 				jr.ulog.Info("Adoption: PTY lost during upgrade; reaped orphan and marked failed").
 					Field("job_id", job.ID).
 					Field("pid", job.PID).
@@ -155,66 +166,47 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 			StructuredOnly().
 			Log(ctx)
 
-		// A job is adoptable only when it has a live PID. Missing or dead PIDs
-		// fall through to the .status reconcile below before we declare failure
-		// — this is the core fix: never mark a job "failed (no PID)" without
-		// first consulting the durable .status file the agent wrote on exit.
-		alive := job.PID > 0 && jr.isPIDAlive(job.PID)
+		// A job is adoptable when an agent process for it is alive — which is
+		// not the same question as "is job.PID alive". See jobAgentAlive: for
+		// an interactive agent job.PID is the launcher, which is expected to be
+		// gone while the agent works on under its PTY. Jobs with no live agent
+		// fall through to the .status reconcile below before any verdict is
+		// recorded, and absence of a .status file yields the non-terminal
+		// "orphaned", never "failed".
+		alive := jr.jobAgentAlive(job, livePtyJobs)
 		if !alive {
-			// Process is missing or dead — try to read .status for exit code.
-			if statusContent, err := jr.readStatusFile(statusPath); err == nil {
-				// .status file exists — reconcile to the true terminal state.
-				if statusContent.ExitCode == 0 {
-					job.Status = "completed"
-				} else {
-					job.Status = "failed"
-					job.Error = "agent exited with code: " + strconv.Itoa(statusContent.ExitCode)
-				}
-			} else {
-				// No .status file — agent vanished without recording an exit.
-				job.Status = "failed"
-				job.Error = "daemon restarted; agent process exited without status file"
-			}
-
-			now := time.Now()
-			job.CompletedAt = &now
-			jr.persister.Save(job)
-
-			updateType := store.UpdateJobCompleted
-			if job.Status == "failed" {
-				updateType = store.UpdateJobFailed
-			}
-			jr.store.ApplyUpdate(store.Update{
-				Type:    updateType,
-				Source:  "adoption",
-				Payload: job,
-			})
-			failed++
-			jr.ulog.Info("Adoption: process not alive, reconciled from .status").
+			status, errMsg := jr.reconcileLostJob(job)
+			jr.applyReconciledStatus(job, status, errMsg, "adoption")
+			reconciled++
+			jr.ulog.Info("Adoption: no live agent process; reconciled from .status").
 				Field("job_id", job.ID).
 				Field("pid", job.PID).
 				Field("status", job.Status).
 				Log(ctx)
 			// markDone-equivalent above owns JobInfo; the finalizer owns
 			// frontmatter. For headless jobs, drive the job-file frontmatter to
-			// the same terminal state from the same .status.
-			jr.finalizeHeadlessFrontmatter(ctx, job)
+			// the same terminal state from the same .status. An orphaned job is
+			// not terminal, so it is left out — there is nothing truthful to
+			// finalize to.
+			if isJobTerminal(job.Status) {
+				jr.finalizeHeadlessFrontmatter(ctx, job)
+			}
 			continue
 		}
 
 		// Process is still alive — spawn a poller to wait for it
 		go jr.adoptedPIDPoller(ctx, job)
 		adopted++
-		jr.ulog.Info("Adoption: process alive, polling for completion").
+		jr.ulog.Info("Adoption: agent alive, polling for completion").
 			Field("job_id", job.ID).
 			Field("pid", job.PID).
 			Log(ctx)
 	}
 
-	if adopted > 0 || failed > 0 {
+	if adopted > 0 || reconciled > 0 {
 		jr.ulog.Info("Agent adoption complete").
 			Field("adopted", adopted).
-			Field("failed", failed).
+			Field("reconciled", reconciled).
 			Log(ctx)
 	}
 }
@@ -300,6 +292,122 @@ func (jr *JobRunner) isPIDAlive(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
+// jobAgentAlive reports whether an agent process for this job is still running.
+//
+// job.PID alone cannot answer that. For an interactive agent the persisted PID
+// is the launcher/orchestrator that spawned the pane — it exits as soon as the
+// agent is mounted, so a dead job.PID is the normal, healthy steady state while
+// the agent works on under the PTY. Deciding liveness from it is answering a
+// question about the wrong process, and answering "failed" for a job that is
+// still writing its transcript.
+//
+// The signals, strongest first:
+//  1. a live out-of-process PTY tagged with this job id — the mux owns the
+//     agent's life, so this is direct evidence;
+//  2. a live PID in the session registry, which the agent itself confirmed;
+//  3. job.PID, which is only meaningful for direct children (headless agents).
+//
+// livePtyJobs may be nil, in which case the PTY list is queried on demand;
+// callers that already hold the list pass it to avoid re-querying per job.
+func (jr *JobRunner) jobAgentAlive(job *models.JobInfo, livePtyJobs map[string]bool) bool {
+	if job == nil {
+		return false
+	}
+	if livePtyJobs == nil {
+		livePtyJobs = jr.livePtyJobIDs()
+	}
+	if livePtyJobs[job.ID] {
+		return true
+	}
+	if pid := jr.registryAgentPID(job.ID); pid > 0 && jr.isPIDAlive(pid) {
+		return true
+	}
+	return job.PID > 0 && jr.isPIDAlive(job.PID)
+}
+
+// registryAgentPID returns the PID the agent recorded for itself in the session
+// registry, or 0 when there is none. PIDs of 1 or less are ignored: they are
+// placeholders written before the real PID was known, and PID 1 is always
+// "alive", which would make every such job permanently unreconcilable.
+func (jr *JobRunner) registryAgentPID(jobID string) int {
+	if jobID == "" {
+		return 0
+	}
+	registry, err := sessions.NewFileSystemRegistry()
+	if err != nil || registry == nil {
+		return 0
+	}
+	metadata, err := registry.Find(jobID)
+	if err != nil || metadata == nil || metadata.PID <= 1 {
+		return 0
+	}
+	return metadata.PID
+}
+
+// livePtyJobIDs returns the set of job ids that still own a live PTY in the
+// standalone tuimux daemon. An unavailable daemon yields an empty set, which
+// makes this signal absent rather than negative — callers must treat a miss as
+// "no evidence", never as "the agent is dead".
+func (jr *JobRunner) livePtyJobIDs() map[string]bool {
+	live := map[string]bool{}
+	metas, err := jr.listLivePtys()
+	if err != nil {
+		return live
+	}
+	for _, meta := range metas {
+		if jobID := meta.Tags["job_id"]; jobID != "" {
+			live[jobID] = true
+		}
+	}
+	return live
+}
+
+// reconcileLostJob decides what a job whose agent is not alive should become.
+// It never returns "failed" on absence of evidence: a job with a .status file
+// reconciles to that file's verdict, and a job without one is orphaned — a
+// non-terminal state that says the daemon lost track of the process without
+// claiming the work failed. Terminal "failed" stays reserved for a recorded
+// non-zero exit.
+func (jr *JobRunner) reconcileLostJob(job *models.JobInfo) (status, errMsg string) {
+	statusContent, err := jr.readStatusFile(jr.getStatusFilePath(job))
+	if err != nil {
+		return "orphaned", "daemon lost track of this job across a restart: no live agent process and no exit status recorded. The agent may still be running; check `aglogs read` for its transcript."
+	}
+	if statusContent.ExitCode == 0 {
+		return "completed", ""
+	}
+	return "failed", "agent exited with code: " + strconv.Itoa(statusContent.ExitCode)
+}
+
+// applyReconciledStatus persists a restart-recovery verdict and broadcasts it.
+// CompletedAt is stamped only for genuinely terminal states — an orphaned job
+// has not completed, and stamping it would let every downstream consumer read
+// the daemon's uncertainty as a finished run.
+func (jr *JobRunner) applyReconciledStatus(job *models.JobInfo, status, errMsg, source string) {
+	job.Status = status
+	job.Error = errMsg
+	if isJobTerminal(status) {
+		now := time.Now()
+		job.CompletedAt = &now
+	}
+	if jr.persister != nil {
+		jr.persister.Save(job)
+	}
+
+	updateType := store.UpdateJobCompleted
+	switch status {
+	case "failed":
+		updateType = store.UpdateJobFailed
+	case "orphaned":
+		updateType = store.UpdateJobOrphaned
+	}
+	jr.store.ApplyUpdate(store.Update{
+		Type:    updateType,
+		Source:  source,
+		Payload: job,
+	})
+}
+
 // listLivePtys queries the standalone tuimux daemon's GET /api/pty/list and
 // returns the live PTY session metadata. It dials the tuimux unix socket
 // directly (the ApiClient does not expose a PTY-list method) so adoption can
@@ -346,42 +454,55 @@ func (e *listError) Error() string {
 	return "pty list returned status " + strconv.Itoa(e.status)
 }
 
-// adoptedPIDPoller polls for the completion of an adopted process and marks it done.
-// It checks the PID every 2 seconds until it disappears.
+// adoptedPIDPoller polls for the completion of an adopted agent and records its
+// outcome. The cheap kill(pid, 0) probe runs every 2 seconds; it is only ever
+// evidence of life, never of death, because job.PID may name a launcher that
+// exited long before the agent will. A negative probe is therefore escalated to
+// the full jobAgentAlive check — PTY list plus session registry — which is rate
+// limited because it talks to the tuimux daemon over its socket.
 func (jr *JobRunner) adoptedPIDPoller(ctx context.Context, job *models.JobInfo) {
+	const fullCheckInterval = 10 * time.Second
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	lastFullCheck := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if !jr.isPIDAlive(job.PID) {
-				// Process is dead — read .status file and mark job
-				statusPath := jr.getStatusFilePath(job)
-				if statusContent, err := jr.readStatusFile(statusPath); err == nil {
-					if statusContent.ExitCode == 0 {
-						jr.markDone(job, "completed", "")
-					} else {
-						jr.markDone(job, "failed", "agent exited with code: "+strconv.Itoa(statusContent.ExitCode))
-					}
-				} else {
-					jr.markDone(job, "failed", "agent process exited without status file")
-				}
-
-				// markDone owns JobInfo; the finalizer owns frontmatter. For
-				// headless jobs, drive the job-file frontmatter to the same
-				// terminal state from the same .status.
-				jr.finalizeHeadlessFrontmatter(ctx, job)
-
-				jr.ulog.Info("Adoption poller: process exited").
-					Field("job_id", job.ID).
-					Field("pid", job.PID).
-					Field("status", job.Status).
-					Log(ctx)
-				return
+			if job.PID > 0 && jr.isPIDAlive(job.PID) {
+				continue
 			}
+			if time.Since(lastFullCheck) < fullCheckInterval {
+				continue
+			}
+			lastFullCheck = time.Now()
+			if jr.jobAgentAlive(job, nil) {
+				continue
+			}
+
+			// No agent process anywhere — reconcile from the durable .status
+			// file, or record the non-terminal orphaned state when the agent
+			// left no exit record.
+			status, errMsg := jr.reconcileLostJob(job)
+			jr.markDone(job, status, errMsg)
+
+			// markDone owns JobInfo; the finalizer owns frontmatter. For
+			// headless jobs, drive the job-file frontmatter to the same
+			// terminal state from the same .status. Skipped for orphaned:
+			// there is no terminal verdict to propagate.
+			if isJobTerminal(job.Status) {
+				jr.finalizeHeadlessFrontmatter(ctx, job)
+			}
+
+			jr.ulog.Info("Adoption poller: agent no longer running").
+				Field("job_id", job.ID).
+				Field("pid", job.PID).
+				Field("status", job.Status).
+				Log(ctx)
+			return
 		}
 	}
 }

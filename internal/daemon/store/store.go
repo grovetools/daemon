@@ -271,7 +271,7 @@ func (s *Store) ApplyUpdate(u Update) {
 		}
 
 	// Job lifecycle updates
-	case UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed, UpdateJobCancelled, UpdateJobPendingUser:
+	case UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed, UpdateJobCancelled, UpdateJobPendingUser, UpdateJobOrphaned:
 		if job, ok := u.Payload.(*models.JobInfo); ok {
 			// jobKey (C7): bare ID for locals, origin-namespaced for federated
 			// rows. Local emitters set no Origin, so this is behavior-preserving.

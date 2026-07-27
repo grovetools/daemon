@@ -324,6 +324,13 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 
 				// Clean up the crash recovery files. Prefer the native ID from the
 				// recovered registry metadata when this daemon's record lacks it.
+				//
+				// Only the recovery state goes: metadata.json is the record
+				// binding this job to its native session and transcript, and
+				// consumers read it after the process is gone. A dead-PID
+				// reading — from a PID that may be stale or may belong to a
+				// launcher rather than the agent — is not licence to delete the
+				// index. Age-based cleanup is sessions.PurgeStaleSessions' job.
 				if registry != nil {
 					nativeID := session.ClaudeSessionID
 					if nativeID == "" && recovered != nil && recovered.ClaudeSessionID != "" {
@@ -332,7 +339,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 					if nativeID == "" {
 						nativeID = session.ID
 					}
-					_ = registry.Unregister(nativeID)
+					_ = registry.RemoveRecoveryFiles(nativeID)
 				}
 
 				delete(c.liveness, session.ID)

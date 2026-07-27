@@ -675,10 +675,53 @@ func newGrovedStartCmd() *cobra.Command {
 						})
 					}
 
+					// Collapse duplicate job records before adoption reads them.
+					// A job submitted through the daemon used to persist under a
+					// filename-derived key alongside the Flow-ID-keyed record for
+					// the same job, so adoption evaluated one job twice and the
+					// typeless copy answered lookups that needed the real one.
+					if collapsed, removed := persister.CollapseDuplicates(); collapsed > 0 || removed > 0 {
+						ulog.Info("Collapsed duplicate daemon job records").
+							Field("merged", collapsed).
+							Field("removed", removed).
+							Log(ctx)
+					}
+
 					// PHASE 2: Adopt running agents from previous daemon instance
 					jr.AdoptRunningAgents(ctx)
 					go jr.Start(ctx)
 					ulog.Info("JobRunner started").Field("workers", workers).Log(ctx)
+
+					// Deliberate, retention-bounded GC of the session registry.
+					// Liveness sweeps only drop pid.lock now (metadata.json is the
+					// job→transcript index), so this is what eventually reclaims
+					// long-dead records. Boot-time and once a day thereafter.
+					go func() {
+						purge := func() {
+							purged, perr := sessions.PurgeStaleSessions(sessions.DefaultSessionRetention)
+							if perr != nil {
+								ulog.Warn("Session registry GC failed").Err(perr).Log(ctx)
+								return
+							}
+							if purged > 0 {
+								ulog.Info("Session registry GC purged stale records").
+									Field("purged", purged).
+									Field("retention", sessions.DefaultSessionRetention.String()).
+									Log(ctx)
+							}
+						}
+						purge()
+						ticker := time.NewTicker(24 * time.Hour)
+						defer ticker.Stop()
+						for {
+							select {
+							case <-ctx.Done():
+								return
+							case <-ticker.C:
+								purge()
+							}
+						}
+					}()
 				}
 
 				// Link the JobRunner to the (already-constructed) log streamer.

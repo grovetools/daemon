@@ -1256,12 +1256,14 @@ func (s *Server) killSession(sessionID string) error {
 		}
 	}
 
-	// Remove the crash-recovery directory so a daemon restart won't
-	// re-resurrect this session as alive. The directory is named after
-	// the native session ID (Claude UUID), falling back to the job ID.
-	// When this daemon's record lacks the native ID (filesystem-watcher
-	// synthesized record), recover it from the registry so we delete the
-	// real directory rather than a non-existent job-ID-named one.
+	// Remove the crash-recovery state so a daemon restart won't re-resurrect
+	// this session as alive. The record itself stays: metadata.json is the
+	// index binding this job to its native session and transcript, and killing
+	// a session is exactly when the transcript still needs resolving. The
+	// directory is named after the native session ID (Claude UUID), falling
+	// back to the job ID. When this daemon's record lacks the native ID
+	// (filesystem-watcher synthesized record), recover it from the registry so
+	// we act on the real directory rather than a non-existent job-ID-named one.
 	dirName := sessionID
 	if session.ClaudeSessionID != "" {
 		dirName = session.ClaudeSessionID
@@ -1269,7 +1271,7 @@ func (s *Server) killSession(sessionID string) error {
 		dirName = md.ClaudeSessionID
 	}
 	if registry, err := sessions.NewFileSystemRegistry(); err == nil {
-		_ = registry.Unregister(dirName)
+		_ = registry.RemoveRecoveryFiles(dirName)
 	}
 
 	// Mark as interrupted in the in-memory store so SSE subscribers
@@ -2527,7 +2529,7 @@ func convertToAPIUpdate(u store.Update) *apiStateUpdate {
 	// Job lifecycle updates
 	case store.UpdateJobSubmitted, store.UpdateJobStarted,
 		store.UpdateJobCompleted, store.UpdateJobFailed, store.UpdateJobCancelled,
-		store.UpdateJobPendingUser:
+		store.UpdateJobPendingUser, store.UpdateJobOrphaned:
 		return &apiStateUpdate{
 			UpdateType: string(u.Type),
 			Source:     u.Source,

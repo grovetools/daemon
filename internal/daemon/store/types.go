@@ -75,6 +75,11 @@ const (
 	UpdateJobFailed      UpdateType = "job_failed"
 	UpdateJobCancelled   UpdateType = "job_cancelled"
 	UpdateJobPendingUser UpdateType = "job_pending_user"
+	// UpdateJobOrphaned marks a job the daemon lost track of across a restart:
+	// no live agent process could be found and no exit was recorded. It is
+	// deliberately NON-terminal — "the daemon cannot see this job" is a claim
+	// about the daemon, not a verdict on the agent's work.
+	UpdateJobOrphaned UpdateType = "job_orphaned"
 
 	// Bulk discovery of idle jobs from filesystem scanning.
 	UpdateJobsDiscovered UpdateType = "jobs_discovered"

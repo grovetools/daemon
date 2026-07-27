@@ -89,6 +89,18 @@ func (jr *JobRunner) Start(ctx context.Context) {
 	// Restore queued and blocked jobs from persistence
 	if jr.persister != nil {
 		restored := jr.persister.Load()
+
+		// Resolve the live PTY set once, and only when a restored job actually
+		// claims to be running — the query costs a round trip to the tuimux
+		// daemon and most boots restore nothing running.
+		var livePtyJobs map[string]bool
+		for _, job := range restored {
+			if job.Status == "running" {
+				livePtyJobs = jr.livePtyJobIDs()
+				break
+			}
+		}
+
 		for _, job := range restored {
 			if job.Status == "queued" {
 				jr.ulog.Info("Restoring queued job").Field("job_id", job.ID).Log(ctx)
@@ -109,17 +121,33 @@ func (jr *JobRunner) Start(ctx context.Context) {
 					Payload: job,
 				})
 			} else if job.Status == "running" {
-				// Mark previously-running jobs as failed (daemon restarted)
-				job.Status = "failed"
-				job.Error = "daemon restarted while job was running"
-				now := time.Now()
-				job.CompletedAt = &now
-				jr.persister.Save(job)
-				jr.store.ApplyUpdate(store.Update{
-					Type:    store.UpdateJobFailed,
-					Source:  "jobrunner",
-					Payload: job,
-				})
+				// A daemon restart is not an agent failure. Agent processes
+				// live outside groved — under a PTY the mux owns, or as
+				// detached process groups — so surviving a restart is their
+				// designed behavior. This used to mark every such job failed
+				// with no liveness check at all, which contradicted the agent
+				// that went on working (and writing its transcript) for the
+				// next hour, and clobbered the verdict adoption had just
+				// reached for the same job.
+				if jr.jobAgentAlive(job, livePtyJobs) {
+					jr.ulog.Info("Restart recovery: agent still alive; job stays running").
+						Field("job_id", job.ID).
+						Field("pid", job.PID).
+						Log(ctx)
+					jr.store.ApplyUpdate(store.Update{
+						Type:    store.UpdateJobStarted,
+						Source:  "jobrunner",
+						Payload: job,
+					})
+					continue
+				}
+				status, errMsg := jr.reconcileLostJob(job)
+				jr.applyReconciledStatus(job, status, errMsg, "jobrunner")
+				jr.ulog.Info("Restart recovery: no live agent process").
+					Field("job_id", job.ID).
+					Field("pid", job.PID).
+					Field("status", status).
+					Log(ctx)
 			}
 		}
 	}
@@ -168,12 +196,31 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 		}
 	}
 
-	baseName := strings.TrimSuffix(req.JobFile, ".md")
-	jobID := fmt.Sprintf("%s-%s", baseName, uuid.New().String()[:6])
+	// One job, one record: the Flow job ID from the job file's frontmatter is
+	// the identity. Minting a second key from the filename used to give a job
+	// two daemon records — a typed one keyed by the Flow ID (which also keys
+	// every artifact path, including the .status file adoption reads) and an
+	// untyped one keyed by filename that owned nothing on disk yet still won
+	// lookups. Fall back to a synthesized key only when the job file can't be
+	// read, and carry the type either way so no record is shaped like the
+	// duplicates were.
+	jobID, jobType, jobTitle := jr.flowJobIdentity(req.PlanDir, req.JobFile)
+	if jobID == "" {
+		baseName := strings.TrimSuffix(req.JobFile, ".md")
+		jobID = fmt.Sprintf("%s-%s", baseName, uuid.New().String()[:6])
+		jr.ulog.Warn("Job frontmatter has no Flow ID; falling back to a filename-derived key").
+			Field("job_id", jobID).
+			Field("plan_dir", req.PlanDir).
+			Field("job_file", req.JobFile).
+			Log(ctx)
+	}
 
 	info := &models.JobInfo{
 		ID:          jobID,
+		Title:       jobTitle,
+		Type:        jobType,
 		PlanDir:     req.PlanDir,
+		PlanName:    filepath.Base(req.PlanDir),
 		JobFile:     req.JobFile,
 		Priority:    req.Priority,
 		TimeoutStr:  timeoutStr,
@@ -181,6 +228,23 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 		AgentTarget: req.AgentTarget,
 		Status:      "queued",
 		SubmittedAt: time.Now(),
+	}
+
+	// Now that submissions share the Flow job's identity, this record and the
+	// one the filesystem scan discovered are the same record. Carry over the
+	// workspace fields only the scan knows, so submitting a job doesn't blank
+	// the repo/branch columns until the next scan restores them.
+	if existing := jr.store.GetJob(jobID); existing != nil {
+		if info.Title == "" {
+			info.Title = existing.Title
+		}
+		if info.Type == "" {
+			info.Type = existing.Type
+		}
+		info.WorkDir = existing.WorkDir
+		info.Repo = existing.Repo
+		info.Branch = existing.Branch
+		info.Channels = existing.Channels
 	}
 
 	// Check if dependencies are met; if not, hold the job in the blocked queue.
@@ -227,6 +291,20 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 		Log(ctx)
 
 	return info, nil
+}
+
+// flowJobIdentity reads the Flow job's own identity — ID, type and title — from
+// the plan. All three are empty when the plan or job file can't be read.
+func (jr *JobRunner) flowJobIdentity(planDir, jobFile string) (id string, jobType models.JobType, title string) {
+	plan, err := orchestration.LoadPlan(planDir)
+	if err != nil {
+		return "", "", ""
+	}
+	job, found := plan.GetJobByFilename(jobFile)
+	if !found || job == nil {
+		return "", "", ""
+	}
+	return job.ID, models.JobType(job.Type), job.Title
 }
 
 // areDependenciesMet loads the plan for the given job and checks whether all
@@ -521,8 +599,10 @@ func (jr *JobRunner) markDone(info *models.JobInfo, status, errMsg string) {
 	info.Status = status
 	info.Error = errMsg
 
-	// Only set CompletedAt for terminal states
-	if status != "pending_user" && status != "running" {
+	// Only set CompletedAt for terminal states. "orphaned" is not one: it
+	// records that the daemon lost track of the process, and stamping a
+	// completion time would present that uncertainty as a finished run.
+	if status != "pending_user" && status != "running" && status != "orphaned" {
 		now := time.Now()
 		info.CompletedAt = &now
 	}
@@ -539,6 +619,8 @@ func (jr *JobRunner) markDone(info *models.JobInfo, status, errMsg string) {
 		updateType = store.UpdateJobCancelled
 	case "pending_user":
 		updateType = store.UpdateJobPendingUser
+	case "orphaned":
+		updateType = store.UpdateJobOrphaned
 	}
 	jr.store.ApplyUpdate(store.Update{
 		Type:    updateType,
