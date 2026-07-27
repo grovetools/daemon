@@ -174,6 +174,11 @@ type Server struct {
 	captureWaitersMu sync.Mutex
 	captureWaiters   map[string]chan string
 
+	// finalOutputs retains the last screen text of agent panes whose PTY has
+	// already exited, so capture can still answer once both live tiers are
+	// dead. See agent_final_output.go for the retention bounds.
+	finalOutputs *finalOutputStore
+
 	// terminalHub routes WebSocket messages for multi-attach
 	// (Primary/Follower groveterm instances).
 	terminalHub *hub.Hub
@@ -213,6 +218,7 @@ func New(autoShutdown bool) *Server {
 	return &Server{
 		ulog:               logging.NewUnifiedLogger("groved.server"),
 		captureWaiters:     make(map[string]chan string),
+		finalOutputs:       newFinalOutputStore(),
 		terminalHub:        hub.NewHub(hubCfg),
 		satelliteLeases:    make(map[string]string),
 		maintenanceTargets: make(map[string]bool),
@@ -2162,7 +2168,8 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "spawned"})
 }
 
-// handleAgentByID routes /api/agents/{id}/* actions (input, capture, capture_response).
+// handleAgentByID routes /api/agents/{id}/* actions (input, capture,
+// capture_response, final_output).
 func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
@@ -2242,6 +2249,9 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		// callers fail fast with the real cause rather than a misleading 5s
 		// "groveterm did not respond" timeout.
 		if s.terminalHub == nil || !s.terminalHub.HasConnections() {
+			if s.serveRetainedFinalOutput(w, r, agentID, "no_terminal_connected") {
+				return
+			}
 			if nativeErr != nil {
 				http.Error(w, "capture failed: "+nativeErr.Error(), http.StatusBadGateway)
 			} else {
@@ -2275,6 +2285,11 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 			s.captureWaitersMu.Lock()
 			delete(s.captureWaiters, agentID)
 			s.captureWaitersMu.Unlock()
+			// A terminal is connected but no panel answered — the usual shape
+			// of an agent that already exited and unmounted its pane.
+			if s.serveRetainedFinalOutput(w, r, agentID, "sse_timeout") {
+				return
+			}
 			http.Error(w, "capture timeout: groveterm did not respond", http.StatusGatewayTimeout)
 		case <-r.Context().Done():
 			s.captureWaitersMu.Lock()
@@ -2310,9 +2325,62 @@ func (s *Server) handleAgentByID(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "received"})
 
+	case "final_output":
+		// POST /api/agents/{id}/final_output — groveterm pushes an agent
+		// pane's last screen text at the instant its PTY session exits, while
+		// the terminal still holds the scrollback. Unsolicited: no waiter is
+		// pending, this is purely retained for a capture that arrives later.
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, finalOutputMaxBytes))
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+
+		s.finalOutputs.Put(agentID, string(body))
+		s.ulog.Debug("Retained agent final output").
+			Field("job_id", agentID).
+			Field("bytes", len(body)).
+			Log(r.Context())
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "retained"})
+
 	default:
 		http.Error(w, "unknown action", http.StatusNotFound)
 	}
+}
+
+// serveRetainedFinalOutput answers a capture request from the death-rattle
+// snapshot pushed when the agent's PTY exited. It is the last tier: both live
+// tiers require a process and a pane, and once those are gone the terminal
+// text explaining the exit exists nowhere else. Reports whether it responded.
+func (s *Server) serveRetainedFinalOutput(w http.ResponseWriter, r *http.Request, agentID, reason string) bool {
+	if s.finalOutputs == nil {
+		return false
+	}
+	text, ok := s.finalOutputs.Get(agentID)
+	if !ok {
+		return false
+	}
+
+	s.ulog.Info("Serving retained final output for capture").
+		Field("job_id", agentID).
+		Field("reason", reason).
+		Field("bytes", len(text)).
+		Log(r.Context())
+
+	w.Header().Set("Content-Type", "text/plain")
+	// Callers (and log readers) should be able to tell a post-mortem snapshot
+	// from a live screen without diffing content.
+	w.Header().Set("X-Grove-Capture-Source", "final_output")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, text)
+	return true
 }
 
 // apiStateUpdate matches the daemon.StateUpdate type for SSE streaming.
