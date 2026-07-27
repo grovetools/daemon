@@ -386,7 +386,13 @@ func newGrovedStartCmd() *cobra.Command {
 				eng.Register(collector.NewWorkspaceCollector(workspaceInterval))
 			}
 			if isEnabled("git") {
-				eng.Register(collector.NewGitStatusCollector(gitInterval))
+				// The global collector owns boot + hourly reconciliation. Scoped
+				// collectors are passive RefreshPaths helpers and mirror all ambient
+				// git state from the already-running global daemon.
+				eng.Register(collector.NewGitStatusCollector(gitInterval, scope))
+				if scope != "" {
+					eng.Register(collector.NewGlobalGitMirrorCollector())
+				}
 			}
 			var sessionColl *collector.SessionCollector
 			if isEnabled("session") {
@@ -992,15 +998,15 @@ func newGrovedStartCmd() *cobra.Command {
 						ulog.Info("Workspace handler registered with unified watcher").Log(ctx)
 					}
 
-					// Register GitHandler for subsecond-fresh git status on the
-					// focused workspace set. It watches .git internals (HEAD, index,
-					// refs/heads, refs/remotes) and emits a WorkspaceDelta on change;
-					// the timer-driven GitStatusCollector remains the background
-					// fallback for unfocused workspaces.
-					if isEnabled("git") {
-						gitHandler := watcher.NewGitHandler(st, 150)
+					// The global daemon is the single event-driven git owner. Its
+					// recursive FSEvents stream covers every worktree and git dir;
+					// UnifiedWatcher retains git-internal watches as a narrow fallback.
+					// Scoped daemons mirror global deltas and register no git watcher.
+					if isEnabled("git") && scope == "" {
+						gitHandler := watcher.NewGitHandler(st, 150).SetBroadCoverage(true)
 						unifiedWatcher.Register(gitHandler)
-						ulog.Info("Git handler registered with unified watcher").Log(ctx)
+						go watcher.RunGlobalGitEvents(ctx, st, gitHandler)
+						ulog.Info("Global event-driven git handler registered").Log(ctx)
 					}
 
 					// Register FlowHandler for plan directory watching

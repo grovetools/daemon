@@ -1133,6 +1133,15 @@ func normFocusPath(p string) string {
 	return strings.ToLower(p)
 }
 
+// NormalizePathKey canonicalizes a path with the same rules the focus set uses
+// (see normFocusPath). Collectors that select workspaces by path — e.g. the
+// git collector's scope-bounded full sweeps — must go through this rather than
+// comparing raw spellings, or a case/symlink difference between the configured
+// scope and the daemon's discovered ws.Path silently drops workspaces.
+func NormalizePathKey(p string) string {
+	return normFocusPath(p)
+}
+
 const defaultFocusTTL = 5 * time.Minute
 
 type focusRegistration struct {

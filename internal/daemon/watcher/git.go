@@ -17,15 +17,10 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/store"
 )
 
-// GitHandler implements DomainHandler for subsecond-fresh git status. It watches
-// the git internals (HEAD, index, refs/heads, refs/remotes, the HEAD reflog,
-// packed-refs) of the focused workspace set and, on a debounced filesystem
-// event, re-runs GetExtendedStatus for just that one workspace, emitting a
-// WorkspaceDelta through the store.
-//
-// It complements (does not replace) the timer-driven GitStatusCollector, which
-// remains the background fallback for unfocused workspaces. Watching only the
-// focused set keeps the fsnotify/kqueue watch count bounded.
+// GitHandler implements per-repository debouncing and status publication. In
+// the global daemon it owns every workspace and is fed both recursive FSEvents
+// and git-internal UnifiedWatcher events. The collector is only an hourly
+// correctness reconciler. Its focused-only mode remains a portable fallback.
 type GitHandler struct {
 	store *store.Store
 	ulog  *logging.UnifiedLogger
@@ -45,7 +40,8 @@ type GitHandler struct {
 	// HandleStoreUpdate on an UpdateWorkspaces, so if ComputeWatchPaths advanced
 	// knownPaths the new-worktree diff below would always come up empty. Access is
 	// serialized because HandleStoreUpdate runs under the UnifiedWatcher lock.
-	knownPaths map[string]bool
+	knownPaths            map[string]bool
+	knownPathsInitialized bool
 
 	// lastWatchSetKey and failedPaths state-change-gate ComputeWatchPaths'
 	// logging so a 15s refresh that changes nothing emits nothing:
@@ -56,6 +52,12 @@ type GitHandler struct {
 	// the UnifiedWatcher lock, so no extra locking is needed.
 	lastWatchSetKey string
 	failedPaths     map[string]bool
+
+	// broadCoverage marks the global event owner. Recursive working-tree and
+	// git-internal events arrive through RunGlobalGitEvents; the unified
+	// fsnotify fallback remains focused-only so broad coverage does not create
+	// thousands of per-repository kqueue watches.
+	broadCoverage bool
 
 	debounceMs  int
 	timers      map[string]*time.Timer
@@ -82,11 +84,18 @@ func (h *GitHandler) Name() string {
 	return "git"
 }
 
-// ComputeWatchPaths returns the git-internal paths to watch for the focused
-// workspace set only. For each focused workspace it resolves the gitdir and
-// commondir (handling linked-worktree indirection) and watches HEAD, index,
-// refs/heads, refs/remotes, the HEAD reflog, and packed-refs when present on
-// disk.
+// SetBroadCoverage makes this handler the global owner for every repository.
+// It must be called before the handler is registered with UnifiedWatcher.
+func (h *GitHandler) SetBroadCoverage(enabled bool) *GitHandler {
+	h.broadCoverage = enabled
+	return h
+}
+
+// ComputeWatchPaths returns fallback git-internal watches for the focused
+// workspace set only. Broad global coverage is provided by one recursive
+// FSEvents stream, not by expanding this set per repository. For each focused
+// workspace it resolves gitdir and commondir and watches HEAD, index, refs,
+// reflog, and packed-refs.
 func (h *GitHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) []string {
 	ctx := context.Background()
 	newWatches := make(map[string][]*workspace.WorkspaceNode)
@@ -108,8 +117,8 @@ func (h *GitHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) [
 			continue
 		}
 
-		// Only watch the focused/visible set; unfocused workspaces fall back to
-		// the timer-driven GitStatusCollector.
+		// Keep the unified fsnotify fallback bounded to the focused set. The
+		// global owner's recursive FSEvents stream covers all repositories.
 		if !h.store.IsFocused(node.Path) {
 			continue
 		}
@@ -353,9 +362,9 @@ func focusedFileData(repoPath string) ([]git.FileStatus, map[string]string) {
 }
 
 // HandleStoreUpdate reacts to store changes. On UpdateWorkspaces it diffs the
-// incoming workspace set against the known set and, for any NEW focused
-// workspace, bypasses the debounce to do an immediate first scan — so freshly
-// created XDG worktrees go subsecond without waiting for the timer collector.
+// incoming workspace set against the known set and, for any NEW workspace the
+// handler owns (all repos globally, focused repos in fallback mode), bypasses
+// the debounce to do an immediate first scan.
 func (h *GitHandler) HandleStoreUpdate(update store.Update) {
 	if update.Type != store.UpdateWorkspaces {
 		return
@@ -373,10 +382,13 @@ func (h *GitHandler) HandleStoreUpdate(update store.Update) {
 		if node == nil {
 			continue
 		}
-		if h.store.IsFocused(path) {
-			// New, focused workspace: scan immediately in a goroutine so we never
-			// block the watcher's store-subscription loop.
-			h.ulog.Debug("git watcher: new focused workspace, immediate scan").Field("path", path).Log(context.Background())
+		// The collector owns the global boot snapshot. Avoid duplicating that
+		// whole-machine scan when the watcher's first workspace update arrives;
+		// broad coverage applies immediately only to workspaces discovered later.
+		if (h.knownPathsInitialized && h.broadCoverage) || h.store.IsFocused(path) {
+			// Scan asynchronously so workspace discovery never blocks the unified
+			// watcher's store-subscription loop.
+			h.ulog.Debug("git watcher: new workspace, immediate scan").Field("path", path).Log(context.Background())
 			go h.scanAndEmit(node)
 		}
 	}
@@ -387,6 +399,7 @@ func (h *GitHandler) HandleStoreUpdate(update store.Update) {
 		known[path] = true
 	}
 	h.knownPaths = known
+	h.knownPathsInitialized = true
 }
 
 // OnStart logs handler startup; the initial watch set is established via

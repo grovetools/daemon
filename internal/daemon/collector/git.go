@@ -2,7 +2,9 @@ package collector
 
 import (
 	"context"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,8 +19,10 @@ import (
 var gitWorkers = max(min(runtime.NumCPU()/2, 8), 2)
 
 const (
-	// backgroundScanInterval is how often to scan non-focused workspaces.
-	backgroundScanInterval = 5 * time.Minute
+	// backgroundScanInterval is the correctness reconciler for the global
+	// event-driven owner. Filesystem events provide freshness; this hourly pass
+	// only repairs dropped/coalesced events.
+	backgroundScanInterval = time.Hour
 	// Focus must never invert into near-continuous polling for small sets.
 	focusedScanFloor = 5 * time.Second
 	// Repeated verify-on-reveal refreshes reuse the just-computed snapshot.
@@ -86,7 +90,14 @@ func dynamicInterval(count int, baseInterval time.Duration) time.Duration {
 
 // GitStatusCollector updates git status for all workspaces.
 type GitStatusCollector struct {
-	interval     time.Duration
+	interval time.Duration
+	// scope is this daemon's owning scope ("" == unscoped/global). A scoped
+	// collector's boot, Refresh, and background full sweeps cover only
+	// workspaces at or under scope — the global workspace list is populated on
+	// every daemon (see the WorkspaceCollector registration), so without this
+	// bound N alive scoped daemons each full-sweep every repo on the machine.
+	// Focused scans and RefreshPaths are demand-driven and stay unscoped.
+	scope        string
 	refresh      chan chan struct{}
 	refreshPaths chan pathRefreshRequest
 }
@@ -100,16 +111,47 @@ type pathRefreshRequest struct {
 }
 
 // NewGitStatusCollector creates a new GitStatusCollector with the specified interval.
-// If interval is 0, defaults to 10 seconds.
-func NewGitStatusCollector(interval time.Duration) *GitStatusCollector {
+// If interval is 0, defaults to 10 seconds. scope is the owning daemon scope
+// ("" == unscoped/global) and bounds which workspaces full sweeps cover.
+func NewGitStatusCollector(interval time.Duration, scope string) *GitStatusCollector {
 	if interval == 0 {
 		interval = 10 * time.Second
 	}
 	return &GitStatusCollector{
 		interval:     interval,
+		scope:        scope,
 		refresh:      make(chan chan struct{}),
 		refreshPaths: make(chan pathRefreshRequest),
 	}
+}
+
+// inScope reports whether a workspace path lies at or under the collector's
+// scope; a global collector (scope == "") owns every workspace. Both sides are
+// canonicalized with the store's focus-path normalization (case/symlink, see
+// store.NormalizePathKey) so scoped selection matches store semantics — a raw
+// string compare would silently drop workspaces whose discovered spelling
+// differs from the scope's (the same macOS case-mismatch that once broke
+// focused per-file attachment). The match is path-boundary aware: /a/bc is
+// NOT under scope /a/b.
+func (c *GitStatusCollector) inScope(path string) bool {
+	if c.scope == "" {
+		return true
+	}
+	scopeKey := store.NormalizePathKey(c.scope)
+	key := store.NormalizePathKey(path)
+	return key == scopeKey || strings.HasPrefix(key, scopeKey+"/")
+}
+
+// scopedWorkspaces returns the workspaces a full sweep covers: everything for
+// a global collector, only in-scope workspaces for a scoped one.
+func (c *GitStatusCollector) scopedWorkspaces(workspaces map[string]*models.EnrichedWorkspace) []*models.EnrichedWorkspace {
+	var out []*models.EnrichedWorkspace
+	for _, ws := range workspaces {
+		if c.inScope(ws.Path) {
+			out = append(out, ws)
+		}
+	}
+	return out
 }
 
 // Refresh triggers an immediate full git status scan and blocks until it completes.
@@ -169,7 +211,14 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		start := time.Now()
 		defer func() {
 			if d := time.Since(start); d > 1*time.Second {
-				ulog.Debug("Slow git status scan detected").Field("duration", d).Log(ctx)
+				// scope/pid disambiguate which daemon swept in the shared log;
+				// scanned separates a broad background sweep from a focused one.
+				ulog.Debug("Slow git status scan detected").
+					Field("duration", d).
+					Field("scope", c.scope).
+					Field("scanned", len(toScan)).
+					Field("pid", os.Getpid()).
+					Log(ctx)
 			}
 		}()
 
@@ -245,70 +294,33 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		}
 	}
 
-	// scan determines which workspaces to scan this tick and scans them.
+	// scan is the global hourly correctness reconciler. Focus no longer causes
+	// timer-driven git forks: the recursive watcher and RefreshPaths are the
+	// latency/demand paths. Scoped collectors are passive RPC helpers and never
+	// run background scans.
 	scan := func() {
-		state := st.Get()
-		focus := st.GetFocus()
-
-		var toScan []*models.EnrichedWorkspace
-
-		if len(focus) == 0 {
-			// No focus set (nav not running): only do periodic background scans
-			if time.Since(lastFullScan) < backgroundScanInterval {
-				return // Skip this tick
-			}
-			for _, ws := range state.Workspaces {
-				toScan = append(toScan, ws)
-			}
-			// A scan of nothing must not consume the background budget: on cold
-			// start workspace discovery often lands after the first tick, and
-			// stamping lastFullScan here would leave every plan-index row
-			// without cached git status for a full backgroundScanInterval.
-			if len(toScan) > 0 {
-				lastFullScan = time.Now()
-			}
-		} else if time.Since(lastFullScan) >= backgroundScanInterval {
-			// Focus is set but it's time for a periodic full scan
-			for _, ws := range state.Workspaces {
-				toScan = append(toScan, ws)
-			}
-			if len(toScan) > 0 {
-				lastFullScan = time.Now()
-			}
-		} else {
-			// Focused scan: only focused workspaces. Select via the same
-			// st.IsFocused check the per-file ChangedFiles attachment uses below,
-			// so a repo that is scanned as focused ALWAYS also gets its per-file
-			// data — previously selection was case-insensitive while attachment
-			// was case-sensitive, dropping ChangedFiles for case-mismatched paths.
-			for _, ws := range state.Workspaces {
-				if st.IsFocused(ws.Path) {
-					toScan = append(toScan, ws)
-				}
-			}
+		if c.scope != "" || time.Since(lastFullScan) < backgroundScanInterval {
+			return
 		}
-
+		state := st.Get()
+		toScan := c.scopedWorkspaces(state.Workspaces)
+		if len(toScan) > 0 {
+			lastFullScan = time.Now()
+		}
 		scanWorkspaces(toScan)
 
-		// Adjust interval dynamically based on focus count
-		focusCount := len(focus)
-		if focusCount == 0 {
-			focusCount = len(state.Workspaces)
-		}
-		newInterval := dynamicInterval(focusCount, c.interval)
+		newInterval := dynamicInterval(len(state.Workspaces), c.interval)
 		if newInterval != currentInterval {
 			currentInterval = newInterval
 			ticker.Reset(currentInterval)
 		}
 	}
 
-	// fullScan forces a scan of all workspaces (used by Refresh).
+	// fullScan forces a scan of all in-scope workspaces (used by Refresh and
+	// the boot pass).
 	fullScan := func() {
 		state := st.Get()
-		var toScan []*models.EnrichedWorkspace
-		for _, ws := range state.Workspaces {
-			toScan = append(toScan, ws)
-		}
+		toScan := c.scopedWorkspaces(state.Workspaces)
 		// See scan(): an empty pass (pre-discovery cold start) must not spend
 		// the background budget, or the first real scan waits ~5 minutes.
 		if len(toScan) > 0 {
@@ -396,9 +408,13 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		return fresh
 	}
 
-	// Wait for workspaces to be populated first
-	time.Sleep(1 * time.Second)
-	fullScan()
+	// The global owner establishes the initial snapshot after workspace
+	// discovery. Scoped collectors deliberately skip this boot scan; they exist
+	// only to serve explicit RefreshPaths without duplicating global work.
+	if c.scope == "" {
+		time.Sleep(1 * time.Second)
+		fullScan()
+	}
 
 	for {
 		select {
@@ -407,7 +423,11 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		case <-ticker.C:
 			scan()
 		case replyCh := <-c.refresh:
-			fullScan()
+			// Bodyless refresh cannot make every scoped daemon duplicate global
+			// state. Explicit path refresh remains available below.
+			if c.scope == "" {
+				fullScan()
+			}
 			close(replyCh)
 		case req := <-c.refreshPaths:
 			req.reply <- scanPaths(req.paths)

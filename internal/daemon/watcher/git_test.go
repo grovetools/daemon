@@ -81,6 +81,34 @@ func TestGitHandlerComputeWatchPaths(t *testing.T) {
 	}
 }
 
+func TestGitHandlerBroadCoverageKeepsFallbackWatchesFocused(t *testing.T) {
+	repo := gitInitRepo(t)
+	st := store.New()
+	node := &workspace.WorkspaceNode{Name: filepath.Base(repo), Path: repo, Kind: workspace.KindStandaloneProject}
+	st.ApplyUpdate(store.Update{Type: store.UpdateWorkspaces, Source: "test", Payload: map[string]*models.EnrichedWorkspace{repo: {WorkspaceNode: node}}})
+
+	h := NewGitHandler(st, 150).SetBroadCoverage(true)
+	if paths := h.ComputeWatchPaths(st.GetWorkspaces()); len(paths) != 0 {
+		t.Fatalf("global handler created %d per-repo fallback watches for an unfocused repository", len(paths))
+	}
+}
+
+func TestGitEventRoutingPrefersNestedRepository(t *testing.T) {
+	outer := &workspace.WorkspaceNode{Path: "/code/ecosystem"}
+	inner := &workspace.WorkspaceNode{Path: "/code/ecosystem/repo"}
+	routes := []gitEventRoute{
+		{root: inner.Path, nodes: []*workspace.WorkspaceNode{inner}},
+		{root: outer.Path, nodes: []*workspace.WorkspaceNode{outer}},
+	}
+	got := routeGitEvent("/code/ecosystem/repo/pkg/file.go", routes)
+	if len(got) != 1 || got[0] != inner {
+		t.Fatalf("nested event routed to %+v, want inner repository", got)
+	}
+	if got := routeGitEvent("/code/ecosystem-other/file", routes); len(got) != 0 {
+		t.Fatalf("path-boundary mismatch routed to %+v", got)
+	}
+}
+
 func TestGitHandlerComputeWatchPathsSkipsUnfocused(t *testing.T) {
 	repo := gitInitRepo(t)
 	st := store.New()

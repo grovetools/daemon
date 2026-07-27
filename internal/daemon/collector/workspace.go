@@ -23,9 +23,9 @@ import (
 // Discovery is deliberately global — it has no scope filter — so a scoped
 // daemon still populates the store with every workspace on the filesystem.
 // That lets clients like nav present a full worldview even when connected
-// to a worktree-scoped daemon. The per-worktree work budget is enforced by
-// the other collectors and watchers (git, plan, note, memory, skills),
-// which each filter by scope against store.IsInScope.
+// to a worktree-scoped daemon. Individual enrichment owners define their own
+// scope policy: for example, scoped daemons mirror global git state, while
+// other collectors may still discover or reconcile globally.
 type WorkspaceCollector struct {
 	interval     time.Duration
 	ulog         *logging.UnifiedLogger

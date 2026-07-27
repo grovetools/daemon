@@ -1,2 +1,4 @@
 golang.org/x/crypto/x509roots/fallback v0.0.0-20260717224146-ff03dafdb03e h1:jsm6uTiwe/T7+k8XNX4Un7F43iLyld5CtNRj0LXxRhw=
 golang.org/x/crypto/x509roots/fallback v0.0.0-20260717224146-ff03dafdb03e/go.mod h1:+UoQFNBq2p2wO+Q6ddVtYc25GZ6VNdOMyyrd4nrqrKs=
+github.com/fsnotify/fsevents v0.2.0 h1:BRlvlqjvNTfogHfeBOFvSC9N0Ddy+wzQCQukyoD7o/c=
+github.com/fsnotify/fsevents v0.2.0/go.mod h1:B3eEk39i4hz8y1zaWS/wPrAP4O6wkIl7HQwKBr1qH/w=

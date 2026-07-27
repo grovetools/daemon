@@ -1,11 +1,24 @@
 package collector
 
 import (
+	"runtime"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/grovetools/core/git"
+	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/workspace"
 )
+
+// wsMap builds a workspace map keyed by path, mirroring store State.Workspaces.
+func wsMap(paths ...string) map[string]*models.EnrichedWorkspace {
+	m := make(map[string]*models.EnrichedWorkspace, len(paths))
+	for _, p := range paths {
+		m[p] = &models.EnrichedWorkspace{WorkspaceNode: &workspace.WorkspaceNode{Path: p}}
+	}
+	return m
+}
 
 func TestDynamicIntervalHasFocusedFloor(t *testing.T) {
 	base := 10 * time.Second
@@ -36,6 +49,53 @@ func TestFocusedFileDataDecisionUsesStatusFingerprint(t *testing.T) {
 	changed := &git.ExtendedGitStatus{LinesAdded: 1}
 	if !shouldComputeFocusedFileData(true, true, status, changed) {
 		t.Fatal("changed status fingerprint did not recompute per-file data")
+	}
+}
+
+func scopedPaths(c *GitStatusCollector, workspaces map[string]*models.EnrichedWorkspace) []string {
+	var paths []string
+	for _, ws := range c.scopedWorkspaces(workspaces) {
+		paths = append(paths, ws.Path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func TestScopedWorkspaceSelection(t *testing.T) {
+	workspaces := wsMap("/a/b", "/a/b/c", "/a/bc", "/other")
+	want := []string{"/a/b", "/a/b/c"}
+
+	got := scopedPaths(NewGitStatusCollector(0, "/a/b"), workspaces)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("scoped selection = %v, want %v", got, want)
+	}
+
+	// A trailing separator on the configured scope must not change selection.
+	got = scopedPaths(NewGitStatusCollector(0, "/a/b/"), workspaces)
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("trailing-slash scope selection = %v, want %v", got, want)
+	}
+}
+
+func TestScopedWorkspaceSelectionMatchesFocusNormalization(t *testing.T) {
+	// The store's focus normalization lowercases on case-insensitive
+	// filesystems; scope selection must match a workspace whose discovered
+	// spelling differs from the scope's only by case.
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("case-insensitive path normalization only applies on darwin/windows")
+	}
+	workspaces := wsMap("/a/b/c", "/a/bc")
+	got := scopedPaths(NewGitStatusCollector(0, "/A/B"), workspaces)
+	if len(got) != 1 || got[0] != "/a/b/c" {
+		t.Fatalf("case-mismatched scope selection = %v, want [/a/b/c]", got)
+	}
+}
+
+func TestUnscopedCollectorSelectsAllWorkspaces(t *testing.T) {
+	workspaces := wsMap("/a/b", "/a/bc", "/other")
+	got := scopedPaths(NewGitStatusCollector(0, ""), workspaces)
+	if len(got) != len(workspaces) {
+		t.Fatalf("unscoped selection = %v, want all %d workspaces", got, len(workspaces))
 	}
 }
 
