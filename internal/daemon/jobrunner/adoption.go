@@ -93,8 +93,17 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 	// authoritative source of truth; reconstruct a models.Session per surviving
 	// agent PTY. Runs before the split-brain check below (which reads
 	// session.PtyID) and before treemux's first GetSessions.
+	// Ownership filter for the rebuild: only PTYs whose job_id names a job in
+	// THIS daemon's persisted store are ours to adopt. A tuimux daemon can host
+	// PTYs owned by another groved (a misconfigured scope, a smoke-test daemon
+	// resolving to the global socket) — importing those would let the plain-stop
+	// shutdown reaper kill agents this daemon never started.
+	ownedJobs := make(map[string]bool, len(jobs))
+	for _, job := range jobs {
+		ownedJobs[job.ID] = true
+	}
 	if tuimuxAvailable {
-		jr.rebuildAgentSessions(ctx, liveMetas)
+		jr.rebuildAgentSessions(ctx, liveMetas, ownedJobs)
 	}
 
 	for _, job := range jobs {
@@ -220,7 +229,16 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 // UpdateSessions — never just the agent PTYs, because that update REPLACES the
 // whole session map and would otherwise clobber the recovered sessions. The
 // operation is idempotent: re-running it neither duplicates nor wipes sessions.
-func (jr *JobRunner) rebuildAgentSessions(ctx context.Context, metas []tuimuxpty.SessionMetadata) {
+//
+// Ownership: ownedJobs is the set of job ids this daemon has persisted state
+// for. A PTY whose job_id is not in that set (and not already a session in the
+// store) belongs to some OTHER daemon sharing the same tuimux — it is left
+// completely alone: not adopted into the session store, and therefore never
+// reaped by the shutdown KillPty loop, which iterates exactly these sessions.
+// This is the fix for the 2026-07-28 incident where a scope-less smoke daemon
+// imported two foreign agent PTYs ("rebuilt:2") from the global tuimuxd and
+// killed both live agents on its own SIGTERM.
+func (jr *JobRunner) rebuildAgentSessions(ctx context.Context, metas []tuimuxpty.SessionMetadata, ownedJobs map[string]bool) {
 	// Start from what's already in the store (disk-recovered sessions) so we
 	// don't clobber them when we re-apply the full set.
 	merged := map[string]*models.Session{}
@@ -236,13 +254,30 @@ func (jr *JobRunner) rebuildAgentSessions(ctx context.Context, metas []tuimuxpty
 		}
 		jobID := m.Tags["job_id"]
 		if jobID == "" {
+			// No job identity at all — nothing ties this PTY to this daemon.
+			jr.ulog.Debug("Adoption: skipping agent PTY with no job_id tag (foreign)").
+				Field("pty_id", m.ID).
+				StructuredOnly().
+				Log(ctx)
 			continue
 		}
 		if sess, ok := merged[jobID]; ok {
+			// Already in the store — recovered for this scope, so it is ours.
 			if sess.PtyID != m.ID {
 				sess.PtyID = m.ID
 				updated++
 			}
+			continue
+		}
+		if !ownedJobs[jobID] {
+			// A live agent PTY for a job this daemon has never persisted: it
+			// belongs to another daemon. Leave it alone — do not adopt, do not
+			// kill.
+			jr.ulog.Debug("Adoption: skipping foreign agent PTY (job unknown to this daemon)").
+				Field("pty_id", m.ID).
+				Field("job_id", jobID).
+				StructuredOnly().
+				Log(ctx)
 			continue
 		}
 		merged[jobID] = &models.Session{
