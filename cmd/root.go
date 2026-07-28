@@ -38,6 +38,7 @@ func init() {
 	rootCmd.AddCommand(newGrovedStopCmd())
 	rootCmd.AddCommand(newGrovedUpgradeCmd())
 	rootCmd.AddCommand(newGrovedStatusCmd())
+	rootCmd.AddCommand(newGrovedResourcesCmd())
 	rootCmd.AddCommand(newGrovedKillCmd())
 	rootCmd.AddCommand(newGrovedClawsCmd())
 	rootCmd.AddCommand(newGrovedConfigCmd())
