@@ -247,7 +247,10 @@ func newGrovedStartCmd() *cobra.Command {
 			// drift) and break that reconnection.
 			verbatimScope, _ := cmd.Flags().GetBool("scope-verbatim")
 			if scope != "" && !verbatimScope {
-				scope = workspace.ResolveScope(scope)
+				var err error
+				if scope, err = resolveExplicitScope(scope, workspace.ResolveScope(scope)); err != nil {
+					return err
+				}
 			}
 			// Export GROVE_SCOPE so jobrunner and any PTYs spawned by this
 			// daemon inherit the scope naturally via os.Environ().
