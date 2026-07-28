@@ -119,6 +119,12 @@ type Server struct {
 	// it to observe the bridge without real osascript/ntfy I/O.
 	satelliteNotifyFn func(ctx context.Context, job *models.JobInfo, updType store.UpdateType, ntfyURL, ntfyTopic string)
 
+	// statsCache caches the /api/system/stats process-table sample so
+	// polling clients cost at most one `ps` exec per statsSampleMaxAge
+	// (see stats_handler.go). Seeded in the background from Listen so the
+	// first request reports interval-true CPU%.
+	statsCache procStatsCache
+
 	// bootStatus is the source of truth for GET /api/system/boot. Nil until
 	// the early-bind boot goroutine sets it; handleSystemBoot then reports
 	// Done=true (the daemon only reaches that handler once serving, which
@@ -533,6 +539,13 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/satellites/reload", s.handleSatellitesReload)
 	// System endpoints
 	mux.HandleFunc("/api/system/info", s.handleSystemInfo)
+	mux.HandleFunc("/api/system/stats", s.handleSystemStats)
+	// Seed the stats sampler in the background so the first
+	// /api/system/stats request already has a previous snapshot and
+	// reports interval-true CPU% instead of ps's decaying average. Chosen
+	// over paying the warm-up in the first request: the handler never
+	// blocks on a sampling interval.
+	go func() { _, _ = s.statsCache.get(0) }()
 	mux.HandleFunc("/api/system/boot", s.handleSystemBoot)
 	mux.HandleFunc("/api/system/treemux-status", s.handleTerminalStatus)
 	// Native agent pane relay endpoints
