@@ -303,6 +303,9 @@ func (s *Store) ApplyUpdate(u Update) {
 				if d.GitStatus != nil {
 					ws.GitStatus = d.GitStatus
 				}
+				if d.GitLanding != nil {
+					ws.GitLanding = d.GitLanding
+				}
 				// *bool: only the git delta builders set ChangedFilesComputed, and
 				// they always populate ChangedFiles/BlobHashes alongside it — so
 				// when it is present, apply all three unconditionally. A nil-guard

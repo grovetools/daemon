@@ -36,6 +36,32 @@ func GitStatusEqual(a, b *git.ExtendedGitStatus) bool {
 		sa.HasUpstream == sb.HasUpstream
 }
 
+// LandingEqual returns true if two landing snapshots are equivalent. The git
+// delta emitters need it because landing state can move while the COARSE status
+// stands still: pushing a branch changes origin/<branch> (HasRemote /
+// BehindOrigin) without touching any count GitStatusEqual compares, and a
+// main/master checkout's local-main divergence lives nowhere in the status at
+// all. Suppressing on GitStatusEqual alone would strand those changes.
+func LandingEqual(a, b *git.LandingState) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	// LastCommitAt goes through Equal, not ==: it is parsed per call from
+	// `git log`'s ISO-8601, and each parse of a numeric offset mints a fresh
+	// *time.Location, so two structs describing the same instant would compare
+	// unequal and emit a delta on every sweep.
+	return a.Onto == b.Onto &&
+		a.Ahead == b.Ahead &&
+		a.Behind == b.Behind &&
+		a.HasRemote == b.HasRemote &&
+		a.BehindOrigin == b.BehindOrigin &&
+		a.Computed == b.Computed &&
+		a.LastCommitAt.Equal(b.LastCommitAt)
+}
+
 // FileDataEqual returns true if two per-file change snapshots (ChangedFiles +
 // BlobHashes) are equivalent. GitStatusEqual only compares coarse status, so an
 // edit to an already-modified file (numstat/blob content moved, counts didn't)

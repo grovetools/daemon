@@ -303,6 +303,13 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		files, hashes = focusedFileData(node.Path)
 	}
 
+	// Landing state (the preflight divergence contract consumers render landing
+	// verdicts from) is recomputed for every repo, focused or not: the events
+	// that reach here include refs/heads, refs/remotes and packed-refs writes —
+	// exactly the pushes and fetches that move it while leaving the coarse
+	// status untouched. Warm and unmoved it costs zero forks.
+	landing := git.GetLandingState(node.Path, status.Branch)
+
 	// Suppress only genuine no-ops — an fs event that moved nothing observable.
 	// Safe because the per-file comparison below sees content (blob hashes), so
 	// no content change can be suppressed by it. Never suppress when a focused
@@ -312,7 +319,8 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		needsFileBackfill := focused && !current.ChangedFilesComputed
 		fileDataChanged := focused && current.ChangedFilesComputed &&
 			!store.FileDataEqual(current.ChangedFiles, current.BlobHashes, files, hashes)
-		if store.GitStatusEqual(current.GitStatus, status) && !needsFileBackfill && !fileDataChanged {
+		if store.GitStatusEqual(current.GitStatus, status) && store.LandingEqual(current.GitLanding, landing) &&
+			!needsFileBackfill && !fileDataChanged {
 			h.ulog.Debug("git watcher: scan no-op (status unchanged)").Field("path", node.Path).Log(ctx)
 			return
 		}
@@ -327,7 +335,7 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		Field("behind_main", status.BehindMainCount).
 		Log(ctx)
 
-	delta := &models.WorkspaceDelta{Path: node.Path, GitStatus: status}
+	delta := &models.WorkspaceDelta{Path: node.Path, GitStatus: status, GitLanding: landing}
 	if focused {
 		delta.ChangedFiles, delta.BlobHashes = files, hashes
 		computed := true

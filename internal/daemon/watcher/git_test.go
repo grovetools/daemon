@@ -245,8 +245,11 @@ func primeStore(t *testing.T, st *store.Store, repo string) (*git.ExtendedGitSta
 		Type:   store.UpdateWorkspacesDelta,
 		Source: "test",
 		Payload: []*models.WorkspaceDelta{{
-			Path:                 repo,
-			GitStatus:            status,
+			Path:      repo,
+			GitStatus: status,
+			// Landing state rides every real git delta, so a primed snapshot
+			// must carry it too — otherwise a no-op scan "changes" it from nil.
+			GitLanding:           git.GetLandingState(repo, status.Branch),
 			ChangedFiles:         files,
 			BlobHashes:           hashes,
 			ChangedFilesComputed: &computed,

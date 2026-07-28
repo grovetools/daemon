@@ -118,7 +118,7 @@ func (c *GlobalGitMirrorCollector) snapshot(ctx context.Context, client gitMirro
 			continue
 		}
 		delta := &models.WorkspaceDelta{
-			Path: ws.Path, GitStatus: ws.GitStatus,
+			Path: ws.Path, GitStatus: ws.GitStatus, GitLanding: ws.GitLanding,
 			ChangedFiles: ws.ChangedFiles, BlobHashes: ws.BlobHashes,
 		}
 		if ws.ChangedFilesComputed {

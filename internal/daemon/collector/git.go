@@ -263,7 +263,15 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				if err != nil {
 					return
 				}
-				coarseChanged := !store.GitStatusEqual(ws.GitStatus, status)
+				// Landing state rides the same sweep: it is the preflight's
+				// divergence contract (local-main ahead/behind, origin-branch
+				// presence, behind-origin, last-commit time) that consumers
+				// render a landing verdict from without shelling out. Warm, it
+				// costs zero forks — every field is pinned to ref SHAs read
+				// straight off disk (git.GetLandingState).
+				landing := git.GetLandingState(ws.Path, status.Branch)
+				gitChanged := !store.GitStatusEqual(ws.GitStatus, status) ||
+					!store.LandingEqual(ws.GitLanding, landing)
 				focused := st.IsFocused(ws.Path)
 				// Backfill: a focused repo whose coarse status is unchanged still
 				// needs its per-file data emitted the FIRST time it becomes
@@ -275,7 +283,7 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				// ChangedFiles == nil: a clean repo's file list is nil, so the nil
 				// test would re-emit every tick.
 				needsFileBackfill := focused && !ws.ChangedFilesComputed
-				if !coarseChanged && !needsFileBackfill {
+				if !gitChanged && !needsFileBackfill {
 					return
 				}
 				// On the TIMER path the coarse status is used as the focused-data
@@ -294,8 +302,9 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 					files, hashes = focusedFileData(ws.Path)
 				}
 				delta := &models.WorkspaceDelta{
-					Path:      ws.Path,
-					GitStatus: status,
+					Path:       ws.Path,
+					GitStatus:  status,
+					GitLanding: landing,
 				}
 				if focused {
 					delta.ChangedFiles, delta.BlobHashes = files, hashes
@@ -395,11 +404,13 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				if err != nil {
 					return
 				}
+				landing := git.GetLandingState(ws.Path, status.Branch)
 				files, hashes := focusedFileData(ws.Path)
 				computed := true
 				delta := &models.WorkspaceDelta{
 					Path:                 ws.Path,
 					GitStatus:            status,
+					GitLanding:           landing,
 					ChangedFiles:         files,
 					BlobHashes:           hashes,
 					ChangedFilesComputed: &computed,
@@ -408,6 +419,7 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				// shared pointer) isn't mutated outside ApplyUpdate.
 				out := *ws
 				out.GitStatus = status
+				out.GitLanding = landing
 				out.ChangedFiles = files
 				out.BlobHashes = hashes
 				out.ChangedFilesComputed = true

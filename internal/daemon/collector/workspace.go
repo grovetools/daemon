@@ -160,6 +160,7 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 			// Preserve existing data if we have it
 			if existing, ok := currentState.Workspaces[node.Path]; ok {
 				ew.GitStatus = existing.GitStatus
+				ew.GitLanding = existing.GitLanding
 				// Preserve the daemon-computed per-file git cache. Without this,
 				// every ~10s workspace rescan rebuilt the map and dropped
 				// ChangedFiles/BlobHashes, so any client full-pull (/api/workspaces)

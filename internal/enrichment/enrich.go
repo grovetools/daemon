@@ -132,6 +132,10 @@ func EnrichWorkspaces(ctx context.Context, nodes []*workspace.WorkspaceNode, opt
 				if fetchGit {
 					if extStatus, err := git.GetExtendedStatus(w.Path); err == nil {
 						w.GitStatus = extStatus
+						// Landing state travels with the status so a consumer of
+						// this enrichment can render a rebase-preflight verdict
+						// without shelling out (see git.LandingState).
+						w.GitLanding = git.GetLandingState(w.Path, extStatus.Branch)
 					}
 				}
 				if fetchRemote {
