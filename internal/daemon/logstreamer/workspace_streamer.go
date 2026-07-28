@@ -329,3 +329,17 @@ func matchesFilter(line logutil.TailedLine, opts models.LogStreamOptions, ecoMap
 
 	return true
 }
+
+// ActiveTailers reports how many workspace log tailers are currently running.
+// It backs the "logstream.workspace_tailers" counter on /api/system/stats: a
+// tailer count that climbs without bound (480 of them, parked in retry loops,
+// in this plan's history) is invisible in CPU but obvious in goroutines, and
+// this number is what attributes those goroutines to a cause.
+func (ws *WorkspaceStreamer) ActiveTailers() int {
+	if ws == nil {
+		return 0
+	}
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	return len(ws.activeTailers)
+}

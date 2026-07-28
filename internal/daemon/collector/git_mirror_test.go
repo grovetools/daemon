@@ -20,6 +20,7 @@ type fakeGitMirrorClient struct {
 func (f *fakeGitMirrorClient) GetEnrichedWorkspaces(context.Context, *models.EnrichmentOptions) ([]*models.EnrichedWorkspace, error) {
 	return f.workspaces, nil
 }
+
 func (f *fakeGitMirrorClient) StreamState(context.Context) (<-chan coredaemon.StateUpdate, error) {
 	return f.stream, nil
 }

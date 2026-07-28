@@ -202,3 +202,109 @@ func TestFilterStatsScope(t *testing.T) {
 		t.Fatalf("global alias failed: %+v", doc.Daemons)
 	}
 }
+
+// TestRenderStatsTableShowsWarningsBudgetsCounters pins that the R3 surfaces
+// reach the human table too — the CLI is not allowed to be a thinner view of
+// the endpoint than the TUI (contract: "everything the TUI shows must be
+// equally observable by CLI and by agents").
+func TestRenderStatsTableShowsWarningsBudgetsCounters(t *testing.T) {
+	doc := &statsDoc{Daemons: []statsDaemon{{
+		Scope:   "perf-audit",
+		PID:     4242,
+		Running: true,
+		Socket:  "/tmp/groved-perf-audit-0bd46c64.sock",
+		Stats: &models.SystemStats{
+			Runtime: models.RuntimeStats{Goroutines: 412, HeapAlloc: 1 << 30, GoMemLimit: 2 << 30},
+			Self:    models.SelfStats{PID: 4242, Procs: 63, Children: []models.ProcStat{}},
+			Counters: map[string]float64{
+				"git.sweep.last_ms":          5401,
+				"store.focused_workspaces":   30,
+				"watcher.events.raw_per_min": 1234,
+				"unlisted.counter":           7,
+			},
+			Warnings: []models.HealthWarning{{
+				Path:      "/Users/u/.config",
+				Condition: "large file hashed on every scan",
+				Offender:  "colima/datadisk (60.0G)",
+				Since:     time.Now().Add(-90 * time.Second),
+			}},
+			Budgets: []models.Budget{
+				{Name: "daemon.goroutines", Class: "daemon", Value: 412, Limit: 2000, Unit: "count"},
+				{Name: "pty.orphans", Class: "pty", Value: 3, Limit: 0, Unit: "count", Exceeded: true, Offender: "nvim(900)"},
+			},
+		},
+	}}}
+
+	var buf bytes.Buffer
+	renderStatsTableOpts(&buf, doc, false)
+	out := buf.String()
+
+	for _, want := range []string{
+		"⚠ warnings (1)",
+		"large file hashed on every scan",
+		"colima/datadisk (60.0G)",
+		"budgets: 2 evaluated, 1 exceeded",
+		"pty.orphans",
+		"nvim(900)",
+		"git sweep last",
+		"focused set 30",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("table missing %q\n---\n%s", want, out)
+		}
+	}
+	// The exceeded budget sorts above the healthy one.
+	if strings.Index(out, "pty.orphans") > strings.Index(out, "daemon.goroutines") {
+		t.Errorf("exceeded budget not listed first:\n%s", out)
+	}
+	// Default view is curated, not exhaustive.
+	if strings.Contains(out, "unlisted.counter") {
+		t.Errorf("default table dumped every counter:\n%s", out)
+	}
+
+	buf.Reset()
+	renderStatsTableOpts(&buf, doc, true)
+	if !strings.Contains(buf.String(), "unlisted.counter") {
+		t.Errorf("--counters did not expand the full set:\n%s", buf.String())
+	}
+}
+
+// A daemon that reports no warnings and no budgets must render neither header
+// — a clean daemon should look clean.
+func TestRenderStatsTableOmitsEmptySections(t *testing.T) {
+	doc := &statsDoc{Daemons: []statsDaemon{{
+		Running: true,
+		Stats: &models.SystemStats{
+			Self:     models.SelfStats{Children: []models.ProcStat{}},
+			Counters: map[string]float64{},
+			Warnings: []models.HealthWarning{},
+			Budgets:  []models.Budget{},
+		},
+	}}}
+	var buf bytes.Buffer
+	renderStatsTableOpts(&buf, doc, false)
+	out := buf.String()
+	for _, unwanted := range []string{"warnings (", "budgets:", "counters"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("empty section %q rendered:\n%s", unwanted, out)
+		}
+	}
+}
+
+func TestFmtCounterUnits(t *testing.T) {
+	cases := map[string]struct {
+		key  string
+		val  float64
+		want string
+	}{
+		"duration": {"git.sweep.last_ms", 5401, "5s"},
+		"bytes":    {"git.blob_hash.largest_offender_bytes", 64 << 20, "64.0M"},
+		"rate":     {"git.divergence_cache.hit_rate", 98.5, "98.5%"},
+		"integral": {"git.sweep.workspaces", 479, "479"},
+	}
+	for name, c := range cases {
+		if got := fmtCounter(c.key, c.val); got != c.want {
+			t.Errorf("%s: fmtCounter(%q, %v) = %q, want %q", name, c.key, c.val, got, c.want)
+		}
+	}
+}

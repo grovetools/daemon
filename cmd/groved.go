@@ -40,6 +40,7 @@ import (
 	daemonssh "github.com/grovetools/daemon/internal/daemon/ssh"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 	"github.com/grovetools/daemon/internal/daemon/theming"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/flow/pkg/orchestration"
@@ -951,6 +952,13 @@ func newGrovedStartCmd() *cobra.Command {
 
 				// 6. Start Engine in background
 				go eng.Start(ctx)
+
+				// Rate ticker for the telemetry registry's *_per_min counters.
+				// Deliberately NOT derived at request time: rates computed
+				// against a caller's poll interval would differ between the
+				// TUI (2s) and an agent curling once an hour, for the same
+				// daemon, in the same second.
+				go telemetry.Default().Run(ctx.Done())
 
 				// 7. Start ConfigWatcher if enabled
 				if configWatchEnabled(cfg) {

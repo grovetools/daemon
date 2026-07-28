@@ -8,115 +8,41 @@ import (
 	"syscall"
 	"time"
 
+	coredaemon "github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/paths"
-	"github.com/grovetools/daemon/internal/daemon/pidfile"
 	"github.com/spf13/cobra"
 )
 
 // daemonEntry is a single entry in the enumerated daemon list.
-type daemonEntry struct {
-	Scope      string // label only ("" for unscoped); the pidfile's middle segment
-	ExactScope string // the daemon's exact resolved scope string, from its .scope sidecar ("" if unscoped or no sidecar)
-	PidPath    string
-	SockPath   string
-	PID        int
-	Running    bool
-	Age        time.Duration
-}
+//
+// R3 moved the struct and the scan itself to core/pkg/daemon so non-CLI
+// consumers (the inspector's Daemons fleet tab, which cannot import this
+// binary's cmd package) enumerate daemons through exactly the same code.
+// The local name and the thin wrappers below are kept so the ~8 existing call
+// sites in this package read unchanged.
+type daemonEntry = coredaemon.FleetEntry
 
-// scopeSidecarPath returns the path to the .scope sidecar that sits next to a
-// daemon's pidfile and records its exact resolved scope string. The pidfile
-// stores only the PID (every reader Atoi's the whole file), so the exact scope
-// — which the successor daemon needs as GROVE_SCOPE so its child clients
-// reconnect to the same socket — lives in this sibling file instead.
+// scopeSidecarPath returns the path to the .scope sidecar next to a pidfile.
 func scopeSidecarPath(pidPath string) string {
-	return strings.TrimSuffix(pidPath, ".pid") + ".scope"
+	return coredaemon.ScopeSidecarPath(pidPath)
 }
 
 // enumerateDaemons scans StateDir() for groved*.pid files and returns a
 // summary of each. Stale entries (pidfile present, process gone) are
 // returned with Running=false so callers can decide how to handle them.
 func enumerateDaemons() ([]daemonEntry, error) {
-	dir := paths.StateDir()
-	matches, err := filepath.Glob(filepath.Join(dir, "groved*.pid"))
-	if err != nil {
-		return nil, err
-	}
-
-	entries := make([]daemonEntry, 0, len(matches))
-	for _, pidPath := range matches {
-		scope := scopeFromPidFilename(filepath.Base(pidPath))
-		// The socket sits next to the pidfile with the same stem. Derive it from
-		// the real filename rather than re-hashing the extracted label: the label
-		// is only filepath.Base(scope), so paths.SocketPath(label) re-hashes the
-		// short label and yields a DIFFERENT hash than the daemon's actual socket
-		// (which hashes the full scope path). That mismatch made `status` print a
-		// socket that didn't exist and would mis-target any path-based action.
-		sockPath := strings.TrimSuffix(pidPath, ".pid") + ".sock"
-
-		var exactScope string
-		if data, err := os.ReadFile(scopeSidecarPath(pidPath)); err == nil {
-			exactScope = strings.TrimSpace(string(data))
-		}
-
-		running, pid, _ := pidfile.IsRunning(pidPath)
-
-		var age time.Duration
-		if info, err := os.Stat(pidPath); err == nil {
-			age = time.Since(info.ModTime()).Round(time.Second)
-		}
-
-		entries = append(entries, daemonEntry{
-			Scope:      scope,
-			ExactScope: exactScope,
-			PidPath:    pidPath,
-			SockPath:   sockPath,
-			PID:        pid,
-			Running:    running,
-			Age:        age,
-		})
-	}
-
-	return entries, nil
+	return coredaemon.EnumerateDaemons()
 }
 
 // scopeFromPidFilename extracts the scope name from a pidfile basename.
-// "groved.pid"                           → ""
-// "groved-env-continued-e2435831.pid"    → "env-continued"
-// The hash suffix is exactly 8 hex chars (see paths.scopedPath).
 func scopeFromPidFilename(name string) string {
-	name = strings.TrimSuffix(name, ".pid")
-	if name == "groved" {
-		return ""
-	}
-	if !strings.HasPrefix(name, "groved-") {
-		return ""
-	}
-	rest := strings.TrimPrefix(name, "groved-")
-	// Hash is the last 8 hex chars after a hyphen.
-	idx := strings.LastIndex(rest, "-")
-	if idx < 0 {
-		return rest
-	}
-	return rest[:idx]
+	return coredaemon.ScopeFromPidFilename(name)
 }
 
 // scopeHashFromPidFilename extracts the 8-hex scope hash suffix from a pidfile
 // basename, or "" for the unscoped daemon / a malformed name.
-// "groved.pid"                        → ""
-// "groved-env-continued-e2435831.pid" → "e2435831"
-// The hash is the last hyphen-delimited segment (see paths.scopedPath).
 func scopeHashFromPidFilename(name string) string {
-	name = strings.TrimSuffix(name, ".pid")
-	if !strings.HasPrefix(name, "groved-") {
-		return ""
-	}
-	rest := strings.TrimPrefix(name, "groved-")
-	idx := strings.LastIndex(rest, "-")
-	if idx < 0 || idx+1 >= len(rest) {
-		return ""
-	}
-	return rest[idx+1:]
+	return coredaemon.ScopeHashFromPidFilename(name)
 }
 
 // resolveUpgradeTarget builds the predicate that selects which running daemon

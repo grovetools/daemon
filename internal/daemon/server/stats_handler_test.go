@@ -10,6 +10,7 @@ import (
 
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/procsample"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 )
 
 // TestHandleSystemStats exercises the real handler end-to-end (including one
@@ -33,16 +34,21 @@ func TestHandleSystemStats(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
 		t.Fatalf("unmarshal raw: %v", err)
 	}
-	for _, key := range []string{"sampled_at", "runtime", "self", "counters", "warnings"} {
+	for _, key := range []string{"sampled_at", "runtime", "self", "counters", "warnings", "budgets"} {
 		if _, ok := raw[key]; !ok {
 			t.Errorf("response missing key %q", key)
 		}
 	}
-	if string(raw["counters"]) != "{}" {
-		t.Errorf("counters = %s, want {}", raw["counters"])
+	// R3: counters/warnings/budgets are containers, never null — a client
+	// must be able to range over them without a nil check.
+	if string(raw["counters"]) == "null" {
+		t.Error("counters serialized as null")
 	}
-	if string(raw["warnings"]) != "[]" {
-		t.Errorf("warnings = %s, want []", raw["warnings"])
+	if string(raw["warnings"]) == "null" {
+		t.Error("warnings serialized as null")
+	}
+	if string(raw["budgets"]) == "null" {
+		t.Error("budgets serialized as null")
 	}
 
 	var stats models.SystemStats
@@ -161,5 +167,95 @@ func TestTopChildren(t *testing.T) {
 		if rows[i].CPUPct > rows[i-1].CPUPct {
 			t.Fatalf("rows not sorted by CPU desc at %d", i)
 		}
+	}
+}
+
+// TestHandleSystemStatsFillsCountersAndBudgets pins R3's contribution to the
+// endpoint: the counters map carries the telemetry registry plus the pulled
+// gauges, and budgets are evaluated SERVER-side so every client reads one
+// verdict.
+func TestHandleSystemStatsFillsCountersAndBudgets(t *testing.T) {
+	telemetry.RecordGitSweep("test-scope", 42, 30*time.Millisecond)
+
+	s := New(false)
+	req := httptest.NewRequest(http.MethodGet, "/api/system/stats", nil)
+	w := httptest.NewRecorder()
+	s.handleSystemStats(w, req)
+
+	var stats models.SystemStats
+	if err := json.Unmarshal(w.Body.Bytes(), &stats); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Recorded counters surface verbatim under their dotted names.
+	if stats.Counters["git.sweep.count"] < 1 {
+		t.Errorf("git.sweep.count = %v, want >= 1 (counters: %v)", stats.Counters["git.sweep.count"], stats.Counters)
+	}
+	if stats.Counters["git.sweep.workspaces"] < 42 {
+		t.Errorf("git.sweep.workspaces = %v, want >= 42", stats.Counters["git.sweep.workspaces"])
+	}
+	// Pulled-at-request-time gauges are present even with no engine wired.
+	if _, ok := stats.Counters["git.divergence_cache.hit_rate"]; !ok {
+		t.Error("divergence cache counters missing")
+	}
+
+	// Budgets always include the runtime classes; the process-derived ones
+	// need a sample, which this handler takes for real.
+	if len(stats.Budgets) == 0 {
+		t.Fatal("no budgets evaluated")
+	}
+	seen := map[string]bool{}
+	for _, b := range stats.Budgets {
+		seen[b.Name] = true
+		if b.Unit == "" || b.Class == "" {
+			t.Errorf("budget %+v missing class/unit", b)
+		}
+		if b.Exceeded != (b.Value > b.Limit) {
+			t.Errorf("budget %+v: Exceeded disagrees with Value/Limit", b)
+		}
+	}
+	if !seen["daemon.goroutines"] {
+		t.Errorf("daemon.goroutines budget missing: %+v", stats.Budgets)
+	}
+}
+
+// A daemon with no engine wired (the --ready-at=bind window, and every test
+// server) must still answer with counters rather than 500ing on a nil store.
+func TestHandleSystemStatsWithoutEngine(t *testing.T) {
+	s := New(false)
+	if s.engine != nil {
+		t.Fatal("fixture assumed no engine")
+	}
+	counters := s.collectCounters()
+	if len(counters) == 0 {
+		t.Fatal("no counters without an engine")
+	}
+	if _, ok := counters["store.focused_workspaces"]; ok {
+		t.Error("store counters reported without a store")
+	}
+	if pids := s.liveAgentPIDs(); pids != nil {
+		t.Errorf("liveAgentPIDs = %v, want nil without an engine", pids)
+	}
+}
+
+func TestLiveAgentPIDsFromState(t *testing.T) {
+	ended := time.Now()
+	got := liveAgentPIDsFromState(map[string]*models.Session{
+		"live":    {ID: "live", PID: 100, PlanName: "perf-audit", JobTitle: "impl-r3"},
+		"nopid":   {ID: "nopid", PID: 0},
+		"ended":   {ID: "ended", PID: 200, EndedAt: &ended},
+		"remote":  {ID: "remote", PID: 300, Origin: "satellite-1"},
+		"minimal": {ID: "minimal", PID: 400},
+		"nil":     nil,
+	})
+	if len(got) != 2 {
+		t.Fatalf("got %v, want 2 entries", got)
+	}
+	if got[100] != "perf-audit/impl-r3" {
+		t.Errorf("label = %q", got[100])
+	}
+	// No title/plan falls back to the session id, never an empty label.
+	if got[400] != "minimal" {
+		t.Errorf("fallback label = %q", got[400])
 	}
 }

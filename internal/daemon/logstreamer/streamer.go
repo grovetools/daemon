@@ -377,3 +377,15 @@ type maxSubscribersError struct{}
 func (e *maxSubscribersError) Error() string {
 	return "maximum number of subscribers reached for this job"
 }
+
+// ActiveStreams reports how many per-job log streams are currently tailing.
+// It is the job-scoped counterpart to WorkspaceStreamer.ActiveTailers and
+// backs "logstream.job_tailers" on /api/system/stats.
+func (ls *LogStreamer) ActiveStreams() int {
+	if ls == nil {
+		return 0
+	}
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	return len(ls.streams)
+}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/fsnotify/fsevents"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 )
 
 const gitEventTopologyDebounce = 250 * time.Millisecond
@@ -87,21 +88,30 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 			if !ok {
 				return nil
 			}
+			// The recursive FSEvents stream is the daemon's highest-volume
+			// event source; raw-vs-matched here is what tells a user whether
+			// a busy machine or an over-broad watch set is driving git scans.
+			telemetry.RecordWatcherBatch(len(batch))
 			for _, event := range batch {
 				if event.Flags&(fsevents.MustScanSubDirs|fsevents.UserDropped|fsevents.KernelDropped) != 0 {
 					// A dropped/coalesced stream is a correctness signal: schedule every
 					// repo once. Per-repo debounce still bounds the resulting burst.
+					scheduled := 0
 					for _, route := range routes {
 						for _, node := range route.nodes {
 							handler.scheduleScan(node)
+							scheduled++
 						}
 					}
+					telemetry.RecordWatcherDropped(scheduled)
 					continue
 				}
 				if !relevantGitEvent(event.Path) {
 					continue
 				}
-				for _, node := range routeGitEvent(event.Path, routes) {
+				nodes := routeGitEvent(event.Path, routes)
+				telemetry.RecordWatcherMatched(len(nodes))
+				for _, node := range nodes {
 					handler.scheduleScan(node)
 				}
 			}

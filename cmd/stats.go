@@ -7,6 +7,9 @@ import (
 	"io"
 	"math"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -184,8 +187,144 @@ func fmtChildren(children []models.ProcStat) string {
 	return s
 }
 
+// counterHighlights is the curated counter set the default table shows: one
+// representative number per subsystem the R-series' incidents came from
+// (git sweeps, blob hashing, watcher ingest, transcripts, cache efficiency,
+// tailers). `--counters` prints every key instead. The table stays readable
+// for a fleet of five daemons while `--json` and `--counters` remain complete.
+var counterHighlights = []struct{ key, label string }{
+	{"git.sweep.last_ms", "git sweep last"},
+	{"git.sweep.mean_ms", "git sweep mean"},
+	{"git.sweep.workspaces_last", "sweep workspaces"},
+	{"store.focused_workspaces", "focused set"},
+	{"git.blob_hash.batches", "blob-hash batches"},
+	{"git.blob_hash.largest_offender_bytes", "largest blob"},
+	{"watcher.events.raw_per_min", "fs events/min"},
+	{"watcher.events.matched_per_min", "matched/min"},
+	{"transcript.parses_per_min", "transcript parses/min"},
+	{"git.divergence_cache.hit_rate", "divergence hit rate"},
+	{"logstream.workspace_tailers", "workspace tailers"},
+	{"logstream.job_tailers", "job tailers"},
+	{"collector.git.interval_ms", "git interval (effective)"},
+}
+
+// fmtCounter renders a counter value with a unit inferred from its key
+// suffix, so the table reads as numbers a human recognizes rather than raw
+// floats (5401 → 5.40s, 68157440 → 65M).
+func fmtCounter(key string, v float64) string {
+	switch {
+	case strings.HasSuffix(key, "_ms"):
+		return shortDur(time.Duration(v) * time.Millisecond)
+	case strings.HasSuffix(key, "_bytes"):
+		return fmtRSS(int64(v) / 1024)
+	case strings.HasSuffix(key, "hit_rate"):
+		return fmt.Sprintf("%.1f%%", v)
+	case v == math.Trunc(v) && math.Abs(v) < 1e15:
+		return strconv.FormatFloat(v, 'f', 0, 64)
+	default:
+		return strconv.FormatFloat(v, 'f', 2, 64)
+	}
+}
+
+// renderWarnings prints the health-warning strip for one daemon. The strip is
+// the same data the inspector renders at the top of its Resources and
+// Overview tabs — log-only alerts go unnoticed (this plan's worst incident was
+// found in Activity Monitor, not in logs), so the warning has to be in the
+// path of anyone who asks the daemon how it is doing.
+func renderWarnings(w io.Writer, warnings []models.HealthWarning) {
+	if len(warnings) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "  ⚠ warnings (%d)\n", len(warnings))
+	for _, wn := range warnings {
+		since := shortDur(time.Since(wn.Since).Round(time.Second))
+		fmt.Fprintf(w, "      %-34s %-24s %s (%s)\n", wn.Condition, wn.Path, wn.Offender, since)
+	}
+}
+
+// renderBudgets prints every evaluated budget, exceeded first. Showing the
+// in-budget rows too is deliberate: "5 budgets, 0 exceeded" is the answer to
+// "is anything leaking?", and a list that only ever appears when something is
+// broken teaches nobody what the limits are.
+func renderBudgets(w io.Writer, budgets []models.Budget) {
+	if len(budgets) == 0 {
+		return
+	}
+	exceeded := 0
+	for _, b := range budgets {
+		if b.Exceeded {
+			exceeded++
+		}
+	}
+	fmt.Fprintf(w, "  budgets: %d evaluated, %d exceeded\n", len(budgets), exceeded)
+	ordered := append([]models.Budget(nil), budgets...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].Exceeded != ordered[j].Exceeded {
+			return ordered[i].Exceeded
+		}
+		return ordered[i].Name < ordered[j].Name
+	})
+	for _, b := range ordered {
+		mark := " "
+		if b.Exceeded {
+			mark = "⚠"
+		}
+		fmt.Fprintf(w, "    %s %-28s %10s / %-10s %s\n", mark, b.Name,
+			fmtBudgetValue(b.Value, b.Unit), fmtBudgetValue(b.Limit, b.Unit), b.Offender)
+	}
+}
+
+func fmtBudgetValue(v float64, unit string) string {
+	switch unit {
+	case "kb":
+		return fmtRSS(int64(v))
+	case "pct":
+		return fmt.Sprintf("%.1f%%", v)
+	default:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	}
+}
+
+// renderCounters prints the collector/watcher observability counters: the
+// curated highlights, or every key when all is set.
+func renderCounters(w io.Writer, counters map[string]float64, all bool) {
+	if len(counters) == 0 {
+		return
+	}
+	if all {
+		keys := make([]string, 0, len(counters))
+		for k := range counters {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Fprintf(w, "  counters (%d)\n", len(keys))
+		for _, k := range keys {
+			fmt.Fprintf(w, "      %-44s %s\n", k, fmtCounter(k, counters[k]))
+		}
+		return
+	}
+	var shown []string
+	for _, h := range counterHighlights {
+		v, ok := counters[h.key]
+		if !ok {
+			continue
+		}
+		shown = append(shown, fmt.Sprintf("%s %s", h.label, fmtCounter(h.key, v)))
+	}
+	if len(shown) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "  counters: %s\n", strings.Join(shown, " · "))
+	fmt.Fprintf(w, "            (%d total — see --counters or --json)\n", len(counters))
+}
+
 // renderStatsTable renders the human-facing per-daemon stats view.
 func renderStatsTable(w io.Writer, doc *statsDoc) {
+	renderStatsTableOpts(w, doc, false)
+}
+
+// renderStatsTableOpts renders the fleet, optionally expanding every counter.
+func renderStatsTableOpts(w io.Writer, doc *statsDoc, allCounters bool) {
 	var stale []statsDaemon
 	for _, d := range doc.Daemons {
 		if !d.Running {
@@ -213,7 +352,11 @@ func renderStatsTable(w io.Writer, doc *statsDoc) {
 		}
 		fmt.Fprintf(w, "  self:    cpu %.1f%%  rss %s  procs %d  top %s\n",
 			self.CPUPct, fmtRSS(self.RSSKB), self.Procs, top)
-		fmt.Fprintf(w, "  children: %s\n\n", fmtChildren(self.Children))
+		fmt.Fprintf(w, "  children: %s\n", fmtChildren(self.Children))
+		renderWarnings(w, d.Stats.Warnings)
+		renderBudgets(w, d.Stats.Budgets)
+		renderCounters(w, d.Stats.Counters, allCounters)
+		fmt.Fprintln(w)
 	}
 
 	if len(stale) > 0 {
@@ -230,9 +373,10 @@ func renderStatsTable(w io.Writer, doc *statsDoc) {
 
 func newGrovedStatsCmd() *cobra.Command {
 	var (
-		jsonOut bool
-		scope   string
-		all     bool
+		jsonOut     bool
+		scope       string
+		all         bool
+		allCounters bool
 	)
 	cmd := &cobra.Command{
 		Use:   "stats",
@@ -267,11 +411,12 @@ entries.`,
 				enc.SetIndent("", "  ")
 				return enc.Encode(doc)
 			}
-			renderStatsTable(out, doc)
+			renderStatsTableOpts(out, doc, allCounters)
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Emit one JSON document (stable snake_case fields)")
+	cmd.Flags().BoolVar(&allCounters, "counters", false, "Print every collector/watcher counter instead of the curated highlights")
 	cmd.Flags().StringVar(&scope, "scope", "", "Show a single daemon by scope label (\"unscoped\" for the global daemon)")
 	cmd.Flags().BoolVar(&all, "all", true, "Show every daemon (default)")
 	cmd.MarkFlagsMutuallyExclusive("scope", "all")

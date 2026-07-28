@@ -14,6 +14,7 @@ import (
 	"github.com/grovetools/core/pkg/process"
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 )
 
 // PtyKiller is satisfied by any type that can terminate an out-of-process PTY
@@ -458,10 +459,18 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 		mtime := transcriptMtime(knownPath)
 		if cached, ok := c.tokenCache[s.ID]; ok && !mtime.IsZero() && mtime.Equal(cached.mtime) {
 			// Transcript unchanged since the last summary; already applied.
+			// Counted as "considered but not parsed" so the telemetry tab can
+			// show the mtime short-circuit working: a considered rate that
+			// tracks the parse rate means the daemon is rescanning transcripts
+			// it has already read, which is exactly the incident this counter
+			// exists to catch.
+			telemetry.RecordTranscriptParse(false, 0)
 			continue
 		}
 
+		parseStart := time.Now()
 		summary, usedPath, err := c.summarizeLiveSession(s)
+		telemetry.RecordTranscriptParse(true, time.Since(parseStart))
 		if err != nil {
 			if !errors.Is(err, errResolveThrottled) && !errors.Is(err, errResolvePermanent) {
 				c.ulog.Debug("Failed to summarize live token usage").

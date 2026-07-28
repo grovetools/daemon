@@ -10,6 +10,7 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 )
 
 // DomainHandler represents a domain-specific event processor that plugs into the
@@ -164,6 +165,14 @@ func (w *UnifiedWatcher) dispatch(ctx context.Context, events []fsnotify.Event) 
 	copy(handlers, w.handlers)
 	w.mu.Unlock()
 
+	// Ingest is counted once per batch; matches are counted per handler, so
+	// matched/raw is a fan-out ratio (>1 is normal when several handlers care
+	// about the same path) and both rates are published per minute. The pair
+	// is what distinguishes "the filesystem is busy" from "our filters are
+	// too broad" — the two causes of watcher-driven load look identical in
+	// CPU alone.
+	telemetry.RecordWatcherBatch(len(events))
+
 	for _, h := range handlers {
 		var matched []fsnotify.Event
 		for _, e := range events {
@@ -172,6 +181,7 @@ func (w *UnifiedWatcher) dispatch(ctx context.Context, events []fsnotify.Event) 
 			}
 		}
 		if len(matched) > 0 {
+			telemetry.RecordWatcherMatched(len(matched))
 			go func(handler DomainHandler, evts []fsnotify.Event) {
 				if err := handler.HandleEvents(ctx, evts); err != nil {
 					w.ulog.Error("Handler failed to process events").

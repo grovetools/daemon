@@ -12,6 +12,7 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 )
 
 // gitWorkers is the number of parallel git status workers.
@@ -47,13 +48,26 @@ func focusedFileData(repoPath string) ([]git.FileStatus, map[string]string) {
 		return nil, nil
 	}
 	if len(files) > maxFocusedChangedFiles {
+		// The cap bounds file COUNT, not bytes (doc 50's byte bomb). Record
+		// the whole set as skipped so the counter shows the cap firing.
+		telemetry.RecordBlobHash(telemetry.BlobHashObservation{Repo: repoPath, Skipped: len(files)})
 		return files, nil
 	}
 	paths := make([]string, 0, len(files))
 	for _, f := range files {
 		paths = append(paths, f.Path)
 	}
-	hashes, err := git.GetBlobHashes(repoPath, paths)
+	started := time.Now()
+	hashes, batch, err := git.GetBlobHashesObserved(repoPath, paths)
+	telemetry.RecordBlobHash(telemetry.BlobHashObservation{
+		Repo:         repoPath,
+		Files:        batch.Hashed,
+		Skipped:      batch.Skipped,
+		NonRegular:   batch.NonRegular,
+		LargestBytes: batch.LargestBytes,
+		LargestPath:  batch.LargestPath,
+		Duration:     time.Since(started),
+	})
 	if err != nil {
 		return files, nil
 	}
@@ -201,6 +215,11 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 	currentInterval := c.interval
 	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
+	// Publish the EFFECTIVE interval, not the configured one: dynamicInterval
+	// rescales it by workspace count below, and "configured 10s / actually
+	// running at 20s" is exactly the kind of divergence the telemetry tab
+	// exists to make visible.
+	telemetry.SetCollectorInterval(c.Name(), currentInterval)
 
 	// scanWorkspaces runs git status on the given workspaces and emits a delta update.
 	scanWorkspaces := func(toScan []*models.EnrichedWorkspace) {
@@ -210,7 +229,13 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 
 		start := time.Now()
 		defer func() {
-			if d := time.Since(start); d > 1*time.Second {
+			d := time.Since(start)
+			// Every sweep feeds the telemetry registry (last/mean/max duration
+			// + workspaces scanned) so /api/system/stats can answer "why is
+			// this daemon busy?" without anyone grepping logs — this incident
+			// class was historically found in Activity Monitor, not here.
+			telemetry.RecordGitSweep(c.scope, len(toScan), d)
+			if d > 1*time.Second {
 				// scope/pid disambiguate which daemon swept in the shared log;
 				// scanned separates a broad background sweep from a focused one.
 				ulog.Debug("Slow git status scan detected").
@@ -313,6 +338,7 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		if newInterval != currentInterval {
 			currentInterval = newInterval
 			ticker.Reset(currentInterval)
+			telemetry.SetCollectorInterval(c.Name(), currentInterval)
 		}
 	}
 

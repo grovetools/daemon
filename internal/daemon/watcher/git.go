@@ -15,6 +15,7 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 )
 
 // GitHandler implements per-repository debouncing and status publication. In
@@ -265,8 +266,17 @@ func (h *GitHandler) scheduleScan(node *workspace.WorkspaceNode) {
 // differs from what the store holds, emits a WorkspaceDelta.
 func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 	ctx := context.Background()
+	started := time.Now()
+	// emitted is flipped on the one path that publishes a delta; every other
+	// return is a no-op scan. The ratio (emitted vs noop) is the watcher's
+	// signal-to-noise, and a collapsing ratio means the debounce is losing to
+	// something writing continuously in a watched tree.
+	emitted := false
+	defer func() { telemetry.RecordGitWatcherScan(node.Path, time.Since(started), emitted) }()
+
 	status, err := git.GetExtendedStatus(node.Path)
 	if err != nil {
+		telemetry.GitWatcherFailed.Inc()
 		h.ulog.Warn("git watcher: scan failed").Err(err).Field("path", node.Path).Log(ctx)
 		return
 	}
@@ -308,6 +318,7 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		}
 	}
 
+	emitted = true
 	h.ulog.Debug("git watcher: emitting delta").
 		Field("path", node.Path).
 		Field("branch", status.Branch).
@@ -348,13 +359,24 @@ func focusedFileData(repoPath string) ([]git.FileStatus, map[string]string) {
 		return nil, nil
 	}
 	if len(files) > maxFocusedChangedFiles {
+		telemetry.RecordBlobHash(telemetry.BlobHashObservation{Repo: repoPath, Skipped: len(files)})
 		return files, nil
 	}
 	paths := make([]string, 0, len(files))
 	for _, f := range files {
 		paths = append(paths, f.Path)
 	}
-	hashes, err := git.GetBlobHashes(repoPath, paths)
+	started := time.Now()
+	hashes, batch, err := git.GetBlobHashesObserved(repoPath, paths)
+	telemetry.RecordBlobHash(telemetry.BlobHashObservation{
+		Repo:         repoPath,
+		Files:        batch.Hashed,
+		Skipped:      batch.Skipped,
+		NonRegular:   batch.NonRegular,
+		LargestBytes: batch.LargestBytes,
+		LargestPath:  batch.LargestPath,
+		Duration:     time.Since(started),
+	})
 	if err != nil {
 		return files, nil
 	}

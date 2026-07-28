@@ -11,8 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/grovetools/core/git"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/procsample"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 )
 
 // processStart anchors uptime_ms when no RunningConfig was wired (early
@@ -118,6 +120,80 @@ func topChildren(sample *procsample.Sample, pids []int, root, max int) []models.
 	return rows
 }
 
+// collectCounters merges the telemetry registry's recorded counters with the
+// gauges that are better read straight from their owner at request time
+// (store sizes, live tailer counts, core's package-global git caches). Those
+// are pulled rather than pushed on purpose: a Set() on every focus change or
+// every tailer teardown is one more thing that can be forgotten in a future
+// refactor, and the number would then lie forever. Reading len() at snapshot
+// time cannot drift from the truth.
+func (s *Server) collectCounters() map[string]float64 {
+	counters := telemetry.Default().Snapshot()
+
+	if s.engine != nil {
+		if st := s.engine.Store(); st != nil {
+			counters["store.focused_workspaces"] = float64(len(st.GetFocus()))
+			counters["store.workspaces"] = float64(len(st.GetWorkspaces()))
+			counters["store.sessions_live"] = float64(len(liveAgentPIDsFromState(st.Get().Sessions)))
+		}
+	}
+	if s.workspaceStreamer != nil {
+		counters["logstream.workspace_tailers"] = float64(s.workspaceStreamer.ActiveTailers())
+	}
+	if s.logStreamer != nil {
+		counters["logstream.job_tailers"] = float64(s.logStreamer.ActiveStreams())
+	}
+
+	// The ahead/behind cache lives as a package global in core/git (it has no
+	// injectable handle and sits on GetExtendedStatus' hot path), so its
+	// counters are exported the same way and read here.
+	hits, misses, wasted := git.DivergenceCacheStats()
+	counters["git.divergence_cache.hits"] = float64(hits)
+	counters["git.divergence_cache.misses"] = float64(misses)
+	counters["git.divergence_cache.wasted_forks"] = float64(wasted)
+	if total := hits + misses; total > 0 {
+		counters["git.divergence_cache.hit_rate"] = statsRound1(float64(hits) / float64(total) * 100)
+	} else {
+		counters["git.divergence_cache.hit_rate"] = 0
+	}
+
+	return counters
+}
+
+// liveAgentPIDs maps every live headless agent's pid to a display label, for
+// the agent-subtree RSS budget.
+func (s *Server) liveAgentPIDs() map[int]string {
+	if s.engine == nil {
+		return nil
+	}
+	st := s.engine.Store()
+	if st == nil {
+		return nil
+	}
+	return liveAgentPIDsFromState(st.Get().Sessions)
+}
+
+// liveAgentPIDsFromState is the pure half of liveAgentPIDs. A session counts
+// when it has a real pid, has not ended, and is local (Origin != "" means it
+// belongs to a satellite, whose pids are meaningless in our process table).
+func liveAgentPIDsFromState(sessions map[string]*models.Session) map[int]string {
+	out := make(map[int]string, len(sessions))
+	for _, sess := range sessions {
+		if sess == nil || sess.PID <= 0 || sess.EndedAt != nil || sess.Origin != "" {
+			continue
+		}
+		label := sess.JobTitle
+		if label == "" {
+			label = sess.ID
+		}
+		if sess.PlanName != "" {
+			label = sess.PlanName + "/" + label
+		}
+		out[sess.PID] = label
+	}
+	return out
+}
+
 // handleSystemStats serves GET /api/system/stats: the daemon's Go runtime
 // state plus a process-tree rollup of its own pid (models.SystemStats).
 // counters and warnings are reserved for R3 and always present-but-empty.
@@ -147,8 +223,9 @@ func (s *Server) handleSystemStats(w http.ResponseWriter, r *http.Request) {
 			UptimeMS:       time.Since(startedAt).Milliseconds(),
 		},
 		Self:     models.SelfStats{PID: os.Getpid(), Children: []models.ProcStat{}},
-		Counters: map[string]float64{}, // reserved; R3 fills
+		Counters: map[string]float64{},
 		Warnings: []models.HealthWarning{},
+		Budgets:  []models.Budget{},
 	}
 
 	sample, err := s.statsCache.get(statsSampleMaxAge)
@@ -162,6 +239,23 @@ func (s *Server) handleSystemStats(w http.ResponseWriter, r *http.Request) {
 			Field("error", err.Error()).
 			Log(r.Context())
 	}
+
+	// R3: counters, budgets, warnings. Order matters — budgets are evaluated
+	// before warnings are read so an exceeded budget appears in the same
+	// response that reports it, rather than one poll later.
+	stats.Counters = s.collectCounters()
+	stats.Budgets = telemetry.EvaluateBudgets(telemetry.BudgetInputs{
+		HeapAlloc:  stats.Runtime.HeapAlloc,
+		GoMemLimit: stats.Runtime.GoMemLimit,
+		Goroutines: stats.Runtime.Goroutines,
+		DaemonPID:  stats.Self.PID,
+		Sample:     sample,
+		AgentPIDs:  s.liveAgentPIDs(),
+	})
+	warnings := telemetry.Default().Warnings()
+	telemetry.RaiseBudgetWarnings(warnings, stats.Budgets)
+	telemetry.CheckWatcherStorm()
+	stats.Warnings = warnings.Active()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(stats)
