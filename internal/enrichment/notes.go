@@ -176,6 +176,13 @@ func indexFileEntry(filePath, wsName, contentDirPath, contentDirType string) *mo
 	}
 
 	name := info.Name()
+	// Dotfiles are not notes: .DS_Store, editor swap files and flow's own
+	// `.<job>.output.log` / `.<job>.journal.json` scratch files would otherwise
+	// surface as browsable entries. nb's own filesystem walks skip them, so the
+	// index must agree or the two sources disagree about what a notebook holds.
+	if strings.HasPrefix(name, ".") {
+		return nil
+	}
 	entry := &models.NoteIndexEntry{
 		Path:       filePath,
 		Name:       name,
