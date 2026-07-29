@@ -185,7 +185,10 @@ Pass the last `seq` you processed as `?since=`. Two outcomes:
 
 `stream_gap` is a control frame and is never suppressed by `?types=` — a
 consumer that filtered itself into silence would otherwise never learn it
-needs to reconcile.
+needs to reconcile. The `initial` snapshot is *not* a control frame: it is
+ordinary state, so a subscriber filtering on `job_*` does not receive it,
+before or after a gap. Such a consumer reconciles through the REST API, which
+is what it was going to do anyway.
 
 The ring holds the last **1024** updates. That is roughly a minute of a busy
 daemon, so reconnect promptly if you care about gap-free resumption; it is a
