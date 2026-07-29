@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1760,18 +1761,31 @@ func splitPath(path string) []string {
 // handleStreamState provides Server-Sent Events (SSE) for real-time state updates.
 // Clients can subscribe to this endpoint to receive updates whenever the daemon state changes.
 //
-// Subscribers may declare what they want with ?types= and ?paths= (see
-// coredaemon.StreamFilter); non-matching events are dropped here, before
-// serialization and before the write. A subscribe with neither parameter gets
-// the full host-wide stream exactly as it always did, so the filter is additive
-// and old clients are unaffected.
+// Query parameters (all optional, all additive — see stream_bus.go and
+// coredaemon.StreamFilter). A subscribe with none of them gets the full
+// host-wide stream exactly as it always did, so old clients are unaffected:
+//
+//	since=<seq>   resume after a sequence number the client already saw. An
+//	              exact resume replays the ring and SKIPS the initial snapshot
+//	              (the client is continuous). A gapped resume emits a
+//	              "stream_gap" control frame plus the snapshot instead, and
+//	              replays nothing: the retained tail is older than the snapshot,
+//	              so replaying it on top would move the client backwards.
+//	types=<globs> comma-separated globs matched against update_type. Control
+//	              frames ("stream_gap") always pass; the "initial" snapshot is
+//	              ordinary state and IS filtered.
+//	paths=<list>  comma-separated workspace path prefixes, applied to the
+//	              workspace-bearing frames only. An event whose rows are all
+//	              dropped is not written at all.
+//
+// Both allow-lists are enforced here, before serialization and before the
+// write, so a filtered subscriber never pays for the JSON of an event it
+// declared no interest in.
 func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
 		return
 	}
-
-	filter := coredaemon.ParseStreamFilter(r.URL.Query())
 
 	// Ensure the connection supports flushing
 	flusher, ok := w.(http.Flusher)
@@ -1780,10 +1794,33 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	query := r.URL.Query()
+	since, wantsReplay, err := parseSinceCursor(query.Get("since"))
+	if err != nil {
+		http.Error(w, "invalid since cursor: must be a decimal sequence number", http.StatusBadRequest)
+		return
+	}
+	// ?types= is owned by the glob filter and ?paths= by the StreamFilter. The
+	// two grew independently and both claimed types=; globs are the superset (a
+	// literal pattern matches exactly, which is what an exact allow-list meant),
+	// so the type decision lives in one place and the StreamFilter carries only
+	// the path allow-list. Leaving its Types populated would filter twice, with
+	// the stricter exact matcher silently overriding a caller's glob.
+	types, err := parseTypeFilter(query.Get("types"))
+	if err != nil {
+		http.Error(w, "invalid types filter: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	filter := coredaemon.StreamFilter{Paths: coredaemon.ParseStreamFilter(query).Paths}
+
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	// Advertise the hardened contract. A client that does not see these has
+	// reached an older daemon, which ignored since/types and emits no seq.
+	w.Header().Set(StreamFeaturesHeader, StreamFeatures)
+	w.Header().Set(StreamRingHeader, strconv.Itoa(store.RingSize))
 
 	// A live state stream is a real daemon client even though it is not a
 	// terminal WebSocket. Keep auto-started scoped daemons alive for the full
@@ -1796,18 +1833,55 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	// reality if a future early-return forgets to decrement.
 	s.sseSubscribers.Add(1)
 	defer s.sseSubscribers.Add(-1)
-	if !filter.IsZero() {
+	if len(types) > 0 || !filter.IsZero() {
 		s.sseSubscribersFiltered.Add(1)
 		defer s.sseSubscribersFiltered.Add(-1)
 	}
 
-	// Subscribe to store updates
-	ch := s.engine.Store().Subscribe()
-	defer s.engine.Store().Unsubscribe(ch)
+	// Subscribe BEFORE reading the ring or the snapshot. Anything published in
+	// between then lands in both places; the lastSent watermark below drops the
+	// duplicate. Subscribing after would lose it entirely.
+	st := s.engine.Store()
+	ch := st.Subscribe()
+	defer st.Unsubscribe(ch)
 
 	// Send initial ping to confirm connection
 	_, _ = fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
+
+	send := func(update *apiStateUpdate) {
+		data, err := json.Marshal(update)
+		if err != nil {
+			s.ulog.Error("Failed to marshal update").Err(err).Log(r.Context())
+			return
+		}
+		// SSE format: "data: {json}\n\n"
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	var lastSent uint64
+	replay, gap := []store.Update(nil), store.ReplayGap{}
+	if wantsReplay {
+		replay, gap = st.Replay(since)
+		if gap.Gapped() {
+			// Control frame: never filtered, and deliberately emitted before
+			// the snapshot so a client reading frame-by-frame knows to treat
+			// what follows as a reconcile rather than a delta.
+			send(&apiStateUpdate{
+				UpdateType: StreamGapUpdateType,
+				Source:     "stream",
+				Seq:        gap.Current,
+				Payload: apiStreamGap{
+					Reason:   gap.Reason,
+					Since:    gap.Since,
+					Oldest:   gap.Oldest,
+					Current:  gap.Current,
+					RingSize: store.RingSize,
+				},
+			})
+		}
+	}
 
 	// Send current state immediately so client has data right away. The
 	// snapshot also carries the current resolved theme so a theme change
@@ -1817,14 +1891,21 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	// finished in between, and never see a Done transition. Sent whenever boot
 	// is still in progress, regardless of whether any workspaces exist yet.
 	//
-	// A filtered subscriber that did not name "initial" skips the whole block:
-	// building this frame means marshalling every enriched workspace plus the
-	// plan index, which is by far the largest thing this endpoint ever writes.
-	// Not producing it is the main saving subscribe-time filtering buys.
-	if !filter.AllowsType(coredaemon.StreamTypeInitial) {
+	// A client resuming exactly (?since= with no gap) skips this: it already
+	// has the state, and the replay below carries it forward.
+	//
+	// So does a filtered subscriber that did not name "initial": building this
+	// frame means marshalling every enriched workspace plus the plan index,
+	// which is by far the largest thing this endpoint ever writes. Not
+	// producing it is the main saving subscribe-time filtering buys.
+	switch {
+	case wantsReplay && !gap.Gapped():
+		// Nothing to send: the replay below is continuous with what the client
+		// already has.
+	case !types.matches(coredaemon.StreamTypeInitial):
 		telemetry.SSEInitialSkipped.Inc()
-	} else {
-		state := s.engine.Store().Get()
+	default:
+		state := st.Get()
 		themePayload := theming.CurrentPayload()
 		boot := s.bootStatus.Load()
 		if len(state.Workspaces) > 0 || state.PlanIndex != nil || themePayload != nil || (boot != nil && !boot.Done) {
@@ -1835,17 +1916,36 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 			initialUpdate := &apiStateUpdate{
 				Workspaces:        workspaces,
 				UpdateType:        coredaemon.StreamTypeInitial,
+				Seq:               st.CurrentSeq(),
 				Theme:             themePayload,
 				BootPhase:         boot,
 				PlanIndexSnapshot: state.PlanIndex,
 			}
 			if sent, ok := applyStreamFilter(filter, initialUpdate); ok {
-				if data, err := json.Marshal(sent); err == nil {
-					_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
-					flusher.Flush()
-					telemetry.SSEInitialSent.Inc()
-				}
+				send(sent)
+				telemetry.SSEInitialSent.Inc()
 			}
+		}
+	}
+
+	if !gap.Gapped() {
+		for _, update := range replay {
+			apiUpdate := convertToAPIUpdate(update)
+			if apiUpdate == nil || !types.matches(apiUpdate.UpdateType) {
+				// Still advance the watermark: the frame was delivered as far
+				// as this subscription is concerned, and not advancing would
+				// let the live loop re-offer it.
+				lastSent = max(lastSent, update.Seq)
+				continue
+			}
+			lastSent = update.Seq
+			// The path allow-list applies to replayed frames too: a resume must
+			// not hand a subscriber the workspaces it declared out of scope.
+			sent, ok := applyStreamFilter(filter, apiUpdate)
+			if !ok {
+				continue
+			}
+			send(sent)
 		}
 	}
 
@@ -1854,6 +1954,11 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case update := <-ch:
+			// Drop what the replay above already delivered on this connection.
+			if update.Seq != 0 && update.Seq <= lastSent {
+				continue
+			}
+			lastSent = update.Seq
 			// Convert internal store.Update to public API format
 			apiUpdate := convertToAPIUpdate(update)
 			if apiUpdate == nil {
@@ -1863,20 +1968,17 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 
 			// Drop before serializing: a filtered subscriber must not pay for
 			// the JSON of an event it declared no interest in.
-			apiUpdate, ok := applyStreamFilter(filter, apiUpdate)
+			if !types.matches(apiUpdate.UpdateType) {
+				telemetry.SSEEventsFiltered.Inc()
+				continue
+			}
+			sent, ok := applyStreamFilter(filter, apiUpdate)
 			if !ok {
 				telemetry.SSEEventsFiltered.Inc()
 				continue
 			}
 
-			data, err := json.Marshal(apiUpdate)
-			if err != nil {
-				s.ulog.Error("Failed to marshal update").Err(err).Log(r.Context())
-				continue
-			}
-			// SSE format: "data: {json}\n\n"
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
-			flusher.Flush()
+			send(sent)
 			telemetry.SSEEventsDelivered.Inc()
 		}
 	}
@@ -2453,10 +2555,14 @@ type apiStateUpdate struct {
 	WorkspaceDeltas []*models.WorkspaceDelta    `json:"workspace_deltas,omitempty"`
 	Sessions        []*models.Session           `json:"sessions,omitempty"`
 	UpdateType      string                      `json:"update_type"`
-	Source          string                      `json:"source,omitempty"`
-	Scanned         int                         `json:"scanned,omitempty"`
-	ConfigFile      string                      `json:"config_file,omitempty"`
-	Payload         interface{}                 `json:"payload,omitempty"`
+	// Seq is the store's monotonic sequence for this update — the cursor a
+	// client passes back as ?since=. Zero (omitted) on control frames the
+	// store never published, and on every frame from a pre-hardening daemon.
+	Seq        uint64      `json:"seq,omitempty"`
+	Source     string      `json:"source,omitempty"`
+	Scanned    int         `json:"scanned,omitempty"`
+	ConfigFile string      `json:"config_file,omitempty"`
+	Payload    interface{} `json:"payload,omitempty"`
 	// Theme stamps the current resolved theme onto the "initial" snapshot so
 	// clients reconnecting after a disconnect never miss a theme change.
 	Theme *coredaemon.ThemeChangedPayload `json:"theme,omitempty"`
@@ -2468,8 +2574,24 @@ type apiStateUpdate struct {
 	PlanIndexSnapshot *models.PlanIndexSnapshot `json:"plan_index_snapshot,omitempty"`
 }
 
-// convertToAPIUpdate converts internal store.Update to the public API format.
+// convertToAPIUpdate converts internal store.Update to the public API format,
+// stamping the store's sequence number onto the frame. A nil result means the
+// update does not reach the wire; that outcome is logged (once per type) by
+// noteUnconvertedUpdate rather than being silently swallowed, and intentional
+// omissions are declared in apiUpdateSkipList.
 func convertToAPIUpdate(u store.Update) *apiStateUpdate {
+	out := convertUpdatePayload(u)
+	if out == nil {
+		noteUnconvertedUpdate(u)
+		return nil
+	}
+	out.Seq = u.Seq
+	return out
+}
+
+// convertUpdatePayload maps one store update onto its wire shape, or nil when
+// there is no mapping. Callers want convertToAPIUpdate.
+func convertUpdatePayload(u store.Update) *apiStateUpdate {
 	switch u.Type {
 	case store.UpdateWorkspaces:
 		if wsMap, ok := u.Payload.(map[string]*models.EnrichedWorkspace); ok {

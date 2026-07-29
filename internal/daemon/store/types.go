@@ -2,6 +2,7 @@
 package store
 
 import (
+	"sort"
 	"time"
 
 	"github.com/grovetools/core/pkg/models"
@@ -205,6 +206,62 @@ const (
 	// ordering never broadcasts because no client can connect until boot ends.
 	UpdateBootPhase UpdateType = "boot_phase"
 )
+
+// allUpdateTypes is the canonical roster of the event vocabulary — every
+// UpdateType constant declared above, in declaration order.
+//
+// It exists because "the switch statement is the spec" is exactly the problem
+// this bus had: the SSE converter's allowlist, the `[[daemon.hooks.on_event]]`
+// matcher and the config reference all need to agree on what an event name
+// can be, and each of them inventing its own list is how they drift. A test
+// (TestAllUpdateTypesCoversEveryConstant) AST-parses this file and fails if a
+// constant is added without being listed here.
+var allUpdateTypes = []UpdateType{
+	UpdateWorkspaces, UpdateSessions, UpdateFocus, UpdateConfigReload,
+	UpdateThemeChanged, UpdateSkillSync, UpdateWatcherStatus,
+	UpdateSessionIntent, UpdateSessionConfirmation, UpdateSessionStatus,
+	UpdateSessionEnd, UpdateSessionTokens,
+	UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed,
+	UpdateJobCancelled, UpdateJobPendingUser, UpdateJobOrphaned,
+	UpdateJobsDiscovered,
+	UpdateNoteEvent, UpdateNoteIndex, UpdateWorkspacesDelta,
+	UpdateSessionChannels, UpdateSessionAutonomous, UpdateSessionPing,
+	UpdateSessionTmuxTarget, UpdateSessionLastSender,
+	UpdateNavBindings,
+	UpdatePlans, UpdatePlanIndexSnapshot, UpdatePlanIndexDelta,
+	UpdateMemoryIndex, UpdateMemoryReindex,
+	UpdateTaskResult, UpdateTestReport,
+	UpdateSpawnAgentPane, UpdateAttachAgentPane, UpdateAgentInput, UpdateCaptureRequest,
+	UpdateSyncConflict,
+	UpdateSatelliteStatus, UpdateSatelliteSnapshot,
+	UpdateWorkflowRunDiscovered, UpdateWorkflowAgentStarted,
+	UpdateWorkflowAgentCompleted, UpdateWorkflowRunStale,
+	UpdateWorkflowRunCompleted, UpdateWorkflowChildrenSnapshot,
+	UpdateWorkflowBashStarted,
+	UpdateSubjobReportReady, UpdateSubjobJoined,
+	UpdateBuildQueued, UpdateBuildStarted, UpdateBuildFinished,
+	UpdateBootPhase,
+}
+
+// AllUpdateTypes returns the event vocabulary, sorted, as a fresh slice.
+// Consumers: the on_event hook matcher's config validation, and anything
+// documenting or completing event names.
+func AllUpdateTypes() []UpdateType {
+	out := make([]UpdateType, len(allUpdateTypes))
+	copy(out, allUpdateTypes)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// IsKnownUpdateType reports whether t names a declared update type.
+func IsKnownUpdateType(t UpdateType) bool {
+	for _, known := range allUpdateTypes {
+		if known == t {
+			return true
+		}
+	}
+	return false
+}
 
 // MemoryIndexPayload describes a single memory store mutation for SSE subscribers.
 type MemoryIndexPayload struct {
@@ -419,7 +476,15 @@ type TestReportPayload struct {
 
 // Update represents a change to the state.
 type Update struct {
-	Type    UpdateType
+	Type UpdateType
+	// Seq is the monotonic sequence number the store stamps on every update
+	// as it is published. It starts at 1 for the first update of a daemon
+	// process and never repeats within that process; it RESETS across daemon
+	// restarts (the bus is in-memory), so a client holding a cursor across a
+	// restart sees a lower Current than its Since and must reconcile — see
+	// Store.Replay. Zero means "not published yet" (or, on the wire, "this
+	// daemon predates sequencing").
+	Seq     uint64
 	Source  string // Which collector sent this update (e.g., "git", "workspace", "session", "plan", "note")
 	Scanned int    // Number of items actually scanned (for focused updates)
 	// Origin scopes a wholesale-replacement update to one satellite's rows (M2

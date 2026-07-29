@@ -34,7 +34,46 @@ type Store struct {
 	// no per-job events (see the UpdateSatelliteSnapshot branch of ApplyUpdate).
 	// Guarded by mu.
 	satSeenSnapshot map[string]struct{}
+
+	// busMu guards the event bus's sequence counter and replay ring. It is the
+	// INNERMOST lock: every publish site already holds s.mu (read or write),
+	// so busMu must never be acquired before s.mu.
+	busMu sync.Mutex
+	// seq is the monotonic sequence stamped on published updates. It starts at
+	// 0 and is pre-incremented, so the first published update carries Seq 1.
+	seq uint64
+	// ring retains the most recent published updates for ?since= replay. It is
+	// a fixed-size circular buffer (len(ring) == RingSize); ringPos is the next
+	// write slot and ringLen the number of live entries.
+	ring    []Update
+	ringPos int
+	ringLen int
 }
+
+// RingSize bounds the in-memory replay ring behind GET /api/stream?since=.
+//
+// The bus is deliberately in-memory and lossy-by-design at the SUBSCRIPTION
+// layer (buffered-100 channels, drop-on-full). The ring is a second, separate
+// buffer that lets a client that reconnects quickly close its own gap without
+// re-snapshotting: a subscriber that misses events because its channel filled,
+// or because it was disconnected, can re-attach with ?since=<last seq it saw>
+// and get everything still retained.
+//
+// What the bound does NOT buy: durability. The ring lives in the daemon
+// process, so a restart empties it AND resets the sequence counter. Clients
+// must treat a gap signal (Store.Replay's ReplayGap) as "snapshot and
+// reconcile", never as "events silently lost".
+//
+// 1024 entries is roughly a minute of a busy daemon's chatter (git enrichment
+// deltas dominate the volume) and a few hundred kilobytes of retained pointers
+// — the ring stores the same payload pointers the store already holds, so it
+// pins almost nothing the state does not.
+//
+// Payloads are retained by REFERENCE. A replayed update carries whatever the
+// pointed-to model looks like now, not a snapshot of what it looked like when
+// the event fired. Events are triggers, not a durable log; consumers that need
+// point-in-time truth must reconcile against the REST endpoints.
+const RingSize = 1024
 
 // New creates a new Store instance, loading any persisted task results and
 // workflow events from disk.
@@ -53,6 +92,7 @@ func New() *Store {
 		},
 		subscribers:       make(map[chan Update]struct{}),
 		focus:             make(map[string]focusRegistration),
+		ring:              make([]Update, RingSize),
 		now:               time.Now,
 		satSeenSnapshot:   make(map[string]struct{}),
 		persister:         newPersister(),
@@ -617,23 +657,14 @@ func (s *Store) ApplyUpdate(u Update) {
 	}
 
 	// Broadcast to subscribers
-	for ch := range s.subscribers {
-		select {
-		case ch <- u:
-		default:
-			// Non-blocking send to prevent slow clients from stalling the daemon
-		}
-	}
+	s.publishLocked(u)
 	// Broadcast derived updates after their source transition so subscribers
 	// observe state-then-delta ordering. These go straight to broadcast because
-	// their state mutations were already applied under this lock.
+	// their state mutations were already applied under this lock. Publishing
+	// them here (rather than inline) is also what gives them their own
+	// sequence numbers, so a ?since= replay reproduces the same ordering.
 	for _, su := range synthesized {
-		for ch := range s.subscribers {
-			select {
-			case ch <- su:
-			default:
-			}
-		}
+		s.publishLocked(su)
 	}
 }
 
@@ -1103,6 +1134,115 @@ func adjustNoteCount(counts *models.NoteCounts, noteType string, delta int) {
 	}
 }
 
+// publishLocked stamps u with the next sequence number, records it in the
+// replay ring, and fans it out to every subscriber. Sends stay non-blocking:
+// a slow client drops frames rather than stalling the daemon (the historical
+// contract — the ring is what lets it recover).
+//
+// The caller must hold s.mu, read or write. Every broadcast in this package
+// goes through here; adding a second fan-out loop would mint updates the ring
+// never saw, so ?since= would silently skip them.
+func (s *Store) publishLocked(u Update) {
+	u.Seq = s.recordLocked(u)
+	for ch := range s.subscribers {
+		select {
+		case ch <- u:
+		default:
+			// Non-blocking send to prevent slow clients from stalling the daemon
+		}
+	}
+}
+
+// recordLocked assigns the next sequence number and writes the stamped update
+// into the replay ring, returning the assigned sequence.
+func (s *Store) recordLocked(u Update) uint64 {
+	s.busMu.Lock()
+	defer s.busMu.Unlock()
+	s.seq++
+	u.Seq = s.seq
+	if len(s.ring) > 0 {
+		s.ring[s.ringPos] = u
+		s.ringPos = (s.ringPos + 1) % len(s.ring)
+		if s.ringLen < len(s.ring) {
+			s.ringLen++
+		}
+	}
+	return s.seq
+}
+
+// CurrentSeq returns the sequence number of the most recently published
+// update (0 when nothing has been published by this daemon process).
+func (s *Store) CurrentSeq() uint64 {
+	s.busMu.Lock()
+	defer s.busMu.Unlock()
+	return s.seq
+}
+
+// ReplayGap reports that a ?since= cursor could not be honored exactly. A zero
+// Reason means the replay was complete: the caller saw every update after its
+// cursor.
+type ReplayGap struct {
+	// Reason is "too_old" when the ring had already evicted the updates the
+	// cursor asked for, and "reset" when the cursor is ahead of the daemon's
+	// current sequence — which means the daemon restarted (sequences restart
+	// at 1) or the client invented a cursor.
+	Reason string
+	// Since is the cursor the caller passed.
+	Since uint64
+	// Oldest is the lowest sequence still retained (0 when the ring is empty).
+	Oldest uint64
+	// Current is the daemon's sequence at the time of the call.
+	Current uint64
+}
+
+// Gapped reports whether the replay was lossy.
+func (g ReplayGap) Gapped() bool { return g.Reason != "" }
+
+const (
+	// ReplayGapTooOld means the ring evicted what the cursor asked for.
+	ReplayGapTooOld = "too_old"
+	// ReplayGapReset means the cursor is ahead of the daemon — a restart.
+	ReplayGapReset = "reset"
+)
+
+// Replay returns every retained update with Seq > since, oldest first, plus a
+// gap verdict. A gapped result still resumes correctly (the caller gets
+// whatever IS retained, or nothing on a reset), but the caller MUST
+// snapshot-reconcile rather than assume continuity: see RingSize.
+func (s *Store) Replay(since uint64) ([]Update, ReplayGap) {
+	s.busMu.Lock()
+	defer s.busMu.Unlock()
+
+	gap := ReplayGap{Since: since, Current: s.seq}
+	if s.ringLen > 0 {
+		gap.Oldest = s.seq - uint64(s.ringLen) + 1
+	}
+
+	switch {
+	case since > s.seq:
+		// The client's cursor predates this daemon process. Replaying nothing
+		// is the only honest answer; the gap tells it to re-snapshot.
+		gap.Reason = ReplayGapReset
+		return nil, gap
+	case since == s.seq:
+		return nil, gap
+	case s.ringLen == 0 || since+1 < gap.Oldest:
+		gap.Reason = ReplayGapTooOld
+	}
+
+	out := make([]Update, 0, s.ringLen)
+	// Walk the ring oldest-first: ringPos is the next write slot, so it is
+	// also the oldest entry once the buffer has wrapped.
+	start := (s.ringPos - s.ringLen + len(s.ring)) % len(s.ring)
+	for i := 0; i < s.ringLen; i++ {
+		u := s.ring[(start+i)%len(s.ring)]
+		if u.Seq > since {
+			out = append(out, u)
+		}
+	}
+	return out, gap
+}
+
 // Subscribe creates a new subscription channel for state updates.
 func (s *Store) Subscribe() chan Update {
 	s.mu.Lock()
@@ -1209,13 +1349,7 @@ func (s *Store) broadcastFocusLocked() {
 	for p := range aggSet {
 		agg = append(agg, p)
 	}
-	update := Update{Type: UpdateFocus, Source: "client", Scanned: len(agg), Payload: agg}
-	for ch := range s.subscribers {
-		select {
-		case ch <- update:
-		default:
-		}
-	}
+	s.publishLocked(Update{Type: UpdateFocus, Source: "client", Scanned: len(agg), Payload: agg})
 }
 
 // GetFocus returns the aggregated, non-expired focused workspace paths.
@@ -1279,17 +1413,11 @@ func (s *Store) BroadcastConfigReload(file string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	update := Update{
+	s.publishLocked(Update{
 		Type:    UpdateConfigReload,
 		Source:  "config",
 		Payload: file, // The file that changed
-	}
-	for ch := range s.subscribers {
-		select {
-		case ch <- update:
-		default:
-		}
-	}
+	})
 }
 
 // BroadcastThemeChanged sends a theme change notification to all subscribers.
@@ -1309,17 +1437,11 @@ func (s *Store) BroadcastThemeChanged(name string, palette *coredaemon.ThemeChan
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	update := Update{
+	s.publishLocked(Update{
 		Type:    UpdateThemeChanged,
 		Source:  "config",
 		Payload: palette,
-	}
-	for ch := range s.subscribers {
-		select {
-		case ch <- update:
-		default:
-		}
-	}
+	})
 }
 
 // BroadcastBootPhase fans a daemon boot-progress transition out to all
@@ -1331,15 +1453,9 @@ func (s *Store) BroadcastBootPhase(status interface{}) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	update := Update{
+	s.publishLocked(Update{
 		Type:    UpdateBootPhase,
 		Source:  "boot",
 		Payload: status,
-	}
-	for ch := range s.subscribers {
-		select {
-		case ch <- update:
-		default:
-		}
-	}
+	})
 }
