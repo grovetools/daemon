@@ -1,6 +1,6 @@
 module github.com/grovetools/daemon
 
-go 1.24.4
+go 1.25.0
 
 require (
 	github.com/charmbracelet/wish v1.4.7
@@ -9,7 +9,7 @@ require (
 	github.com/grovetools/core v0.6.3
 	github.com/grovetools/flow v0.6.3
 	github.com/grovetools/tuimux v0.0.1
-	github.com/grovetools/skills v0.6.3
+	github.com/grovetools/skills v0.6.1-0.20260727192925-24c2196cb16e
 	github.com/grovetools/tend v0.6.0
 	github.com/grovetools/memory v0.6.3
 	github.com/grovetools/grove-gemini v0.6.1
