@@ -31,6 +31,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/collector"
 	"github.com/grovetools/daemon/internal/daemon/engine"
 	daemonenv "github.com/grovetools/daemon/internal/daemon/env"
+	daemonhooks "github.com/grovetools/daemon/internal/daemon/hooks"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
 	"github.com/grovetools/daemon/internal/daemon/pairwatch"
@@ -1038,6 +1039,22 @@ func newGrovedStartCmd() *cobra.Command {
 						ulog.Info("Config watcher started").Log(ctx)
 						go configWatcher.Start(ctx)
 					}
+				}
+
+				// 7.2. The [[daemon.hooks.on_event]] dispatcher — the exec-side
+				// subscription to the same bus /api/stream serves. Started
+				// only when hooks are configured: an idle subscriber still
+				// costs a channel and a non-blocking send per store update.
+				// The reload closure re-reads config from disk rather than
+				// closing over the boot cfg, so hand-edited hooks hot-reload
+				// on config_reload (the same pattern SetSatelliteReloader
+				// uses). Values from untrusted workspace layers were already
+				// stripped by the exec-provenance gate inside LoadDefault.
+				eventDispatcher := daemonhooks.NewDispatcher(st, daemonhooks.NewExecutor(cfg), cfg, config.LoadDefault)
+				if eventDispatcher.HasHooks() {
+					eventDispatcher.Start(ctx)
+				} else {
+					ulog.Debug("No [[daemon.hooks.on_event]] hooks configured; dispatcher idle").Log(ctx)
 				}
 
 				advanceBoot(5) // watchers
