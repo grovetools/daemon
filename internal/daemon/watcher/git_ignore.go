@@ -99,11 +99,11 @@ type deadSubtreeCache struct {
 	// separate, bounded observer polls only these inputs and their nearest existing
 	// ancestors; they must never widen the recursive repository FSEvents stream.
 	// Exact/ancestor matching prevents unrelated sibling churn from causing scans.
-	excludeFiles  map[string]bool
-	configFiles   map[string]bool
-	watchChanged  chan struct{}
-	activeDirs    map[string]bool
-	requireActive bool
+	excludeFiles     map[string]bool
+	configFiles      map[string]bool
+	watchChanged     chan struct{}
+	activeInputPaths map[string]bool
+	requireActive    bool
 
 	queue chan probeRequest
 	ulog  *logging.UnifiedLogger
@@ -164,15 +164,15 @@ func newDeadSubtreeCache(ctx context.Context) *deadSubtreeCache {
 // install seams before anything reads them.
 func newDeadSubtreeCacheStopped() *deadSubtreeCache {
 	return &deadSubtreeCache{
-		repos:        make(map[string]*repoProofs),
-		lru:          list.New(),
-		excludeFiles: make(map[string]bool),
-		configFiles:  make(map[string]bool),
-		watchChanged: make(chan struct{}, 1),
-		activeDirs:   make(map[string]bool),
-		queue:        make(chan probeRequest, deadSubtreeQueueDepth),
-		ulog:         logging.NewUnifiedLogger("groved.watcher.git.deadsubtree"),
-		probeFn:      probeDeadSubtree,
+		repos:            make(map[string]*repoProofs),
+		lru:              list.New(),
+		excludeFiles:     make(map[string]bool),
+		configFiles:      make(map[string]bool),
+		watchChanged:     make(chan struct{}, 1),
+		activeInputPaths: make(map[string]bool),
+		queue:            make(chan probeRequest, deadSubtreeQueueDepth),
+		ulog:             logging.NewUnifiedLogger("groved.watcher.git.deadsubtree"),
+		probeFn:          probeDeadSubtree,
 	}
 }
 
@@ -251,7 +251,7 @@ func (c *deadSubtreeCache) ObserveGlobal(path string) bool {
 	if isConfig {
 		c.excludeFiles = make(map[string]bool)
 		c.configFiles = make(map[string]bool)
-		c.activeDirs = make(map[string]bool)
+		c.activeInputPaths = make(map[string]bool)
 		c.signalWatchChangedLocked()
 	} else if isAncestor {
 		// The target set is still valid, but its nearest existing watch directory
@@ -432,28 +432,20 @@ func (c *deadSubtreeCache) inputObservationPaths() []string {
 	return out
 }
 
-// inputWatchDirs describes the nearest-existing-ancestor coverage required by
-// the exact input set. It is also the proof-activation key used by the cache.
-func (c *deadSubtreeCache) inputWatchDirs() []string {
-	paths := c.inputObservationPaths()
-	roots := make(map[string]bool, len(paths))
-	for _, path := range paths {
-		roots[observationRoot(path)] = true
-	}
-	out := make([]string, 0, len(roots))
-	for root := range roots {
-		out = append(out, root)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func (c *deadSubtreeCache) activateInputWatchDirs(dirs []string) {
+// activateInputSnapshot generation-invalidates every proof and publishes the
+// exact canonical path set owned by one live observer while holding the same
+// lock. A probe from an older observer generation therefore cannot land after
+// the replacement, and a newly learned same-parent input remains fail-open
+// until a later observer snapshot contains that exact path.
+func (c *deadSubtreeCache) activateInputSnapshot(paths []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.activeDirs = make(map[string]bool, len(dirs))
-	for _, dir := range dirs {
-		c.activeDirs[dir] = true
+	c.clearProofsLocked()
+	c.activeInputPaths = make(map[string]bool, len(paths))
+	for _, path := range paths {
+		if path != "" {
+			c.activeInputPaths[resolveObservedInputPath(path)] = true
+		}
 	}
 }
 
@@ -540,7 +532,7 @@ func (c *deadSubtreeCache) record(req probeRequest, result probeResult) {
 				target[file] = true
 				changed = true
 			}
-			if c.requireActive && !c.activeDirs[observationRoot(file)] {
+			if c.requireActive && !c.activeInputPaths[file] {
 				inputsObservable = false
 			}
 		}

@@ -338,17 +338,74 @@ func TestDeadSubtreeProofWaitsForExternalWatchTopology(t *testing.T) {
 	if awaitVerdict(t, verdicts, repo, "dead") {
 		t.Fatal("proof became active before its external inputs were watched")
 	}
-	dirs := c.inputWatchDirs()
-	if len(dirs) == 0 {
+	paths := c.inputObservationPaths()
+	if len(paths) == 0 {
 		t.Fatal("probe did not request external watcher topology")
 	}
-	// This is the production rebuild ordering: clear generations, start the
-	// exact-input observer, then mark exactly its successful directories active.
-	c.dropAll()
-	c.activateInputWatchDirs(dirs)
+	// This is the production rebuild ordering: start the exact-input observer,
+	// then atomically invalidate proofs and publish its exact path snapshot.
+	c.activateInputSnapshot(paths)
 	c.Suppress(repo, event)
 	if !awaitVerdict(t, verdicts, repo, "dead") || !c.Suppress(repo, event) {
 		t.Fatal("proof did not become usable after watcher topology activation")
+	}
+}
+
+func TestDeadSubtreeNewSameParentInputWaitsForExactObserverSnapshot(t *testing.T) {
+	repo := gitInitRepo(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	global := filepath.Join(home, "global.gitconfig")
+	first := filepath.Join(home, "first.cfg")
+	second := filepath.Join(home, "second.cfg")
+	ignored := filepath.Join(home, "ignored")
+	writeFile(t, first, "")
+	writeFile(t, second, "")
+	writeFile(t, ignored, "dead/\n")
+	writeFile(t, global, "[core]\n\texcludesFile = "+ignored+"\n[include]\n\tpath = "+first+"\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	writeFile(t, filepath.Join(repo, "dead", "state.db"), "one")
+
+	c, verdicts := newTestDeadCache(t)
+	c.mu.Lock()
+	c.requireActive = true
+	c.mu.Unlock()
+	event := filepath.Join(repo, "dead", "state.db")
+
+	// Learn and activate the initial snapshot, which contains several paths under
+	// home. Parent-directory activation would incorrectly cover any later input.
+	c.Suppress(repo, event)
+	if awaitVerdict(t, verdicts, repo, "dead") {
+		t.Fatal("initial proof became active before observer snapshot")
+	}
+	c.activateInputSnapshot(c.inputObservationPaths())
+	c.Suppress(repo, event)
+	if !awaitVerdict(t, verdicts, repo, "dead") || !c.Suppress(repo, event) {
+		t.Fatal("initial exact observer snapshot did not authorize proof")
+	}
+
+	// Re-resolution learns a different include under the already-active parent.
+	// It must remain fail-open until a rebuilt observer publishes that exact path.
+	writeFile(t, global, "[core]\n\texcludesFile = "+ignored+"\n[include]\n\tpath = "+second+"\n")
+	c.drop(repo)
+	c.Suppress(repo, event)
+	if awaitVerdict(t, verdicts, repo, "dead") {
+		t.Fatal("new same-parent input authorized proof before exact observer rebuild")
+	}
+	second = resolveObservedInputPath(second)
+	c.mu.Lock()
+	learned, active := c.configFiles[second], c.activeInputPaths[second]
+	c.mu.Unlock()
+	if !learned || active {
+		t.Fatalf("new input state: learned=%v active=%v, want true/false", learned, active)
+	}
+
+	c.activateInputSnapshot(c.inputObservationPaths())
+	c.Suppress(repo, event)
+	if !awaitVerdict(t, verdicts, repo, "dead") || !c.Suppress(repo, event) {
+		t.Fatal("rebuilt exact observer snapshot did not authorize proof")
 	}
 }
 

@@ -38,7 +38,7 @@ func TestRecursiveGitEventPathsExcludeHomeRootAndExternalInputs(t *testing.T) {
 	c := newDeadSubtreeCacheStopped()
 	c.configFiles[resolveEventPath(filepath.Join(home, ".gitconfig"))] = true
 	c.excludeFiles[resolveEventPath(filepath.Join(home, ".config", "git", "ignore"))] = true
-	if dirs := c.inputWatchDirs(); len(dirs) == 0 {
+	if paths := c.inputObservationPaths(); len(paths) == 0 {
 		t.Fatal("exact-input observer did not receive external config inputs")
 	}
 	after := recursiveGitEventPaths(routes)
@@ -54,7 +54,7 @@ func TestRecursiveGitEventPathsExcludeHomeRootAndExternalInputs(t *testing.T) {
 
 func TestExactInputObserverDetectsTargetAndAncestorTransitions(t *testing.T) {
 	root := t.TempDir()
-	target := filepath.Join(root, "missing", "tree", "config")
+	target := resolveObservedInputPath(filepath.Join(root, "missing", "tree", "config"))
 	observer, err := newExactInputObserver([]string{target}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -100,6 +100,42 @@ func TestExactInputObserverDetectsTargetAndAncestorTransitions(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertChanged("target remove")
+}
+
+func TestExactInputObserverDetectsSameSizeMtimePreservedRewrite(t *testing.T) {
+	path := resolveObservedInputPath(filepath.Join(t.TempDir(), "gitconfig"))
+	if err := os.WriteFile(path, []byte("aaaa\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	observer, err := newExactInputObserver([]string{path}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Ensure the rewrite's change time cannot alias the construction snapshot,
+	// then restore mtime so only Darwin's change time exposes the transition.
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(path, []byte("bbbb\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(info, after) || info.Size() != after.Size() || info.ModTime() != after.ModTime() {
+		t.Fatalf("test did not preserve identity/size/mtime: before=%v after=%v", info, after)
+	}
+	changed := observer.Poll()
+	if len(changed) != 1 || changed[0] != path {
+		t.Fatalf("same-size mtime-preserved rewrite changed=%v, want [%s]", changed, path)
+	}
 }
 
 func TestExactInputObserverResourcesIgnoreUnrelatedSiblings(t *testing.T) {

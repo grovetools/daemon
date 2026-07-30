@@ -76,13 +76,12 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 
 	rebuild := func() error {
 		stop()
-		// No proof may survive a period outside either watcher topology. This also
+		// Disable activation before replacing either watcher topology. This also
 		// generation-invalidates probes that were in flight during the rebuild.
-		deadCache.dropAll()
+		deadCache.activateInputSnapshot(nil)
 		routes = buildGitEventRoutes(ctx, st.GetWorkspaces())
 		paths := recursiveGitEventPaths(routes)
 		if len(paths) == 0 {
-			deadCache.activateInputWatchDirs(nil)
 			return nil
 		}
 		stream = &fsevents.EventStream{
@@ -97,15 +96,17 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 		events = stream.Events
 
 		// Exact inputs are bounded by deadSubtreeMaxObservedFiles. If observer
-		// construction ever rejects the topology, no directory is activated and
-		// dead-subtree proofs safely remain disabled.
-		activeDirs := []string(nil)
+		// construction ever rejects the topology, no path is activated and
+		// dead-subtree proofs safely remain disabled. Publishing the exact snapshot
+		// and invalidating proofs under one cache lock closes both in-flight and
+		// same-parent learned-input races.
+		activePaths := []string(nil)
 		if observer, err := newExactInputObserver(deadCache.inputObservationPaths(), gitInputPollInterval); err == nil {
 			inputObserver = observer
 			inputEvents = observer.Events()
-			activeDirs = observer.ActiveDirs()
+			activePaths = observer.ActivePaths()
 		}
-		deadCache.activateInputWatchDirs(activeDirs)
+		deadCache.activateInputSnapshot(activePaths)
 		return nil
 	}
 	if err := rebuild(); err != nil {
