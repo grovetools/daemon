@@ -48,6 +48,26 @@ func (p *Persistence) saveLocked(job *models.JobInfo) {
 	_ = os.WriteFile(filepath.Join(p.dir, job.ID+".json"), b, 0o644) //nolint:gosec // G306: daemon state file
 }
 
+// Get reads a single persisted job record by ID, or nil when this daemon has
+// never written one (or the file is unreadable/corrupt). Callers that need one
+// known job must use this rather than filtering Load(): the state directory
+// accumulates a file per job ever submitted, so a full load is unbounded work
+// for a single lookup.
+func (p *Persistence) Get(jobID string) *models.JobInfo {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	b, err := os.ReadFile(filepath.Join(p.dir, jobID+".json")) //nolint:gosec // G304: ID-keyed daemon state file
+	if err != nil {
+		return nil
+	}
+	var j models.JobInfo
+	if json.Unmarshal(b, &j) != nil {
+		return nil
+	}
+	return &j
+}
+
 // Load reads all persisted job files from disk.
 func (p *Persistence) Load() []*models.JobInfo {
 	p.mu.Lock()

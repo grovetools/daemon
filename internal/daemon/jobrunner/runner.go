@@ -247,6 +247,25 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 		info.Channels = existing.Channels
 	}
 
+	// Same reasoning for routing, one step further out: a resubmission of a job
+	// this daemon has already run (a retry, or a re-run after an interrupted
+	// agent) must not lose the agent_target the first submission established.
+	// Belt and braces only — every submitter is still expected to tag its own
+	// jobs, and a genuinely untagged FIRST submission still fails hard in the
+	// executor, because there is nothing to recover and guessing a mux from the
+	// daemon's own environment would route agents into whatever terminal
+	// happened to start groved.
+	if info.AgentTarget == "" {
+		if recovered := jr.lastKnownAgentTarget(jobID); recovered != "" {
+			info.AgentTarget = recovered
+			jr.ulog.Info("Recovered agent_target from this job's previous submission").
+				Field("job_id", info.ID).
+				Field("agent_target", recovered).
+				Field("job_file", req.JobFile).
+				Log(ctx)
+		}
+	}
+
 	// Check if dependencies are met; if not, hold the job in the blocked queue.
 	if !jr.areDependenciesMet(info) {
 		info.Status = "blocked"
@@ -291,6 +310,31 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 		Log(ctx)
 
 	return info, nil
+}
+
+// lastKnownAgentTarget returns the agent_target a previous submission of this
+// job recorded, or "" when this daemon has never seen one.
+//
+// It consults both of the daemon's records because each is lossy in a different
+// way. The in-memory store row is authoritative immediately after a submit, but
+// both filesystem producers — the periodic JobCollector sweep and the flow
+// watcher's fsnotify path — republish jobs as JobInfo built from frontmatter
+// alone, which knows nothing of agent_target, and UpdateJobsDiscovered replaces
+// the row wholesale. The field is therefore gone from the store moments after
+// submission, which is exactly the window a retry lands in. The on-disk record
+// is written only by this runner, so it keeps the field until the next
+// submission overwrites it — which is also why this lookup must happen here, in
+// Submit, before Save() replaces it with the new record.
+func (jr *JobRunner) lastKnownAgentTarget(jobID string) string {
+	if existing := jr.store.GetJob(jobID); existing != nil && existing.AgentTarget != "" {
+		return existing.AgentTarget
+	}
+	if jr.persister != nil {
+		if saved := jr.persister.Get(jobID); saved != nil {
+			return saved.AgentTarget
+		}
+	}
+	return ""
 }
 
 // flowJobIdentity reads the Flow job's own identity — ID, type and title — from
