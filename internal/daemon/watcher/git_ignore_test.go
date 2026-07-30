@@ -428,8 +428,9 @@ func TestResolveIncludeTargetFormsAndUnsafeValues(t *testing.T) {
 			testOrigin = filepath.Join(linkDir, "config")
 		}
 		got, ok := resolveIncludeTarget(tc.value, testOrigin)
-		if ok != tc.ok || (ok && got != resolveEventPath(tc.want)) {
-			t.Errorf("resolveIncludeTarget(%q) = (%q, %v), want (%q, %v)", tc.value, got, ok, resolveEventPath(tc.want), tc.ok)
+		want := resolveObservedInputPath(tc.want)
+		if ok != tc.ok || (ok && got != want) {
+			t.Errorf("resolveIncludeTarget(%q) = (%q, %v), want (%q, %v)", tc.value, got, ok, want, tc.ok)
 		}
 	}
 	if _, ok := resolveIncludeTarget("relative.cfg", ""); ok {

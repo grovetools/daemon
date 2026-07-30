@@ -4,6 +4,7 @@ package watcher
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,7 +34,7 @@ func TestRecursiveGitEventPathsExcludeHomeRootAndExternalInputs(t *testing.T) {
 	}
 
 	// Even after external inputs are learned, the actual recursive path builder
-	// remains route-only. Those inputs are consumed by inputWatchDirs/fsnotify.
+	// remains route-only. Those inputs are consumed by the exact polling observer.
 	c := newDeadSubtreeCacheStopped()
 	c.configFiles[resolveEventPath(filepath.Join(home, ".gitconfig"))] = true
 	c.excludeFiles[resolveEventPath(filepath.Join(home, ".config", "git", "ignore"))] = true
@@ -48,6 +49,93 @@ func TestRecursiveGitEventPathsExcludeHomeRootAndExternalInputs(t *testing.T) {
 		if after[i] != paths[i] {
 			t.Fatalf("external inputs changed recursive FSEvents roots: before=%v after=%v", paths, after)
 		}
+	}
+}
+
+func TestExactInputObserverDetectsTargetAndAncestorTransitions(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "missing", "tree", "config")
+	observer, err := newExactInputObserver([]string{target}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+
+	assertChanged := func(label string) {
+		t.Helper()
+		changed := observer.Poll()
+		if len(changed) != 1 || changed[0] != target {
+			t.Fatalf("%s: changed=%v, want [%s]", label, changed, target)
+		}
+	}
+	if changed := observer.Poll(); len(changed) != 0 {
+		t.Fatalf("stable missing target changed: %v", changed)
+	}
+	if err := os.Mkdir(filepath.Join(root, "missing"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertChanged("ancestor create")
+	if err := os.Mkdir(filepath.Join(root, "missing", "tree"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	assertChanged("nearest ancestor create")
+	if err := os.WriteFile(target, []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	assertChanged("target create")
+	if err := os.WriteFile(target, []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	assertChanged("target write")
+	renamed := target + ".old"
+	if err := os.Rename(target, renamed); err != nil {
+		t.Fatal(err)
+	}
+	assertChanged("target rename away")
+	if err := os.Rename(renamed, target); err != nil {
+		t.Fatal(err)
+	}
+	assertChanged("target rename back")
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	assertChanged("target remove")
+}
+
+func TestExactInputObserverResourcesIgnoreUnrelatedSiblings(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "gitconfig")
+	for i := 0; i < 500; i++ {
+		name := filepath.Join(root, fmt.Sprintf("unrelated-%04d", i))
+		if err := os.WriteFile(name, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	countFDs := func() int {
+		entries, err := os.ReadDir("/dev/fd")
+		if err != nil {
+			t.Skipf("cannot inspect process descriptors: %v", err)
+		}
+		return len(entries)
+	}
+	before := countFDs()
+	observer, err := newExactInputObserver([]string{target}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	after := countFDs()
+	if delta := after - before; delta > 1 {
+		t.Fatalf("one exact input with 500 unrelated siblings grew descriptors by %d (before=%d after=%d)", delta, before, after)
+	}
+	if got := len(observer.states); got != 1 {
+		t.Fatalf("observer state grew with unrelated siblings: got %d entries, want 1", got)
+	}
+	if err := os.WriteFile(filepath.Join(root, "another-unrelated"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if changed := observer.Poll(); len(changed) != 0 {
+		t.Fatalf("unrelated sibling churn changed exact inputs: %v", changed)
 	}
 }
 

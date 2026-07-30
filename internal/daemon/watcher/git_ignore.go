@@ -96,8 +96,8 @@ type deadSubtreeCache struct {
 	// was invalidated cannot record a stale proof.
 	nextGen uint64
 	// excludeFiles and configFiles are exact input paths learned from git. A
-	// separate, non-recursive fsnotify observer watches their nearest existing
-	// parents; they must never widen the recursive repository FSEvents stream.
+	// separate, bounded observer polls only these inputs and their nearest existing
+	// ancestors; they must never widen the recursive repository FSEvents stream.
 	// Exact/ancestor matching prevents unrelated sibling churn from causing scans.
 	excludeFiles  map[string]bool
 	configFiles   map[string]bool
@@ -412,17 +412,32 @@ func (c *deadSubtreeCache) signalWatchChangedLocked() {
 	}
 }
 
-// inputWatchDirs returns the bounded, deduplicated non-recursive directory
-// topology needed to observe arbitrary git inputs. Watching the nearest existing
-// parent also observes delete/recreate without widening repository FSEvents.
-func (c *deadSubtreeCache) inputWatchDirs() []string {
+// inputObservationPaths returns the bounded exact file set consumed by the
+// Darwin polling observer. It is copied so polling never holds the cache lock.
+func (c *deadSubtreeCache) inputObservationPaths() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	roots := make(map[string]bool)
+	paths := make(map[string]bool, len(c.excludeFiles)+len(c.configFiles))
 	for path := range c.excludeFiles {
-		roots[observationRoot(path)] = true
+		paths[path] = true
 	}
 	for path := range c.configFiles {
+		paths[path] = true
+	}
+	out := make([]string, 0, len(paths))
+	for path := range paths {
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// inputWatchDirs describes the nearest-existing-ancestor coverage required by
+// the exact input set. It is also the proof-activation key used by the cache.
+func (c *deadSubtreeCache) inputWatchDirs() []string {
+	paths := c.inputObservationPaths()
+	roots := make(map[string]bool, len(paths))
+	for _, path := range paths {
 		roots[observationRoot(path)] = true
 	}
 	out := make([]string, 0, len(roots))
