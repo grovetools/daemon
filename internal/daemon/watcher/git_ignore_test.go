@@ -280,6 +280,130 @@ func TestDeadSubtreeIndexEventInvalidatesForceAdd(t *testing.T) {
 	}
 }
 
+func TestDeadSubtreeExternalExcludesAndConfigInvalidate(t *testing.T) {
+	repo := gitInitRepo(t)
+	externalDir := t.TempDir()
+	first := filepath.Join(externalDir, "ignore-one")
+	second := filepath.Join(externalDir, "ignore-two")
+	writeFile(t, first, "dead/\n")
+	writeFile(t, second, "dead/\n")
+	gitIn(t, repo, "config", "core.excludesFile", first)
+	writeFile(t, filepath.Join(repo, "dead", "state.db"), "one")
+
+	c, verdicts := newTestDeadCache(t)
+	event := filepath.Join(repo, "dead", "state.db")
+	c.Suppress(repo, event)
+	if !awaitVerdict(t, verdicts, repo, "dead") || !c.Suppress(repo, event) {
+		t.Fatal("external excludes file did not establish a dead proof")
+	}
+	if !c.ObserveGlobal(resolveEventPath(first)) {
+		t.Fatal("arbitrary external excludes file was not observable without a route")
+	}
+	if _, known := c.probeState(repo, "dead"); known {
+		t.Fatal("external excludes edit left a stale proof")
+	}
+
+	// Re-prove, then change the effective setting itself. The repository config
+	// source must invalidate and force re-resolution to the second arbitrary path.
+	c.Suppress(repo, event)
+	awaitVerdict(t, verdicts, repo, "dead")
+	gitIn(t, repo, "config", "core.excludesFile", second)
+	configPath := resolveEventPath(filepath.Join(repo, ".git", "config"))
+	if !c.ObserveGlobal(configPath) {
+		t.Fatal("effective config source change was not observable")
+	}
+	c.Suppress(repo, event)
+	awaitVerdict(t, verdicts, repo, "dead")
+	c.mu.Lock()
+	observesSecond := c.excludeFiles[resolveEventPath(second)]
+	c.mu.Unlock()
+	if !observesSecond {
+		t.Fatal("cache did not re-resolve the changed core.excludesFile")
+	}
+}
+
+func TestDeadSubtreeProofWaitsForExternalWatchTopology(t *testing.T) {
+	repo := gitInitRepo(t)
+	external := filepath.Join(t.TempDir(), "global-ignore")
+	writeFile(t, external, "dead/\n")
+	gitIn(t, repo, "config", "core.excludesFile", external)
+	writeFile(t, filepath.Join(repo, "dead", "state.db"), "one")
+
+	c, verdicts := newTestDeadCache(t)
+	c.mu.Lock()
+	c.requireActive = true
+	c.mu.Unlock()
+	event := filepath.Join(repo, "dead", "state.db")
+	c.Suppress(repo, event)
+	if awaitVerdict(t, verdicts, repo, "dead") {
+		t.Fatal("proof became active before its external inputs were watched")
+	}
+	roots := c.watchRoots()
+	if len(roots) == 0 {
+		t.Fatal("probe did not request external watcher topology")
+	}
+	// This is the production rebuild ordering: clear generations, start the
+	// stream, then mark exactly those input roots active.
+	c.dropAll()
+	c.activateWatchRoots(roots)
+	c.Suppress(repo, event)
+	if !awaitVerdict(t, verdicts, repo, "dead") || !c.Suppress(repo, event) {
+		t.Fatal("proof did not become usable after watcher topology activation")
+	}
+}
+
+func TestDeadSubtreeSymlinkWorkspaceIndexInvalidatesCanonicalKey(t *testing.T) {
+	repo := gitInitRepo(t)
+	writeFile(t, filepath.Join(repo, ".gitignore"), "local/\n")
+	writeFile(t, filepath.Join(repo, "local", "keep.sh"), "echo keep\n")
+	symlink := filepath.Join(t.TempDir(), "workspace-link")
+	if err := os.Symlink(repo, symlink); err != nil {
+		t.Fatal(err)
+	}
+	node := &workspace.WorkspaceNode{Name: "linked", Path: symlink, Kind: workspace.KindStandaloneProject}
+	routes := buildGitEventRoutes(context.Background(), []*models.EnrichedWorkspace{{WorkspaceNode: node}})
+	canonical := resolveEventPath(symlink)
+
+	c, verdicts := newTestDeadCache(t)
+	event := filepath.Join(canonical, "local", "keep.sh")
+	c.Suppress(canonical, event)
+	if !awaitVerdict(t, verdicts, canonical, "local") {
+		t.Fatal("ignored directory was not proven dead")
+	}
+	gitIn(t, repo, "add", "-f", "local/keep.sh")
+	index := resolveEventPath(filepath.Join(repo, ".git", "index"))
+	route, _ := routeGitEvent(index, routes)
+	if route == nil || !c.Observe(route, index) {
+		t.Fatal("symlink-addressed workspace index did not invalidate")
+	}
+	if _, known := c.probeState(canonical, "local"); known {
+		t.Fatal("index invalidation left the canonical cache key alive")
+	}
+}
+
+func TestDeadSubtreeTopologyRebuildDropsUnseenMutation(t *testing.T) {
+	repo := gitInitRepo(t)
+	writeFile(t, filepath.Join(repo, ".gitignore"), "dead/\n")
+	writeFile(t, filepath.Join(repo, "dead", "state.db"), "one")
+	c, verdicts := newTestDeadCache(t)
+	event := filepath.Join(repo, "dead", "state.db")
+	c.Suppress(repo, event)
+	if !awaitVerdict(t, verdicts, repo, "dead") || !c.Suppress(repo, event) {
+		t.Fatal("initial dead proof was not established")
+	}
+
+	// runGlobalGitEvents calls dropAll before every topology rebuild. Mutate while
+	// absent, then model re-add: no proof from the earlier topology may survive.
+	c.dropAll()
+	writeFile(t, filepath.Join(repo, ".gitignore"), "")
+	if c.Suppress(repo, event) {
+		t.Fatal("proof survived workspace removal and re-add")
+	}
+	if awaitVerdict(t, verdicts, repo, "dead") {
+		t.Fatal("unseen mutation was not reflected by the re-proof")
+	}
+}
+
 // The hot path must never do I/O. With a prober that never answers, Suppress
 // still returns immediately — and returns false, so the event scans.
 func TestDeadSubtreeCacheMissFailsOpenWithoutIO(t *testing.T) {
@@ -292,13 +416,13 @@ func TestDeadSubtreeCacheMissFailsOpenWithoutIO(t *testing.T) {
 	blocked := make(chan struct{})
 	entered := make(chan struct{}, 1)
 	c := newDeadSubtreeCacheStopped()
-	c.probeFn = func(context.Context, probeRequest) (bool, string) {
+	c.probeFn = func(context.Context, probeRequest) probeResult {
 		select {
 		case entered <- struct{}{}:
 		default:
 		}
 		<-blocked
-		return true, ""
+		return probeResult{dead: true}
 	}
 	go c.run(ctx)
 	defer close(blocked)

@@ -89,6 +89,10 @@ func buildGitEventRoutes(ctx context.Context, workspaces []*models.EnrichedWorks
 func resolveEventPath(path string) string {
 	if real, err := filepath.EvalSymlinks(path); err == nil {
 		path = real
+	} else if parent, parentErr := filepath.EvalSymlinks(filepath.Dir(path)); parentErr == nil {
+		// FSEvents can report a path after deletion. Canonicalizing its surviving
+		// parent keeps it comparable to roots discovered through symlinks.
+		path = filepath.Join(parent, filepath.Base(path))
 	}
 	return filepath.Clean(path)
 }

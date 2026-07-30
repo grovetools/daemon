@@ -23,6 +23,11 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 	var stream *fsevents.EventStream
 	var routes []gitEventRoute
 	var events <-chan []fsevents.Event
+
+	// One cache for the source lifetime. Topology rebuilds explicitly invalidate
+	// its proofs, and discovered external git inputs expand this same bounded
+	// recursive stream before those proofs are allowed to suppress.
+	deadCache := newDeadSubtreeCache(ctx)
 	stop := func() {
 		if stream != nil {
 			stream.Stop()
@@ -34,13 +39,28 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 
 	rebuild := func() error {
 		stop()
+		// No proof may survive a period outside the watcher topology. This also
+		// generation-invalidates probes that were in flight during the rebuild.
+		deadCache.dropAll()
 		routes = buildGitEventRoutes(ctx, st.GetWorkspaces())
-		if len(routes) == 0 {
-			return nil
-		}
 		paths := make([]string, 0, len(routes))
+		seen := make(map[string]bool)
 		for _, route := range routes {
-			paths = append(paths, route.root)
+			if !seen[route.root] {
+				paths = append(paths, route.root)
+				seen[route.root] = true
+			}
+		}
+		inputRoots := deadCache.watchRoots()
+		for _, root := range inputRoots {
+			if !seen[root] {
+				paths = append(paths, root)
+				seen[root] = true
+			}
+		}
+		if len(paths) == 0 {
+			deadCache.activateWatchRoots(nil)
+			return nil
 		}
 		stream = &fsevents.EventStream{
 			Paths:   paths,
@@ -51,17 +71,13 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 			stream = nil
 			return err
 		}
+		deadCache.activateWatchRoots(inputRoots)
 		events = stream.Events
 		return nil
 	}
 	if err := rebuild(); err != nil {
 		return err
 	}
-
-	// One cache for the life of the stream. It outlives topology rebuilds on
-	// purpose: proofs are keyed by (repo, directory), which a workspace-set
-	// change does not invalidate.
-	deadCache := newDeadSubtreeCache(ctx)
 
 	var topologyTimer *time.Timer
 	var topologyC <-chan time.Time
@@ -83,6 +99,12 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 				topologyTimer = time.NewTimer(gitEventTopologyDebounce)
 				topologyC = topologyTimer.C
 			}
+		case <-deadCache.watchChanged:
+			if topologyTimer != nil {
+				topologyTimer.Stop()
+			}
+			topologyTimer = time.NewTimer(gitEventTopologyDebounce)
+			topologyC = topologyTimer.C
 		case <-topologyC:
 			topologyC = nil
 			topologyTimer = nil
@@ -99,8 +121,10 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 			telemetry.RecordWatcherBatch(len(batch))
 			for _, event := range batch {
 				if event.Flags&(fsevents.MustScanSubDirs|fsevents.UserDropped|fsevents.KernelDropped) != 0 {
-					// A dropped/coalesced stream is a correctness signal: schedule every
-					// repo once. Per-repo debounce still bounds the resulting burst.
+					// A dropped/coalesced stream is a correctness signal: no proof may
+					// survive potentially unseen index/ignore/config writes. Schedule
+					// every repo once; per-repo debounce still bounds the burst.
+					deadCache.dropAll()
 					scheduled := 0
 					for _, route := range routes {
 						for _, node := range route.nodes {
@@ -116,6 +140,24 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 				// as internal. Textual .git suffixes are valid working-tree names.
 				path := resolveEventPath(event.Path)
 				route, nodes := routeGitEvent(path, routes)
+				// External ignore/config sources have no repository route. Match them
+				// first, invalidate fleet-wide, and schedule each workspace once so
+				// the effective status change is itself observable.
+				if deadCache.ObserveGlobal(path) {
+					scheduled := 0
+					seenNodes := make(map[string]bool)
+					for _, candidate := range routes {
+						for _, node := range candidate.nodes {
+							if node != nil && !seenNodes[node.Path] {
+								seenNodes[node.Path] = true
+								handler.scheduleScan(node)
+								scheduled++
+							}
+						}
+					}
+					telemetry.RecordWatcherMatched(scheduled)
+					continue
+				}
 				if !relevantGitEvent(route, path) {
 					continue
 				}

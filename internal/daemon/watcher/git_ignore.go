@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -94,19 +95,22 @@ type deadSubtreeCache struct {
 	// nextGen stamps each repo entry so a probe that finishes after its entry
 	// was invalidated cannot record a stale proof.
 	nextGen uint64
-	// excludeFiles is the set of resolved core.excludesFile paths seen across
-	// probes — usually one file for the whole machine, and on this fleet it lives
-	// inside a watched repository (~/.config/git/ignore). A write to one voids
-	// every repo's proofs, so it is checked as a single map lookup rather than by
-	// scanning entries.
-	excludeFiles map[string]bool
+	// excludeFiles and configFiles are exact input paths learned from git. Their
+	// parent directories are added to the one recursive FSEvents stream; exact
+	// matching here prevents unrelated files in those directories from causing
+	// scans. A bounded set keeps watcher topology bounded even with config includes.
+	excludeFiles  map[string]bool
+	configFiles   map[string]bool
+	watchChanged  chan struct{}
+	activeRoots   map[string]bool
+	requireActive bool
 
 	queue chan probeRequest
 	ulog  *logging.UnifiedLogger
 
 	// probeFn runs the two git questions. Indirected only so tests can avoid
 	// forking; production is probeDeadSubtree.
-	probeFn func(ctx context.Context, req probeRequest) (dead bool, excludesFile string)
+	probeFn func(ctx context.Context, req probeRequest) probeResult
 	// probed, when non-nil, is called after a verdict is recorded. Test seam for
 	// awaiting the async probe; production leaves it nil. Both seams are written
 	// before run() starts and never after, so the prober reads them race-free.
@@ -132,15 +136,26 @@ type probeRequest struct {
 	repoRoot string
 	dir      string
 	gen      uint64
-	// needExcludes asks the prober for this repo's core.excludesFile too, set
-	// only on the first probe of a repo so the lookup costs one fork per
-	// repository rather than one per directory.
+	// needExcludes asks the prober for this repo's external git inputs too, set
+	// only on the first probe of a repo.
 	needExcludes bool
 }
+
+type probeResult struct {
+	dead           bool
+	excludesFile   string
+	configFiles    []string
+	inputsComplete bool
+}
+
+const deadSubtreeMaxObservedFiles = deadSubtreeMaxRepos * 8
 
 // newDeadSubtreeCache starts the background prober, which exits on ctx.
 func newDeadSubtreeCache(ctx context.Context) *deadSubtreeCache {
 	c := newDeadSubtreeCacheStopped()
+	// Production proofs are usable only after every discovered external input's
+	// parent is installed in the live FSEvents topology.
+	c.requireActive = true
 	go c.run(ctx)
 	return c
 }
@@ -152,6 +167,9 @@ func newDeadSubtreeCacheStopped() *deadSubtreeCache {
 		repos:        make(map[string]*repoProofs),
 		lru:          list.New(),
 		excludeFiles: make(map[string]bool),
+		configFiles:  make(map[string]bool),
+		watchChanged: make(chan struct{}, 1),
+		activeRoots:  make(map[string]bool),
 		queue:        make(chan probeRequest, deadSubtreeQueueDepth),
 		ulog:         logging.NewUnifiedLogger("groved.watcher.git.deadsubtree"),
 		probeFn:      probeDeadSubtree,
@@ -176,31 +194,44 @@ func (c *deadSubtreeCache) Observe(route *gitEventRoute, path string) bool {
 	}
 	base := filepath.Base(path)
 	slashed := filepath.ToSlash(path)
-	switch {
-	case base == gitignoreName:
-	case strings.HasSuffix(slashed, "/info/exclude"):
-	case route.internal && base == "index":
-	default:
-		// core.excludesFile is an arbitrary path outside the repository, so it
-		// cannot be recognized by shape — only by having been resolved already.
-		c.mu.Lock()
-		hit := c.excludeFiles[path]
-		c.mu.Unlock()
-		if !hit {
-			return false
-		}
-		c.dropAll()
-		return true
+	if base != gitignoreName && !strings.HasSuffix(slashed, "/info/exclude") && !(route.internal && base == "index") {
+		return false
 	}
 
-	// A git-internal route fans out to every worktree sharing the commondir;
-	// a working-tree route's root IS its workspace path.
+	// A git-internal route fans out to every worktree sharing the commondir.
+	// Workspace paths are canonicalized exactly like suppression cache keys, so
+	// discovery through a symlink cannot leave the real-path proof behind.
 	c.drop(route.root)
 	for _, node := range route.nodes {
 		if node != nil {
-			c.drop(node.Path)
+			c.drop(resolveEventPath(node.Path))
 		}
 	}
+	return true
+}
+
+// ObserveGlobal recognizes arbitrary external ignore files and every active or
+// candidate git-config source learned by a probe. It intentionally works without
+// a repository route. Config changes also discard learned inputs: until a later
+// probe resolves and installs the new effective topology, the cache fails open.
+func (c *deadSubtreeCache) ObserveGlobal(path string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	isExclude, isConfig := c.excludeFiles[path], c.configFiles[path]
+	if !isExclude && !isConfig {
+		c.mu.Unlock()
+		return false
+	}
+	c.clearProofsLocked()
+	if isConfig {
+		c.excludeFiles = make(map[string]bool)
+		c.configFiles = make(map[string]bool)
+		c.activeRoots = make(map[string]bool)
+		c.signalWatchChangedLocked()
+	}
+	c.mu.Unlock()
 	return true
 }
 
@@ -339,8 +370,64 @@ func (c *deadSubtreeCache) drop(repoRoot string) {
 func (c *deadSubtreeCache) dropAll() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.clearProofsLocked()
+}
+
+func (c *deadSubtreeCache) clearProofsLocked() {
 	c.repos = make(map[string]*repoProofs)
 	c.lru.Init()
+}
+
+func (c *deadSubtreeCache) signalWatchChangedLocked() {
+	select {
+	case c.watchChanged <- struct{}{}:
+	default:
+	}
+}
+
+// watchRoots returns the bounded, deduplicated directory topology needed to
+// observe arbitrary git inputs. Watching parents also observes delete/recreate.
+func (c *deadSubtreeCache) watchRoots() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	roots := make(map[string]bool)
+	for path := range c.excludeFiles {
+		roots[observationRoot(path)] = true
+	}
+	for path := range c.configFiles {
+		roots[observationRoot(path)] = true
+	}
+	out := make([]string, 0, len(roots))
+	for root := range roots {
+		out = append(out, root)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (c *deadSubtreeCache) activateWatchRoots(roots []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.activeRoots = make(map[string]bool, len(roots))
+	for _, root := range roots {
+		c.activeRoots[root] = true
+	}
+}
+
+// observationRoot returns an existing directory. Config candidates are watched
+// even before creation, so their immediate parent may not exist yet.
+func observationRoot(path string) string {
+	root := resolveEventPath(filepath.Dir(path))
+	for {
+		if info, err := os.Stat(root); err == nil && info.IsDir() {
+			return root
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			return root
+		}
+		root = parent
+	}
 }
 
 // run is the single prober. Every fork the cache makes happens here.
@@ -350,11 +437,11 @@ func (c *deadSubtreeCache) run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case req := <-c.queue:
-			dead, excludesFile := c.probeFn(ctx, req)
+			result := c.probeFn(ctx, req)
 			if ctx.Err() != nil {
 				return
 			}
-			c.record(req, dead, excludesFile)
+			c.record(req, result)
 		}
 	}
 }
@@ -362,7 +449,7 @@ func (c *deadSubtreeCache) run(ctx context.Context) {
 // record stores a verdict, unless the repo entry was invalidated or evicted
 // while the probe ran — in which case the proof describes a state that no longer
 // exists and is discarded.
-func (c *deadSubtreeCache) record(req probeRequest, dead bool, excludesFile string) {
+func (c *deadSubtreeCache) record(req probeRequest, result probeResult) {
 	c.mu.Lock()
 	proofs, ok := c.repos[req.repoRoot]
 	if !ok || proofs.gen != req.gen {
@@ -370,12 +457,37 @@ func (c *deadSubtreeCache) record(req probeRequest, dead bool, excludesFile stri
 		return
 	}
 	delete(proofs.pending, req.dir)
+	inputsObservable := true
 	if req.needExcludes {
 		proofs.excludesResolved = true
-		if excludesFile != "" {
-			c.excludeFiles[excludesFile] = true
+		inputsObservable = result.inputsComplete
+		changed := false
+		addInput := func(file string, target map[string]bool) {
+			if file == "" {
+				return
+			}
+			file = resolveEventPath(file)
+			if len(c.excludeFiles)+len(c.configFiles) >= deadSubtreeMaxObservedFiles && !c.excludeFiles[file] && !c.configFiles[file] {
+				inputsObservable = false
+				return
+			}
+			if !target[file] {
+				target[file] = true
+				changed = true
+			}
+			if c.requireActive && !c.activeRoots[observationRoot(file)] {
+				inputsObservable = false
+			}
+		}
+		addInput(result.excludesFile, c.excludeFiles)
+		for _, file := range result.configFiles {
+			addInput(file, c.configFiles)
+		}
+		if changed {
+			c.signalWatchChangedLocked()
 		}
 	}
+	dead := result.dead && inputsObservable
 	if len(proofs.dirs) >= deadSubtreeMaxDirs {
 		proofs.dirs = make(map[string]bool)
 	}
@@ -412,14 +524,17 @@ func (c *deadSubtreeCache) probeState(repoRoot, dir string) (dead, known bool) {
 // core.excludesFile, so the cache knows which outside file invalidates it.
 //
 // Any error, any ambiguity, any timeout ⇒ not dead.
-func probeDeadSubtree(ctx context.Context, req probeRequest) (bool, string) {
+func probeDeadSubtree(ctx context.Context, req probeRequest) probeResult {
 	ctx, cancel := context.WithTimeout(ctx, deadSubtreeProbeTimeout)
 	defer cancel()
 
 	repoRoot, dir := req.repoRoot, req.dir
-	excludesFile := ""
+	result := probeResult{}
 	if req.needExcludes {
-		excludesFile = resolveExcludesFile(ctx, repoRoot)
+		var excludesOK, configOK bool
+		result.excludesFile, excludesOK = resolveExcludesFile(ctx, repoRoot)
+		result.configFiles, configOK = resolveConfigFiles(ctx, repoRoot)
+		result.inputsComplete = excludesOK && configOK
 	}
 
 	// check-ignore is index-aware by default: a directory holding a force-added
@@ -429,22 +544,66 @@ func probeDeadSubtree(ctx context.Context, req probeRequest) (bool, string) {
 	// path).
 	_, code, err := runGitProbe(ctx, repoRoot, "check-ignore", "-q", "--", dir)
 	if err != nil || code != 0 {
-		return false, excludesFile
+		return result
 	}
 	out, code, err := runGitProbe(ctx, repoRoot, "ls-files", "-z", "--", dir)
 	if err != nil || code != 0 {
-		return false, excludesFile
+		return result
 	}
-	return len(strings.Trim(string(out), "\x00")) == 0, excludesFile
+	result.dead = len(strings.Trim(string(out), "\x00")) == 0
+	return result
+}
+
+// resolveConfigFiles returns active include-expanded config origins plus
+// candidate global/system files that may not exist yet. Watching their parents
+// makes creation, removal, includes, and effective-value changes observable.
+func resolveConfigFiles(ctx context.Context, repoRoot string) ([]string, bool) {
+	files := make(map[string]bool)
+	out, code, err := runGitProbe(ctx, repoRoot, "config", "--show-origin", "--list", "--includes")
+	if err != nil || code != 0 {
+		return nil, false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		origin, _, _ := strings.Cut(line, "\t")
+		if strings.HasPrefix(origin, "file:") {
+			file := strings.TrimPrefix(origin, "file:")
+			if !filepath.IsAbs(file) {
+				file = filepath.Join(repoRoot, file)
+			}
+			files[resolveEventPath(file)] = true
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		files[resolveEventPath(filepath.Join(home, ".gitconfig"))] = true
+		xdg := os.Getenv("XDG_CONFIG_HOME")
+		if xdg == "" {
+			xdg = filepath.Join(home, ".config")
+		}
+		files[resolveEventPath(filepath.Join(xdg, "git", "config"))] = true
+	}
+	for _, candidate := range []string{os.Getenv("GIT_CONFIG_GLOBAL"), os.Getenv("GIT_CONFIG_SYSTEM"), "/etc/gitconfig"} {
+		if candidate != "" {
+			files[resolveEventPath(candidate)] = true
+		}
+	}
+	result := make([]string, 0, len(files))
+	for file := range files {
+		result = append(result, file)
+	}
+	sort.Strings(result)
+	return result, true
 }
 
 // resolveExcludesFile returns the repository's effective core.excludesFile, or
 // git's documented default location when the setting is unset. The path is
 // canonicalized the same way event paths are, so it can be compared to one.
-func resolveExcludesFile(ctx context.Context, repoRoot string) string {
+func resolveExcludesFile(ctx context.Context, repoRoot string) (string, bool) {
 	out, code, err := runGitProbe(ctx, repoRoot, "config", "--path", "--get", "core.excludesFile")
+	if err != nil || (code != 0 && code != 1) {
+		return "", false
+	}
 	file := ""
-	if err == nil && code == 0 {
+	if code == 0 {
 		file = strings.TrimSpace(string(out))
 	}
 	if file == "" {
@@ -453,7 +612,7 @@ func resolveExcludesFile(ctx context.Context, repoRoot string) string {
 		if base == "" {
 			home, err := os.UserHomeDir()
 			if err != nil {
-				return ""
+				return "", false
 			}
 			base = filepath.Join(home, ".config")
 		}
@@ -462,7 +621,7 @@ func resolveExcludesFile(ctx context.Context, repoRoot string) string {
 	if !filepath.IsAbs(file) {
 		file = filepath.Join(repoRoot, file)
 	}
-	return resolveEventPath(file)
+	return resolveEventPath(file), true
 }
 
 // runGitProbe runs one read-only git command in repoRoot and returns its stdout
