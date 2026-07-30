@@ -1,4 +1,4 @@
-package collector
+package jobattr
 
 import (
 	"testing"
@@ -61,14 +61,14 @@ func TestWorktreeResolutionIsOwnerRelativeAndOrderIndependent(t *testing.T) {
 
 	for name, nodes := range orders {
 		t.Run(name, func(t *testing.T) {
-			ix := newWorktreeIndex(nodes)
+			ix := NewIndex(nodes)
 
-			got, outcome := ix.resolve(a, "markdown-toc")
-			if outcome != worktreeResolved || got != wtA {
+			got, outcome := ix.Resolve(a, "markdown-toc")
+			if outcome != Resolved || got != wtA {
 				t.Fatalf("owner A resolved to %+v (outcome %v), want %+v", got, outcome, wtA)
 			}
-			got, outcome = ix.resolve(b, "markdown-toc")
-			if outcome != worktreeResolved || got != wtB {
+			got, outcome = ix.Resolve(b, "markdown-toc")
+			if outcome != Resolved || got != wtB {
 				t.Fatalf("owner B resolved to %+v (outcome %v), want %+v", got, outcome, wtB)
 			}
 		})
@@ -82,10 +82,10 @@ func TestWorktreeResolutionFromAWorktreeOwner(t *testing.T) {
 	a, b, wtA, wtB := collidingWorld()
 	siblingA := ecoWorktree(rootA, rootA+"/.grove-worktrees/perf-audit", "perf-audit")
 
-	ix := newWorktreeIndex([]*workspace.WorkspaceNode{b, wtB, a, wtA, siblingA})
+	ix := NewIndex([]*workspace.WorkspaceNode{b, wtB, a, wtA, siblingA})
 
-	got, outcome := ix.resolve(siblingA, "markdown-toc")
-	if outcome != worktreeResolved || got != wtA {
+	got, outcome := ix.Resolve(siblingA, "markdown-toc")
+	if outcome != Resolved || got != wtA {
 		t.Fatalf("worktree-owned plan resolved to %+v (outcome %v), want A's worktree %+v", got, outcome, wtA)
 	}
 }
@@ -99,11 +99,11 @@ func TestWorktreeResolutionReportsAmbiguityInsteadOfGuessing(t *testing.T) {
 	dup1 := ecoWorktree(rootA, rootA+"/.grove-worktrees/markdown-toc", "markdown-toc")
 	dup2 := ecoWorktree(rootA, rootA+"/nested/.grove-worktrees/markdown-toc", "markdown-toc")
 
-	ix := newWorktreeIndex([]*workspace.WorkspaceNode{a, dup1, dup2})
+	ix := NewIndex([]*workspace.WorkspaceNode{a, dup1, dup2})
 
-	got, outcome := ix.resolve(a, "markdown-toc")
-	if outcome != worktreeAmbiguous {
-		t.Fatalf("outcome = %v, want worktreeAmbiguous", outcome)
+	got, outcome := ix.Resolve(a, "markdown-toc")
+	if outcome != Ambiguous {
+		t.Fatalf("outcome = %v, want Ambiguous", outcome)
 	}
 	if got != nil {
 		t.Fatalf("ambiguous resolution returned a node: %+v", got)
@@ -119,9 +119,9 @@ func TestWorktreeResolutionPrefersWorktreeKind(t *testing.T) {
 	wt := ecoWorktree(rootA, rootA+"/.grove-worktrees/markdown-toc", "markdown-toc")
 
 	for _, nodes := range [][]*workspace.WorkspaceNode{{a, sub, wt}, {a, wt, sub}} {
-		ix := newWorktreeIndex(nodes)
-		got, outcome := ix.resolve(a, "markdown-toc")
-		if outcome != worktreeResolved || got != wt {
+		ix := NewIndex(nodes)
+		got, outcome := ix.Resolve(a, "markdown-toc")
+		if outcome != Resolved || got != wt {
 			t.Fatalf("resolved to %+v (outcome %v), want the worktree node", got, outcome)
 		}
 	}
@@ -132,10 +132,10 @@ func TestWorktreeResolutionPrefersWorktreeKind(t *testing.T) {
 // precise failure that persisted a grovetools plan pointing at a treemux path.
 func TestWorktreeResolutionMissNeverCrossesEcosystems(t *testing.T) {
 	a, b, _, wtB := collidingWorld()
-	ix := newWorktreeIndex([]*workspace.WorkspaceNode{a, b, wtB})
+	ix := NewIndex([]*workspace.WorkspaceNode{a, b, wtB})
 
-	got, outcome := ix.resolve(a, "markdown-toc")
-	if outcome != worktreeNotFound || got != nil {
+	got, outcome := ix.Resolve(a, "markdown-toc")
+	if outcome != NotFound || got != nil {
 		t.Fatalf("resolved to %+v (outcome %v), want a miss — %s belongs to another ecosystem", got, outcome, wtB.Path)
 	}
 }
@@ -148,9 +148,9 @@ func TestJobWorkspaceFieldsPersistOwnerPathOnCollision(t *testing.T) {
 	dupB := ecoWorktree(rootB, rootB+"/nested/.grove-worktrees/markdown-toc", "markdown-toc")
 
 	t.Run("unique hit adopts the worktree", func(t *testing.T) {
-		ix := newWorktreeIndex([]*workspace.WorkspaceNode{b, wtB, a, wtA})
-		wd, repo, branch, outcome := jobWorkspace(ix, a, "markdown-toc", rootA, "grovetools")
-		if outcome != worktreeResolved {
+		ix := NewIndex([]*workspace.WorkspaceNode{b, wtB, a, wtA})
+		wd, repo, branch, outcome := JobWorkspace(ix, a, "markdown-toc", rootA, "grovetools")
+		if outcome != Resolved {
 			t.Fatalf("outcome = %v, want resolved", outcome)
 		}
 		if wd != wtA.Path || repo != "markdown-toc" || branch != "markdown-toc" {
@@ -159,9 +159,9 @@ func TestJobWorkspaceFieldsPersistOwnerPathOnCollision(t *testing.T) {
 	})
 
 	t.Run("ambiguous keeps the owner path", func(t *testing.T) {
-		ix := newWorktreeIndex([]*workspace.WorkspaceNode{b, wtB, dupB})
-		wd, repo, branch, outcome := jobWorkspace(ix, b, "markdown-toc", rootB, "treemux")
-		if outcome != worktreeAmbiguous {
+		ix := NewIndex([]*workspace.WorkspaceNode{b, wtB, dupB})
+		wd, repo, branch, outcome := JobWorkspace(ix, b, "markdown-toc", rootB, "treemux")
+		if outcome != Ambiguous {
 			t.Fatalf("outcome = %v, want ambiguous", outcome)
 		}
 		if wd != rootB || repo != "treemux" {
@@ -173,9 +173,9 @@ func TestJobWorkspaceFieldsPersistOwnerPathOnCollision(t *testing.T) {
 	})
 
 	t.Run("foreign-only name keeps the owner path", func(t *testing.T) {
-		ix := newWorktreeIndex([]*workspace.WorkspaceNode{a, b, wtB})
-		wd, repo, branch, outcome := jobWorkspace(ix, a, "markdown-toc", rootA, "grovetools")
-		if outcome != worktreeNotFound {
+		ix := NewIndex([]*workspace.WorkspaceNode{a, b, wtB})
+		wd, repo, branch, outcome := JobWorkspace(ix, a, "markdown-toc", rootA, "grovetools")
+		if outcome != NotFound {
 			t.Fatalf("outcome = %v, want not-found", outcome)
 		}
 		if wd != rootA || repo != "grovetools" || branch != "markdown-toc" {
@@ -184,8 +184,8 @@ func TestJobWorkspaceFieldsPersistOwnerPathOnCollision(t *testing.T) {
 	})
 
 	t.Run("no worktree key leaves branch empty", func(t *testing.T) {
-		ix := newWorktreeIndex([]*workspace.WorkspaceNode{a, wtA})
-		wd, repo, branch, _ := jobWorkspace(ix, a, "", rootA, "grovetools")
+		ix := NewIndex([]*workspace.WorkspaceNode{a, wtA})
+		wd, repo, branch, _ := JobWorkspace(ix, a, "", rootA, "grovetools")
 		if wd != rootA || repo != "grovetools" || branch != "" {
 			t.Fatalf("WorkDir=%q Repo=%q Branch=%q, want %q/grovetools/<empty>", wd, repo, branch, rootA)
 		}

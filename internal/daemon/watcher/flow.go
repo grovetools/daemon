@@ -20,6 +20,7 @@ import (
 	"github.com/grovetools/core/pkg/worktreeregistry"
 	corestate "github.com/grovetools/core/state"
 	"github.com/grovetools/core/util/frontmatter"
+	"github.com/grovetools/daemon/internal/daemon/jobattr"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/enrichment"
 	"github.com/grovetools/flow/pkg/orchestration"
@@ -34,8 +35,15 @@ type FlowHandler struct {
 	locator *workspace.NotebookLocator
 	ulog    *logging.UnifiedLogger
 
-	// Maps watched path -> workspace node
+	// Maps watched path -> the workspace node that OWNS that path's plans.
+	// Many workspaces of one ecosystem resolve to a single centralized plans
+	// directory, so the value is chosen by sortPlanOwners rather than by
+	// whichever workspace happened to be registered last (see
+	// ComputeWatchPaths). watchedNodes is the node set the same computation
+	// saw, indexed for frontmatter `worktree:` resolution; it is replaced
+	// atomically with watchedPaths so a lookup can never mix generations.
 	watchedPaths map[string]*workspace.WorkspaceNode
+	watchedNodes *jobattr.Index
 	pathsMutex   sync.RWMutex
 
 	// Debounce timer + accumulated scope for the next refresh (guarded by
@@ -101,12 +109,26 @@ func (h *FlowHandler) Name() string {
 func (h *FlowHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) []string {
 	newWatches := make(map[string]*workspace.WorkspaceNode)
 
+	nodes := make([]*workspace.WorkspaceNode, 0, len(workspaces))
 	for _, ew := range workspaces {
-		node := ew.WorkspaceNode
-		if node == nil {
-			continue
+		if ew != nil && ew.WorkspaceNode != nil {
+			nodes = append(nodes, ew.WorkspaceNode)
 		}
+	}
+	// Registration order decides who owns a plans directory, and the caller's
+	// order is not an order at all: store.GetWorkspaces() materializes its
+	// slice by ranging a map, so it is a fresh permutation on every refresh.
+	// Every member repo and worktree of one ecosystem resolves to the SAME
+	// centralized plans directory (NotebookLocator.getContextNodeForPath maps
+	// them all onto the origin ecosystem's notebook workspace), so an
+	// unordered registration attributed that directory — and therefore every
+	// job discovered under it — to whichever workspace happened to land last.
+	// That is how a grovetools plan job was persisted against a `tuimux`
+	// checkout inside an unrelated worktree container.
+	sortPlanOwners(nodes)
 
+	claimed := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
 		plansDir, err := h.locator.GetPlansDir(node)
 		if err != nil || plansDir == "" {
 			continue
@@ -114,12 +136,22 @@ func (h *FlowHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 
 		// Centralized notebook workspaces can be reached through aliases. Register
 		// the resolved root because fsnotify reports target-path events on Darwin.
-		addWatchRecursive(resolveFlowWatchPath(plansDir), node, newWatches)
+		resolved := resolveFlowWatchPath(plansDir)
+		// First claim wins, and sortPlanOwners has already put the workspace
+		// that should win first. Claiming explicitly (rather than relying on
+		// addWatchRecursive's overwrite) keeps the rule readable and stops a
+		// later node from silently re-owning the directory's subpaths.
+		if _, dup := claimed[resolved]; dup {
+			continue
+		}
+		claimed[resolved] = struct{}{}
+		addWatchRecursive(resolved, node, newWatches)
 	}
 
 	h.pathsMutex.Lock()
 	previous := h.watchedPaths
 	h.watchedPaths = newWatches
+	h.watchedNodes = jobattr.NewIndex(nodes)
 	h.pathsMutex.Unlock()
 
 	// Watch-registration boundary: a live daemon log must be able to prove
@@ -257,21 +289,27 @@ func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 				job.Channels = meta.Channels
 			}
 
-			// Look up workspace from watched paths
+			// Attribute the job to a workspace. This is the same computation
+			// the JobCollector performs on its periodic sweep, and both
+			// publish under the same store key with last-write-wins, so it
+			// MUST go through the shared jobattr rule: any divergence makes a
+			// job's recorded workspace flip depending on which producer ran
+			// most recently.
+			//
+			// The plans directory only identifies the plan's OWNER workspace
+			// (one ecosystem, many members). The job's own frontmatter
+			// `worktree:` is the higher authority for which checkout the job
+			// actually runs in, resolved within the owner's ecosystem and
+			// deliberately degrading to the owner — never to a stranger — when
+			// the name is missing, unknown, or ambiguous.
 			h.pathsMutex.RLock()
-			for watchedPath, wsNode := range h.watchedPaths {
-				if strings.HasPrefix(event.Name, watchedPath+string(filepath.Separator)) || event.Name == watchedPath {
-					job.WorkDir = wsNode.Path
-					job.Repo = wsNode.Name
-					if meta.Worktree != "" {
-						job.Branch = meta.Worktree
-					} else if wsNode.IsWorktree() {
-						job.Branch = wsNode.Name
-					}
-					break
-				}
-			}
+			owner := h.ownerForPath(resolveFlowWatchPath(event.Name))
+			index := h.watchedNodes
 			h.pathsMutex.RUnlock()
+			if owner != nil {
+				job.WorkDir, job.Repo, job.Branch, _ = jobattr.JobWorkspace(
+					index, owner, meta.Worktree, owner.Path, owner.Name)
+			}
 
 			discoveredJobs = append(discoveredJobs, job)
 		}
@@ -339,15 +377,16 @@ func (h *FlowHandler) affectedPlansDirs(events []fsnotify.Event) map[string]stru
 	h.pathsMutex.RLock()
 	defer h.pathsMutex.RUnlock()
 	for _, event := range events {
-		eventPath := resolveFlowWatchPath(event.Name)
-		for watchedPath, wsNode := range h.watchedPaths {
-			if eventPath != watchedPath && !strings.HasPrefix(eventPath, watchedPath+string(filepath.Separator)) {
-				continue
-			}
-			if plansDir, err := h.locator.GetPlansDir(wsNode); err == nil && plansDir != "" {
-				dirs[plansDir] = struct{}{}
-			}
-			break
+		// One event belongs to exactly one plans directory, so the enclosing
+		// watch entry has to be the most specific one — first-match-over-a-map
+		// could scope the follow-up rescan to a different directory than the
+		// one that actually changed and leave the real edit unindexed.
+		owner := h.ownerForPath(resolveFlowWatchPath(event.Name))
+		if owner == nil {
+			continue
+		}
+		if plansDir, err := h.locator.GetPlansDir(owner); err == nil && plansDir != "" {
+			dirs[plansDir] = struct{}{}
 		}
 	}
 	return dirs
@@ -513,9 +552,19 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 	state := h.store.Get()
 
 	// Snapshot the watch set into unique plansDir -> workspace node targets.
+	// The first entry wins per directory, so the keys are visited in sorted
+	// order: the representative decides each row's WorkspaceRoot and selected
+	// plan, and those must not differ between two refreshes of an unchanged
+	// watch set.
 	h.pathsMutex.RLock()
+	watched := make([]string, 0, len(h.watchedPaths))
+	for path := range h.watchedPaths {
+		watched = append(watched, path)
+	}
+	sort.Strings(watched)
 	targets := make(map[string]*workspace.WorkspaceNode)
-	for _, wsNode := range h.watchedPaths {
+	for _, path := range watched {
+		wsNode := h.watchedPaths[path]
 		plansDir, err := h.locator.GetPlansDir(wsNode)
 		if err != nil || plansDir == "" {
 			continue
@@ -697,10 +746,59 @@ func (h *FlowHandler) refreshPlanStats(ctx context.Context, seq uint64) {
 	}
 }
 
+// sortPlanOwners orders workspaces so the first node claiming a shared plans
+// directory is the one that should own it.
+//
+// The preference is the same one NotebookLocator.ScanForAllPlans applies for
+// the JobCollector ("prefer main projects over worktrees"), expressed through
+// planWorkspaceRoot: a node that IS its own plan-workspace root is the
+// workspace the centralized plans directory is named after, while members and
+// worktrees merely inherit it. Path is the tiebreak purely so the result is
+// reproducible across daemon restarts — never a coin flip that files the same
+// job under a different workspace on the next scan.
+func sortPlanOwners(nodes []*workspace.WorkspaceNode) {
+	sort.Slice(nodes, func(i, j int) bool {
+		a, b := nodes[i], nodes[j]
+		ownsA := planWorkspaceRoot(a) == a.Path
+		ownsB := planWorkspaceRoot(b) == b.Path
+		if ownsA != ownsB {
+			return ownsA
+		}
+		if a.Path != b.Path {
+			return a.Path < b.Path
+		}
+		return a.Name < b.Name
+	})
+}
+
+// ownerForPath returns the workspace node owning the watched path that most
+// specifically contains eventPath, or nil when the path is unwatched.
+//
+// Most-specific wins: the watch set holds a plans directory AND each of its
+// plan subdirectories, so any job file matches several entries at once. Taking
+// whichever entry map iteration yielded first was arbitrary twice over — it
+// ignored prefix length, and it re-rolled on every event. Callers must hold
+// pathsMutex.
+func (h *FlowHandler) ownerForPath(eventPath string) *workspace.WorkspaceNode {
+	var best string
+	var owner *workspace.WorkspaceNode
+	for watchedPath, wsNode := range h.watchedPaths {
+		if eventPath != watchedPath && !strings.HasPrefix(eventPath, watchedPath+string(filepath.Separator)) {
+			continue
+		}
+		if owner != nil && len(watchedPath) <= len(best) {
+			continue
+		}
+		best, owner = watchedPath, wsNode
+	}
+	return owner
+}
+
 // planWorkspaceRoot returns the canonical owner identity for plan rows. Many
-// ecosystem members resolve to the same centralized plans directory, so the
-// map's representative node is intentionally arbitrary; row identity must
-// still be the parent ecosystem rather than whichever child won iteration.
+// ecosystem members resolve to the same centralized plans directory; the
+// representative node is picked deterministically by sortPlanOwners, and this
+// still normalizes it, so row identity is the parent ecosystem even when the
+// representative is a child checkout.
 func planWorkspaceRoot(node *workspace.WorkspaceNode) string {
 	if node == nil {
 		return ""

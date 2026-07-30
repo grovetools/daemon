@@ -12,6 +12,7 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/util/frontmatter"
+	"github.com/grovetools/daemon/internal/daemon/jobattr"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/sirupsen/logrus"
 )
@@ -91,7 +92,7 @@ func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger
 
 	var discoveredJobs []*models.JobInfo
 
-	index := newWorktreeIndex(provider.All())
+	index := jobattr.NewIndex(provider.All())
 
 	for _, scannedDir := range scannedDirs {
 		plansRootDir := scannedDir.Path
@@ -159,10 +160,12 @@ func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger
 				// Resolve workspace: if frontmatter specifies a worktree, find
 				// the matching workspace node for an accurate WorkDir. The
 				// lookup is constrained to the plan owner's own ecosystem —
-				// see worktreeIndex.resolve.
-				jobWorkDir, jobRepo, jobBranch, outcome := jobWorkspace(
+				// see jobattr.Index.Resolve. The flow watcher publishes the
+				// same rows from its fsnotify path and MUST use this same
+				// helper, or the two producers overwrite each other.
+				jobWorkDir, jobRepo, jobBranch, outcome := jobattr.JobWorkspace(
 					index, scannedDir.Owner, meta.Worktree, ownerWorkDir, ownerRepo)
-				if outcome == worktreeAmbiguous {
+				if outcome == jobattr.Ambiguous {
 					ulog.Warn("Ambiguous worktree name in job frontmatter; keeping owner-derived workspace").
 						Field("job_path", jobPath).
 						Field("worktree", meta.Worktree).
