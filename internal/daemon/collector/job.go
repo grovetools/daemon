@@ -20,16 +20,33 @@ import (
 // JobCollector scans the filesystem for idle/pending jobs and seeds the daemon store.
 // This ensures jobs created by `flow chat` (which only writes a markdown file)
 // are visible in the daemon's ListJobs API and the hooks TUI.
+//
+// It also reconciles job files stuck on an active status with nothing
+// alive behind them — see job_reconcile.go. That rides this collector's
+// existing sweep because it already re-parses every job's frontmatter,
+// so the extra work is one registry read per tick.
 type JobCollector struct {
 	interval time.Duration
+	// scope is this daemon's owning scope ("" == unscoped/global). The
+	// reconciliation sweep only touches jobs whose owning scope matches,
+	// exactly like the session reaper, so a scoped daemon can never
+	// rewrite another scope's job files.
+	scope string
+	// cfg supplies the reconciliation settings. Nil means defaults,
+	// which are report-only.
+	cfg *config.Config
+	// stateDir overrides paths.StateDir() for the session-registry read
+	// the reconciliation sweep does. Empty uses the real one; only
+	// tests set it.
+	stateDir string
 }
 
 // NewJobCollector creates a new JobCollector with the specified interval.
-func NewJobCollector(interval time.Duration) *JobCollector {
+func NewJobCollector(interval time.Duration, scope string, cfg *config.Config) *JobCollector {
 	if interval == 0 {
 		interval = 5 * time.Minute
 	}
-	return &JobCollector{interval: interval}
+	return &JobCollector{interval: interval, scope: scope, cfg: cfg}
 }
 
 func (c *JobCollector) Name() string { return "job" }
@@ -49,6 +66,10 @@ func (c *JobCollector) Run(ctx context.Context, st *store.Store, updates chan<- 
 				Payload: jobs,
 			}
 		}
+		// Reconcile job files claiming to run with nothing behind them.
+		// Runs after the store update so the sweep sees the freshest
+		// session picture it can.
+		c.sweepStuckJobFiles(ctx, ulog, st, jobs, time.Now())
 	}
 
 	// Wait for workspaces to be populated first

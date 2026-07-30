@@ -13,8 +13,10 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/process"
 	"github.com/grovetools/core/pkg/sessions"
+	"github.com/grovetools/core/pkg/sessions/health"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/telemetry"
+	"github.com/grovetools/flow/pkg/orchestration"
 )
 
 // PtyKiller is satisfied by any type that can terminate an out-of-process PTY
@@ -323,6 +325,13 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 					},
 				}
 
+				// The store now says interrupted, but the job file on
+				// disk still says "running" — and flow tooling reads
+				// the file, not the store. Reconcile it here so a
+				// reaped agent can't leave a phantom running job behind
+				// for anyone to trip over later.
+				c.reconcileJobFile(ctx, session)
+
 				// Clean up the crash recovery files. Prefer the native ID from the
 				// recovered registry metadata when this daemon's record lacks it.
 				//
@@ -380,6 +389,46 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				c.ulog.Debug("Slow PID verification detected").Field("duration", d).Log(ctx)
 			}
 		}
+	}
+}
+
+// reconcileJobFile flips a reaped session's job file out of its
+// "running" claim.
+//
+// The daemon's reaper has always marked the STORE interrupted, but the
+// job file kept saying running forever — that is exactly the
+// "87-commit.md running 23m" class of ghost, and it survived precisely
+// because nobody was watching. The reaper is the right place for it:
+// it has already assembled the evidence (seen-alive, N consecutive dead
+// PID reads, past the grace window) that justifies the write.
+//
+// Which status it flips to mirrors the jobrunner's adoption
+// philosophy: a turn-based job (chat/oneshot) is safely re-runnable so
+// it gets the terminal "interrupted"; an agent job gets the
+// non-terminal "orphaned" — "we lost it", not "it failed".
+//
+// Best-effort by design: a failure here must never stop the reap. Every
+// outcome is logged with the evidence so a wrong flip is diagnosable.
+func (c *SessionCollector) reconcileJobFile(ctx context.Context, session *models.Session) {
+	if session.JobFilePath == "" {
+		return
+	}
+	want := health.ReconciledStatusFor(session.Type)
+	changed, err := orchestration.ReconcileJobFile(session.JobFilePath, want)
+	switch {
+	case err != nil:
+		c.ulog.Warn("Failed to reconcile job file for reaped session").
+			Err(err).
+			Field("job_id", session.ID).
+			Field("job_file", session.JobFilePath).
+			Log(ctx)
+	case changed:
+		c.ulog.Info("Reconciled stuck job file after reaping its session").
+			Field("job_id", session.ID).
+			Field("job_file", session.JobFilePath).
+			Field("new_status", want).
+			Field("evidence", "session reaped: pid dead past grace window").
+			Log(ctx)
 	}
 }
 
