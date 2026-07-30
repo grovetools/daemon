@@ -338,17 +338,132 @@ func TestDeadSubtreeProofWaitsForExternalWatchTopology(t *testing.T) {
 	if awaitVerdict(t, verdicts, repo, "dead") {
 		t.Fatal("proof became active before its external inputs were watched")
 	}
-	roots := c.watchRoots()
-	if len(roots) == 0 {
+	dirs := c.inputWatchDirs()
+	if len(dirs) == 0 {
 		t.Fatal("probe did not request external watcher topology")
 	}
 	// This is the production rebuild ordering: clear generations, start the
-	// stream, then mark exactly those input roots active.
+	// exact-input observer, then mark exactly its successful directories active.
 	c.dropAll()
-	c.activateWatchRoots(roots)
+	c.activateInputWatchDirs(dirs)
 	c.Suppress(repo, event)
 	if !awaitVerdict(t, verdicts, repo, "dead") || !c.Suppress(repo, event) {
 		t.Fatal("proof did not become usable after watcher topology activation")
+	}
+}
+
+func TestDeadSubtreeMissingIncludeCreationInvalidatesProof(t *testing.T) {
+	repo := gitInitRepo(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	global := filepath.Join(home, "global.gitconfig")
+	missingInclude := filepath.Join(home, "missing.cfg")
+	ignored := filepath.Join(home, "ignored")
+	visible := filepath.Join(home, "visible")
+	writeFile(t, ignored, "dead/\n")
+	writeFile(t, visible, "")
+	writeFile(t, global, "[core]\n\texcludesFile = "+ignored+"\n[include]\n\tpath = missing.cfg\n[includeIf \"gitdir:/does/not/match/\"]\n\tpath = ~/conditional-missing.cfg\n")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	writeFile(t, filepath.Join(repo, "dead", "state.db"), "one")
+
+	c, verdicts := newTestDeadCache(t)
+	event := filepath.Join(repo, "dead", "state.db")
+	c.Suppress(repo, event)
+	if !awaitVerdict(t, verdicts, repo, "dead") || !c.Suppress(repo, event) {
+		t.Fatal("initial global excludes file did not establish a dead proof")
+	}
+	c.mu.Lock()
+	observesMissing := c.configFiles[resolveEventPath(missingInclude)]
+	observesConditional := c.configFiles[resolveEventPath(filepath.Join(home, "conditional-missing.cfg"))]
+	c.mu.Unlock()
+	if !observesMissing || !observesConditional {
+		t.Fatalf("declared include targets were not observed: regular=%v conditional=%v", observesMissing, observesConditional)
+	}
+
+	// The formerly missing include overrides core.excludesFile. Route its create
+	// through the same exact-input invalidator production uses.
+	writeFile(t, missingInclude, "[core]\n\texcludesFile = "+visible+"\n")
+	if !c.ObserveGlobal(resolveEventPath(missingInclude)) {
+		t.Fatal("missing include creation was not recognized as a config input")
+	}
+	if _, known := c.probeState(repo, "dead"); known {
+		t.Fatal("include creation left the old dead proof alive")
+	}
+	if c.Suppress(repo, event) {
+		t.Fatal("include creation suppressed before re-proof")
+	}
+	if awaitVerdict(t, verdicts, repo, "dead") {
+		t.Fatal("re-proof ignored the newly created include")
+	}
+	if c.Suppress(repo, event) {
+		t.Fatal("directory remained suppressed after include made it visible")
+	}
+}
+
+func TestResolveIncludeTargetFormsAndUnsafeValues(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	origin := filepath.Join(t.TempDir(), "config")
+	realDir := t.TempDir()
+	linkDir := filepath.Join(t.TempDir(), "config-link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		value string
+		want  string
+		ok    bool
+	}{
+		{value: "relative.cfg", want: filepath.Join(filepath.Dir(origin), "relative.cfg"), ok: true},
+		{value: "~/included.cfg", want: filepath.Join(home, "included.cfg"), ok: true},
+		{value: filepath.Join(home, "absolute.cfg"), want: filepath.Join(home, "absolute.cfg"), ok: true},
+		{value: "missing/tree/included.cfg", want: filepath.Join(realDir, "missing", "tree", "included.cfg"), ok: true},
+		{value: "", ok: false},
+		{value: "~another-user/config", ok: false},
+	} {
+		testOrigin := origin
+		if tc.value == "missing/tree/included.cfg" {
+			testOrigin = filepath.Join(linkDir, "config")
+		}
+		got, ok := resolveIncludeTarget(tc.value, testOrigin)
+		if ok != tc.ok || (ok && got != resolveEventPath(tc.want)) {
+			t.Errorf("resolveIncludeTarget(%q) = (%q, %v), want (%q, %v)", tc.value, got, ok, resolveEventPath(tc.want), tc.ok)
+		}
+	}
+	if _, ok := resolveIncludeTarget("relative.cfg", ""); ok {
+		t.Fatal("relative include without a file origin did not fail open")
+	}
+}
+
+func TestDeadSubtreeUnrelatedInputDirectoryChurnDoesNotInvalidate(t *testing.T) {
+	repo := gitInitRepo(t)
+	writeFile(t, filepath.Join(repo, ".gitignore"), "dead/\n")
+	writeFile(t, filepath.Join(repo, "dead", "state.db"), "one")
+	c, verdicts := newTestDeadCache(t)
+	event := filepath.Join(repo, "dead", "state.db")
+	c.Suppress(repo, event)
+	if !awaitVerdict(t, verdicts, repo, "dead") || !c.Suppress(repo, event) {
+		t.Fatal("dead proof was not established")
+	}
+
+	c.mu.Lock()
+	var configInput string
+	for path := range c.configFiles {
+		configInput = path
+		break
+	}
+	c.mu.Unlock()
+	if configInput == "" {
+		t.Fatal("probe learned no config input")
+	}
+	unrelated := filepath.Join(filepath.Dir(configInput), "unrelated-churn.tmp")
+	if c.ObserveGlobal(resolveEventPath(unrelated)) {
+		t.Fatal("unrelated sibling churn matched the exact-input observer")
+	}
+	if !c.Suppress(repo, event) {
+		t.Fatal("unrelated sibling churn invalidated a fleet-wide proof")
 	}
 }
 
