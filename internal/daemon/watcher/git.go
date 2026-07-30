@@ -80,7 +80,13 @@ type GitHandler struct {
 
 	// scanFn is the scan entry point, indirected ONLY so tests can count and
 	// stall scans without forking real git. Production is always scanAndEmit.
-	scanFn func(*workspace.WorkspaceNode)
+	// The state identity and generation let publication reject work made stale
+	// by a remove/re-add while preserving one serialization authority per path.
+	scanFn func(*workspace.WorkspaceNode, *scanState, uint64)
+
+	// beforeTimerScan is a deterministic test seam for the fired-timer eviction
+	// window. Production leaves it nil.
+	beforeTimerScan func()
 }
 
 // scanState is one workspace's scan serialization state. At most one scan runs
@@ -91,9 +97,13 @@ type GitHandler struct {
 // events have stopped is permanent staleness — the collector's reconciler is
 // hourly and scoped daemons never sweep at all.
 type scanState struct {
-	timer    *time.Timer
-	inFlight bool
-	rerun    bool
+	timer      *time.Timer
+	timerToken uint64
+	inFlight   bool
+	rerun      bool
+	live       bool
+	generation uint64
+	node       *workspace.WorkspaceNode
 }
 
 // NewGitHandler creates a GitHandler with a per-workspace trailing debounce.
@@ -111,7 +121,7 @@ func NewGitHandler(st *store.Store, debounceMs int) *GitHandler {
 		scanSem:      make(chan struct{}, gitlimits.Workers),
 		debounceMs:   debounceMs,
 	}
-	h.scanFn = h.scanAndEmit
+	h.scanFn = h.scanAndEmitCurrent
 	return h
 }
 
@@ -291,6 +301,13 @@ func (h *GitHandler) scheduleScan(node *workspace.WorkspaceNode) {
 	defer h.scansMutex.Unlock()
 
 	st := h.scanStateLocked(path)
+	// A retained tombstone is an in-flight scan for a workspace that is no
+	// longer in the store. Stale routes must not revive it; HandleStoreUpdate's
+	// first-sight path is the only operation that can make it live again.
+	if !st.live {
+		return
+	}
+	st.node = node
 	if st.inFlight {
 		// Coalesce. The rerun bit is what keeps this from dropping the event:
 		// the running scan re-runs exactly once after it finishes.
@@ -300,8 +317,13 @@ func (h *GitHandler) scheduleScan(node *workspace.WorkspaceNode) {
 	if st.timer != nil {
 		st.timer.Stop()
 	}
+	st.timerToken++
+	token := st.timerToken
 	st.timer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
-		h.beginScan(node)
+		if h.beforeTimerScan != nil {
+			h.beforeTimerScan()
+		}
+		h.beginTimerScan(node, st, token)
 	})
 }
 
@@ -310,7 +332,7 @@ func (h *GitHandler) scheduleScan(node *workspace.WorkspaceNode) {
 func (h *GitHandler) scanStateLocked(path string) *scanState {
 	st, ok := h.scans[path]
 	if !ok {
-		st = &scanState{}
+		st = &scanState{live: true}
 		h.scans[path] = st
 	}
 	return st
@@ -333,16 +355,38 @@ func (h *GitHandler) requestRerunLocked(st *scanState) {
 func (h *GitHandler) beginScan(node *workspace.WorkspaceNode) {
 	h.scansMutex.Lock()
 	st := h.scanStateLocked(node.Path)
-	// Clear the debounce slot. When this call IS the timer firing, Stop is a
-	// no-op; when it is HandleStoreUpdate's first-sight scan, it retires a
-	// pending timer whose request the about-to-start scan already covers — the
-	// scan observes state strictly later than the event that armed it. Nothing
-	// is dropped either way: a timer that already fired reaches beginScan, sees
-	// the in-flight slot taken, and becomes a trailing rerun.
+	if !st.live {
+		// Re-add the path without replacing its state: an old loop remains the
+		// serialization authority until it exits. Advancing the generation also
+		// prevents that old scan from publishing after the re-add.
+		st.live = true
+		st.generation++
+	}
+	st.node = node
 	if st.timer != nil {
 		st.timer.Stop()
 		st.timer = nil
 	}
+	h.beginScanLocked(st)
+}
+
+// beginTimerScan accepts only the exact timer and state that were armed. A
+// fired callback queued behind eviction therefore cannot recreate an absent
+// map entry or act on a later generation.
+func (h *GitHandler) beginTimerScan(node *workspace.WorkspaceNode, st *scanState, token uint64) {
+	h.scansMutex.Lock()
+	if h.scans[node.Path] != st || !st.live || st.timer == nil || st.timerToken != token {
+		h.scansMutex.Unlock()
+		return
+	}
+	st.timer = nil
+	st.node = node
+	h.beginScanLocked(st)
+}
+
+// beginScanLocked claims st or coalesces onto its existing loop, then releases
+// scansMutex. The caller must hold scansMutex.
+func (h *GitHandler) beginScanLocked(st *scanState) {
 	if st.inFlight {
 		h.requestRerunLocked(st)
 		h.scansMutex.Unlock()
@@ -350,8 +394,7 @@ func (h *GitHandler) beginScan(node *workspace.WorkspaceNode) {
 	}
 	st.inFlight = true
 	h.scansMutex.Unlock()
-
-	go h.scanLoop(node, st)
+	go h.scanLoop(st)
 }
 
 // scanLoop runs the workspace's scan, then one more for each pending rerun
@@ -359,20 +402,30 @@ func (h *GitHandler) beginScan(node *workspace.WorkspaceNode) {
 // lifetime, so exactly one of these loops exists per workspace at a time; N
 // overlapping requests collapse into "one scan per scan-duration, plus one
 // trailing catch-up".
-func (h *GitHandler) scanLoop(node *workspace.WorkspaceNode, st *scanState) {
+func (h *GitHandler) scanLoop(st *scanState) {
 	for {
+		h.scansMutex.Lock()
+		node, generation := st.node, st.generation
+		h.scansMutex.Unlock()
+
 		// The global bound is taken per scan rather than per loop so a repo
 		// being rescanned in a tight event storm cannot hold a slot forever.
 		// It is acquired OUTSIDE scanFn so the recorded scan duration measures
 		// the git work, not the time spent queued behind other workspaces.
 		h.scanSem <- struct{}{}
-		h.scanFn(node)
+		h.scanFn(node, st, generation)
 		<-h.scanSem
 
 		h.scansMutex.Lock()
-		// A state evicted by HandleStoreUpdate (workspace gone) ends the loop:
-		// the map no longer points at st, so nothing can request more work.
-		if !st.rerun || h.scans[node.Path] != st {
+		if !st.live {
+			st.inFlight = false
+			if h.scans[node.Path] == st {
+				delete(h.scans, node.Path)
+			}
+			h.scansMutex.Unlock()
+			return
+		}
+		if !st.rerun {
 			st.inFlight = false
 			h.scansMutex.Unlock()
 			return
@@ -384,7 +437,13 @@ func (h *GitHandler) scanLoop(node *workspace.WorkspaceNode, st *scanState) {
 
 // scanAndEmit re-runs GetExtendedStatus for one workspace and, if the status
 // differs from what the store holds, emits a WorkspaceDelta.
+// scanAndEmit is the synchronous test/helper entry point. Scheduled production
+// scans use scanAndEmitCurrent so eviction generations gate publication.
 func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
+	h.scanAndEmitCurrent(node, nil, 0)
+}
+
+func (h *GitHandler) scanAndEmitCurrent(node *workspace.WorkspaceNode, scanState *scanState, generation uint64) {
 	ctx := context.Background()
 	started := time.Now()
 	// emitted is flipped on the one path that publishes a delta; every other
@@ -446,15 +505,6 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		}
 	}
 
-	emitted = true
-	h.ulog.Debug("git watcher: emitting delta").
-		Field("path", node.Path).
-		Field("branch", status.Branch).
-		Field("dirty", status.IsDirty).
-		Field("ahead_main", status.AheadMainCount).
-		Field("behind_main", status.BehindMainCount).
-		Log(ctx)
-
 	delta := &models.WorkspaceDelta{Path: node.Path, GitStatus: status, GitLanding: landing}
 	if focused {
 		delta.ChangedFiles, delta.BlobHashes = files, hashes
@@ -462,12 +512,40 @@ func (h *GitHandler) scanAndEmit(node *workspace.WorkspaceNode) {
 		delta.ChangedFilesComputed = &computed
 	}
 
-	h.store.ApplyUpdate(store.Update{
-		Type:    store.UpdateWorkspacesDelta,
-		Source:  "git_watcher",
-		Scanned: 1,
-		Payload: []*models.WorkspaceDelta{delta},
+	h.publishIfCurrent(node.Path, scanState, generation, func() {
+		emitted = true
+		h.ulog.Debug("git watcher: emitting delta").
+			Field("path", node.Path).
+			Field("branch", status.Branch).
+			Field("dirty", status.IsDirty).
+			Field("ahead_main", status.AheadMainCount).
+			Field("behind_main", status.BehindMainCount).
+			Log(ctx)
+		h.store.ApplyUpdate(store.Update{
+			Type:    store.UpdateWorkspacesDelta,
+			Source:  "git_watcher",
+			Scanned: 1,
+			Payload: []*models.WorkspaceDelta{delta},
+		})
 	})
+}
+
+// publishIfCurrent makes the generation check and publication atomic with
+// eviction/re-add. Holding scansMutex across publish is intentional: otherwise
+// removal could advance the generation after the check but before ApplyUpdate,
+// allowing the old generation's stale delta to land last.
+func (h *GitHandler) publishIfCurrent(path string, st *scanState, generation uint64, publish func()) bool {
+	if st == nil { // synchronous helper/test scans have no eviction generation
+		publish()
+		return true
+	}
+	h.scansMutex.Lock()
+	defer h.scansMutex.Unlock()
+	if h.scans[path] != st || !st.live || st.generation != generation {
+		return false
+	}
+	publish()
+	return true
 }
 
 // maxFocusedChangedFiles caps how many changed files a focused repo may have
@@ -555,20 +633,26 @@ func (h *GitHandler) HandleStoreUpdate(update store.Update) {
 	h.knownPaths = known
 	h.knownPathsInitialized = true
 
-	// Prune scan state for workspaces that no longer exist. The old timers map
-	// was never deleted from, so it grew with every workspace ever seen. A scan
-	// still running for a pruned path holds its own *scanState pointer and
-	// simply finds itself evicted when it finishes (see scanLoop), so nothing
-	// is orphaned or left running.
+	// Prune scan state for workspaces that no longer exist. Pending states are
+	// deleted immediately. In-flight states remain as tombstones until their
+	// loop exits: retaining the same pointer is what serializes a remove/re-add
+	// and its advanced generation suppresses stale old-generation publication.
 	h.scansMutex.Lock()
 	for path, st := range h.scans {
 		if known[path] {
 			continue
 		}
+		st.live = false
+		st.generation++
+		st.rerun = false
 		if st.timer != nil {
 			st.timer.Stop()
+			st.timer = nil
+			st.timerToken++
 		}
-		delete(h.scans, path)
+		if !st.inFlight {
+			delete(h.scans, path)
+		}
 	}
 	h.scansMutex.Unlock()
 }

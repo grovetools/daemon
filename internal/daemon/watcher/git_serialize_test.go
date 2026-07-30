@@ -35,7 +35,7 @@ func newFakeScanner(buffer int) *fakeScanner {
 	}
 }
 
-func (f *fakeScanner) scan(node *workspace.WorkspaceNode) {
+func (f *fakeScanner) scan(node *workspace.WorkspaceNode, _ *scanState, _ uint64) {
 	f.mu.Lock()
 	f.started++
 	n := f.started
@@ -225,6 +225,118 @@ func TestGitHandlerGlobalSemaphoreCapsConcurrency(t *testing.T) {
 // per-path map was never deleted from, so it grew with every workspace ever
 // seen. HandleStoreUpdate already rebuilds knownPaths from the live set; the
 // scan state must shrink with it.
+// TestGitHandlerFiredTimerCannotResurrectEvictedState deterministically parks
+// a timer callback after it fires but before it claims scansMutex. Eviction
+// must make that exact callback stale; it may neither scan nor recreate state.
+func TestGitHandlerFiredTimerCannotResurrectEvictedState(t *testing.T) {
+	f := newFakeScanner(1)
+	h := fakeHandler(t, 1, f)
+	node := testNode("/repo/fired-timer")
+
+	callbackFired := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	h.beforeTimerScan = func() {
+		close(callbackFired)
+		<-releaseCallback
+	}
+	h.scheduleScan(node)
+	select {
+	case <-callbackFired:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for timer callback to fire")
+	}
+
+	h.HandleStoreUpdate(store.Update{
+		Type: store.UpdateWorkspaces, Source: "test",
+		Payload: map[string]*models.EnrichedWorkspace{},
+	})
+	close(releaseCallback)
+
+	f.expectNoEntry(t, 100*time.Millisecond, "an evicted fired timer was allowed to scan")
+	waitFor(t, "evicted fired-timer state to remain absent", func() bool {
+		h.scansMutex.Lock()
+		defer h.scansMutex.Unlock()
+		_, ok := h.scans[node.Path]
+		return !ok
+	})
+}
+
+// TestGitHandlerRemoveReaddRetainsAuthorityAndRejectsStalePublish covers the
+// eviction ABA: an in-flight old generation remains the sole scan authority,
+// cannot publish after re-add, and hands off to exactly one current catch-up.
+func TestGitHandlerRemoveReaddRetainsAuthorityAndRejectsStalePublish(t *testing.T) {
+	h := NewGitHandler(store.New(), 1).SetBroadCoverage(true)
+	oldNode := testNode("/repo/aba")
+	newNode := testNode("/repo/aba")
+
+	entered := make(chan uint64, 2)
+	release := make(chan struct{}, 2)
+	published := make(chan uint64, 2)
+	rejected := make(chan uint64, 2)
+	h.scanFn = func(node *workspace.WorkspaceNode, st *scanState, generation uint64) {
+		entered <- generation
+		<-release
+		if h.publishIfCurrent(node.Path, st, generation, func() { published <- generation }) {
+			return
+		}
+		rejected <- generation
+	}
+
+	// Make the path known, then start and hold generation zero.
+	h.HandleStoreUpdate(store.Update{
+		Type: store.UpdateWorkspaces, Source: "test",
+		Payload: map[string]*models.EnrichedWorkspace{oldNode.Path: {WorkspaceNode: oldNode}},
+	})
+	h.beginScan(oldNode)
+	oldGeneration := <-entered
+
+	// Remove and immediately re-add while the old scan is still running.
+	h.HandleStoreUpdate(store.Update{
+		Type: store.UpdateWorkspaces, Source: "test",
+		Payload: map[string]*models.EnrichedWorkspace{},
+	})
+	h.HandleStoreUpdate(store.Update{
+		Type: store.UpdateWorkspaces, Source: "test",
+		Payload: map[string]*models.EnrichedWorkspace{newNode.Path: {WorkspaceNode: newNode}},
+	})
+
+	select {
+	case generation := <-entered:
+		t.Fatalf("generation %d started concurrently with old generation %d", generation, oldGeneration)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// The old generation loses its publication race; only after it returns may
+	// the current generation's one catch-up enter and publish.
+	release <- struct{}{}
+	select {
+	case got := <-rejected:
+		if got != oldGeneration {
+			t.Fatalf("rejected generation = %d, want old generation %d", got, oldGeneration)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for stale generation rejection")
+	}
+	var currentGeneration uint64
+	select {
+	case currentGeneration = <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for current-generation catch-up")
+	}
+	if currentGeneration == oldGeneration {
+		t.Fatalf("catch-up reused stale generation %d", currentGeneration)
+	}
+	release <- struct{}{}
+	select {
+	case got := <-published:
+		if got != currentGeneration {
+			t.Fatalf("published generation = %d, want current %d", got, currentGeneration)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for current-generation publication")
+	}
+}
+
 func TestGitHandlerStoreUpdatePrunesScanState(t *testing.T) {
 	f := newFakeScanner(8)
 	// A long debounce keeps the scheduled scans pending so the test is asserting
