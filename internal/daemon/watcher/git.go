@@ -14,6 +14,7 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/daemon/internal/daemon/gitlimits"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/telemetry"
 )
@@ -60,9 +61,39 @@ type GitHandler struct {
 	// thousands of per-repository kqueue watches.
 	broadCoverage bool
 
-	debounceMs  int
-	timers      map[string]*time.Timer
-	timersMutex sync.Mutex
+	debounceMs int
+
+	// scans holds the per-workspace scan serialization state, keyed by
+	// workspace path. It replaces the old bare timers map, which had no
+	// in-flight tracking at all: time.Timer.Stop's return value was discarded,
+	// so a timer that had ALREADY FIRED was silently rearmed on top of the scan
+	// it started, and N events during one scan produced N concurrent scans of
+	// the same repository. Entries are pruned in HandleStoreUpdate.
+	scans      map[string]*scanState
+	scansMutex sync.Mutex
+
+	// scanSem bounds concurrent watcher scans across all workspaces, mirroring
+	// the collector's sweep pool (both sized from gitlimits.Workers). Without
+	// it, a fleet-wide burst of events fans out to one git process per touched
+	// repository at once.
+	scanSem chan struct{}
+
+	// scanFn is the scan entry point, indirected ONLY so tests can count and
+	// stall scans without forking real git. Production is always scanAndEmit.
+	scanFn func(*workspace.WorkspaceNode)
+}
+
+// scanState is one workspace's scan serialization state. At most one scan runs
+// at a time (inFlight); requests that arrive while it runs set rerun, which
+// buys exactly one trailing catch-up scan after it finishes. That trailing scan
+// is MANDATORY, not an optimization: events that arrived mid-scan may describe
+// state the running scan did not observe, and a dropped scan on a repo whose
+// events have stopped is permanent staleness — the collector's reconciler is
+// hourly and scoped daemons never sweep at all.
+type scanState struct {
+	timer    *time.Timer
+	inFlight bool
+	rerun    bool
 }
 
 // NewGitHandler creates a GitHandler with a per-workspace trailing debounce.
@@ -70,15 +101,18 @@ func NewGitHandler(st *store.Store, debounceMs int) *GitHandler {
 	if debounceMs <= 0 {
 		debounceMs = 150
 	}
-	return &GitHandler{
+	h := &GitHandler{
 		store:        st,
 		ulog:         logging.NewUnifiedLogger("groved.watcher.git"),
 		watchedPaths: make(map[string][]*workspace.WorkspaceNode),
 		knownPaths:   make(map[string]bool),
 		failedPaths:  make(map[string]bool),
-		timers:       make(map[string]*time.Timer),
+		scans:        make(map[string]*scanState),
+		scanSem:      make(chan struct{}, gitlimits.Workers),
 		debounceMs:   debounceMs,
 	}
+	h.scanFn = h.scanAndEmit
+	return h
 }
 
 func (h *GitHandler) Name() string {
@@ -248,18 +282,104 @@ func (h *GitHandler) HandleEvents(ctx context.Context, events []fsnotify.Event) 
 }
 
 // scheduleScan resets the per-workspace trailing debounce timer; when it fires
-// the workspace is rescanned and a delta emitted if changed.
+// the workspace is rescanned and a delta emitted if changed. If a scan for this
+// workspace is already running, no timer is armed and no second scan is
+// started: the request is folded into that scan's single trailing rerun.
 func (h *GitHandler) scheduleScan(node *workspace.WorkspaceNode) {
 	path := node.Path
-	h.timersMutex.Lock()
-	defer h.timersMutex.Unlock()
+	h.scansMutex.Lock()
+	defer h.scansMutex.Unlock()
 
-	if timer, ok := h.timers[path]; ok {
-		timer.Stop()
+	st := h.scanStateLocked(path)
+	if st.inFlight {
+		// Coalesce. The rerun bit is what keeps this from dropping the event:
+		// the running scan re-runs exactly once after it finishes.
+		h.requestRerunLocked(st)
+		return
 	}
-	h.timers[path] = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
-		h.scanAndEmit(node)
+	if st.timer != nil {
+		st.timer.Stop()
+	}
+	st.timer = time.AfterFunc(time.Duration(h.debounceMs)*time.Millisecond, func() {
+		h.beginScan(node)
 	})
+}
+
+// scanStateLocked returns (creating if needed) the scan state for path. Callers
+// must hold scansMutex.
+func (h *GitHandler) scanStateLocked(path string) *scanState {
+	st, ok := h.scans[path]
+	if !ok {
+		st = &scanState{}
+		h.scans[path] = st
+	}
+	return st
+}
+
+// requestRerunLocked sets the trailing-rerun bit, counting only the transition
+// so the counter reads as "scan requests that were coalesced away". Callers
+// must hold scansMutex.
+func (h *GitHandler) requestRerunLocked(st *scanState) {
+	st.rerun = true
+	telemetry.GitWatcherCoalesced.Inc()
+}
+
+// beginScan claims the workspace's in-flight slot and runs the scan loop in the
+// background, or — if a scan is already running — records a trailing rerun and
+// returns. It is the single entry point for actually scanning: both the
+// debounce timer and HandleStoreUpdate's first-sight path go through it, so no
+// caller can start a scan that bypasses the per-workspace guard or the global
+// semaphore. It never blocks the caller.
+func (h *GitHandler) beginScan(node *workspace.WorkspaceNode) {
+	h.scansMutex.Lock()
+	st := h.scanStateLocked(node.Path)
+	// Clear the debounce slot. When this call IS the timer firing, Stop is a
+	// no-op; when it is HandleStoreUpdate's first-sight scan, it retires a
+	// pending timer whose request the about-to-start scan already covers — the
+	// scan observes state strictly later than the event that armed it. Nothing
+	// is dropped either way: a timer that already fired reaches beginScan, sees
+	// the in-flight slot taken, and becomes a trailing rerun.
+	if st.timer != nil {
+		st.timer.Stop()
+		st.timer = nil
+	}
+	if st.inFlight {
+		h.requestRerunLocked(st)
+		h.scansMutex.Unlock()
+		return
+	}
+	st.inFlight = true
+	h.scansMutex.Unlock()
+
+	go h.scanLoop(node, st)
+}
+
+// scanLoop runs the workspace's scan, then one more for each pending rerun
+// request, until no request is outstanding. It owns st.inFlight for its whole
+// lifetime, so exactly one of these loops exists per workspace at a time; N
+// overlapping requests collapse into "one scan per scan-duration, plus one
+// trailing catch-up".
+func (h *GitHandler) scanLoop(node *workspace.WorkspaceNode, st *scanState) {
+	for {
+		// The global bound is taken per scan rather than per loop so a repo
+		// being rescanned in a tight event storm cannot hold a slot forever.
+		// It is acquired OUTSIDE scanFn so the recorded scan duration measures
+		// the git work, not the time spent queued behind other workspaces.
+		h.scanSem <- struct{}{}
+		h.scanFn(node)
+		<-h.scanSem
+
+		h.scansMutex.Lock()
+		// A state evicted by HandleStoreUpdate (workspace gone) ends the loop:
+		// the map no longer points at st, so nothing can request more work.
+		if !st.rerun || h.scans[node.Path] != st {
+			st.inFlight = false
+			h.scansMutex.Unlock()
+			return
+		}
+		st.rerun = false
+		h.scansMutex.Unlock()
+	}
 }
 
 // scanAndEmit re-runs GetExtendedStatus for one workspace and, if the status
@@ -417,9 +537,13 @@ func (h *GitHandler) HandleStoreUpdate(update store.Update) {
 		// broad coverage applies immediately only to workspaces discovered later.
 		if (h.knownPathsInitialized && h.broadCoverage) || h.store.IsFocused(path) {
 			// Scan asynchronously so workspace discovery never blocks the unified
-			// watcher's store-subscription loop.
+			// watcher's store-subscription loop. beginScan skips the debounce
+			// entirely — the first sight of a workspace is still scanned
+			// immediately — but it takes the same in-flight slot as an
+			// event-driven scan, so discovery and an fs event landing together
+			// cannot race two git passes over one repo.
 			h.ulog.Debug("git watcher: new workspace, immediate scan").Field("path", path).Log(context.Background())
-			go h.scanAndEmit(node)
+			h.beginScan(node)
 		}
 	}
 
@@ -430,6 +554,23 @@ func (h *GitHandler) HandleStoreUpdate(update store.Update) {
 	}
 	h.knownPaths = known
 	h.knownPathsInitialized = true
+
+	// Prune scan state for workspaces that no longer exist. The old timers map
+	// was never deleted from, so it grew with every workspace ever seen. A scan
+	// still running for a pruned path holds its own *scanState pointer and
+	// simply finds itself evicted when it finishes (see scanLoop), so nothing
+	// is orphaned or left running.
+	h.scansMutex.Lock()
+	for path, st := range h.scans {
+		if known[path] {
+			continue
+		}
+		if st.timer != nil {
+			st.timer.Stop()
+		}
+		delete(h.scans, path)
+	}
+	h.scansMutex.Unlock()
 }
 
 // OnStart logs handler startup; the initial watch set is established via

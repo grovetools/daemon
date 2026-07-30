@@ -57,6 +57,14 @@ var (
 	GitWatcherNoop   = Default().Counter("git.watcher_scan.noop")
 	GitWatcherEmit   = Default().Counter("git.watcher_scan.emitted")
 	GitWatcherFailed = Default().Counter("git.watcher_scan.failed")
+	// GitWatcherCoalesced counts scan requests that landed on a workspace whose
+	// scan was already running and were folded into its single trailing rerun
+	// instead of starting a concurrent one. It is deliberately ONE global
+	// counter, not one per repo: Registry.Counter get-or-creates with no cap or
+	// eviction and Snapshot() serializes every key into every /api/system/stats
+	// response, so 479 repos would permanently inflate the wire payload. The
+	// bounded per-repo door is WarningLedger.
+	GitWatcherCoalesced = Default().Counter("git.watcher_scan.coalesced")
 
 	// Blob hashing (the hash-object storm's signature).
 	BlobHashBatches = Default().Counter("git.blob_hash.batches")

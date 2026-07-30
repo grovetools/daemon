@@ -3,7 +3,6 @@ package collector
 import (
 	"context"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -11,13 +10,15 @@ import (
 	"github.com/grovetools/core/git"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/daemon/internal/daemon/gitlimits"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/telemetry"
 )
 
-// gitWorkers is the number of parallel git status workers.
-// Uses half of CPU cores (min 2, max 8) to stay unobtrusive.
-var gitWorkers = max(min(runtime.NumCPU()/2, 8), 2)
+// gitWorkers is the number of parallel git status workers. The size is shared
+// with the watcher's event-driven scan pool (see gitlimits) so the two bounds
+// cannot drift apart.
+var gitWorkers = gitlimits.Workers
 
 const (
 	// backgroundScanInterval is the correctness reconciler for the global
