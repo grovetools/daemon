@@ -52,34 +52,54 @@ func TestNoopStormRefreshesRatherThanRestarts(t *testing.T) {
 	if !active[0].Since.Equal(wantSince) {
 		t.Errorf("Since = %v, want %v (re-raise must not reset the clock)", active[0].Since, wantSince)
 	}
-	if want := fmt.Sprintf("%d no-op scans in %s", noopStormPerWindow*2, noopStormWindow); active[0].Offender != want {
-		t.Errorf("Offender = %q, want %q (the newest count)", active[0].Offender, want)
+	// Timestamp storage is deliberately capped at the threshold, so the text
+	// reports the exact decision count rather than an unbounded total.
+	if want := fmt.Sprintf("%d no-op scans in %s", noopStormPerWindow, noopStormWindow); active[0].Offender != want {
+		t.Errorf("Offender = %q, want %q (the bounded sliding count)", active[0].Offender, want)
 	}
 }
 
-// The window tumbles: scans spread thinly enough never accumulate.
-func TestNoopStormWindowTumbles(t *testing.T) {
+// Bursts straddling the old tumbling boundary must still trip the threshold
+// when they coexist inside one actual trailing five-minute interval.
+func TestNoopStormSlidesAcrossFormerBucketBoundary(t *testing.T) {
 	l, tr := NewWarningLedger(), newNoopStormTracker()
 	t0 := time.Unix(1_700_000_000, 0)
 
-	// Half a window's worth of no-ops, then another half a window later —
-	// twice the threshold in total, never more than half of it at once.
-	noopBurst(l, tr, "/repo", noopStormPerWindow-1, t0)
+	// Establish the old bucket at t0, then put its other 58 events immediately
+	// before that bucket's rollover. The 59 events after rollover share a real
+	// trailing window with those 58, even though a tumbling counter discards all
+	// of them at once.
+	recordNoopScan(l, tr, "/repo", t0)
+	noopBurst(l, tr, "/repo", noopStormPerWindow-2,
+		t0.Add(noopStormWindow-time.Duration(noopStormPerWindow-2)*time.Second))
 	noopBurst(l, tr, "/repo", noopStormPerWindow-1, t0.Add(noopStormWindow))
 
-	if got := l.activeAt(t0.Add(2 * noopStormWindow)); len(got) != 0 {
-		t.Fatalf("a repo below the rate in every window raised %d warnings: %+v", len(got), got)
+	active := l.activeAt(t0.Add(noopStormWindow + time.Minute))
+	if len(active) != 1 || active[0].Path != "/repo" {
+		t.Fatalf("boundary-spanning storm was missed: %+v", active)
+	}
+}
+
+// A genuinely sparse stream never has the threshold inside any trailing window.
+func TestNoopStormSparseStreamDoesNotAccumulate(t *testing.T) {
+	l, tr := NewWarningLedger(), newNoopStormTracker()
+	t0 := time.Unix(1_700_000_000, 0)
+	for i := 0; i < noopStormPerWindow*2; i++ {
+		recordNoopScan(l, tr, "/repo", t0.Add(time.Duration(i)*6*time.Second))
+	}
+	if got := l.activeAt(t0.Add(12 * time.Minute)); len(got) != 0 {
+		t.Fatalf("a sparse repo raised %d warnings: %+v", len(got), got)
 	}
 }
 
 // A storm that stops must stop re-raising, so the warning ages out by itself.
-func TestNoopStormStopsRaisingAfterWindowRollover(t *testing.T) {
+func TestNoopStormStopsRaisingAfterWindowExpires(t *testing.T) {
 	tr := newNoopStormTracker()
 	t0 := time.Unix(1_700_000_000, 0)
 	noopBurst(NewWarningLedger(), tr, "/repo", noopStormPerWindow, t0)
 
-	if n, storming := tr.record("/repo", t0.Add(noopStormWindow+time.Second)); storming {
-		t.Fatalf("count %d still storming after the window rolled over", n)
+	if n, storming := tr.record("/repo", t0.Add(2*noopStormWindow)); storming {
+		t.Fatalf("count %d still storming after every observation expired", n)
 	}
 }
 
@@ -97,6 +117,16 @@ func TestNoopTrackerIsBounded(t *testing.T) {
 	tr.mu.Unlock()
 	if got > noopTrackerCap {
 		t.Fatalf("tracker grew to %d entries, cap is %d", got, noopTrackerCap)
+	}
+
+	for i := 0; i < noopStormPerWindow*3; i++ {
+		tr.record("/hot", t0.Add(time.Duration(i)*time.Millisecond))
+	}
+	tr.mu.Lock()
+	stored := len(tr.windows["/hot"].times)
+	tr.mu.Unlock()
+	if stored > noopStormPerWindow {
+		t.Fatalf("hot path retained %d timestamps, threshold cap is %d", stored, noopStormPerWindow)
 	}
 }
 

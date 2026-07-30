@@ -51,17 +51,19 @@ const (
 	noopTrackerCap = 1024
 )
 
-// noopStormTracker counts per-repository no-op scans inside a tumbling
+// noopStormTracker counts per-repository no-op scans inside a true sliding
 // noopStormWindow. It is NOT a metric: nothing serializes it, it never leaves
 // this package, and its only output is the boolean that raises a warning.
+// Each repository retains at most noopStormPerWindow timestamps: once the
+// threshold is reached, only the newest threshold observations are needed to
+// decide whether the threshold remains met.
 type noopStormTracker struct {
 	mu      sync.Mutex
 	windows map[string]*noopWindow
 }
 
 type noopWindow struct {
-	count int
-	start time.Time // when the current tumbling window opened
+	times []time.Time
 	last  time.Time // last no-op seen, for eviction
 }
 
@@ -69,13 +71,12 @@ func newNoopStormTracker() *noopStormTracker {
 	return &noopStormTracker{windows: map[string]*noopWindow{}}
 }
 
-// record counts one no-op scan of path and returns the running count for the
-// current window plus whether it has reached noopStormPerWindow. Once the
-// threshold is crossed every subsequent no-op in the window reports true, so
-// the caller re-raises and the warning stays fresh (health warnings are
-// level-triggered — see warningTTL). When the window rolls over the count
-// restarts from zero, so a repository that stops storming stops re-raising and
-// its warning ages out on its own.
+// record counts one no-op scan of path and returns the bounded count in the
+// trailing window plus whether it has reached noopStormPerWindow. Events at
+// exactly now-noopStormWindow are outside the window. Once the threshold is
+// crossed, every subsequent no-op that leaves a threshold-sized trailing set
+// re-raises the level-triggered warning; when traffic stops, observations age
+// out individually rather than at an arbitrary bucket boundary.
 func (t *noopStormTracker) record(path string, now time.Time) (int, bool) {
 	if t == nil || path == "" {
 		return 0, false
@@ -84,17 +85,28 @@ func (t *noopStormTracker) record(path string, now time.Time) (int, bool) {
 	defer t.mu.Unlock()
 
 	w, ok := t.windows[path]
-	switch {
-	case !ok:
+	if !ok {
 		t.evictLocked(now)
-		w = &noopWindow{start: now}
+		w = &noopWindow{times: make([]time.Time, 0, noopStormPerWindow)}
 		t.windows[path] = w
-	case now.Sub(w.start) >= noopStormWindow:
-		w.count, w.start = 0, now
 	}
-	w.count++
+
+	cutoff := now.Add(-noopStormWindow)
+	first := 0
+	for first < len(w.times) && !w.times[first].After(cutoff) {
+		first++
+	}
+	if first > 0 {
+		copy(w.times, w.times[first:])
+		w.times = w.times[:len(w.times)-first]
+	}
+	if len(w.times) == noopStormPerWindow {
+		copy(w.times, w.times[1:])
+		w.times = w.times[:noopStormPerWindow-1]
+	}
+	w.times = append(w.times, now)
 	w.last = now
-	return w.count, w.count >= noopStormPerWindow
+	return len(w.times), len(w.times) >= noopStormPerWindow
 }
 
 // evictLocked makes room when the tally map is full, dropping windows that

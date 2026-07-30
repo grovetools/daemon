@@ -111,13 +111,14 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 					telemetry.RecordWatcherDropped(scheduled)
 					continue
 				}
-				if !relevantGitEvent(event.Path) {
-					continue
-				}
-				// Resolve once: routing, invalidation and suppression must all
-				// see the same canonical path as the route roots they compare to.
+				// Resolve and route before filtering: only a route built from git's
+				// actual gitdir/commondir identity may classify object or lock churn
+				// as internal. Textual .git suffixes are valid working-tree names.
 				path := resolveEventPath(event.Path)
 				route, nodes := routeGitEvent(path, routes)
+				if !relevantGitEvent(route, path) {
+					continue
+				}
 				telemetry.RecordWatcherMatched(len(nodes))
 				// Invalidation runs FIRST and always falls through to a scan: an
 				// ignore-rule or index write both voids cached proofs and is

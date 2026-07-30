@@ -128,8 +128,8 @@ func TestGitEventRoutingPrefersNestedRepository(t *testing.T) {
 	}
 }
 
-// A root registered as BOTH a workspace path and a git dir must latch internal:
-// "internal" only ever means "always scan", so ambiguity has to resolve that way.
+// A root registered as BOTH a workspace path and a git dir must latch internal,
+// preserving its proven gitdir identity and disabling working-tree suppression.
 func TestGitEventRoutesLatchInternalForAmbiguousRoots(t *testing.T) {
 	repo := gitInitRepo(t)
 	gitDir, commonDir, err := git.ResolveGitDirs(context.Background(), repo)
