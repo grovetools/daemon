@@ -24,6 +24,14 @@ const (
 	// backgroundScanInterval is the correctness reconciler for the global
 	// event-driven owner. Filesystem events provide freshness; this hourly pass
 	// only repairs dropped/coalesced events.
+	//
+	// It is ONE HOUR, and it runs on the global daemon ONLY — scan() returns
+	// immediately when c.scope != "", so a scoped daemon has no reconciler at
+	// all. This is the safety net any change to event routing or scan
+	// suppression is priced against: on the global daemon a wrongly-dropped
+	// event costs up to an hour of staleness, and on a scoped daemon it costs
+	// staleness until something explicitly refreshes that path. Do not read
+	// "the sweep will catch it" as a five-minute promise; it is not one.
 	backgroundScanInterval = time.Hour
 	// Focus must never invert into near-continuous polling for small sets.
 	focusedScanFloor = 5 * time.Second
@@ -329,10 +337,12 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		}
 	}
 
-	// scan is the global hourly correctness reconciler. Focus no longer causes
-	// timer-driven git forks: the recursive watcher and RefreshPaths are the
-	// latency/demand paths. Scoped collectors are passive RPC helpers and never
-	// run background scans.
+	// scan is the global HOURLY correctness reconciler — the ticker fires far
+	// more often (see currentInterval) but every tick before the hour is up
+	// returns here. Focus no longer causes timer-driven git forks: the
+	// recursive watcher and RefreshPaths are the latency/demand paths. Scoped
+	// collectors are passive RPC helpers and never run background scans, so on
+	// a scoped daemon this reconciler does not exist.
 	scan := func() {
 		if c.scope != "" || time.Since(lastFullScan) < backgroundScanInterval {
 			return
@@ -358,7 +368,9 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		state := st.Get()
 		toScan := c.scopedWorkspaces(state.Workspaces)
 		// See scan(): an empty pass (pre-discovery cold start) must not spend
-		// the background budget, or the first real scan waits ~5 minutes.
+		// the background budget, or the first real reconcile waits a full
+		// backgroundScanInterval — an hour, not the five minutes this comment
+		// used to claim.
 		if len(toScan) > 0 {
 			lastFullScan = time.Now()
 		}

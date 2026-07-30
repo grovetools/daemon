@@ -83,10 +83,56 @@ func routeGitEvent(path string, routes []gitEventRoute) []*workspace.WorkspaceNo
 // retain refs, HEAD, index, logs and packed-refs changes.
 func relevantGitEvent(path string) bool {
 	p := filepath.ToSlash(path)
-	if strings.Contains(p, "/.git/objects/") || strings.Contains(p, "/objects/") && strings.Contains(p, "/worktrees/") {
+	if inGitObjectDB(p) {
 		return false
 	}
 	return !strings.HasSuffix(p, ".lock")
+}
+
+// inGitObjectDB reports whether p lies inside a git object database: the
+// in-tree `.git/objects/`, or a linked worktree gitdir's `worktrees/<id>/
+// objects/`.
+//
+// The second form MUST be anchored to the gitdir layout. This condition was
+// once written as
+//
+//	strings.Contains(p, "/.git/objects/") || strings.Contains(p, "/objects/") && strings.Contains(p, "/worktrees/")
+//
+// which Go parses as A || (B && C) because && binds tighter than ||. Every
+// grove worktree lives under a literal `/worktrees/` path component, so C was
+// true for the entire fleet and the filter silently dropped ANY path
+// containing `/objects/` — including live working-tree files such as
+// .../worktrees/<plan>/grove-website/node_modules/axobject-query/lib/etc/objects/*.
+// Dropped events mean a repository's status silently stops refreshing until
+// something else wakes it, and on a scoped daemon nothing else does (the
+// collector's hourly reconciler is global-only; see collector.scan).
+func inGitObjectDB(p string) bool {
+	if strings.Contains(p, "/.git/objects/") {
+		return true
+	}
+	// Anchor on the git directory itself (".git", or "<name>.git" for a bare
+	// repository), then look for a worktrees/<id>/objects/ triple BELOW it with
+	// something inside — matching the containment semantics of the in-tree
+	// check above. Both anchors are required: a working tree can contain a
+	// directory named objects, and every grove worktree path contains
+	// "worktrees", but neither sits under a git dir.
+	segs := strings.Split(p, "/")
+	gitDir := -1
+	for i, s := range segs {
+		if s == ".git" || strings.HasSuffix(s, ".git") {
+			gitDir = i
+			break
+		}
+	}
+	if gitDir < 0 {
+		return false
+	}
+	for i := gitDir + 1; i+3 < len(segs); i++ {
+		if segs[i] == "worktrees" && segs[i+1] != "" && segs[i+2] == "objects" {
+			return true
+		}
+	}
+	return false
 }
 
 // RunGlobalGitEvents starts the platform recursive event source. It is called

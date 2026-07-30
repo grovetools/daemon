@@ -21,6 +21,7 @@ import (
 const (
 	CondSlowGitSweep     = "slow git status sweep"
 	CondSlowGitScan      = "slow git watcher scan"
+	CondNoopStorm        = "repeated no-op git scans"
 	CondLargeBlobHash    = "large file hashed on every scan"
 	CondHeapNearLimit    = "heap approaching GOMEMLIMIT"
 	CondWatcherStorm     = "filesystem event storm"
@@ -45,6 +46,11 @@ const (
 	// something is writing continuously inside a watched tree.
 	watcherStormPerMin = 20000
 )
+
+// gitWatcherNoops attributes no-op watcher scans to the repository causing
+// them. See noop_storm.go for why this is a bounded side table feeding the
+// WarningLedger rather than a per-repo counter.
+var gitWatcherNoops = newNoopStormTracker()
 
 var (
 	// Git status sweeps (collector: whole in-scope workspace set).
@@ -115,13 +121,17 @@ func RecordGitSweep(scope string, n int, d time.Duration) {
 	}
 }
 
-// RecordGitWatcherScan records one event-driven per-workspace scan.
+// RecordGitWatcherScan records one event-driven per-workspace scan. The path
+// is used for attribution only: a scan slower than slowScanMS names the repo,
+// and so does a repo whose no-op rate separates it from the fleet (the whole
+// point of a global 99%-no-op ratio is that it cannot tell you WHICH repo).
 func RecordGitWatcherScan(path string, d time.Duration, emitted bool) {
 	GitWatcherScan.ObserveDuration(d)
 	if emitted {
 		GitWatcherEmit.Inc()
 	} else {
 		GitWatcherNoop.Inc()
+		recordNoopScan(Default().Warnings(), gitWatcherNoops, path, time.Now())
 	}
 	if d.Milliseconds() >= slowScanMS {
 		Default().Warnings().Raise(path, CondSlowGitScan,
