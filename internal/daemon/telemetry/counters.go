@@ -88,6 +88,13 @@ var (
 	WatcherEventsMatched = Default().RateCounter("watcher.events.matched")
 	WatcherEventsDropped = Default().Counter("watcher.events.dropped")
 	WatcherBatches       = Default().Counter("watcher.batches")
+	// WatcherEventsSuppressed counts routed events dropped by dead-subtree
+	// suppression: the path lay under a directory git itself proved both ignored
+	// and free of tracked files, so a status scan could not have observed
+	// anything. Read against watcher.events.matched — the difference is the
+	// scans this fix removed — and against git.watcher_scan.emitted, which must
+	// NOT fall.
+	WatcherEventsSuppressed = Default().Counter("watcher.events.suppressed")
 
 	// Transcript parsing (the rescan-loop signature).
 	TranscriptConsidered = Default().RateCounter("transcript.considered")
@@ -178,6 +185,10 @@ func RecordWatcherBatch(raw int) {
 
 // RecordWatcherMatched records events that survived a handler's filter.
 func RecordWatcherMatched(n int) { WatcherEventsMatched.Add(int64(n)) }
+
+// RecordWatcherSuppressed records one event dropped as provably invisible to
+// git.
+func RecordWatcherSuppressed() { WatcherEventsSuppressed.Inc() }
 
 // RecordWatcherDropped records kernel-coalesced/dropped FSEvents batches,
 // which force a fan-out rescan of every route and are therefore a first-class

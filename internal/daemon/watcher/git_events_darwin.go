@@ -58,6 +58,11 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 		return err
 	}
 
+	// One cache for the life of the stream. It outlives topology rebuilds on
+	// purpose: proofs are keyed by (repo, directory), which a workspace-set
+	// change does not invalidate.
+	deadCache := newDeadSubtreeCache(ctx)
+
 	var topologyTimer *time.Timer
 	var topologyC <-chan time.Time
 	defer func() {
@@ -109,8 +114,23 @@ func runGlobalGitEvents(ctx context.Context, st *store.Store, handler *GitHandle
 				if !relevantGitEvent(event.Path) {
 					continue
 				}
-				nodes := routeGitEvent(event.Path, routes)
+				// Resolve once: routing, invalidation and suppression must all
+				// see the same canonical path as the route roots they compare to.
+				path := resolveEventPath(event.Path)
+				route, nodes := routeGitEvent(path, routes)
 				telemetry.RecordWatcherMatched(len(nodes))
+				// Invalidation runs FIRST and always falls through to a scan: an
+				// ignore-rule or index write both voids cached proofs and is
+				// itself news.
+				deadCache.Observe(route, path)
+				// !route.internal is the one place the .git split is enforced.
+				// Without it a .gitignore containing `index` or `HEAD` could
+				// suppress git-internal writes and grove would go blind to
+				// commits and branch switches.
+				if route != nil && !route.internal && deadCache.Suppress(route.root, path) {
+					telemetry.RecordWatcherSuppressed()
+					continue
+				}
 				for _, node := range nodes {
 					handler.scheduleScan(node)
 				}

@@ -19,13 +19,25 @@ import (
 type gitEventRoute struct {
 	root  string
 	nodes []*workspace.WorkspaceNode
+	// internal marks a root that is a git directory (the gitdir or the
+	// commondir) rather than a working tree. It exists so dead-subtree
+	// suppression can be confined to working-tree paths: HEAD, index and refs
+	// writes are how grove learns about commits and branch switches, and a
+	// .gitignore is free to contain patterns like `index` or `HEAD`.
+	//
+	// It LATCHES true. A root registered as BOTH a workspace path and a git dir
+	// (a bare or nested layout where node.Path IS the git dir) counts as
+	// internal, because "internal" is the fail-open direction: it only ever
+	// means "always scan".
+	internal bool
 }
 
 // buildGitEventRoutes builds the path-to-repository index used by the global
 // recursive event source. Both worktree contents and git internals are covered.
 func buildGitEventRoutes(ctx context.Context, workspaces []*models.EnrichedWorkspace) []gitEventRoute {
 	byRoot := make(map[string]map[string]*workspace.WorkspaceNode)
-	add := func(root string, node *workspace.WorkspaceNode) {
+	internalRoots := make(map[string]bool)
+	add := func(root string, node *workspace.WorkspaceNode, internal bool) {
 		if root == "" || node == nil {
 			return
 		}
@@ -37,6 +49,9 @@ func buildGitEventRoutes(ctx context.Context, workspaces []*models.EnrichedWorks
 			byRoot[root] = make(map[string]*workspace.WorkspaceNode)
 		}
 		byRoot[root][node.Path] = node
+		if internal {
+			internalRoots[root] = true
+		}
 	}
 	for _, ew := range workspaces {
 		if ew == nil || ew.WorkspaceNode == nil {
@@ -47,9 +62,9 @@ func buildGitEventRoutes(ctx context.Context, workspaces []*models.EnrichedWorks
 		if err != nil { // container/ecosystem rows are not repositories
 			continue
 		}
-		add(node.Path, node)
-		add(gitDir, node)
-		add(commonDir, node)
+		add(node.Path, node, false)
+		add(gitDir, node, true)
+		add(commonDir, node, true)
 	}
 	routes := make([]gitEventRoute, 0, len(byRoot))
 	for root, nodesByPath := range byRoot {
@@ -57,7 +72,7 @@ func buildGitEventRoutes(ctx context.Context, workspaces []*models.EnrichedWorks
 		for _, node := range nodesByPath {
 			nodes = append(nodes, node)
 		}
-		routes = append(routes, gitEventRoute{root: root, nodes: nodes})
+		routes = append(routes, gitEventRoute{root: root, nodes: nodes, internal: internalRoots[root]})
 	}
 	// Deepest root first makes nested repositories route to their actual owner,
 	// rather than also dirtying every containing ecosystem repository.
@@ -65,17 +80,31 @@ func buildGitEventRoutes(ctx context.Context, workspaces []*models.EnrichedWorks
 	return routes
 }
 
-func routeGitEvent(path string, routes []gitEventRoute) []*workspace.WorkspaceNode {
+// resolveEventPath canonicalizes one raw event path against the same
+// symlink-resolved, cleaned form buildGitEventRoutes stores its roots in.
+// Callers resolve ONCE and pass the result to routing, invalidation and
+// suppression alike: EvalSymlinks walks every path component, so doing it per
+// consumer would multiply a syscall on the daemon's highest-volume hot path,
+// and mixing resolved roots with unresolved paths breaks filepath.Rel.
+func resolveEventPath(path string) string {
 	if real, err := filepath.EvalSymlinks(path); err == nil {
 		path = real
 	}
-	path = filepath.Clean(path)
-	for _, route := range routes {
+	return filepath.Clean(path)
+}
+
+// routeGitEvent returns the deepest route containing path together with the
+// workspaces it affects. path must already be canonical (see resolveEventPath).
+// The route itself is returned because the caller needs its metadata — notably
+// route.internal, which gates suppression.
+func routeGitEvent(path string, routes []gitEventRoute) (*gitEventRoute, []*workspace.WorkspaceNode) {
+	for i := range routes {
+		route := &routes[i]
 		if path == route.root || strings.HasPrefix(path, route.root+string(filepath.Separator)) {
-			return route.nodes
+			return route, route.nodes
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // relevantGitEvent filters high-volume git object churn that cannot change the

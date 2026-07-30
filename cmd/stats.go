@@ -201,6 +201,7 @@ var counterHighlights = []struct{ key, label string }{
 	{"git.blob_hash.largest_offender_bytes", "largest blob"},
 	{"watcher.events.raw_per_min", "fs events/min"},
 	{"watcher.events.matched_per_min", "matched/min"},
+	{"watcher.events.suppressed", "suppressed (dead subtree)"},
 	{"transcript.parses_per_min", "transcript parses/min"},
 	{"git.divergence_cache.hit_rate", "divergence hit rate"},
 	{"logstream.workspace_tailers", "workspace tailers"},

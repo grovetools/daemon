@@ -100,12 +100,65 @@ func TestGitEventRoutingPrefersNestedRepository(t *testing.T) {
 		{root: inner.Path, nodes: []*workspace.WorkspaceNode{inner}},
 		{root: outer.Path, nodes: []*workspace.WorkspaceNode{outer}},
 	}
-	got := routeGitEvent("/code/ecosystem/repo/pkg/file.go", routes)
+	route, got := routeGitEvent("/code/ecosystem/repo/pkg/file.go", routes)
 	if len(got) != 1 || got[0] != inner {
 		t.Fatalf("nested event routed to %+v, want inner repository", got)
 	}
-	if got := routeGitEvent("/code/ecosystem-other/file", routes); len(got) != 0 {
+	if route == nil || route.root != inner.Path {
+		t.Fatalf("routing returned %+v, want the inner route itself", route)
+	}
+	if route.internal {
+		t.Fatalf("working-tree route reported internal=true; suppression would be disabled for every worktree path")
+	}
+	if _, got := routeGitEvent("/code/ecosystem-other/file", routes); len(got) != 0 {
 		t.Fatalf("path-boundary mismatch routed to %+v", got)
+	}
+
+	// A git dir is deeper than its worktree root, so an index write routes to the
+	// internal route — the flag that keeps dead-subtree suppression off git
+	// internals.
+	gitDir := gitEventRoute{root: inner.Path + "/.git", nodes: []*workspace.WorkspaceNode{inner}, internal: true}
+	deep := append([]gitEventRoute{gitDir}, routes...)
+	route, got = routeGitEvent("/code/ecosystem/repo/.git/index", deep)
+	if len(got) != 1 || got[0] != inner {
+		t.Fatalf("index event routed to %+v, want inner repository", got)
+	}
+	if route == nil || !route.internal {
+		t.Fatalf("git-dir route reported %+v, want internal=true", route)
+	}
+}
+
+// A root registered as BOTH a workspace path and a git dir must latch internal:
+// "internal" only ever means "always scan", so ambiguity has to resolve that way.
+func TestGitEventRoutesLatchInternalForAmbiguousRoots(t *testing.T) {
+	repo := gitInitRepo(t)
+	gitDir, commonDir, err := git.ResolveGitDirs(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("resolve git dirs: %v", err)
+	}
+	node := &workspace.WorkspaceNode{Name: filepath.Base(repo), Path: repo, Kind: workspace.KindStandaloneProject}
+	// A workspace whose path IS the git dir (bare/nested layouts) collides with
+	// the gitDir registration of the repository itself.
+	bare := &workspace.WorkspaceNode{Name: ".git", Path: gitDir, Kind: workspace.KindStandaloneProject}
+	routes := buildGitEventRoutes(context.Background(), []*models.EnrichedWorkspace{
+		{WorkspaceNode: node}, {WorkspaceNode: bare},
+	})
+
+	byRoot := make(map[string]gitEventRoute, len(routes))
+	for _, route := range routes {
+		byRoot[route.root] = route
+	}
+	if route, ok := byRoot[repo]; !ok || route.internal {
+		t.Fatalf("worktree root route = %+v (ok=%v), want internal=false", route, ok)
+	}
+	for _, dir := range []string{gitDir, commonDir} {
+		route, ok := byRoot[dir]
+		if !ok {
+			t.Fatalf("no route for git dir %q", dir)
+		}
+		if !route.internal {
+			t.Fatalf("git dir %q registered from both sides did not latch internal: %+v", dir, route)
+		}
 	}
 }
 
