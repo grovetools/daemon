@@ -8,7 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/pkg/exectrust"
 	"github.com/grovetools/core/pkg/worktreeregistry"
 	"github.com/grovetools/core/util/pathutil"
 )
@@ -42,6 +45,56 @@ func isTrusted(projects map[string]any, key string) bool {
 	return v
 }
 
+// trustWorktreeConfig approves the worktree's grove.toml in the exec-trust
+// store, the way `grove config trust --yes` does.
+//
+// [claude] is a RiskCapability field (core/config/execgate.go), so the
+// exec-provenance gate strips the whole block out of a project-layer
+// grove.toml the user has not reviewed — including manageTrust. That gate sits
+// in config.LoadFrom, which is exactly how handleSeedTrust resolves the
+// profile, so an untrusted fixture makes the handler no-op no matter what the
+// fixture says. Tests of the seeding path must open the gate first; the closed
+// gate has its own test below.
+//
+// GROVE_HOME (set by the callers) already redirects paths.StateDir(), and the
+// store lives there, so this never touches the developer's real trust
+// decisions.
+func trustWorktreeConfig(t *testing.T, worktreePath string) {
+	t.Helper()
+	cfg, err := config.LoadFrom(worktreePath)
+	if err != nil {
+		t.Fatalf("load worktree config: %v", err)
+	}
+	if cfg.ExecGate == nil || len(cfg.ExecGate.Files) == 0 {
+		t.Fatalf("no gated config files found under %s — fixture is not exercising the gate", worktreePath)
+	}
+	store := exectrust.Load()
+	now := time.Now()
+	trusted := 0
+	for _, f := range cfg.ExecGate.Files {
+		// Only the fixture's own file. The developer's ecosystem config can
+		// also land in this report when the test runs from a real checkout,
+		// and trusting that would be a side effect, not a fixture.
+		if filepath.Dir(f.Path) != worktreePath {
+			continue
+		}
+		store.Trust(f.Path, f.Digest, now)
+		trusted++
+	}
+	if trusted == 0 {
+		t.Fatalf("worktree grove.toml under %s carried no gated values to trust", worktreePath)
+	}
+	if err := store.Save(); err != nil {
+		t.Fatalf("save exec-trust store: %v", err)
+	}
+	// LoadFrom memoizes by startDir for 2s (config/config.go loadCache), and the
+	// load above just cached the PRE-trust verdict for this very path. Without
+	// this the handler would be handed the gated config it is meant to no
+	// longer get, and the test would fail for a reason that has nothing to do
+	// with trust.
+	config.ResetLoadCache()
+}
+
 // seedTrustTestEnv isolates StateDir (registry) and HOME (~/.claude.json) under
 // temp dirs so the handler never touches the developer's real registry or
 // trust file. It returns the worktree container path and the canonical trust
@@ -62,6 +115,9 @@ func seedTrustTestEnv(t *testing.T, repos []string) (home, worktreePath string, 
 	if err := os.WriteFile(filepath.Join(worktreePath, "grove.toml"), []byte("[claude]\nmanageTrust = true\n"), 0o644); err != nil {
 		t.Fatalf("write grove.toml: %v", err)
 	}
+	// ...and approve it, or the exec gate strips [claude] before the handler
+	// ever sees manageTrust. See trustWorktreeConfig.
+	trustWorktreeConfig(t, worktreePath)
 	for _, r := range repos {
 		if err := os.MkdirAll(filepath.Join(worktreePath, r), 0o755); err != nil {
 			t.Fatalf("mkdir repo %s: %v", r, err)
@@ -170,6 +226,10 @@ func TestHandleSeedTrustSkipsWhenManageTrustDisabled(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(worktreePath, "grove.toml"), []byte("[claude.permissions]\nallow = [\"Bash(git:*)\"]\n"), 0o644); err != nil {
 		t.Fatalf("write grove.toml: %v", err)
 	}
+	// Trust it, so this test fails for ITS OWN reason. Untrusted, the exec gate
+	// would strip [claude] wholesale and the no-op would prove nothing about
+	// the manageTrust gate.
+	trustWorktreeConfig(t, worktreePath)
 	if err := worktreeregistry.Save(&worktreeregistry.Entry{AbsPath: worktreePath, Repos: []string{"core"}}); err != nil {
 		t.Fatalf("save registry entry: %v", err)
 	}
@@ -180,6 +240,42 @@ func TestHandleSeedTrustSkipsWhenManageTrustDisabled(t *testing.T) {
 	}
 	if projects := readClaudeProjects(t, home); projects != nil {
 		t.Errorf("manageTrust disabled but ~/.claude.json projects were written: %v", projects)
+	}
+}
+
+// TestHandleSeedTrustSkipsWhenConfigUntrusted proves the exec-provenance gate
+// reaches this handler: a worktree that asks for manageTrust in a grove.toml
+// the user has NOT approved gets nothing. [claude] is a RiskCapability field,
+// so config.LoadFrom strips the block from the untrusted project layer and the
+// handler sees no manageTrust to act on.
+//
+// This is the behaviour that makes the gate worth having here — a repo cloned
+// into an ecosystem cannot grant itself Claude folder-trust by shipping a
+// grove.toml. It also means grove-managed trust needs `grove config trust`
+// once per config file before it propagates.
+func TestHandleSeedTrustSkipsWhenConfigUntrusted(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	worktreePath := filepath.Join(t.TempDir(), "my-worktree")
+	if err := os.MkdirAll(filepath.Join(worktreePath, "core"), 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	// manageTrust=true, but deliberately NOT trusted.
+	if err := os.WriteFile(filepath.Join(worktreePath, "grove.toml"), []byte("[claude]\nmanageTrust = true\n"), 0o644); err != nil {
+		t.Fatalf("write grove.toml: %v", err)
+	}
+	if err := worktreeregistry.Save(&worktreeregistry.Entry{AbsPath: worktreePath, Repos: []string{"core"}}); err != nil {
+		t.Fatalf("save registry entry: %v", err)
+	}
+
+	rec := postSeedTrust(t, map[string]any{"worktree_ref": worktreePath})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if projects := readClaudeProjects(t, home); projects != nil {
+		t.Errorf("untrusted grove.toml but ~/.claude.json projects were written: %v", projects)
 	}
 }
 

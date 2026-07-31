@@ -62,6 +62,16 @@ func (s *Server) handleSeedTrust(w http.ResponseWriter, r *http.Request) {
 	// privileged surface, so re-check here from the daemon's own authority.
 	// config.LoadFrom cascades the global ~/.config/grove config into the
 	// worktree layer. Any load/parse error degrades to disabled (safe default).
+	//
+	// TWO gates, not one. [claude] is a RiskCapability field, so LoadFrom's
+	// exec-provenance gate strips the whole block out of any repo-controlled
+	// layer the user has not approved with `grove config trust` — a repo cannot
+	// grant itself Claude folder-trust by shipping a grove.toml that asks for
+	// it. That means manageTrust reaches this check only from a TRUSTED file:
+	// an ecosystem whose grove.toml has never been trusted seeds nothing, and
+	// the fix is `grove config trust --yes` there, not a change here. See the
+	// [claude] entry in core/config/execgate.go for why the block is gated as
+	// one coarse unit.
 	cfg, cfgErr := config.LoadFrom(entry.AbsPath)
 	var cc claudenotebook.ClaudeConfig
 	if cfgErr == nil && cfg != nil {
