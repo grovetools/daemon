@@ -81,6 +81,30 @@ handoff_max = 20
 		if cfg.MaxChainResetsPerDay != DefaultMaxChainResetsPerDay {
 			t.Errorf("reset budget = %d", cfg.MaxChainResetsPerDay)
 		}
+		// The default that matters most: tmux records no daemon PTY, so an
+		// assistant that defaulted there would run where its pane cannot
+		// attach.
+		if cfg.AgentTarget != DefaultAgentTarget {
+			t.Errorf("agent target = %q, want %q", cfg.AgentTarget, DefaultAgentTarget)
+		}
+	})
+
+	t.Run("agent_target is read and normalized", func(t *testing.T) {
+		// snake_case, so it also re-proves the yaml tag: without one,
+		// mapstructure's field-name fallback drops the key silently and the
+		// default masks the loss.
+		cfg, err := LoadConfig(writeGroveToml(t, `
+[assistant]
+enabled = true
+plan = "steward"
+agent_target = "  TUIMUX "
+`))
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.AgentTarget != "tuimux" {
+			t.Errorf("agent target = %q, want the normalized %q", cfg.AgentTarget, "tuimux")
+		}
 	})
 
 	t.Run("no block means no supervision", func(t *testing.T) {

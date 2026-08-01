@@ -70,17 +70,22 @@ type AddedJob struct {
 // `--dir` is worse than useless here: it is a deprecated alias that can
 // silently resolve a DIFFERENT plan. The absolute directory is the one form
 // that means exactly one thing.
+// Every launching verb takes an explicit agentTarget for the reason
+// Config.AgentTarget documents: flow derives routing from the SUBMITTING
+// process's environment, and this submitter is a daemon with no mux markers at
+// all, so leaving it to the derivation routes every continuation to tmux —
+// where pi cannot resume and the assistant pane has no PTY to attach.
 type FlowCLI interface {
 	// PlanJobs returns the jobs of the plan at planDir, newest last.
 	PlanJobs(ctx context.Context, planDir string) ([]Job, error)
 	// Resume relaunches a job in place against its existing agent session.
-	Resume(ctx context.Context, jobPath string) error
+	Resume(ctx context.Context, jobPath, agentTarget string) error
 	// Retry resets a job to pending and immediately submits it (-r).
-	Retry(ctx context.Context, jobPath string) error
+	Retry(ctx context.Context, jobPath, agentTarget string) error
 	// AddJob creates a new root job and returns its path.
 	AddJob(ctx context.Context, req AddJobRequest) (*AddedJob, error)
 	// Run submits a job to the daemon and returns without waiting.
-	Run(ctx context.Context, jobPath string) error
+	Run(ctx context.Context, jobPath, agentTarget string) error
 	// Claw re-applies channel + autonomous flags to a running agent.
 	Claw(ctx context.Context, planDir, jobFile, channel, signalTarget string, idleMinutes int) error
 }
@@ -159,14 +164,25 @@ func (e *ExecFlowCLI) PlanJobs(ctx context.Context, planDir string) ([]Job, erro
 	return status.Jobs, nil
 }
 
-func (e *ExecFlowCLI) Resume(ctx context.Context, jobPath string) error {
-	_, err := e.run(ctx, "plan", "resume", jobPath)
+func (e *ExecFlowCLI) Resume(ctx context.Context, jobPath, agentTarget string) error {
+	_, err := e.run(ctx, withAgentTarget(agentTarget, "plan", "resume", jobPath)...)
 	return err
 }
 
-func (e *ExecFlowCLI) Retry(ctx context.Context, jobPath string) error {
-	_, err := e.run(ctx, "plan", "retry", "-r", jobPath)
+func (e *ExecFlowCLI) Retry(ctx context.Context, jobPath, agentTarget string) error {
+	_, err := e.run(ctx, withAgentTarget(agentTarget, "plan", "retry", "-r", jobPath)...)
 	return err
+}
+
+// withAgentTarget appends --agent-target when one is named. An empty target
+// leaves the flag off, which restores flow's own environment derivation — the
+// right degradation for a caller that genuinely has no opinion, and the shape
+// every test fake sees.
+func withAgentTarget(agentTarget string, args ...string) []string {
+	if strings.TrimSpace(agentTarget) == "" {
+		return args
+	}
+	return append(args, "--agent-target", agentTarget)
 }
 
 func (e *ExecFlowCLI) AddJob(ctx context.Context, req AddJobRequest) (*AddedJob, error) {
@@ -216,8 +232,8 @@ func (e *ExecFlowCLI) AddJob(ctx context.Context, req AddJobRequest) (*AddedJob,
 	return &added, nil
 }
 
-func (e *ExecFlowCLI) Run(ctx context.Context, jobPath string) error {
-	_, err := e.run(ctx, "plan", "run", "--yes", "--background", jobPath)
+func (e *ExecFlowCLI) Run(ctx context.Context, jobPath, agentTarget string) error {
+	_, err := e.run(ctx, withAgentTarget(agentTarget, "plan", "run", "--yes", "--background", jobPath)...)
 	return err
 }
 

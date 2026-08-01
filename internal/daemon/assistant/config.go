@@ -72,6 +72,21 @@ type Config struct {
 	HandoffThreshold int `toml:"handoff_threshold" yaml:"handoff_threshold"`
 	HandoffMax       int `toml:"handoff_max" yaml:"handoff_max"`
 
+	// AgentTarget is the mux every continuation launches into, passed to flow
+	// as --agent-target. Zero uses DefaultAgentTarget.
+	//
+	// It must be stated rather than derived. flow's own derivation reads the
+	// SUBMITTING process's environment (TMUX, TUIMUX_PTY, GROVE_TERMINAL),
+	// which assumes the submitter lives in the mux the agent will live in. The
+	// supervisor structurally cannot: it runs inside groved, which has none of
+	// those markers, so the derivation always answers "tmux" — and that answer
+	// is wrong twice. The pi family has no prepared tmux resume, so every
+	// `plan resume` failed outright; and a tmux-hosted session records no
+	// daemon PTY, which is the only handle the treemux assistant pane can
+	// attach, so even a successful tmux launch would leave the pane empty
+	// while the agent ran somewhere the operator could not see.
+	AgentTarget string `toml:"agent_target" yaml:"agent_target"`
+
 	// MaxChainResetsPerDay rate-limits chain resets (spec §6 proposes 3).
 	// A chain that burns through its reset budget is a runaway, not a
 	// resilient assistant, so the breaker trips instead. Zero uses
@@ -90,6 +105,12 @@ const (
 	// DefaultCoordMode keeps a reset chain autonomous, so its successor
 	// handoffs continue to fire without an operator.
 	DefaultCoordMode = "autonomous"
+	// DefaultAgentTarget is the mux continuations launch into. "native" is
+	// treemux's own PTY (flow records it as mux treemux), which is where the
+	// assistant pane lives; "tuimux" is the alternative for an operator whose
+	// assistant is hosted by a tuimux daemon instead. "tmux" is deliberately
+	// NOT the default: it records no daemon PTY for the pane to attach.
+	DefaultAgentTarget = "native"
 )
 
 // LoadConfig resolves the [assistant] block for the ecosystem rooted at dir.
@@ -149,6 +170,10 @@ func (c *Config) withDefaults() *Config {
 	}
 	if strings.TrimSpace(out.Channel) == "" {
 		out.Channel = DefaultChannel
+	}
+	out.AgentTarget = strings.ToLower(strings.TrimSpace(out.AgentTarget))
+	if out.AgentTarget == "" {
+		out.AgentTarget = DefaultAgentTarget
 	}
 	if out.MaxChainResetsPerDay <= 0 {
 		out.MaxChainResetsPerDay = DefaultMaxChainResetsPerDay

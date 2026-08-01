@@ -683,7 +683,7 @@ func (s *Supervisor) continueChain(ctx context.Context) (action, error) {
 		return actionResume, nil
 
 	case "failed", "pending", "blocked", "needs_review":
-		if err := s.flow.Retry(ctx, head.FilePath); err != nil {
+		if err := s.flow.Retry(ctx, head.FilePath, s.agentTarget()); err != nil {
 			return actionRetry, err
 		}
 		s.reclaw(ctx, head)
@@ -704,11 +704,36 @@ func (s *Supervisor) continueChain(ctx context.Context) (action, error) {
 			return s.chainReset(ctx, &head)
 		}
 		if err := s.resumeOrRetry(ctx, head); err != nil {
-			return actionResume, err
+			// Both continuations-in-place refused. That is not a transient
+			// failure to back off from — flow refuses for STRUCTURAL reasons
+			// (a provider with no resume path for this routing, a completed
+			// job retry will not touch), and every later pass will hit the
+			// identical refusal until the breaker trips. Rung 5 is the answer
+			// the ladder already has for "this chain cannot be continued in
+			// place": start a fresh one, seeded from the predecessor's handoff
+			// spec, under the same rate limit. The assistant stays immortal;
+			// the budget still bounds a genuine runaway.
+			s.ulog.Warn("Assistant cannot be continued in place; resetting the chain").
+				Err(err).
+				Field("job", jobFileName(head)).
+				Field("status", head.Status).
+				Log(ctx)
+			resetAction, resetErr := s.chainReset(ctx, &head)
+			if resetErr != nil {
+				return resetAction, fmt.Errorf("%w; chain reset also failed: %v", err, resetErr)
+			}
+			return resetAction, nil
 		}
 		s.reclaw(ctx, head)
 		return actionResume, nil
 	}
+}
+
+// agentTarget is the mux every continuation launches into. See
+// Config.AgentTarget: the supervisor must state it, because flow would
+// otherwise derive it from groved's own (mux-less) environment.
+func (s *Supervisor) agentTarget() string {
+	return s.res().cfg.AgentTarget
 }
 
 // resumeOrRetry prefers resume — it is the only continuation that keeps the
@@ -717,7 +742,7 @@ func (s *Supervisor) continueChain(ctx context.Context) (action, error) {
 // some other status does not, and the fallback is what keeps the crash case
 // from dead-ending on that gate.
 func (s *Supervisor) resumeOrRetry(ctx context.Context, head Job) error {
-	resumeErr := s.flow.Resume(ctx, head.FilePath)
+	resumeErr := s.flow.Resume(ctx, head.FilePath, s.agentTarget())
 	if resumeErr == nil {
 		return nil
 	}
@@ -725,7 +750,7 @@ func (s *Supervisor) resumeOrRetry(ctx context.Context, head Job) error {
 		Err(resumeErr).
 		Field("job", jobFileName(head)).
 		Log(ctx)
-	if err := s.flow.Retry(ctx, head.FilePath); err != nil {
+	if err := s.flow.Retry(ctx, head.FilePath, s.agentTarget()); err != nil {
 		return fmt.Errorf("resume failed (%v) and retry failed: %w", resumeErr, err)
 	}
 	return nil
@@ -769,7 +794,7 @@ func (s *Supervisor) chainReset(ctx context.Context, predecessor *Job) (action, 
 	if err != nil {
 		return actionChainReset, fmt.Errorf("create assistant root job: %w", err)
 	}
-	if err := s.flow.Run(ctx, added.Path); err != nil {
+	if err := s.flow.Run(ctx, added.Path, s.agentTarget()); err != nil {
 		return actionChainReset, fmt.Errorf("launch assistant root job %s: %w", added.Path, err)
 	}
 

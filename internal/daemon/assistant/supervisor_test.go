@@ -31,6 +31,22 @@ type fakeFlow struct {
 	added *AddedJob
 
 	calls []string
+	// targets records the agent target every launching verb was given, so a
+	// test can assert the supervisor STATES its routing instead of leaving
+	// flow to derive it from groved's mux-less environment.
+	targets []string
+}
+
+func (f *fakeFlow) recordTarget(agentTarget string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.targets = append(f.targets, agentTarget)
+}
+
+func (f *fakeFlow) targetHistory() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.targets...)
 }
 
 func (f *fakeFlow) record(format string) {
@@ -50,13 +66,15 @@ func (f *fakeFlow) PlanJobs(context.Context, string) ([]Job, error) {
 	return f.jobs, f.jobsErr
 }
 
-func (f *fakeFlow) Resume(_ context.Context, jobPath string) error {
+func (f *fakeFlow) Resume(_ context.Context, jobPath, agentTarget string) error {
 	f.record("resume " + filepath.Base(jobPath))
+	f.recordTarget(agentTarget)
 	return f.resumeErr
 }
 
-func (f *fakeFlow) Retry(_ context.Context, jobPath string) error {
+func (f *fakeFlow) Retry(_ context.Context, jobPath, agentTarget string) error {
 	f.record("retry " + filepath.Base(jobPath))
+	f.recordTarget(agentTarget)
 	return f.retryErr
 }
 
@@ -71,8 +89,9 @@ func (f *fakeFlow) AddJob(_ context.Context, req AddJobRequest) (*AddedJob, erro
 	return &AddedJob{Path: filepath.Join(req.PlanDir, "02-steward.md"), ID: "steward-new"}, nil
 }
 
-func (f *fakeFlow) Run(_ context.Context, jobPath string) error {
+func (f *fakeFlow) Run(_ context.Context, jobPath, agentTarget string) error {
 	f.record("run " + filepath.Base(jobPath))
+	f.recordTarget(agentTarget)
 	return f.runErr
 }
 
@@ -458,6 +477,101 @@ func TestLongLivedChainForgivesPastFailures(t *testing.T) {
 	}
 	if status.ConsecutiveFailures != 0 || status.LastError != "" {
 		t.Errorf("status = %+v, want the failure history forgiven", status)
+	}
+}
+
+// TestContinuationsStateTheirAgentTarget: the supervisor runs flow from inside
+// groved, where TMUX, TUIMUX_PTY and GROVE_TERMINAL are all absent, so flow's
+// own derivation can only answer "tmux" — a routing pi cannot resume into and
+// the assistant pane cannot attach. Every launching verb must therefore carry
+// the target explicitly.
+func TestContinuationsStateTheirAgentTarget(t *testing.T) {
+	// A completed head that refuses both continuations in place exercises all
+	// three verbs in one pass: resume, its retry fallback, and the chain
+	// reset's run.
+	flow := &fakeFlow{
+		jobs:      []Job{agentJob("01-steward.md", "completed", 0)},
+		resumeErr: errors.New(`agent provider "grove-agent" does not support prepared resume launch on tmux`),
+		retryErr:  errors.New("job already completed: 01-steward.md"),
+	}
+	s, _ := newTestSupervisor(t, flow)
+
+	if _, err := s.Ensure(context.Background(), "test", false); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	targets := flow.targetHistory()
+	if len(targets) != 3 {
+		t.Fatalf("targets = %v, want one per launching verb (resume, retry, run)", targets)
+	}
+	for i, got := range targets {
+		if got != DefaultAgentTarget {
+			t.Errorf("target[%d] = %q, want %q — an empty target lets flow derive tmux from groved's environment",
+				i, got, DefaultAgentTarget)
+		}
+	}
+}
+
+// TestUncontinuableChainResetsInsteadOfBackingOff: when flow refuses BOTH
+// continuations in place, the refusal is structural — a provider with no
+// resume path for this routing, and a completed job retry will not touch — so
+// every later pass hits the identical refusal until the breaker trips. This is
+// the live failure that motivated the ladder's fallthrough: the standing
+// steward sat in backoff with `does not support prepared resume launch on
+// tmux` / `job already completed`, which no amount of waiting could clear.
+func TestUncontinuableChainResetsInsteadOfBackingOff(t *testing.T) {
+	flow := &fakeFlow{
+		jobs:      []Job{agentJob("01-steward.md", "completed", 0)},
+		resumeErr: errors.New(`agent provider "grove-agent" does not support prepared resume launch on tmux`),
+		retryErr:  errors.New("job already completed: 01-steward.md. Use 'flow plan run' to re-run"),
+	}
+	s, _ := newTestSupervisor(t, flow)
+
+	status, err := s.Ensure(context.Background(), "test", false)
+	if err != nil {
+		t.Fatalf("Ensure: %v — an uncontinuable chain must reset, not fail", err)
+	}
+	want := []string{
+		"jobs",
+		"resume 01-steward.md",
+		"retry 01-steward.md",
+		"add steward",
+		"run 02-steward.md",
+		"claw 02-steward.md signal",
+	}
+	if got := flow.history(); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+	if status.State != models.AssistantStateStarting {
+		t.Errorf("state = %q, want starting", status.State)
+	}
+	if status.ChainResets != 1 {
+		t.Errorf("chain resets = %d, want 1", status.ChainResets)
+	}
+	if status.ConsecutiveFailures != 0 {
+		t.Errorf("failures = %d, want 0: the reset succeeded", status.ConsecutiveFailures)
+	}
+}
+
+// TestUncontinuableChainStillReportsBothCauses: the reset is a fallback, not a
+// cover-up. When it ALSO fails, the operator needs the refusal that sent us
+// there, not just the budget message.
+func TestUncontinuableChainStillReportsBothCauses(t *testing.T) {
+	flow := &fakeFlow{
+		jobs:      []Job{agentJob("01-steward.md", "completed", 0)},
+		resumeErr: errors.New("no prepared resume on tmux"),
+		retryErr:  errors.New("job already completed"),
+		addErr:    errors.New("plan add refused"),
+	}
+	s, _ := newTestSupervisor(t, flow)
+
+	status, err := s.Ensure(context.Background(), "test", false)
+	if err == nil {
+		t.Fatal("want a failure when neither continuation nor reset works")
+	}
+	for _, want := range []string{"no prepared resume on tmux", "job already completed", "plan add refused"} {
+		if !strings.Contains(status.LastError, want) {
+			t.Errorf("last error %q is missing %q", status.LastError, want)
+		}
 	}
 }
 
