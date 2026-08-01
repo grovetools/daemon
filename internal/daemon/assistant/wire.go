@@ -59,6 +59,34 @@ func ForDaemon(scope, socketPath string, st *store.Store) *Supervisor {
 // assistant plan is deliberately worktree-less (spec §3.1), so it has no entry
 // there; `--dir` is a deprecated alias that can silently resolve a different
 // plan. Resolving the directory once keeps every flow invocation unambiguous.
+// A scoped daemon whose scope is an ecosystem WORKTREE supervises nothing. This
+// is the same narrowing DiscoverTargets applies, and it became load-bearing when
+// LoadConfig started honouring the global config layer: a single [assistant]
+// block in ~/.config/grove/grove.toml is inherited by every worktree of the
+// ecosystem, so without this guard every feature-branch daemon would resolve the
+// same plan, decide it supervises the assistant, and re-register `default_claw`
+// with its own socket — last writer wins, and several ensure loops would each
+// conclude the chain is down. One open feature branch must not become a rival
+// supervisor. (A scoped daemon started AT the ecosystem root still supervises,
+// which is the documented double-supervision hazard; unchanged here.)
+//
+// isRoot is permissive when the ecosystem set cannot be determined at all — an
+// empty answer means "we do not know yet", not "this is a worktree", and a
+// transient boot-time unknown must not silently disable a correctly scoped
+// development daemon.
+func scopeMaySupervise(scopeDir string, st *store.Store) bool {
+	roots := EcosystemRoots(st)
+	if len(roots) == 0 {
+		return true
+	}
+	for _, r := range roots {
+		if r == scopeDir {
+			return true
+		}
+	}
+	return false
+}
+
 func fromScope(scopeDir string, st *store.Store) *Supervisor {
 	return newWired(st, func() *resolution {
 		cfg, err := LoadConfig(scopeDir)
@@ -68,12 +96,26 @@ func fromScope(scopeDir string, st *store.Store) *Supervisor {
 		if !cfg.Active() {
 			return &resolution{cfg: cfg, scope: scopeDir}
 		}
+		if !scopeMaySupervise(scopeDir, st) {
+			return &resolution{
+				cfg:   &Config{},
+				scope: scopeDir,
+				err:   fmt.Errorf("%s is an ecosystem worktree, not an ecosystem root; its [assistant] block is supervised by the ecosystem's own daemon", scopeDir),
+			}
+		}
 		planDir := coreplan.ResolvePlanDir(scopeDir, cfg.Plan)
 		if planDir == "" {
 			return &resolution{
 				cfg:   &Config{},
 				scope: scopeDir,
 				err:   fmt.Errorf("cannot resolve the plans directory for %q under %s", cfg.Plan, scopeDir),
+			}
+		}
+		if !planDirExists(planDir) {
+			return &resolution{
+				cfg:   &Config{},
+				scope: scopeDir,
+				err:   fmt.Errorf("plan %q under %s resolves to %s, which does not exist", cfg.Plan, scopeDir, planDir),
 			}
 		}
 		return &resolution{cfg: cfg, planDir: planDir, scope: scopeDir}
@@ -99,10 +141,20 @@ func fromDiscovery(st *store.Store) *Supervisor {
 			scope:      target.Scope,
 			candidates: candidates,
 		}
+		// A problem is only worth surfacing as the supervisor's last error
+		// when it explains why resolution did not land cleanly. Once ONE
+		// ecosystem has been selected unambiguously, the other roots' skips
+		// are the normal outcome, not a fault: a GLOBAL [assistant] block is
+		// inherited by every root, so on a machine with five ecosystems and
+		// one assistant plan, four "that plan does not exist here" skips are
+		// produced on every single resolution. Promoting one of those to
+		// LastError puts a permanent `last error:` line under a healthy
+		// `Assistant: live` in `groved health` and on the status endpoint —
+		// which trains an operator to ignore the field that exists to tell
+		// them something is wrong. The skips remain in the returned problems
+		// slice for logging.
 		if len(candidates) > 0 {
 			r.err = AmbiguityError(target.Scope, candidates)
-		} else if len(problems) > 0 {
-			r.err = problems[0]
 		}
 		return r
 	})

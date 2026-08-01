@@ -10,11 +10,9 @@
 package assistant
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 
-	"github.com/pelletier/go-toml/v2"
+	coreconfig "github.com/grovetools/core/config"
 )
 
 // Config is the `[assistant]` block of an ecosystem's grove.toml.
@@ -23,50 +21,62 @@ import (
 //	enabled = true
 //	plan = "steward"
 //	provider = "grove-agent"
+//
+// Every field carries BOTH a toml and a yaml tag, and they must stay in sync.
+// The toml tag names the key an operator writes; the yaml tag is what actually
+// binds it, because the block arrives through config.UnmarshalExtension, which
+// decodes the generic extension map with mapstructure under TagName "yaml"
+// (core/config/types.go). Without a yaml tag, mapstructure falls back to
+// case-insensitive field-NAME matching, which matches single-word keys like
+// `enabled` and `plan` but silently drops every snake_case one —
+// `idle_minutes`, `handoff_threshold`, `handoff_max`, `signal_target`,
+// `max_chain_resets_per_day` — leaving them zero and letting the defaults below
+// mask the loss. claudenotebook.ClaudeConfig carries the same dual tags for the
+// same reason.
 type Config struct {
 	// Enabled turns the supervisor on. Absent or false means the daemon
 	// supervises nothing, which is the default for every ecosystem that has
 	// not opted in.
-	Enabled bool `toml:"enabled"`
+	Enabled bool `toml:"enabled" yaml:"enabled"`
 
 	// Plan is the assistant's home plan name (spec §3.1 proposes "steward").
-	Plan string `toml:"plan"`
+	Plan string `toml:"plan" yaml:"plan"`
 
 	// Provider is the agent CLI provider stamped on chain-reset root jobs.
-	Provider string `toml:"provider"`
+	Provider string `toml:"provider" yaml:"provider"`
 
 	// Model optionally pins the successor's model. Agent jobs do NOT inherit
 	// the plan's default model (orchestration job.go InheritsPlanModel), so
 	// leaving this empty rides the provider's own default.
-	Model string `toml:"model"`
+	Model string `toml:"model" yaml:"model"`
 
 	// Skills is the skill_sequence stamped on chain-reset root jobs. They
 	// must also be authorized in [skills] use, and `pi` must be in [skills]
 	// providers or .pi/skills never syncs.
-	Skills []string `toml:"skills"`
+	Skills []string `toml:"skills" yaml:"skills"`
 
 	// Channel is the messaging channel re-applied after every (re)launch
 	// (spec §3.3 "re-claw"). Empty disables re-clawing.
-	Channel string `toml:"channel"`
+	Channel string `toml:"channel" yaml:"channel"`
 
 	// SignalTarget is the named signal contact/group for outbound messages.
-	SignalTarget string `toml:"signal_target"`
+	SignalTarget string `toml:"signal_target" yaml:"signal_target"`
 
 	// IdleMinutes is the autonomous idle-ping interval re-applied with the
 	// claw. Zero uses DefaultIdleMinutes.
-	IdleMinutes int `toml:"idle_minutes"`
+	IdleMinutes int `toml:"idle_minutes" yaml:"idle_minutes"`
 
 	// HandoffThreshold and HandoffMax are stamped on chain-reset root jobs so
 	// a reset chain inherits the same context budget as the one it replaces.
 	// Zero leaves flow's own defaults in place.
-	HandoffThreshold int `toml:"handoff_threshold"`
-	HandoffMax       int `toml:"handoff_max"`
+	HandoffThreshold int `toml:"handoff_threshold" yaml:"handoff_threshold"`
+	HandoffMax       int `toml:"handoff_max" yaml:"handoff_max"`
 
 	// MaxChainResetsPerDay rate-limits chain resets (spec §6 proposes 3).
 	// A chain that burns through its reset budget is a runaway, not a
 	// resilient assistant, so the breaker trips instead. Zero uses
 	// DefaultMaxChainResetsPerDay.
-	MaxChainResetsPerDay int `toml:"max_chain_resets_per_day"`
+	MaxChainResetsPerDay int `toml:"max_chain_resets_per_day" yaml:"max_chain_resets_per_day"`
 }
 
 const (
@@ -82,13 +92,27 @@ const (
 	DefaultCoordMode = "autonomous"
 )
 
-// groveToml is the projection of grove.toml this package parses. Every other
-// block is ignored, so an unrelated schema change cannot break the supervisor.
-type groveToml struct {
-	Assistant *Config `toml:"assistant"`
-}
-
-// LoadConfig reads the [assistant] block from <dir>/grove.toml.
+// LoadConfig resolves the [assistant] block for the ecosystem rooted at dir.
+//
+// It goes through config.LoadFrom, which is grove's ONE config cascade:
+//
+//  1. global    ~/.config/grove/grove.toml (+ that directory's *.toml fragments)
+//  2. project   <dir>/grove.toml — overrides global
+//  3. override  grove.override.toml — overrides all
+//
+// Reading <dir>/grove.toml directly instead — which this did originally — makes
+// [assistant] the one block in the ecosystem that a global preference cannot
+// reach. That is a silent trap, not a small one: an operator who puts a working
+// [assistant] block in ~/.config/grove/grove.toml (where `grove config` writes,
+// and where every other global preference lives) gets no error and no warning,
+// only a daemon that reports `disabled (no [assistant] block enabled in
+// grove.toml)` while pointing at a file they did in fact configure.
+//
+// Note the consequence for discovery: a GLOBAL block opts in every ecosystem
+// root at once, because the global layer is common to all of them. That is why
+// DiscoverTargets requires the named plan's directory to EXIST rather than
+// merely be computable — existence is what distinguishes the ecosystem the
+// operator actually meant from the ones that only inherited the block.
 //
 // A missing file, a missing block, or a block with enabled = false all yield a
 // disabled Config and no error: not opting in is the normal case, not a
@@ -99,22 +123,18 @@ func LoadConfig(dir string) (*Config, error) {
 	if strings.TrimSpace(dir) == "" {
 		return &Config{}, nil
 	}
-	data, err := os.ReadFile(filepath.Join(dir, "grove.toml")) //nolint:gosec // G304: path derived from the daemon's own resolved scope
+	cfg, err := coreconfig.LoadFrom(dir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return &Config{}, nil
-		}
 		return nil, err
 	}
-
-	var parsed groveToml
-	if err := toml.Unmarshal(data, &parsed); err != nil {
-		return nil, err
-	}
-	if parsed.Assistant == nil {
+	if cfg == nil {
 		return &Config{}, nil
 	}
-	return parsed.Assistant.withDefaults(), nil
+	var parsed Config
+	if err := cfg.UnmarshalExtension("assistant", &parsed); err != nil {
+		return nil, err
+	}
+	return parsed.withDefaults(), nil
 }
 
 // withDefaults fills the zero values that have a sensible default. It does NOT

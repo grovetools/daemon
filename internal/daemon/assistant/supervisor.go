@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	coreconfig "github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/daemon/internal/daemon/store"
@@ -161,10 +162,19 @@ func (s *Supervisor) SetOnResolved(fn func(models.AssistantStatus)) {
 // A supervisor built from an explicit Config (NewSupervisor) has no resolver to
 // re-run, so its resolution is permanent and this is a no-op — dropping it
 // would silently disable the supervisor on the first forced ensure.
+//
+// Dropping OUR cached answer is not enough. LoadConfig reads through
+// config.LoadFrom, which keeps its own 2-second memo of the parsed cascade, so
+// a re-resolution that lands inside that window would re-read the very config
+// the operator just edited and conclude nothing changed — the force silently
+// doing nothing, which is the one outcome an escape hatch may not have. The
+// window is short, but "did my edit take?" must not depend on how fast the
+// operator typed the curl.
 func (s *Supervisor) reresolve() {
 	if s.resolve == nil {
 		return
 	}
+	coreconfig.ResetLoadCache()
 	s.resolveMu.Lock()
 	s.resolved.Store(nil)
 	s.resolveMu.Unlock()

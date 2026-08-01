@@ -15,7 +15,36 @@ func writeGroveToml(t *testing.T, body string) string {
 	return dir
 }
 
+// isolateGlobalConfig points the config cascade's global layer at an empty
+// directory. LoadConfig reads through config.LoadFrom, so without this every
+// case below would inherit the developer's own ~/.config/grove/grove.toml — and
+// a machine that happens to enable [assistant] there would turn the
+// "no block means no supervision" cases green-to-red for reasons having nothing
+// to do with the code under test.
+func isolateGlobalConfig(t *testing.T) string {
+	t.Helper()
+	cfgHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfgHome)
+	dir := filepath.Join(cfgHome, "grove")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// writeGlobalGroveToml seeds the cascade's GLOBAL layer, the one an operator
+// edits via `grove config`.
+func writeGlobalGroveToml(t *testing.T, body string) {
+	t.Helper()
+	dir := isolateGlobalConfig(t)
+	if err := os.WriteFile(filepath.Join(dir, "grove.toml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
+	isolateGlobalConfig(t)
+
 	t.Run("reads the assistant block", func(t *testing.T) {
 		dir := writeGroveToml(t, `
 workspaces = ["*"]
@@ -109,4 +138,68 @@ handoff_max = 20
 			t.Error("want inactive")
 		}
 	})
+}
+
+// TestLoadConfigReadsTheGlobalLayer pins the bug this cascade fix exists for.
+//
+// An operator who configures the assistant the way every other global grove
+// preference is configured — `grove config`, which writes
+// ~/.config/grove/grove.toml — used to get silence: LoadConfig read
+// <root>/grove.toml directly, saw no [assistant] block, and the daemon reported
+// `disabled (no [assistant] block enabled in grove.toml)` while naming a file
+// the operator had in fact configured correctly.
+func TestLoadConfigReadsTheGlobalLayer(t *testing.T) {
+	writeGlobalGroveToml(t, `
+[assistant]
+enabled = true
+plan = 'steward'
+provider = 'pi'
+skills = ['grove-steward']
+idle_minutes = 30
+handoff_threshold = 70
+handoff_max = 20
+`)
+	// An ecosystem whose OWN grove.toml says nothing about the assistant.
+	cfg, err := LoadConfig(writeGroveToml(t, "workspaces = [\"*\"]\n"))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.Active() {
+		t.Fatal("a global [assistant] block must reach the ecosystem through the config cascade")
+	}
+	if cfg.Plan != "steward" || cfg.Provider != "pi" {
+		t.Errorf("cfg = %+v", cfg)
+	}
+
+	// The snake_case keys are the real trap: UnmarshalExtension decodes with
+	// mapstructure under TagName "yaml", so a field without a yaml tag falls
+	// back to case-insensitive NAME matching, which cannot match an
+	// underscored key. These three would silently read back as 0 — and
+	// withDefaults would paper over idle_minutes, making the loss invisible.
+	if cfg.IdleMinutes != 30 {
+		t.Errorf("idle_minutes = %d, want 30 (snake_case key dropped by the decoder)", cfg.IdleMinutes)
+	}
+	if cfg.HandoffThreshold != 70 {
+		t.Errorf("handoff_threshold = %d, want 70 (snake_case key dropped by the decoder)", cfg.HandoffThreshold)
+	}
+	if cfg.HandoffMax != 20 {
+		t.Errorf("handoff_max = %d, want 20 (snake_case key dropped by the decoder)", cfg.HandoffMax)
+	}
+	if len(cfg.Skills) != 1 || cfg.Skills[0] != "grove-steward" {
+		t.Errorf("skills = %v", cfg.Skills)
+	}
+}
+
+// TestProjectLayerOverridesGlobal keeps the cascade's precedence honest: an
+// ecosystem that disables the assistant locally must win over a global opt-in,
+// or there would be no way to exempt one ecosystem from a global preference.
+func TestProjectLayerOverridesGlobal(t *testing.T) {
+	writeGlobalGroveToml(t, "[assistant]\nenabled = true\nplan = 'steward'\n")
+	cfg, err := LoadConfig(writeGroveToml(t, "workspaces = [\"*\"]\n\n[assistant]\nenabled = false\nplan = 'steward'\n"))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Active() {
+		t.Error("a local enabled = false must override the global opt-in")
+	}
 }

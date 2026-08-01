@@ -16,14 +16,31 @@ import (
 // stubPlanDirs points resolvePlanDir at a fake notebook: <root>/plans/<name>.
 // The real resolver walks workspace discovery and a notebook locator, neither
 // of which a unit test should have to stand up.
+//
+// The directory is really created, so DiscoverTargets' existence check runs
+// against the real filesystem rather than another stub. A test that wants the
+// "named plan is missing" branch stubs resolvePlanDir itself to somewhere it
+// has not created.
+//
+// It also isolates the config cascade's global layer. LoadConfig reads through
+// config.LoadFrom, so without this every discovery test would inherit the
+// developer's own ~/.config/grove/grove.toml — and on a machine that enables
+// [assistant] globally (the very configuration this feature is for) an
+// ecosystem the test wrote as opted-OUT would come back opted-in, failing for
+// reasons that have nothing to do with discovery.
 func stubPlanDirs(t *testing.T) {
 	t.Helper()
+	isolateGlobalConfig(t)
 	prev := resolvePlanDir
 	resolvePlanDir = func(root, plan string) string {
 		if root == "" || plan == "" {
 			return ""
 		}
-		return filepath.Join(root, "plans", plan)
+		dir := filepath.Join(root, "plans", plan)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return dir
 	}
 	t.Cleanup(func() { resolvePlanDir = prev })
 }
@@ -363,5 +380,116 @@ func TestResolutionIsOnceAndConcurrencySafe(t *testing.T) {
 
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("resolver ran %d times, want exactly 1", got)
+	}
+}
+
+// TestGlobalBlockResolvesToTheEcosystemThatHasThePlan is the discovery half of
+// the cascade fix, and the reason DiscoverTargets requires the plan directory
+// to exist.
+//
+// A global [assistant] block is inherited by EVERY ecosystem root at once, so
+// opting in stops being a per-ecosystem signal. Without an existence check all
+// four roots below are "opted in" with a confidently computed plan directory,
+// SelectTarget takes the alphabetically lowest, and the supervisor drives an
+// ecosystem the operator never named — against a directory that was never
+// there. Existence is what identifies the one ecosystem that really has the
+// assistant.
+func TestGlobalBlockResolvesToTheEcosystemThatHasThePlan(t *testing.T) {
+	dir := isolateGlobalConfig(t)
+	if err := os.WriteFile(filepath.Join(dir, "grove.toml"),
+		[]byte("[assistant]\nenabled = true\nplan = 'steward'\nprovider = 'pi'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Four ecosystems, none of which mentions [assistant] itself.
+	base := t.TempDir()
+	var roots []string
+	for _, name := range []string{"a-plugins", "b-grovetools", "c-solutils", "d-xdg-test"} {
+		root := filepath.Join(base, name)
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "grove.toml"), []byte("workspaces = [\"*\"]\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+	// Only the SECOND one actually has a steward plan on disk. Note it is not
+	// the lowest path, so a run that ignores existence picks a-plugins.
+	withPlan := roots[1]
+	if err := os.MkdirAll(filepath.Join(withPlan, "plans", "steward"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := resolvePlanDir
+	resolvePlanDir = func(root, plan string) string { return filepath.Join(root, "plans", plan) }
+	t.Cleanup(func() { resolvePlanDir = prev })
+
+	targets, problems := DiscoverTargets(roots)
+	if len(targets) != 1 {
+		t.Fatalf("targets = %+v, want exactly the ecosystem whose plan exists", targets)
+	}
+	if targets[0].Scope != withPlan {
+		t.Fatalf("scope = %q, want %q — a global block must not hand the supervisor an ecosystem it only inherited", targets[0].Scope, withPlan)
+	}
+	// The three skips are reported, not swallowed: an operator who named a
+	// plan that does not exist yet has to be able to see why.
+	if len(problems) != 3 {
+		t.Fatalf("problems = %v, want the three ecosystems without the plan named", problems)
+	}
+
+	// And the collapse is unambiguous — no candidate list, so no warning.
+	target, candidates, ok := SelectTarget(targets)
+	if !ok || target.Scope != withPlan || len(candidates) != 0 {
+		t.Fatalf("SelectTarget = (%q, %v, %v), want a clean single resolution", target.Scope, candidates, ok)
+	}
+}
+
+// A clean single resolution must not report an error, even though the other
+// ecosystem roots were skipped along the way.
+//
+// With [assistant] readable from the global config layer, skips are the normal
+// case rather than a symptom: every root inherits the block, and every root
+// without that plan is skipped on every resolution. Surfacing one of them as
+// LastError would print a permanent `last error:` under a healthy
+// `Assistant: live` in `groved health`, which is how an operator learns to stop
+// reading the field.
+func TestCleanResolutionReportsNoError(t *testing.T) {
+	stubPlanDirs(t)
+
+	yes := ecosystem(t, "b-yes", optedIn)
+	// An ecosystem that opted in but whose plan does not exist — a skip.
+	skipped := ecosystem(t, "a-skipped", optedIn)
+	prev := resolvePlanDir
+	resolvePlanDir = func(root, plan string) string {
+		dir := filepath.Join(root, "plans", plan)
+		if root == yes {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+	t.Cleanup(func() { resolvePlanDir = prev })
+
+	// Drive the REAL fromDiscovery closure by giving the store the two roots,
+	// rather than re-implementing its logic in the test.
+	st := store.New()
+	st.ApplyUpdate(store.Update{
+		Type:   store.UpdateWorkspaces,
+		Source: "test",
+		Payload: map[string]*models.EnrichedWorkspace{
+			skipped: {WorkspaceNode: &workspace.WorkspaceNode{Path: skipped, Kind: workspace.KindEcosystemRoot}},
+			yes:     {WorkspaceNode: &workspace.WorkspaceNode{Path: yes, Kind: workspace.KindEcosystemRoot}},
+		},
+	})
+
+	sup := fromDiscovery(st)
+	status := sup.Status()
+	if !sup.Enabled() || status.Scope != yes {
+		t.Fatalf("scope = %q enabled = %v, want a clean resolution to %q", status.Scope, sup.Enabled(), yes)
+	}
+	if status.LastError != "" {
+		t.Fatalf("LastError = %q, want empty: the other root's skip is the normal case, not a fault", status.LastError)
 	}
 }

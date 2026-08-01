@@ -2,6 +2,7 @@ package assistant
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -115,12 +116,33 @@ func dedupeSorted(in []string) []string {
 }
 
 // DiscoverTargets reads the [assistant] block of every root and returns the
-// ones that opted in, ordered by path.
+// ones that opted in AND whose named plan actually exists on disk, ordered by
+// path.
 //
 // A root whose grove.toml is malformed, or whose named plan has no resolvable
 // directory, is skipped rather than fatal: one ecosystem's typo must not stop
 // the daemon from supervising another's assistant, and it must never stop the
 // daemon from booting.
+//
+// ── Why existence, and not merely resolvability ──────────────────────────────
+// ResolvePlanDir is pure path arithmetic: it maps (root, plan) to
+// <notebook>/workspaces/<ws>/plans/<plan> and returns it whether or not
+// anything is there. That was harmless while [assistant] could only be written
+// per-ecosystem, because naming a plan was itself the opt-in. It stops being
+// harmless the moment the block can come from the GLOBAL config layer
+// (LoadConfig), which every ecosystem root inherits at once: a single
+// `plan = "steward"` would make every root a candidate, each with a confidently
+// computed plan directory that does not exist, and SelectTarget would hand the
+// supervisor the alphabetically-lowest one — an ecosystem the operator never
+// meant, whose flow invocations then fail against a directory that was never
+// there.
+//
+// Requiring the directory to exist is what separates the ecosystem that really
+// has the assistant from the ones that only inherited the preference. It is a
+// tightening of the rule this function already stated ("no resolvable
+// directory" is skipped), not a new concept, and it degrades the right way: the
+// skip is reported as a problem, so an operator who names a plan that has not
+// been created yet is told so instead of being silently supervised elsewhere.
 func DiscoverTargets(roots []string) ([]Target, []error) {
 	var targets []Target
 	var problems []error
@@ -138,10 +160,22 @@ func DiscoverTargets(roots []string) ([]Target, []error) {
 			problems = append(problems, fmt.Errorf("%s: cannot resolve the plans directory for %q", root, cfg.Plan))
 			continue
 		}
+		if !planDirExists(planDir) {
+			problems = append(problems, fmt.Errorf("%s: plan %q resolves to %s, which does not exist", root, cfg.Plan, planDir))
+			continue
+		}
 		targets = append(targets, Target{Scope: root, Config: cfg, PlanDir: planDir})
 	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].Scope < targets[j].Scope })
 	return targets, problems
+}
+
+// planDirExists reports whether path is a directory that is really there.
+// Indirected through a variable for the same reason resolvePlanDir is: a
+// discovery test should not have to materialize a notebook tree on disk.
+var planDirExists = func(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // SelectTarget picks the ONE ecosystem this daemon supervises.
