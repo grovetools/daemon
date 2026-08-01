@@ -30,6 +30,7 @@ import (
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/util/pathutil"
+	"github.com/grovetools/daemon/internal/daemon/assistant"
 	"github.com/grovetools/daemon/internal/daemon/autonomous"
 	"github.com/grovetools/daemon/internal/daemon/buildqueue"
 	daemonchannels "github.com/grovetools/daemon/internal/daemon/channels"
@@ -242,9 +243,77 @@ func newGrovedHealthCmd() *cobra.Command {
 				fmt.Printf("Channel status:     (error: %v)\n", chErr)
 			}
 
+			printAssistantHealth(ctx, client)
+
 			return nil
 		},
 	}
+}
+
+// printAssistantHealth renders the assistant supervisor section of
+// `groved health` (assistant-pane spec §3.3). A crash-looping assistant must
+// degrade to a visible "stopped: <error>" line here, never to a silent loop —
+// this is the operator's half of that promise.
+//
+// The assistant is per-ecosystem, so its supervisor lives in the SCOPED daemon
+// while this command talks to the global one. The scoped daemon is asked
+// directly when this daemon has nothing to report.
+func printAssistantHealth(ctx context.Context, client daemon.Client) {
+	status, err := client.GetAssistantStatus(ctx)
+	if err != nil || status == nil || !status.Enabled {
+		if scoped := scopedAssistantStatus(ctx); scoped != nil {
+			status = scoped
+		}
+	}
+
+	fmt.Println()
+	if status == nil {
+		fmt.Println("Assistant:          (no daemon reported one)")
+		return
+	}
+	if !status.Enabled {
+		fmt.Println("Assistant:          disabled (no [assistant] block enabled in grove.toml)")
+		return
+	}
+
+	fmt.Printf("Assistant:          %s (plan %s)\n", status.State, status.Plan)
+	if status.HeadJobID != "" {
+		fmt.Printf("  head session:     %s\n", status.HeadJobID)
+	}
+	if status.LastAction != "" {
+		when := ""
+		if status.LastActionAt != nil {
+			when = " at " + status.LastActionAt.Format(time.RFC3339)
+		}
+		fmt.Printf("  last action:      %s%s\n", status.LastAction, when)
+	}
+	fmt.Printf("  continuations:    %d (chain resets: %d)\n", status.RestartCount, status.ChainResets)
+	if status.ConsecutiveFailures > 0 {
+		fmt.Printf("  failures in a row: %d\n", status.ConsecutiveFailures)
+	}
+	if status.NextAttemptAt != nil {
+		fmt.Printf("  next attempt:     %s\n", status.NextAttemptAt.Format(time.RFC3339))
+	}
+	if status.LastError != "" {
+		fmt.Printf("  last error:       %s\n", trimStatusError(status.LastError))
+	}
+	if status.State == models.AssistantStateStopped {
+		fmt.Println("  → supervision stopped; restart the daemon or POST /api/assistant/ensure?force=1")
+	}
+}
+
+// scopedAssistantStatus asks the daemon scoped to the current directory for its
+// assistant status. daemon.New resolves cwd → scope → socket and falls back to
+// a LocalClient, which answers "requires the grove daemon" — so an ecosystem
+// with no running scoped daemon simply yields nil here.
+func scopedAssistantStatus(ctx context.Context) *models.AssistantStatus {
+	scoped := daemon.New()
+	defer func() { _ = scoped.Close() }()
+	status, err := scoped.GetAssistantStatus(ctx)
+	if err != nil {
+		return nil
+	}
+	return status
 }
 
 const defaultDaemonMemoryLimit = int64(2 << 30) // 2 GiB allocation-spike backstop
@@ -965,6 +1034,37 @@ func newGrovedStartCmd() *cobra.Command {
 				pinger := autonomous.NewPinger(st, "")
 				pinger.SendInput = sendInputToSession
 				eng.Register(pinger)
+
+				// Assistant supervisor (assistant-pane spec §3.3): the
+				// ensure-running loop behind the rail's assistant pane, a
+				// sibling of the pinger above. It is per-ECOSYSTEM, so it
+				// reads its [assistant] block from the scope root — which
+				// leaves the global daemon (scope=="") with nothing to
+				// supervise, correctly: every assistant duty is
+				// ecosystem-scoped. Registered here, before eng.Start, for
+				// the same F19 reason the satellite collector is.
+				assistantSup, asErr := assistant.FromScope(scope, st)
+				if asErr != nil {
+					// A broken [assistant] block disables the assistant; it
+					// must never stop the daemon from booting.
+					ulog.Warn("Assistant supervisor disabled").Err(asErr).
+						Field("scope", scope).Log(ctx)
+				} else {
+					eng.Register(assistantSup)
+					srv.SetAssistantSupervisor(assistantSup)
+					if chMgr != nil {
+						// Inbound that reached no live agent is, for an
+						// ecosystem with a standing assistant claw, the
+						// assistant's mail. Poke the ensure loop.
+						chMgr.EnsureAssistant = assistantSup.Trigger
+					}
+					if assistantSup.Enabled() {
+						ulog.Info("Assistant supervisor registered").
+							Field("plan", assistantSup.Status().Plan).
+							Field("plan_dir", assistantSup.PlanDir()).
+							Log(ctx)
+					}
+				}
 
 				// 5. Handle Signals + auto-shutdown
 				stop := make(chan os.Signal, 1)

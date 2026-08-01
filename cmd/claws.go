@@ -16,21 +16,24 @@ import (
 )
 
 // newGrovedClawsCmd inspects the host-wide Signal claw state from the
-// two on-disk routing tables and the running signal-cli process. Gives
-// a quick read of which agents are claw-enabled and which daemons own
-// their sessions, without needing to dial any daemon.
+// on-disk channel state and the running signal-cli process. Gives a quick
+// read of which agents are claw-enabled and which daemons own their
+// sessions, without needing to dial any daemon.
 func newGrovedClawsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "claws",
 		Short: "Show active claws (agents with Signal enabled)",
 		Long: `List every agent currently designated as a Signal claw.
 
-Reads two on-disk tables under $(groved state-dir)/channels/:
-  signal_routes.json — timestamp→jobID for recent outbound messages
-                       (used for quote-reply routing)
-  routing.json       — jobID→scoped-daemon-socket for cross-daemon
-                       inbound forwarding (written by scoped daemons
-                       when a user claws a session)
+Reads the consolidated channel state at
+$(groved state-dir)/channels/state.json, which holds three tables:
+  inbound_routes   — jobID→scoped-daemon-socket for cross-daemon inbound
+                     forwarding (written by scoped daemons when a user
+                     claws a session)
+  quote_routes     — timestamp→jobID for recent outbound messages (used
+                     for quote-reply routing)
+  session_delivery — jobID→mux/target, the delivery address routing falls
+                     back to after a daemon restart
 
 Also reports signal-cli daemon health and the list of running groveds
 so you can tell which daemon owns each claw-enabled session.`,
@@ -45,34 +48,35 @@ so you can tell which daemon owns each claw-enabled session.`,
 			}
 			fmt.Println()
 
-			// --- routing.json (cross-daemon inbound routes) -------------------
-			routes, routesErr := loadRoutingJSON()
-			fmt.Println("Cross-daemon inbound routes (routing.json):")
-			if routesErr != nil {
-				fmt.Printf("  error reading file: %v\n", routesErr)
-			} else if len(routes) == 0 {
+			state, stateErr := loadChannelState()
+
+			// --- inbound_routes (cross-daemon inbound routes) -----------------
+			fmt.Println("Cross-daemon inbound routes (state.json inbound_routes):")
+			switch {
+			case stateErr != nil:
+				fmt.Printf("  error reading %s: %v\n", channelStatePath(), stateErr)
+			case len(state.InboundRoutes) == 0:
 				fmt.Println("  (empty — no claws registered by scoped daemons)")
-			} else {
-				jobIDs := sortedKeys(routes)
-				for _, jobID := range jobIDs {
-					sock := routes[jobID]
+			default:
+				for _, jobID := range sortedKeys(state.InboundRoutes) {
+					sock := state.InboundRoutes[jobID]
 					scope := scopeFromSocketPath(sock)
 					fmt.Printf("  %-30s → [%s] %s\n", jobID, displayScope(scope), filepath.Base(sock))
 				}
 			}
 			fmt.Println()
 
-			// --- signal_routes.json (timestamp → jobID for quote-reply) -------
-			sigRoutes, sigRoutesErr := loadSignalRoutesJSON()
-			fmt.Println("Outbound route table (signal_routes.json):")
-			if sigRoutesErr != nil {
-				fmt.Printf("  error reading file: %v\n", sigRoutesErr)
-			} else if len(sigRoutes) == 0 {
+			// --- quote_routes (timestamp → jobID for quote-reply) -------------
+			fmt.Println("Outbound route table (state.json quote_routes):")
+			switch {
+			case stateErr != nil:
+				fmt.Println("  (unavailable)")
+			case len(state.QuoteRoutes) == 0:
 				fmt.Println("  (empty — no recent outbound messages)")
-			} else {
+			default:
 				// Aggregate by jobID so the output stays compact.
 				byJob := map[string]int{}
-				for _, jobID := range sigRoutes {
+				for _, jobID := range state.QuoteRoutes {
 					byJob[jobID]++
 				}
 				jobIDs := make([]string, 0, len(byJob))
@@ -86,13 +90,46 @@ so you can tell which daemon owns each claw-enabled session.`,
 			}
 			fmt.Println()
 
-			// --- Claw summary: union of both tables ---------------------------
-			unique := map[string]bool{}
-			for j := range routes {
-				unique[j] = true
+			// --- session_delivery (persisted mux/target per claw) -------------
+			fmt.Println("Persisted delivery targets (state.json session_delivery):")
+			switch {
+			case stateErr != nil:
+				fmt.Println("  (unavailable)")
+			case len(state.SessionDelivery) == 0:
+				fmt.Println("  (empty — no claw has recorded a delivery target)")
+			default:
+				jobIDs := make([]string, 0, len(state.SessionDelivery))
+				for j := range state.SessionDelivery {
+					jobIDs = append(jobIDs, j)
+				}
+				sort.Strings(jobIDs)
+				for _, j := range jobIDs {
+					d := state.SessionDelivery[j]
+					target := d.TmuxTarget
+					if target == "" {
+						target = d.PtyID
+					}
+					mux := d.Mux
+					if mux == "" {
+						mux = "(unset)"
+					}
+					fmt.Printf("  %-30s → %s %s\n", j, mux, target)
+				}
 			}
-			for _, j := range sigRoutes {
-				unique[j] = true
+			fmt.Println()
+
+			// --- Claw summary: union of all three tables ----------------------
+			unique := map[string]bool{}
+			if stateErr == nil {
+				for j := range state.InboundRoutes {
+					unique[j] = true
+				}
+				for _, j := range state.QuoteRoutes {
+					unique[j] = true
+				}
+				for j := range state.SessionDelivery {
+					unique[j] = true
+				}
 			}
 			fmt.Printf("Total distinct claw-designated sessions: %d\n", len(unique))
 
@@ -162,44 +199,66 @@ func channelsDir() string {
 	return filepath.Join(paths.StateDir(), "channels")
 }
 
-func loadRoutingJSON() (map[string]string, error) {
-	data, err := os.ReadFile(filepath.Join(channelsDir(), "routing.json"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return map[string]string{}, nil
-		}
-		return nil, err
-	}
-	out := map[string]string{}
-	if len(data) == 0 {
-		return out, nil
-	}
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+// channelStatePath is the consolidated channel state file. It replaced the
+// separate routing.json + signal_routes.json tables; reading those legacy
+// paths against a current daemon produced empty tables and a "0 claws"
+// summary while state.json held the real routes.
+func channelStatePath() string {
+	return filepath.Join(channelsDir(), "state.json")
 }
 
-func loadSignalRoutesJSON() (map[string]string, error) {
-	// File stores numeric timestamps as JSON object keys; values are jobIDs.
-	data, err := os.ReadFile(filepath.Join(channelsDir(), "signal_routes.json"))
+// sessionDelivery mirrors channels.SessionDeliveryInfo. It is duplicated
+// rather than imported because this command is deliberately daemon-free: it
+// reads the file so it can report claw state with no daemon running at all.
+type sessionDelivery struct {
+	Mux        string `json:"mux,omitempty"`
+	TmuxTarget string `json:"tmux_target,omitempty"`
+	PtyID      string `json:"pty_id,omitempty"`
+}
+
+// channelState mirrors channels.ChannelState. Integer map keys are encoded as
+// JSON strings, so quote_routes decodes as map[string]string here.
+type channelState struct {
+	InboundRoutes   map[string]string          `json:"inbound_routes"`
+	QuoteRoutes     map[string]string          `json:"quote_routes"`
+	SessionDelivery map[string]sessionDelivery `json:"session_delivery"`
+}
+
+func emptyChannelState() *channelState {
+	return &channelState{
+		InboundRoutes:   map[string]string{},
+		QuoteRoutes:     map[string]string{},
+		SessionDelivery: map[string]sessionDelivery{},
+	}
+}
+
+// loadChannelState reads channels/state.json. A missing or empty file is the
+// normal pre-first-claw state, not an error.
+func loadChannelState() (*channelState, error) {
+	data, err := os.ReadFile(channelStatePath())
 	if err != nil {
 		if os.IsNotExist(err) {
-			return map[string]string{}, nil
+			return emptyChannelState(), nil
 		}
-		return nil, err
+		return emptyChannelState(), err
 	}
-	// routeTable is map[int64]string on the Go side, but json.Marshal
-	// encodes integer map keys as strings, so we decode into map[string]string
-	// and keep it that way for display.
-	out := map[string]string{}
+	state := emptyChannelState()
 	if len(data) == 0 {
-		return out, nil
+		return state, nil
 	}
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, err
+	if err := json.Unmarshal(data, state); err != nil {
+		return emptyChannelState(), err
 	}
-	return out, nil
+	if state.InboundRoutes == nil {
+		state.InboundRoutes = map[string]string{}
+	}
+	if state.QuoteRoutes == nil {
+		state.QuoteRoutes = map[string]string{}
+	}
+	if state.SessionDelivery == nil {
+		state.SessionDelivery = map[string]sessionDelivery{}
+	}
+	return state, nil
 }
 
 // scopeFromSocketPath extracts the scope-basename from a socket path like

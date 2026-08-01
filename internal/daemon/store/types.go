@@ -47,6 +47,15 @@ type State struct {
 	// the global daemon populates this (the ConnManager is constructed under
 	// the scope=="" gate); scoped daemons leave it empty.
 	Satellites map[string]*SatelliteStatusPayload `json:"satellites,omitempty"`
+
+	// Assistant is the daemon-side assistant supervisor's latest status
+	// (assistant-pane spec §3.3), written by the supervisor on every ensure
+	// pass. It rides the state stream so the rail's assistant pane can render
+	// "assistant stopped: <error>" instead of spinning on a placeholder — a
+	// crash-looping assistant must degrade to a VISIBLE state, never a silent
+	// loop. Nil until the supervisor publishes (or forever, on an ecosystem
+	// with no [assistant] block).
+	Assistant *models.AssistantStatus `json:"assistant,omitempty"`
 }
 
 // UpdateType defines what kind of data changed.
@@ -151,6 +160,13 @@ const (
 	// `grove status` satellite line see it over SSE for free (M2 contract C17).
 	// Payload: *SatelliteStatusPayload.
 	UpdateSatelliteStatus UpdateType = "satellite_status"
+
+	// Assistant supervisor status — emitted by the assistant supervisor after
+	// every ensure pass (assistant-pane spec §3.3). Recorded into
+	// State.Assistant and passed through to SSE subscribers so the rail pane
+	// and `groved health` read one source of truth.
+	// Payload: *models.AssistantStatus.
+	UpdateAssistantStatus UpdateType = "assistant_status"
 
 	// Satellite federation snapshot — the reconcile primitive the
 	// SatelliteCollector emits on every (re)connect and debounced re-snapshot

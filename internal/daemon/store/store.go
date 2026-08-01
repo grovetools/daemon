@@ -223,6 +223,18 @@ func (s *Store) GetSatelliteStatuses() map[string]*SatelliteStatusPayload {
 	return result
 }
 
+// GetAssistantStatus returns a copy of the assistant supervisor's last
+// published status, or nil when nothing has published one.
+func (s *Store) GetAssistantStatus() *models.AssistantStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.state.Assistant == nil {
+		return nil
+	}
+	statusCopy := *s.state.Assistant
+	return &statusCopy
+}
+
 // GetNoteIndex returns note index entries, optionally filtered by workspace.
 // If workspace is empty, all entries are returned.
 func (s *Store) GetNoteIndex(workspace string) []*models.NoteIndexEntry {
@@ -621,6 +633,14 @@ func (s *Store) ApplyUpdate(u Update) {
 				s.state.Satellites = make(map[string]*SatelliteStatusPayload)
 			}
 			s.state.Satellites[payload.Name] = payload
+		}
+
+	// Assistant supervisor status (spec §3.3). Last-writer-wins on a single
+	// slot: there is exactly one assistant per scoped daemon.
+	case UpdateAssistantStatus:
+		if payload, ok := u.Payload.(*models.AssistantStatus); ok && payload != nil {
+			statusCopy := *payload
+			s.state.Assistant = &statusCopy
 		}
 
 	// Origin-scoped federation snapshot from the SatelliteCollector (C7/C16).

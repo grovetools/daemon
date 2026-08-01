@@ -99,6 +99,20 @@ type Manager struct {
 	// resolves the mux + PTY/tmux target internally).
 	SendInput func(ctx context.Context, jobID, message string) error
 
+	// EnsureAssistant, when set, is poked whenever inbound could not be
+	// delivered to any live agent — no active claws, or a delivery that
+	// failed. With a standing assistant claw registered, that case IS mail
+	// for the assistant: the claw is gone because its session died, and the
+	// supervisor is the thing that brings it back (assistant-pane spec §3.3
+	// "ensure on inbound"). It is called asynchronously and never blocks the
+	// inbound path.
+	//
+	// This wires the TRIGGER only. Routing untagged inbound to a configured
+	// default claw, and queueing the message for delivery on attach, are
+	// phase 3 (spec §3.4) — today the message that woke the assistant is
+	// still dropped, and the sender is told so by the existing reply path.
+	EnsureAssistant func(reason string)
+
 	recentInbound    [10]models.InboundRecord
 	recentInboundIdx int
 	recentInboundLen int
@@ -814,6 +828,7 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 			m.mu.Unlock()
 			m.ulog.Warn("Inbound message dropped — no active agents").Log(ctx)
 			m.recordInbound(msg.Source, "dropped", "", "no active agents", false)
+			m.pokeAssistant("inbound_no_agents")
 			return
 		}
 	}
@@ -918,10 +933,23 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 			Field("job_id", targetJobID).
 			Log(ctx)
 		m.recordInbound(msg.Source, resolvedVia, targetJobID, err.Error(), false)
+		// A claw whose session no longer accepts input is a dead agent with a
+		// live route. If it was the assistant's, the supervisor can fix it.
+		m.pokeAssistant("inbound_undeliverable")
 		return
 	}
 	m.ulog.Success("Signal message injected").Field("job_id", targetJobID).Log(ctx)
 	m.recordInbound(msg.Source, resolvedVia, targetJobID, "", true)
+}
+
+// pokeAssistant asks the assistant supervisor to ensure a live assistant, off
+// the inbound path. Best-effort in both directions: no supervisor means no
+// poke, and a poke never delays or fails the message it rode in on.
+func (m *Manager) pokeAssistant(reason string) {
+	if m.EnsureAssistant == nil {
+		return
+	}
+	go m.EnsureAssistant(reason)
 }
 
 // startSignalChannel starts the signal-cli daemon process.

@@ -34,6 +34,7 @@ import (
 	coretmux "github.com/grovetools/core/pkg/tmux"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/version"
+	"github.com/grovetools/daemon/internal/daemon/assistant"
 	"github.com/grovetools/daemon/internal/daemon/buildqueue"
 	"github.com/grovetools/daemon/internal/daemon/channels"
 	"github.com/grovetools/daemon/internal/daemon/engine"
@@ -104,6 +105,11 @@ type Server struct {
 	jobRunner      atomic.Pointer[jobrunner.JobRunner]
 	envManager     atomic.Pointer[daemonenv.Manager]
 	channelManager atomic.Pointer[channels.Manager]
+
+	// assistantSupervisor is the ensure-running loop behind the rail's
+	// assistant pane (spec §3.3). Nil on every daemon whose ecosystem has no
+	// enabled [assistant] block, which is the default.
+	assistantSupervisor atomic.Pointer[assistant.Supervisor]
 
 	// satelliteCM is the SSH transport to registered satellites (M2 C1/C10).
 	// It is wired ONLY on the global daemon (scope==""); scoped daemons leave
@@ -469,6 +475,8 @@ var daemonRoutes = []daemonRoute{
 	{pattern: "/api/channels/send"},
 	{pattern: "/api/channels/status"},
 	{pattern: "/api/channels/cleanup"},
+	{pattern: "/api/assistant/ensure"},
+	{pattern: "/api/assistant/status"},
 	{pattern: "/api/memory/search"},
 	{pattern: "/api/memory/coverage"},
 	{pattern: "/api/memory/status"},
@@ -691,6 +699,10 @@ func (s *Server) registerNormalRoutes(routes classifiedRouteRegistrar) {
 	routes.HandleFunc("/api/channels/send", s.handleChannelSend)
 	routes.HandleFunc("/api/channels/status", s.handleChannelStatus)
 	routes.HandleFunc("/api/channels/cleanup", s.handleChannelCleanup)
+	// Assistant supervisor endpoints (spec §3.3). The ensure endpoint is what
+	// the rail's assistant pane calls when it finds no live head.
+	routes.HandleFunc("/api/assistant/ensure", s.handleAssistantEnsure)
+	routes.HandleFunc("/api/assistant/status", s.handleAssistantStatus)
 	// Memory search endpoints
 	routes.HandleFunc("/api/memory/search", s.handleMemorySearch)
 	routes.HandleFunc("/api/memory/coverage", s.handleMemoryCoverage)
@@ -3175,6 +3187,16 @@ func convertUpdatePayload(u store.Update) *apiStateUpdate {
 	case store.UpdateSatelliteStatus:
 		return &apiStateUpdate{
 			UpdateType: "satellite_status",
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
+
+	// Assistant supervisor status (spec §3.3) — passthrough so the rail's
+	// assistant pane learns about a stopped or backing-off supervisor over the
+	// stream it is already subscribed to, rather than by polling.
+	case store.UpdateAssistantStatus:
+		return &apiStateUpdate{
+			UpdateType: "assistant_status",
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
