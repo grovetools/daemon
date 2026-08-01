@@ -35,7 +35,15 @@ type statusFileContent struct {
 //  2. If alive, spawns a poller to detect when it exits
 //  3. If not, reconciles from the durable .status file, or records the
 //     non-terminal "orphaned" when the agent left no exit behind
+//
+// It runs at most once per daemon: the sweep is boot recovery, and a second
+// pass would re-walk every job record on the machine and start a duplicate
+// poller goroutine for every live agent.
 func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
+	jr.adoptOnce.Do(func() { jr.adoptRunningAgents(ctx) })
+}
+
+func (jr *JobRunner) adoptRunningAgents(ctx context.Context) {
 	if jr.persister == nil {
 		return
 	}
@@ -113,9 +121,18 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 			// finalize fix), but the job-file frontmatter may still sit at
 			// running/idle — the exact strand this feature fixes.
 			// FinalizeHeadlessJob re-reads frontmatter from disk and no-ops if
-			// it is already terminal, so this is safe to call unconditionally
-			// for headless jobs and converts pre-fix strands at the next boot.
-			if job.Type == models.JobType("headless_agent") {
+			// it is already terminal, so this is safe to call for headless jobs
+			// and converts strands at the next boot.
+			//
+			// Bounded to jobs that were active recently (see
+			// jobRecentlyActive). The persisted store is a file per job ever
+			// submitted on this machine — thousands deep — and every boot used
+			// to re-load, re-parse and re-finalize all of them, logging
+			// "finalized" for jobs that ended weeks ago and warning about plan
+			// directories the user has since deleted. A strand can only be
+			// created by a boot that lost a running job, so anything older than
+			// the window has already been through this pass on an earlier boot.
+			if job.Type == models.JobType("headless_agent") && jobRecentlyActive(job) {
 				jr.finalizeHeadlessFrontmatter(ctx, job)
 			}
 			continue
@@ -218,6 +235,37 @@ func (jr *JobRunner) AdoptRunningAgents(ctx context.Context) {
 			Field("reconciled", reconciled).
 			Log(ctx)
 	}
+}
+
+// adoptionLookback bounds the boot-time rescan of jobs that are ALREADY
+// terminal. It only has to cover "a daemon died between the job ending and its
+// frontmatter being finalized", which is a same-session window; a day of slack
+// absorbs an overnight laptop suspend without dragging the whole history along.
+const adoptionLookback = 24 * time.Hour
+
+// jobRecentlyActive reports whether a non-running job ended (or, failing that,
+// started or was submitted) inside the lookback window. Timestamps are checked
+// newest-first because a job carries whichever ones its lifecycle reached.
+//
+// A job with no timestamp at all is treated as OLD: every record written by a
+// current daemon has at least SubmittedAt, so the timestamp-less case is a
+// legacy or hand-edited file, and those are precisely the ones not worth
+// re-finalizing on every boot forever.
+func jobRecentlyActive(job *models.JobInfo) bool {
+	if job == nil {
+		return false
+	}
+	cutoff := time.Now().Add(-adoptionLookback)
+	if job.CompletedAt != nil {
+		return job.CompletedAt.After(cutoff)
+	}
+	if job.StartedAt != nil {
+		return job.StartedAt.After(cutoff)
+	}
+	if !job.SubmittedAt.IsZero() {
+		return job.SubmittedAt.After(cutoff)
+	}
+	return false
 }
 
 // rebuildAgentSessions reconstructs the agent-session store from the live tuimux
@@ -556,6 +604,22 @@ func (jr *JobRunner) getStatusFilePath(job *models.JobInfo) string {
 // this is safe to call from every adoption branch.
 func (jr *JobRunner) finalizeHeadlessFrontmatter(ctx context.Context, job *models.JobInfo) {
 	if job == nil || job.Type != models.JobType("headless_agent") {
+		return
+	}
+
+	// A plan directory the user has deleted is an ordinary outcome, not a
+	// fault: the job's record outlives its plan, and there is no frontmatter
+	// left to finalize. Checked before LoadPlan so it never surfaces as a
+	// warning per dead plan on every boot.
+	if job.PlanDir == "" {
+		return
+	}
+	if _, statErr := os.Stat(job.PlanDir); statErr != nil {
+		jr.ulog.Debug("Adoption: plan directory is gone; nothing to finalize").
+			Field("job_id", job.ID).
+			Field("plan_dir", job.PlanDir).
+			StructuredOnly().
+			Log(ctx)
 		return
 	}
 

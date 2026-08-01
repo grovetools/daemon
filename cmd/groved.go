@@ -266,6 +266,18 @@ func newGrovedStartCmd() *cobra.Command {
 				sockPath = paths.SocketPath(scope)
 			}
 
+			// Declare this process a daemon before ANY boot step can run
+			// borrowed code. groved executes flow's orchestration package
+			// in-process (the JobRunner runs jobs by calling into it) and that
+			// code reaches for daemon.NewWithAutoStart, whose "start one if
+			// needed" contract is wrong inside a daemon: a groved that forks a
+			// sibling for another worktree creates a daemon with no clients and
+			// no work, which idles until --auto-shutdown reaps it and reappears
+			// on the next poll. On a fleet restart that turned one restart into
+			// one surplus daemon per active worktree. From here on the factory
+			// hands in-process callers this daemon's own client instead.
+			daemon.MarkInProcessDaemon(sockPath)
+
 			autoShutdown, _ := cmd.Flags().GetBool("auto-shutdown")
 			pairPID, _ := cmd.Flags().GetInt("pair-with-pid")
 			readyFd, _ := cmd.Flags().GetInt("ready-fd")
@@ -534,18 +546,43 @@ func newGrovedStartCmd() *cobra.Command {
 			go workspaceStreamer.Start(ctx)
 			srv.SetWorkspaceStreamer(workspaceStreamer)
 
-			// If the parent passed --ready-fd, close that inherited fd as soon as
-			// the socket is bound (Listen fires OnReady). The parent reads EOF and
-			// stops polling — a deterministic handshake. Wired before Listen so
-			// early bind signals readiness at the earliest defensible point.
-			// No-op when readyFd is 0 (ad-hoc / manual startups).
-			if readyFd > 0 {
-				srv.OnReady = func() {
+			// Fires the instant the unix socket is bound — the earliest moment a
+			// client can dial us. Two things hang off it:
+			//
+			//  1. If the parent passed --ready-fd, close that inherited fd. The
+			//     parent reads EOF and stops polling — a deterministic
+			//     handshake. No-op when readyFd is 0 (ad-hoc / manual startups).
+			//  2. The GLOBAL daemon registers itself as the routing endpoint of
+			//     last resort (daemon.RegisterDaemonHost). Without it, "no live
+			//     registered UI host" and "no host at all" are the same answer,
+			//     which is exactly wrong during a fleet restart: treemux is
+			//     still coming back, the hosts registry is empty, and every
+			//     scope-resolving client in a worktree concludes "no host" and
+			//     spawns a scoped groved nothing will use. A live UI host always
+			//     outranks this record, so treemux's routing is unchanged while
+			//     it is up. Registered at BIND, not after boot, because the
+			//     window this closes is measured in seconds. Scoped daemons
+			//     never register: their socket would become the most specific
+			//     host for their own subtree and could steal session traffic
+			//     from a global treemux streaming a different daemon.
+			var unregisterDaemonHost func()
+			srv.OnReady = func() {
+				if readyFd > 0 {
 					if err := syscall.Close(readyFd); err != nil {
 						ulog.Warn("failed to close ready-fd").
 							Field("fd", readyFd).Err(err).Log(ctx)
 					}
 				}
+				if scope != "" {
+					return
+				}
+				unregister, herr := daemon.RegisterDaemonHost(scope, "groved")
+				if herr != nil {
+					ulog.Warn("Failed to register daemon host; scoped clients may spawn their own daemons").
+						Err(herr).Log(ctx)
+					return
+				}
+				unregisterDaemonHost = unregister
 			}
 
 			// Boot phases published under early bind. Each boundary updates the
@@ -928,7 +965,14 @@ func newGrovedStartCmd() *cobra.Command {
 						ulog.Error("Server shutdown error").Err(err).Log(bgCtx)
 					}
 
-					// Explicitly release pidfile before exit in signal handler
+					// Explicitly release pidfile and drop the daemon-host record
+					// before exit in signal handler (os.Exit skips defers). A
+					// leftover record is harmless — lookups skip dead pids and
+					// the next registration prunes it — but leaving one behind
+					// means every lookup pays a dial to a dead socket first.
+					if unregisterDaemonHost != nil {
+						unregisterDaemonHost()
+					}
 					_ = pidfile.Release(pidPath)
 					os.Exit(0)
 				}()

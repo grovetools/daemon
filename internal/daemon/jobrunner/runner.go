@@ -39,6 +39,13 @@ type JobRunner struct {
 	// May be nil when the tuimux daemon could not be started.
 	tuimuxClient *tuimux.ApiClient
 
+	// adoptOnce makes AdoptRunningAgents a boot-time singleton. The sweep
+	// loads every job record this machine has ever persisted (the store is a
+	// file per job in a shared state dir, thousands deep on a working laptop),
+	// starts a poller goroutine per live agent, and reconciles frontmatter —
+	// none of which is idempotent-cheap enough to run twice.
+	adoptOnce sync.Once
+
 	// blocked holds jobs whose dependencies are not yet satisfied.
 	// They are promoted to the run queue by evaluateBlockedJobs().
 	blocked   map[string]*models.JobInfo
