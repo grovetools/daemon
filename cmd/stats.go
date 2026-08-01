@@ -206,6 +206,10 @@ var counterHighlights = []struct{ key, label string }{
 	{"git.divergence_cache.hit_rate", "divergence hit rate"},
 	{"logstream.workspace_tailers", "workspace tailers"},
 	{"logstream.job_tailers", "job tailers"},
+	{"sse.subscribers", "sse subscribers"},
+	{"sse.events.published", "sse published"},
+	{"sse.events.filtered", "sse filtered"},
+	{"sse.initial.skipped", "sse snapshots skipped"},
 	{"collector.git.interval_ms", "git interval (effective)"},
 }
 

@@ -21,7 +21,7 @@ func (f *fakeGitMirrorClient) GetEnrichedWorkspaces(context.Context, *models.Enr
 	return f.workspaces, nil
 }
 
-func (f *fakeGitMirrorClient) StreamState(context.Context) (<-chan coredaemon.StateUpdate, error) {
+func (f *fakeGitMirrorClient) StreamState(context.Context, ...coredaemon.StreamFilter) (<-chan coredaemon.StateUpdate, error) {
 	return f.stream, nil
 }
 func (f *fakeGitMirrorClient) Close() error { return nil }

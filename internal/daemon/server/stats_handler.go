@@ -137,6 +137,8 @@ func (s *Server) collectCounters() map[string]float64 {
 			counters["store.sessions_live"] = float64(len(liveAgentPIDsFromState(st.Get().Sessions)))
 		}
 	}
+	counters["sse.subscribers"] = float64(s.sseSubscribers.Load())
+	counters["sse.subscribers.filtered"] = float64(s.sseSubscribersFiltered.Load())
 	if s.workspaceStreamer != nil {
 		counters["logstream.workspace_tailers"] = float64(s.workspaceStreamer.ActiveTailers())
 	}

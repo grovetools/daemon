@@ -40,6 +40,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/satellite"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 	"github.com/grovetools/daemon/internal/daemon/theming"
 	"github.com/grovetools/daemon/internal/daemon/watcher"
 	"github.com/grovetools/daemon/internal/enrichment"
@@ -130,6 +131,14 @@ type Server struct {
 	// Done=true (the daemon only reaches that handler once serving, which
 	// under bind-last means boot already finished).
 	bootStatus atomic.Pointer[coredaemon.BootStatus]
+
+	// sseSubscribers / sseSubscribersFiltered count live /api/stream
+	// subscriptions and how many of those declared a subscribe-time filter.
+	// They back the sse.subscribers* counters on /api/system/stats — the
+	// denominator for sse.events.*, which are meaningless without knowing how
+	// many streams were open.
+	sseSubscribers         atomic.Int64
+	sseSubscribersFiltered atomic.Int64
 
 	// scope is the daemon's configured ecosystem scope — empty for the
 	// global/unscoped daemon, non-empty for scoped daemons. Proxy
@@ -1750,11 +1759,19 @@ func splitPath(path string) []string {
 
 // handleStreamState provides Server-Sent Events (SSE) for real-time state updates.
 // Clients can subscribe to this endpoint to receive updates whenever the daemon state changes.
+//
+// Subscribers may declare what they want with ?types= and ?paths= (see
+// coredaemon.StreamFilter); non-matching events are dropped here, before
+// serialization and before the write. A subscribe with neither parameter gets
+// the full host-wide stream exactly as it always did, so the filter is additive
+// and old clients are unaffected.
 func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		http.Error(w, "engine not initialized", http.StatusServiceUnavailable)
 		return
 	}
+
+	filter := coredaemon.ParseStreamFilter(r.URL.Query())
 
 	// Ensure the connection supports flushing
 	flusher, ok := w.(http.Flusher)
@@ -1774,6 +1791,16 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	releaseLease := s.terminalHub.AcquireClientLease()
 	defer releaseLease()
 
+	// Live-subscriber gauges, read at snapshot time by collectCounters. Tracked
+	// here rather than pushed into telemetry so the number cannot drift from
+	// reality if a future early-return forgets to decrement.
+	s.sseSubscribers.Add(1)
+	defer s.sseSubscribers.Add(-1)
+	if !filter.IsZero() {
+		s.sseSubscribersFiltered.Add(1)
+		defer s.sseSubscribersFiltered.Add(-1)
+	}
+
 	// Subscribe to store updates
 	ch := s.engine.Store().Subscribe()
 	defer s.engine.Store().Unsubscribe(ch)
@@ -1789,24 +1816,36 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	// after the pre-stream GetBootStatus poll would otherwise miss a boot that
 	// finished in between, and never see a Done transition. Sent whenever boot
 	// is still in progress, regardless of whether any workspaces exist yet.
-	state := s.engine.Store().Get()
-	themePayload := theming.CurrentPayload()
-	boot := s.bootStatus.Load()
-	if len(state.Workspaces) > 0 || state.PlanIndex != nil || themePayload != nil || (boot != nil && !boot.Done) {
-		workspaces := make([]*models.EnrichedWorkspace, 0, len(state.Workspaces))
-		for _, ws := range state.Workspaces {
-			workspaces = append(workspaces, ws)
-		}
-		initialUpdate := &apiStateUpdate{
-			Workspaces:        workspaces,
-			UpdateType:        "initial",
-			Theme:             themePayload,
-			BootPhase:         boot,
-			PlanIndexSnapshot: state.PlanIndex,
-		}
-		if data, err := json.Marshal(initialUpdate); err == nil {
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
-			flusher.Flush()
+	//
+	// A filtered subscriber that did not name "initial" skips the whole block:
+	// building this frame means marshalling every enriched workspace plus the
+	// plan index, which is by far the largest thing this endpoint ever writes.
+	// Not producing it is the main saving subscribe-time filtering buys.
+	if !filter.AllowsType(coredaemon.StreamTypeInitial) {
+		telemetry.SSEInitialSkipped.Inc()
+	} else {
+		state := s.engine.Store().Get()
+		themePayload := theming.CurrentPayload()
+		boot := s.bootStatus.Load()
+		if len(state.Workspaces) > 0 || state.PlanIndex != nil || themePayload != nil || (boot != nil && !boot.Done) {
+			workspaces := make([]*models.EnrichedWorkspace, 0, len(state.Workspaces))
+			for _, ws := range state.Workspaces {
+				workspaces = append(workspaces, ws)
+			}
+			initialUpdate := &apiStateUpdate{
+				Workspaces:        workspaces,
+				UpdateType:        coredaemon.StreamTypeInitial,
+				Theme:             themePayload,
+				BootPhase:         boot,
+				PlanIndexSnapshot: state.PlanIndex,
+			}
+			if sent, ok := applyStreamFilter(filter, initialUpdate); ok {
+				if data, err := json.Marshal(sent); err == nil {
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+					telemetry.SSEInitialSent.Inc()
+				}
+			}
 		}
 	}
 
@@ -1820,6 +1859,15 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 			if apiUpdate == nil {
 				continue
 			}
+			telemetry.SSEEventsPublished.Inc()
+
+			// Drop before serializing: a filtered subscriber must not pay for
+			// the JSON of an event it declared no interest in.
+			apiUpdate, ok := applyStreamFilter(filter, apiUpdate)
+			if !ok {
+				telemetry.SSEEventsFiltered.Inc()
+				continue
+			}
 
 			data, err := json.Marshal(apiUpdate)
 			if err != nil {
@@ -1829,6 +1877,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 			// SSE format: "data: {json}\n\n"
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
+			telemetry.SSEEventsDelivered.Inc()
 		}
 	}
 }

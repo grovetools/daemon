@@ -96,6 +96,22 @@ var (
 	// NOT fall.
 	WatcherEventsSuppressed = Default().Counter("watcher.events.suppressed")
 
+	// SSE fan-out (/api/stream). Counted per subscriber-event, not per store
+	// broadcast: the cost this measures is serialize-and-write, which the
+	// daemon pays once per subscriber, and the whole point of subscribe-time
+	// filtering is to not pay it. published == delivered + filtered by
+	// construction — an event that never survives conversion to the public
+	// wire shape is counted by neither.
+	SSEEventsPublished = Default().Counter("sse.events.published")
+	SSEEventsDelivered = Default().Counter("sse.events.delivered")
+	SSEEventsFiltered  = Default().Counter("sse.events.filtered")
+	// The subscribe-time snapshot is tracked separately because it is not one
+	// event among many: it is the whole enriched-workspace map, and on a mature
+	// host it dwarfs every other frame combined. sse.initial.skipped is
+	// therefore the counter that shows whether filtering is actually paying.
+	SSEInitialSent    = Default().Counter("sse.initial.sent")
+	SSEInitialSkipped = Default().Counter("sse.initial.skipped")
+
 	// Transcript parsing (the rescan-loop signature).
 	TranscriptConsidered = Default().RateCounter("transcript.considered")
 	TranscriptParsed     = Default().RateCounter("transcript.parses")

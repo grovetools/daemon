@@ -16,7 +16,7 @@ const gitMirrorRetryInterval = 5 * time.Second
 // daemons. Keeping the interface small makes the state-transfer rules testable.
 type gitMirrorClient interface {
 	GetEnrichedWorkspaces(context.Context, *models.EnrichmentOptions) ([]*models.EnrichedWorkspace, error)
-	StreamState(context.Context) (<-chan coredaemon.StateUpdate, error)
+	StreamState(context.Context, ...coredaemon.StreamFilter) (<-chan coredaemon.StateUpdate, error)
 	Close() error
 }
 
