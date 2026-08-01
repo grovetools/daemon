@@ -645,17 +645,26 @@ const (
 // continueChain picks and performs the cheapest continuation (spec §3.3):
 //
 //  1. orphaned/interrupted  → flow plan resume (pi resumes in place: same
-//     session uuid, same transcript, same context)
+//     session uuid, same transcript, same context),
+//     falling back to retry and then to rung 5
 //  2. failed/pending        → flow plan retry -r
 //  3. running               → nothing; `flow status` PID-verifies running jobs
 //     (job_verify.go), so a job that STILL reads running
 //     after that pass is believed alive, and launching a
 //     second head would fork the chain
 //  4. anything else, chain  → flow plan resume (continue in place; the agent's
-//     not exhausted            own handoff monitor hands off when it fills up)
+//     not exhausted            own handoff monitor hands off when it fills up),
+//     falling back to retry and then to rung 5
 //  5. exhausted or no job   → chain reset: flow plan add --json + flow plan
 //     run --yes --background, seeded from the last
 //     handoff spec plus the memory-dir pointer
+//
+// Rungs 1 and 4 both continue in place, so both share one rescue: when BOTH
+// resume and retry refuse, continueInPlaceOrReset drops to rung 5 rather than
+// returning the refusal. They share a helper rather than a copied block
+// precisely because they drifted apart once already — rung 4 got the
+// fallthrough and rung 1 did not, and rung 1 is the branch that actually wedged
+// in production.
 //
 // idle and pending_user deliberately land on rung 4, not rung 3. flow verifies
 // only `running` jobs, so an idle job whose agent died in a reboot reads idle
@@ -676,11 +685,7 @@ func (s *Supervisor) continueChain(ctx context.Context) (action, error) {
 
 	switch strings.ToLower(head.Status) {
 	case "orphaned", "interrupted":
-		if err := s.resumeOrRetry(ctx, head); err != nil {
-			return actionResume, err
-		}
-		s.reclaw(ctx, head)
-		return actionResume, nil
+		return s.continueInPlaceOrReset(ctx, head)
 
 	case "failed", "pending", "blocked", "needs_review":
 		if err := s.flow.Retry(ctx, head.FilePath, s.agentTarget()); err != nil {
@@ -703,30 +708,44 @@ func (s *Supervisor) continueChain(ctx context.Context) (action, error) {
 		if s.exhausted(head) {
 			return s.chainReset(ctx, &head)
 		}
-		if err := s.resumeOrRetry(ctx, head); err != nil {
-			// Both continuations-in-place refused. That is not a transient
-			// failure to back off from — flow refuses for STRUCTURAL reasons
-			// (a provider with no resume path for this routing, a completed
-			// job retry will not touch), and every later pass will hit the
-			// identical refusal until the breaker trips. Rung 5 is the answer
-			// the ladder already has for "this chain cannot be continued in
-			// place": start a fresh one, seeded from the predecessor's handoff
-			// spec, under the same rate limit. The assistant stays immortal;
-			// the budget still bounds a genuine runaway.
-			s.ulog.Warn("Assistant cannot be continued in place; resetting the chain").
-				Err(err).
-				Field("job", jobFileName(head)).
-				Field("status", head.Status).
-				Log(ctx)
-			resetAction, resetErr := s.chainReset(ctx, &head)
-			if resetErr != nil {
-				return resetAction, fmt.Errorf("%w; chain reset also failed: %v", err, resetErr)
-			}
-			return resetAction, nil
-		}
-		s.reclaw(ctx, head)
-		return actionResume, nil
+		return s.continueInPlaceOrReset(ctx, head)
 	}
+}
+
+// continueInPlaceOrReset continues head where it stands, and drops to rung 5
+// when it cannot be.
+//
+// Both continuations-in-place refusing is not a transient failure to back off
+// from — flow refuses for STRUCTURAL reasons, and every later pass hits the
+// identical refusal until the breaker trips. Rung 5 is the answer the ladder
+// already has for "this chain cannot be continued in place": start a fresh one,
+// seeded from the predecessor's handoff spec, under the same rate limit. The
+// assistant stays immortal; the budget still bounds a genuine runaway.
+//
+// Two distinct refusal pairs have been seen doing exactly this. A completed
+// head answers `does not support prepared resume launch on tmux` / `job already
+// completed`. An interrupted head — what flow's own verifier marks a job whose
+// agent died without recording it (job_verify.go, "session not found after
+// grace period") — answers `cannot resume job: status is 'running', must be
+// 'completed'` / `cannot reset running job … Use --force to override`, and
+// repeated it every ~50s until a human intervened. Hence one helper for both
+// call sites: the rescue belongs to the CONDITION, not to whichever branch
+// noticed it first.
+func (s *Supervisor) continueInPlaceOrReset(ctx context.Context, head Job) (action, error) {
+	if err := s.resumeOrRetry(ctx, head); err != nil {
+		s.ulog.Warn("Assistant cannot be continued in place; resetting the chain").
+			Err(err).
+			Field("job", jobFileName(head)).
+			Field("status", head.Status).
+			Log(ctx)
+		resetAction, resetErr := s.chainReset(ctx, &head)
+		if resetErr != nil {
+			return resetAction, fmt.Errorf("%w; chain reset also failed: %v", err, resetErr)
+		}
+		return resetAction, nil
+	}
+	s.reclaw(ctx, head)
+	return actionResume, nil
 }
 
 // agentTarget is the mux every continuation launches into. See

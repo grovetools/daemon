@@ -552,6 +552,73 @@ func TestUncontinuableChainResetsInsteadOfBackingOff(t *testing.T) {
 	}
 }
 
+// TestUncontinuableInterruptedChainResetsInsteadOfBackingOff: the same rescue,
+// on the rung that actually wedges. `interrupted` is what flow's own verifier
+// marks a job whose agent died without recording it (job_verify.go, "session
+// not found after grace period"), so this is the MOST likely head status to
+// find a chain in — and for a while it was the one branch of the ladder with no
+// fallthrough, which is how the standing steward spent an afternoon emitting
+// these two refusals every ~50s until a human intervened.
+func TestUncontinuableInterruptedChainResetsInsteadOfBackingOff(t *testing.T) {
+	flow := &fakeFlow{
+		jobs:      []Job{agentJob("01-steward.md", "interrupted", 0)},
+		resumeErr: errors.New("cannot resume job: status is 'running', must be 'completed'"),
+		retryErr:  errors.New("cannot reset running job: 01-steward.md (no live agent process found). Use --force to override."),
+	}
+	s, _ := newTestSupervisor(t, flow)
+
+	status, err := s.Ensure(context.Background(), "test", false)
+	if err != nil {
+		t.Fatalf("Ensure: %v — an uncontinuable interrupted chain must reset, not fail", err)
+	}
+	want := []string{
+		"jobs",
+		"resume 01-steward.md",
+		"retry 01-steward.md",
+		"add steward",
+		"run 02-steward.md",
+		"claw 02-steward.md signal",
+	}
+	if got := flow.history(); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("calls = %v, want %v", got, want)
+	}
+	if status.LastAction != string(actionChainReset) {
+		t.Errorf("last action = %q, want chain_reset", status.LastAction)
+	}
+	if status.State != models.AssistantStateStarting {
+		t.Errorf("state = %q, want starting", status.State)
+	}
+	if status.ChainResets != 1 {
+		t.Errorf("chain resets = %d, want 1", status.ChainResets)
+	}
+	if status.ConsecutiveFailures != 0 {
+		t.Errorf("failures = %d, want 0: the reset succeeded", status.ConsecutiveFailures)
+	}
+}
+
+// TestUncontinuableInterruptedChainStillReportsBothCauses: rung 1 owes the
+// operator the same honesty rung 4 does — when the reset ALSO fails, the
+// refusals that sent us there must survive, not just the budget message.
+func TestUncontinuableInterruptedChainStillReportsBothCauses(t *testing.T) {
+	flow := &fakeFlow{
+		jobs:      []Job{agentJob("01-steward.md", "interrupted", 0)},
+		resumeErr: errors.New("cannot resume job: status is 'running', must be 'completed'"),
+		retryErr:  errors.New("cannot reset running job: 01-steward.md (no live agent process found). Use --force to override."),
+		addErr:    errors.New("plan add refused"),
+	}
+	s, _ := newTestSupervisor(t, flow)
+
+	status, err := s.Ensure(context.Background(), "test", false)
+	if err == nil {
+		t.Fatal("want a failure when neither continuation nor reset works")
+	}
+	for _, want := range []string{"must be 'completed'", "no live agent process found", "plan add refused"} {
+		if !strings.Contains(status.LastError, want) {
+			t.Errorf("last error %q is missing %q", status.LastError, want)
+		}
+	}
+}
+
 // TestUncontinuableChainStillReportsBothCauses: the reset is a fallback, not a
 // cover-up. When it ALSO fails, the operator needs the refusal that sent us
 // there, not just the budget message.
