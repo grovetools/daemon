@@ -23,6 +23,7 @@ func (f *fakeChannel) Name() string { return "signal" }
 func (f *fakeChannel) Start(context.Context, func(notifychannels.InboundMessage)) error {
 	return nil
 }
+
 func (f *fakeChannel) Send(_ context.Context, req notifychannels.OutboundMessage) (*notifychannels.SendResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -33,11 +34,13 @@ func (f *fakeChannel) Stop(context.Context) error { return nil }
 func (f *fakeChannel) Status() notifychannels.ChannelStatus {
 	return notifychannels.ChannelStatus{IsAlive: true}
 }
+
 func (f *fakeChannel) messages() []notifychannels.OutboundMessage {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]notifychannels.OutboundMessage(nil), f.sent...)
 }
+
 func (f *fakeChannel) contains(substr string) bool {
 	for _, m := range f.messages() {
 		if strings.Contains(m.Message, substr) {
