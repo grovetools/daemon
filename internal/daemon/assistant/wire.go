@@ -20,45 +20,115 @@ var liveSessionStatuses = map[string]bool{
 	"starting":     true,
 }
 
-// FromScope builds a supervisor for the ecosystem rooted at scopeDir, reading
-// its [assistant] grove.toml block and resolving the assistant plan to an
-// ABSOLUTE plan directory.
+// ForDaemon builds the supervisor for a daemon whose own scope is scope.
+//
+// The two deployments resolve differently and this is the only place that
+// knows it:
+//
+//   - scope != "" — a SCOPED daemon, one per ecosystem worktree. Development
+//     only. It reads [assistant] from its own scope root, which is the
+//     ecosystem it was started for.
+//   - scope == "" — the GLOBAL daemon, which is what production runs. It has no
+//     scope to read, so it DISCOVERS the ecosystems it can see and reads their
+//     blocks (discover.go). Before this existed the global daemon read
+//     LoadConfig(""), got an empty Config, and supervised nothing — the
+//     supervisor was dead on arrival in the only deployment that matters.
+//
+// Resolution is lazy in both cases (see resolution): the daemon wires this
+// before its collectors have published a workspace set, and a config read must
+// never sit on the boot path.
+// socketPath is this daemon's own socket, published to every flow child so the
+// sessions the supervisor launches register with the daemon that supervises
+// them (see ExecFlowCLI.HostSocket).
+func ForDaemon(scope, socketPath string, st *store.Store) *Supervisor {
+	var sup *Supervisor
+	if scope != "" {
+		sup = fromScope(scope, st)
+	} else {
+		sup = fromDiscovery(st)
+	}
+	sup.flow = &ExecFlowCLI{HostSocket: socketPath}
+	return sup
+}
+
+// fromScope resolves the ecosystem rooted at scopeDir: its [assistant] block,
+// and the ABSOLUTE directory of the plan that block names.
 //
 // The absolute directory is not a convenience — it is the only address that
 // works. `--at <plan>` resolves through the worktree registry, and the
 // assistant plan is deliberately worktree-less (spec §3.1), so it has no entry
 // there; `--dir` is a deprecated alias that can silently resolve a different
-// plan. Resolving the directory once, here, keeps every flow invocation
-// unambiguous.
-//
-// A disabled or absent block yields an inert supervisor and no error: not
-// opting in is the normal case.
-func FromScope(scopeDir string, st *store.Store) (*Supervisor, error) {
-	cfg, err := LoadConfig(scopeDir)
-	if err != nil {
-		return nil, fmt.Errorf("read [assistant] config: %w", err)
-	}
-
-	planDir := ""
-	if cfg.Active() {
-		planDir = coreplan.ResolvePlanDir(scopeDir, cfg.Plan)
+// plan. Resolving the directory once keeps every flow invocation unambiguous.
+func fromScope(scopeDir string, st *store.Store) *Supervisor {
+	return newWired(st, func() *resolution {
+		cfg, err := LoadConfig(scopeDir)
+		if err != nil {
+			return &resolution{cfg: &Config{}, err: fmt.Errorf("read [assistant] config in %s: %w", scopeDir, err)}
+		}
+		if !cfg.Active() {
+			return &resolution{cfg: cfg, scope: scopeDir}
+		}
+		planDir := coreplan.ResolvePlanDir(scopeDir, cfg.Plan)
 		if planDir == "" {
-			return nil, fmt.Errorf("cannot resolve the plans directory for %q under %s", cfg.Plan, scopeDir)
+			return &resolution{
+				cfg:   &Config{},
+				scope: scopeDir,
+				err:   fmt.Errorf("cannot resolve the plans directory for %q under %s", cfg.Plan, scopeDir),
+			}
 		}
-	}
+		return &resolution{cfg: cfg, planDir: planDir, scope: scopeDir}
+	})
+}
 
-	sup := NewSupervisor(cfg, planDir, &ExecFlowCLI{})
-	if st != nil {
-		sup.LiveHead = func() (Head, bool) { return LiveHeadFromStore(st, cfg.Plan) }
-		sup.Publish = func(status models.AssistantStatus) {
-			st.ApplyUpdate(store.Update{
-				Type:    store.UpdateAssistantStatus,
-				Source:  "assistant_supervisor",
-				Payload: &status,
-			})
+// fromDiscovery resolves by walking the ecosystems this daemon can see and
+// reading each one's [assistant] block — the global daemon's path.
+func fromDiscovery(st *store.Store) *Supervisor {
+	return newWired(st, func() *resolution {
+		targets, problems := DiscoverTargets(EcosystemRoots(st))
+		target, candidates, ok := SelectTarget(targets)
+		if !ok {
+			r := &resolution{cfg: &Config{}}
+			if len(problems) > 0 {
+				r.err = problems[0]
+			}
+			return r
 		}
+		r := &resolution{
+			cfg:        target.Config,
+			planDir:    target.PlanDir,
+			scope:      target.Scope,
+			candidates: candidates,
+		}
+		if len(candidates) > 0 {
+			r.err = AmbiguityError(target.Scope, candidates)
+		} else if len(problems) > 0 {
+			r.err = problems[0]
+		}
+		return r
+	})
+}
+
+// newWired builds a supervisor over resolve and connects it to the daemon's
+// session store: the live-head query it asks on every pass, and the status
+// updates it puts on the state stream.
+//
+// Both closures read the plan name through the supervisor's own resolution
+// rather than capturing one, so a lazily-resolved supervisor and the things
+// that observe it can never disagree about which plan the assistant lives in.
+func newWired(st *store.Store, resolve func() *resolution) *Supervisor {
+	sup := newSupervisor(nil, resolve)
+	if st == nil {
+		return sup
 	}
-	return sup, nil
+	sup.LiveHead = func() (Head, bool) { return LiveHeadFromStore(st, sup.Plan()) }
+	sup.Publish = func(status models.AssistantStatus) {
+		st.ApplyUpdate(store.Update{
+			Type:    store.UpdateAssistantStatus,
+			Source:  "assistant_supervisor",
+			Payload: &status,
+		})
+	}
+	return sup
 }
 
 // LiveHeadFromStore resolves the current head of the assistant chain from the

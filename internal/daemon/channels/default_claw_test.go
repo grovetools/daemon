@@ -99,12 +99,19 @@ func (h *inboundHarness) deliveries() []delivery {
 	return append([]delivery(nil), h.delivered...)
 }
 
-// registerEndpoint claims the ecosystem's assistant endpoint the way a scoped
-// daemon does at boot. The socket matches the manager's own so ensureAssistant
-// stays in-process instead of dialling anything.
+// testEcosystem is the ecosystem root the harness registers its assistant for.
+// It has to look like a real path rather than a t.TempDir(): RegisterDefaultClaw
+// refuses to publish a sandbox ecosystem into state.json.
+const testEcosystem = "/eco/grovetools"
+
+// registerEndpoint claims the ecosystem's assistant endpoint the way the daemon
+// does the moment its supervisor resolves. The socket matches the manager's own
+// so ensureAssistant stays in-process instead of dialling anything — which is
+// the PRODUCTION shape, where the global daemon owns both signal-cli and the
+// assistant.
 func (h *inboundHarness) registerEndpoint(t *testing.T, plan string) {
 	t.Helper()
-	h.m.RegisterDefaultClaw(plan)
+	h.m.RegisterDefaultClaw(plan, testEcosystem)
 	if !LoadDefaultClaw().IsEndpoint() {
 		t.Fatal("RegisterDefaultClaw wrote no endpoint")
 	}
@@ -331,7 +338,7 @@ func TestDefaultClawRegistrationLifecycle(t *testing.T) {
 	// A re-registration (daemon restart across an upgrade drain) keeps the
 	// claw: the assistant's PTY survives the restart, so forgetting its claw
 	// would route its mail to the ensure path for nothing.
-	h.m.RegisterDefaultClaw("steward")
+	h.m.RegisterDefaultClaw("steward", testEcosystem)
 	if got := LoadDefaultClaw().JobID; got != "assistant-1" {
 		t.Fatalf("job_id = %q after re-registration, want it preserved", got)
 	}

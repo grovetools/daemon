@@ -137,7 +137,16 @@ so you can tell which daemon owns each claw-enabled session.`,
 					fmt.Printf("  registered claw: %s\n", dc.JobID)
 				}
 				if dc.Socket != "" {
-					fmt.Printf("  supervisor socket: %s\n", filepath.Base(dc.Socket))
+					// Which daemon hosts the supervisor is the operative
+					// fact: the global daemon owns signal-cli, so when the
+					// supervisor is ALSO there, inbound never leaves the
+					// process. Naming that case explicitly saves an operator
+					// from reading a socket basename to work it out.
+					host := filepath.Base(dc.Socket)
+					if dc.Socket == paths.SocketPath() {
+						host += " (the global daemon — inbound is delivered in process)"
+					}
+					fmt.Printf("  supervisor socket: %s\n", host)
 				}
 			}
 			fmt.Println()

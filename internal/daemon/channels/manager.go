@@ -1350,10 +1350,22 @@ func hasChannel(chList []string) bool {
 // sandbox temp directory. Test-spawned daemons must not write to the
 // host's routing.json or they hijack inbound message delivery.
 func (m *Manager) isSandboxScope() bool {
-	return strings.Contains(m.scope, "/grove-tend-") ||
-		strings.HasPrefix(m.scope, os.TempDir()) ||
-		strings.HasPrefix(m.scope, "/private/var/folders/") ||
-		strings.HasPrefix(m.scope, "/tmp/")
+	return isSandboxPath(m.scope)
+}
+
+// isSandboxPath is isSandboxScope's test for an arbitrary path. The default
+// claw needs it for the ECOSYSTEM it registers as well as for the daemon's own
+// scope: an unscoped daemon has no scope to disqualify it, so a sandbox
+// ecosystem carrying an [assistant] block would otherwise publish itself into
+// the host's real state.json.
+func isSandboxPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	return strings.Contains(p, "/grove-tend-") ||
+		strings.HasPrefix(p, os.TempDir()) ||
+		strings.HasPrefix(p, "/private/var/folders/") ||
+		strings.HasPrefix(p, "/tmp/")
 }
 
 // saveSessionDelivery persists a session's mux/target to state.json. Called

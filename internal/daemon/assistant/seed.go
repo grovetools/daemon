@@ -27,15 +27,16 @@ const (
 // Derived from the plan directory rather than configured, because the two are
 // the same fact: plans/<plan> and <plan>/memory both hang off the workspace.
 func (s *Supervisor) MemoryDir() string {
-	if s.planDir == "" || s.cfg.Plan == "" {
+	r := s.res()
+	if r.planDir == "" || r.cfg.Plan == "" {
 		return ""
 	}
-	plansDir := filepath.Dir(s.planDir)
+	plansDir := filepath.Dir(r.planDir)
 	workspace := filepath.Dir(plansDir)
 	if workspace == "" || workspace == "." || workspace == string(filepath.Separator) {
 		return ""
 	}
-	return filepath.Join(workspace, s.cfg.Plan, "memory")
+	return filepath.Join(workspace, r.cfg.Plan, "memory")
 }
 
 // seedPrompt builds the prompt for a chain-reset root job: the predecessor's
@@ -48,7 +49,7 @@ func (s *Supervisor) MemoryDir() string {
 func (s *Supervisor) seedPrompt(predecessor *Job) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "You are the standing assistant for this grove ecosystem, running in plan `%s`.\n\n", s.cfg.Plan)
+	fmt.Fprintf(&b, "You are the standing assistant for this grove ecosystem, running in plan `%s`.\n\n", s.res().cfg.Plan)
 	b.WriteString("This session is a **chain reset**: the previous handoff chain reached its\n")
 	b.WriteString("`handoff_max` bound and was retired by the daemon's assistant supervisor. The\n")
 	b.WriteString("bound caps a chain, not you — you are its continuation, starting from a clean\n")
@@ -134,15 +135,16 @@ to destroy something, and it is the weakest credential in this system.
 // the newest spec anywhere under .artifacts — the retired chain's last word,
 // whichever link of it spoke.
 func (s *Supervisor) lastHandoffSpec(predecessor *Job) (spec, path string, ok bool) {
+	planDir := s.res().planDir
 	if predecessor != nil && predecessor.ID != "" {
-		p := filepath.Join(s.planDir, ".artifacts", predecessor.ID, handoffSpecFile)
+		p := filepath.Join(planDir, ".artifacts", predecessor.ID, handoffSpecFile)
 		if content, err := readBoundedFile(p, maxSeedSpecBytes); err == nil {
 			return content, p, true
 		}
 	}
 
 	newest, newestMod := "", int64(0)
-	entries, err := os.ReadDir(filepath.Join(s.planDir, ".artifacts"))
+	entries, err := os.ReadDir(filepath.Join(planDir, ".artifacts"))
 	if err != nil {
 		return "", "", false
 	}
@@ -150,7 +152,7 @@ func (s *Supervisor) lastHandoffSpec(predecessor *Job) (spec, path string, ok bo
 		if !e.IsDir() {
 			continue
 		}
-		p := filepath.Join(s.planDir, ".artifacts", e.Name(), handoffSpecFile)
+		p := filepath.Join(planDir, ".artifacts", e.Name(), handoffSpecFile)
 		info, statErr := os.Stat(p)
 		if statErr != nil || info.IsDir() {
 			continue

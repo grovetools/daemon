@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/util/delegation"
 )
 
@@ -89,6 +90,23 @@ type FlowCLI interface {
 type ExecFlowCLI struct {
 	// Timeout bounds a single flow invocation. Zero uses DefaultFlowTimeout.
 	Timeout time.Duration
+
+	// HostSocket is this daemon's own socket, published to every flow child as
+	// GROVE_HOST_DAEMON_SOCKET.
+	//
+	// It closes a loop that is invisible on a scoped daemon and fatal on the
+	// global one. The supervisor decides "is the assistant up?" by reading its
+	// OWN session store, so a continuation it launches has to register its
+	// session HERE. Without a published host endpoint, flow resolves a daemon
+	// from the job's scope (daemon.NewSessionHostClient precedence 3): for a
+	// scoped daemon that happens to be itself, but for the global daemon it is
+	// the ecosystem's scoped socket — a daemon that is not running and that
+	// flow would auto-start. The session would land over there, LiveHead here
+	// would never see it, and the supervisor would launch a fresh head every
+	// pass until the circuit breaker tripped.
+	//
+	// Empty leaves the child's environment untouched, which is what tests want.
+	HostSocket string
 }
 
 // DefaultFlowTimeout bounds one flow invocation. Generous, because
@@ -118,6 +136,9 @@ func (e *ExecFlowCLI) run(ctx context.Context, args ...string) (string, error) {
 	// A supervisor-launched flow must never inherit an interactive stdin: the
 	// commands it runs prompt when they think a human is present.
 	cmd.Stdin = nil
+	if e.HostSocket != "" {
+		cmd.Env = append(os.Environ(), daemon.HostSocketEnv+"="+e.HostSocket)
+	}
 
 	if err := cmd.Run(); err != nil {
 		return stdout.String(), fmt.Errorf("flow %s: %w: %s",

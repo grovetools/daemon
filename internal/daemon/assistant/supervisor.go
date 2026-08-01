@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/grovetools/core/logging"
@@ -63,6 +64,112 @@ type Head struct {
 	JobFile string
 }
 
+// resolution is what the supervisor supervises: which ecosystem, which config,
+// which plan directory. It is computed once, lazily, and then immutable.
+//
+// Lazy because the two deployments learn it at different times. A scoped daemon
+// knows its ecosystem at construction (it is its own scope). The global daemon
+// has to DISCOVER it, and discovery wants the workspace set the collectors
+// publish after boot — so resolving eagerly in the daemon's wiring would either
+// force a filesystem walk onto the boot path or read an empty store. Deferring
+// to first use puts it on the collector goroutine, after Run has started.
+type resolution struct {
+	cfg     *Config
+	planDir string
+	// scope is the ecosystem root the config came from. Empty means the
+	// supervisor never resolved one.
+	scope string
+	// candidates is every ecosystem that opted in, when more than one did.
+	candidates []string
+	// err explains a resolution that produced nothing supervisable. It is a
+	// diagnosis, not a fatal: an unresolvable assistant is a disabled one.
+	err error
+}
+
+func (r *resolution) enabled() bool {
+	return r != nil && r.cfg.Active() && r.planDir != ""
+}
+
+// disabledResolution is what every unresolved read sees.
+func disabledResolution() *resolution { return &resolution{cfg: &Config{}} }
+
+// res returns the supervisor's resolution, computing it on first use.
+//
+// Cached in both directions: a resolution that found nothing is remembered too,
+// so a daemon whose ecosystems have no [assistant] block does not re-walk the
+// workspace tree on every tick. An operator who adds the block to grove.toml
+// therefore restarts the daemon — or POSTs /api/assistant/ensure?force=1, which
+// re-resolves (see Ensure).
+func (s *Supervisor) res() *resolution {
+	if r := s.resolved.Load(); r != nil {
+		return r
+	}
+	return s.resolveNow()
+}
+
+// resolveNow runs the resolver and installs its answer. Callers that already
+// hold s.mu must NOT call it: it takes s.mu to publish the state transition.
+func (s *Supervisor) resolveNow() *resolution {
+	s.resolveMu.Lock()
+	if r := s.resolved.Load(); r != nil {
+		s.resolveMu.Unlock()
+		return r
+	}
+	r := disabledResolution()
+	if s.resolve != nil {
+		if got := s.resolve(); got != nil {
+			r = got
+		}
+	}
+	if r.cfg == nil {
+		r.cfg = &Config{}
+	}
+	s.resolved.Store(r)
+	s.resolveMu.Unlock()
+
+	s.mu.Lock()
+	if r.err != nil {
+		s.lastError = r.err.Error()
+	}
+	if r.enabled() && s.state == models.AssistantStateDisabled {
+		s.state = models.AssistantStateStarting
+	}
+	s.mu.Unlock()
+
+	if hook := s.onResolved.Load(); hook != nil && *hook != nil {
+		(*hook)(s.Status())
+	}
+	return r
+}
+
+// SetOnResolved registers a callback fired once, the moment the supervisor
+// learns what it supervises. It is how the daemon claims the ecosystem's
+// default claw (spec §3.4) without knowing the plan name at wiring time.
+//
+// A hook registered after resolution already happened fires immediately, so the
+// order of daemon wiring versus an early inbound request cannot lose it.
+func (s *Supervisor) SetOnResolved(fn func(models.AssistantStatus)) {
+	s.onResolved.Store(&fn)
+	if fn != nil && s.resolved.Load() != nil {
+		fn(s.Status())
+	}
+}
+
+// reresolve discards a cached resolution so the next read recomputes it. Only
+// a forced ensure does this: the operator has changed grove.toml and asked.
+//
+// A supervisor built from an explicit Config (NewSupervisor) has no resolver to
+// re-run, so its resolution is permanent and this is a no-op — dropping it
+// would silently disable the supervisor on the first forced ensure.
+func (s *Supervisor) reresolve() {
+	if s.resolve == nil {
+		return
+	}
+	s.resolveMu.Lock()
+	s.resolved.Store(nil)
+	s.resolveMu.Unlock()
+}
+
 // Supervisor keeps an ecosystem's standing assistant chain alive.
 //
 // It is an ENSURE-RUNNING loop, not a hot restart loop: every trigger asks the
@@ -70,10 +177,14 @@ type Head struct {
 // cheapest thing that makes the answer yes. A chain that is already live costs
 // one map scan.
 type Supervisor struct {
-	cfg     *Config
-	planDir string
-	flow    FlowCLI
-	ulog    *logging.UnifiedLogger
+	flow FlowCLI
+	ulog *logging.UnifiedLogger
+
+	// resolve answers "what does this daemon supervise?". See resolution.
+	resolve    func() *resolution
+	resolveMu  sync.Mutex
+	resolved   atomic.Pointer[resolution]
+	onResolved atomic.Pointer[func(models.AssistantStatus)]
 
 	// LiveHead reports the live head of the assistant chain. Injected by the
 	// daemon so this package never reaches into the session store's locking.
@@ -107,40 +218,58 @@ type Supervisor struct {
 	ensuring      bool
 }
 
-// NewSupervisor builds a supervisor for cfg. planDir must be the ABSOLUTE
-// directory of the assistant plan — see FlowCLI for why the address is a
-// directory and not `--at <plan>`.
+// NewSupervisor builds a supervisor for a config that is already known. planDir
+// must be the ABSOLUTE directory of the assistant plan — see FlowCLI for why
+// the address is a directory and not `--at <plan>`.
 func NewSupervisor(cfg *Config, planDir string, flow FlowCLI) *Supervisor {
 	if cfg == nil {
 		cfg = &Config{}
 	}
-	if flow == nil {
-		flow = &ExecFlowCLI{}
-	}
-	s := &Supervisor{
-		cfg:      cfg,
-		planDir:  planDir,
-		flow:     flow,
-		ulog:     logging.NewUnifiedLogger("groved.assistant"),
-		triggers: make(chan string, 1),
-		Clock:    time.Now,
-		backoff:  InitialBackoff,
-		state:    models.AssistantStateDisabled,
-	}
+	s := newSupervisor(flow, nil)
+	s.resolved.Store(&resolution{cfg: cfg, planDir: planDir})
 	if cfg.Active() && planDir != "" {
 		s.state = models.AssistantStateStarting
 	}
 	return s
 }
 
+// newSupervisor is the shared constructor. resolve may be nil, in which case
+// the caller is expected to install a resolution directly.
+func newSupervisor(flow FlowCLI, resolve func() *resolution) *Supervisor {
+	if flow == nil {
+		flow = &ExecFlowCLI{}
+	}
+	return &Supervisor{
+		flow:     flow,
+		ulog:     logging.NewUnifiedLogger("groved.assistant"),
+		resolve:  resolve,
+		triggers: make(chan string, 1),
+		Clock:    time.Now,
+		backoff:  InitialBackoff,
+		state:    models.AssistantStateDisabled,
+	}
+}
+
 // Name implements the collector.Collector interface.
 func (s *Supervisor) Name() string { return "assistant_supervisor" }
 
-// Enabled reports whether this supervisor supervises anything.
-func (s *Supervisor) Enabled() bool { return s.cfg.Active() && s.planDir != "" }
+// Enabled reports whether this supervisor supervises anything. It resolves on
+// first call, so it is also the cheapest way to force resolution.
+func (s *Supervisor) Enabled() bool { return s.res().enabled() }
 
 // PlanDir is the absolute assistant plan directory.
-func (s *Supervisor) PlanDir() string { return s.planDir }
+func (s *Supervisor) PlanDir() string { return s.res().planDir }
+
+// Plan is the assistant's home plan name, or "" when nothing is supervised.
+// The channels manager asks for it on the inbound path to decide whether a
+// clawing job is the default claw, which is why it reads through the same
+// resolution the supervisor acts on: the two can never name different plans.
+func (s *Supervisor) Plan() string { return s.res().cfg.Plan }
+
+// Scope is the ecosystem root whose [assistant] block configured this
+// supervisor. On a scoped daemon it is the daemon's own scope; on the global
+// daemon it is the ecosystem discovery selected.
+func (s *Supervisor) Scope() string { return s.res().scope }
 
 func (s *Supervisor) now() time.Time {
 	if s.Clock != nil {
@@ -230,14 +359,24 @@ func (s *Supervisor) ownsSession(st *store.Store, jobID string) bool {
 	if sess == nil {
 		return false
 	}
-	return sess.PlanName == s.cfg.Plan
+	return sess.PlanName == s.Plan()
 }
 
 // Ensure runs one ensure pass synchronously and returns the resulting status.
 // force re-arms a tripped circuit breaker; an ordinary request (the rail
 // pane's) must not, or the breaker would be defeated by the very UI it exists
 // to inform.
+//
+// A forced ensure also RE-RESOLVES what is supervised. Resolution is otherwise
+// cached for the daemon's lifetime, so this is the operator's way to pick up an
+// [assistant] block that was added to grove.toml since boot without restarting
+// a daemon that is hosting live agents:
+//
+//	curl -X POST --unix-socket <sock> 'http://localhost/api/assistant/ensure?force=1'
 func (s *Supervisor) Ensure(ctx context.Context, reason string, force bool) (models.AssistantStatus, error) {
+	if force {
+		s.reresolve()
+	}
 	if !s.Enabled() {
 		return s.Status(), ErrDisabled
 	}
@@ -246,18 +385,25 @@ func (s *Supervisor) Ensure(ctx context.Context, reason string, force bool) (mod
 }
 
 // Status returns the current public snapshot.
+//
+// Resolution happens BEFORE the lock is taken: resolveNow publishes a state
+// transition under s.mu, so resolving from inside the locked section would
+// deadlock the first status read.
 func (s *Supervisor) Status() models.AssistantStatus {
+	r := s.res()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.statusLocked()
+	return s.statusLocked(r)
 }
 
-func (s *Supervisor) statusLocked() models.AssistantStatus {
+func (s *Supervisor) statusLocked(r *resolution) models.AssistantStatus {
 	st := models.AssistantStatus{
-		Enabled:             s.Enabled(),
+		Enabled:             r.enabled(),
 		State:               s.state,
-		Plan:                s.cfg.Plan,
-		PlanDir:             s.planDir,
+		Plan:                r.cfg.Plan,
+		PlanDir:             r.planDir,
+		Scope:               r.scope,
+		Candidates:          r.candidates,
 		HeadJobID:           s.headJobID,
 		HeadJobFile:         s.headJobFile,
 		LastAction:          s.lastAction,
@@ -266,7 +412,7 @@ func (s *Supervisor) statusLocked() models.AssistantStatus {
 		ChainResets:         s.chainResets,
 		ConsecutiveFailures: s.fastFailures,
 	}
-	if !s.Enabled() {
+	if !r.enabled() {
 		st.State = models.AssistantStateDisabled
 	}
 	if !s.lastActionAt.IsZero() {
@@ -363,15 +509,15 @@ func (s *Supervisor) ensureLocked(ctx context.Context, reason string) error {
 
 	s.ulog.Info("Ensuring the assistant chain").
 		Field("reason", reason).
-		Field("plan", s.cfg.Plan).
-		Field("plan_dir", s.planDir).
+		Field("plan", s.Plan()).
+		Field("plan_dir", s.PlanDir()).
 		Log(ctx)
 
 	action, err := s.continueChain(ctx)
 	if err != nil {
 		s.ulog.Error("Assistant continuation failed").Err(err).
 			Field("action", action).
-			Field("plan", s.cfg.Plan).
+			Field("plan", s.Plan()).
 			Field("event", "assistant.down").
 			Log(ctx)
 		if s.countFailure(s.now(), err.Error()) {
@@ -398,7 +544,7 @@ func (s *Supervisor) ensureLocked(ctx context.Context, reason string) error {
 
 	s.ulog.Success("Assistant continuation launched").
 		Field("action", string(action)).
-		Field("plan", s.cfg.Plan).
+		Field("plan", s.Plan()).
 		Field("event", "assistant.up").
 		Log(ctx)
 	return nil
@@ -508,7 +654,7 @@ const (
 // function when the daemon session store — the same authority the rail pane
 // reads — has already said no live session exists.
 func (s *Supervisor) continueChain(ctx context.Context) (action, error) {
-	jobs, err := s.flow.PlanJobs(ctx, s.planDir)
+	jobs, err := s.flow.PlanJobs(ctx, s.PlanDir())
 	if err != nil {
 		return actionNone, fmt.Errorf("read assistant plan: %w", err)
 	}
@@ -582,7 +728,7 @@ func (s *Supervisor) resumeOrRetry(ctx context.Context, head Job) error {
 func (s *Supervisor) exhausted(head Job) bool {
 	max := head.HandoffMax
 	if max <= 0 {
-		max = s.cfg.HandoffMax
+		max = s.res().cfg.HandoffMax
 	}
 	if max <= 0 {
 		return false
@@ -597,16 +743,17 @@ func (s *Supervisor) chainReset(ctx context.Context, predecessor *Job) (action, 
 		return actionChainReset, err
 	}
 
+	r := s.res()
 	prompt := s.seedPrompt(predecessor)
 	added, err := s.flow.AddJob(ctx, AddJobRequest{
-		PlanDir:          s.planDir,
-		Title:            s.cfg.Plan,
-		Provider:         s.cfg.Provider,
-		Model:            s.cfg.Model,
-		Skills:           s.cfg.Skills,
+		PlanDir:          r.planDir,
+		Title:            r.cfg.Plan,
+		Provider:         r.cfg.Provider,
+		Model:            r.cfg.Model,
+		Skills:           r.cfg.Skills,
 		CoordMode:        DefaultCoordMode,
-		HandoffThreshold: s.cfg.HandoffThreshold,
-		HandoffMax:       s.cfg.HandoffMax,
+		HandoffThreshold: r.cfg.HandoffThreshold,
+		HandoffMax:       r.cfg.HandoffMax,
 		Prompt:           prompt,
 	})
 	if err != nil {
@@ -629,6 +776,11 @@ func (s *Supervisor) chainReset(ctx context.Context, predecessor *Job) (action, 
 // it is not a transient failure — it means every fresh chain is dying — so it
 // is reported as an error, which the caller counts toward the breaker.
 func (s *Supervisor) checkResetBudget() error {
+	// Resolved BEFORE the lock: resolveNow publishes its state transition
+	// under s.mu, so reading the config from inside the locked section could
+	// deadlock the very first pass.
+	maxResets := s.res().cfg.MaxChainResetsPerDay
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -641,9 +793,9 @@ func (s *Supervisor) checkResetBudget() error {
 	}
 	s.resetTimes = kept
 
-	if len(s.resetTimes) >= s.cfg.MaxChainResetsPerDay {
+	if len(s.resetTimes) >= maxResets {
 		return fmt.Errorf("chain-reset budget exhausted: %d resets in the last %s (max %d)",
-			len(s.resetTimes), ChainResetWindow, s.cfg.MaxChainResetsPerDay)
+			len(s.resetTimes), ChainResetWindow, maxResets)
 	}
 	return nil
 }
@@ -654,24 +806,25 @@ func (s *Supervisor) checkResetBudget() error {
 // a claw failure must not undo a successful launch, so it is logged and the
 // continuation still counts as a success.
 func (s *Supervisor) reclaw(ctx context.Context, head Job) {
-	if s.cfg.Channel == "" {
+	r := s.res()
+	if r.cfg.Channel == "" {
 		return
 	}
 	jobFile := jobFileName(head)
 	if jobFile == "" {
 		return
 	}
-	if err := s.flow.Claw(ctx, s.planDir, jobFile, s.cfg.Channel, s.cfg.SignalTarget, s.cfg.IdleMinutes); err != nil {
+	if err := s.flow.Claw(ctx, r.planDir, jobFile, r.cfg.Channel, r.cfg.SignalTarget, r.cfg.IdleMinutes); err != nil {
 		s.ulog.Warn("Failed to re-claw the assistant after launch").
 			Err(err).
 			Field("job", jobFile).
-			Field("channel", s.cfg.Channel).
+			Field("channel", r.cfg.Channel).
 			Log(ctx)
 		return
 	}
 	s.ulog.Info("Re-clawed the assistant").
 		Field("job", jobFile).
-		Field("channel", s.cfg.Channel).
+		Field("channel", r.cfg.Channel).
 		Log(ctx)
 }
 

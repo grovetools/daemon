@@ -255,9 +255,11 @@ func newGrovedHealthCmd() *cobra.Command {
 // degrade to a visible "stopped: <error>" line here, never to a silent loop —
 // this is the operator's half of that promise.
 //
-// The assistant is per-ecosystem, so its supervisor lives in the SCOPED daemon
-// while this command talks to the global one. The scoped daemon is asked
-// directly when this daemon has nothing to report.
+// The assistant is per-ecosystem, but its supervisor lives wherever the daemon
+// that supervises it does. In production that is the GLOBAL daemon this command
+// already talks to, which resolves its ecosystem by discovery. In development it
+// can be a scoped daemon in an ecosystem worktree, so a global daemon with
+// nothing to report falls back to asking the scoped one directly.
 func printAssistantHealth(ctx context.Context, client daemon.Client) {
 	status, err := client.GetAssistantStatus(ctx)
 	if err != nil || status == nil || !status.Enabled {
@@ -273,10 +275,23 @@ func printAssistantHealth(ctx context.Context, client daemon.Client) {
 	}
 	if !status.Enabled {
 		fmt.Println("Assistant:          disabled (no [assistant] block enabled in grove.toml)")
+		if status.LastError != "" {
+			fmt.Printf("  reason:           %s\n", trimStatusError(status.LastError))
+		}
 		return
 	}
 
 	fmt.Printf("Assistant:          %s (plan %s)\n", status.State, status.Plan)
+	if status.Scope != "" {
+		fmt.Printf("  ecosystem:        %s\n", status.Scope)
+	}
+	if len(status.Candidates) > 1 {
+		// More than one ecosystem opted in and this daemon supervises one.
+		// Naming all of them is the difference between a diagnosable
+		// configuration and an assistant that silently belongs to whichever
+		// ecosystem sorted first.
+		fmt.Printf("  ⚠ also opted in:  %s\n", strings.Join(status.Candidates, ", "))
+	}
 	if status.HeadJobID != "" {
 		fmt.Printf("  head session:     %s\n", status.HeadJobID)
 	}
@@ -1037,52 +1052,81 @@ func newGrovedStartCmd() *cobra.Command {
 
 				// Assistant supervisor (assistant-pane spec §3.3): the
 				// ensure-running loop behind the rail's assistant pane, a
-				// sibling of the pinger above. It is per-ECOSYSTEM, so it
-				// reads its [assistant] block from the scope root — which
-				// leaves the global daemon (scope=="") with nothing to
-				// supervise, correctly: every assistant duty is
-				// ecosystem-scoped. Registered here, before eng.Start, for
-				// the same F19 reason the satellite collector is.
-				assistantSup, asErr := assistant.FromScope(scope, st)
-				if asErr != nil {
-					// A broken [assistant] block disables the assistant; it
-					// must never stop the daemon from booting.
-					ulog.Warn("Assistant supervisor disabled").Err(asErr).
-						Field("scope", scope).Log(ctx)
-				} else {
-					eng.Register(assistantSup)
-					srv.SetAssistantSupervisor(assistantSup)
-					if chMgr != nil {
-						// Inbound that reached no live agent is, for an
-						// ecosystem with a standing assistant claw, the
-						// assistant's mail. Ensure a live chain, and say why
-						// when that fails — the sender is owed an answer
-						// (spec §3.4 ensure-on-inbound).
-						chMgr.EnsureAssistant = func(ectx context.Context, reason string) error {
-							_, err := assistantSup.Ensure(ectx, reason, false)
-							return err
-						}
+				// sibling of the pinger above. Registered here, before
+				// eng.Start, for the same F19 reason the satellite collector
+				// is.
+				//
+				// The assistant is per-ECOSYSTEM, but the daemon that
+				// supervises it is not necessarily scoped to one. Scoped
+				// daemons are a development convenience (one per ecosystem
+				// worktree); PRODUCTION is the global daemon, whose scope is
+				// empty. So ForDaemon reads [assistant] from the scope root
+				// when there is one and DISCOVERS the ecosystem otherwise
+				// (assistant/discover.go) — an earlier cut did only the
+				// former and was therefore inert in production.
+				//
+				// Resolution is deliberately LAZY: at this point the
+				// workspace collectors have not published anything yet, and a
+				// discovery walk has no business on the boot path. Everything
+				// that needs the resolved plan hangs off SetOnResolved below
+				// instead of an Enabled() gate here.
+				assistantSup := assistant.ForDaemon(scope, sockPath, st)
+				eng.Register(assistantSup)
+				srv.SetAssistantSupervisor(assistantSup)
+				if chMgr != nil {
+					// Inbound that reached no live agent is, for an ecosystem
+					// with a standing assistant claw, the assistant's mail.
+					// Ensure a live chain, and say why when that fails — the
+					// sender is owed an answer (spec §3.4
+					// ensure-on-inbound).
+					chMgr.EnsureAssistant = func(ectx context.Context, reason string) error {
+						_, err := assistantSup.Ensure(ectx, reason, false)
+						return err
 					}
-					if assistantSup.Enabled() {
-						if chMgr != nil {
-							// Claim the ecosystem's default claw (spec §3.4).
-							// The endpoint is published even while the
-							// assistant is down: it is what tells the global
-							// daemon's inbound cascade that unresolved mail
-							// has somewhere to go and somewhere to wake.
-							plan := assistantSup.Status().Plan
-							chMgr.RegisterDefaultClaw(plan)
-							chMgr.IsDefaultClawJob = func(jobID string) bool {
-								sess := st.GetSession(jobID)
-								return sess != nil && sess.PlanName == plan
-							}
+					// Read through the supervisor rather than capturing a
+					// plan name: with lazy resolution there is no name to
+					// capture here, and reading keeps this predicate and the
+					// chain the supervisor maintains on the same plan forever.
+					chMgr.IsDefaultClawJob = func(jobID string) bool {
+						plan := assistantSup.Plan()
+						if plan == "" {
+							return false
 						}
-						ulog.Info("Assistant supervisor registered").
-							Field("plan", assistantSup.Status().Plan).
-							Field("plan_dir", assistantSup.PlanDir()).
-							Log(ctx)
+						sess := st.GetSession(jobID)
+						return sess != nil && sess.PlanName == plan
 					}
 				}
+				assistantSup.SetOnResolved(func(status models.AssistantStatus) {
+					if status.LastError != "" {
+						ulog.Warn("Assistant supervisor resolution problem").
+							Field("error", status.LastError).
+							Field("daemon_scope", scope).
+							Log(ctx)
+					}
+					if !status.Enabled {
+						ulog.Info("Assistant supervisor disabled").
+							Field("daemon_scope", scope).
+							Field("reason", "no ecosystem this daemon can see enables [assistant]").
+							Log(ctx)
+						return
+					}
+					if chMgr != nil {
+						// Claim the ecosystem's default claw (spec §3.4). The
+						// endpoint is published even while the assistant is
+						// down: it is what tells the inbound cascade that
+						// unresolved mail has somewhere to go and somewhere
+						// to wake. Socket is this daemon's own, which is how
+						// the cascade knows to ensure in process instead of
+						// forwarding to itself.
+						chMgr.RegisterDefaultClaw(status.Plan, status.Scope)
+					}
+					ulog.Info("Assistant supervisor registered").
+						Field("plan", status.Plan).
+						Field("plan_dir", status.PlanDir).
+						Field("ecosystem", status.Scope).
+						Field("daemon_scope", scope).
+						Log(ctx)
+				})
 
 				// 5. Handle Signals + auto-shutdown
 				stop := make(chan os.Signal, 1)
