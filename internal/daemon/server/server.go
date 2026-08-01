@@ -28,7 +28,6 @@ import (
 	coredaemon "github.com/grovetools/core/pkg/daemon"
 	coreenv "github.com/grovetools/core/pkg/env"
 	"github.com/grovetools/core/pkg/models"
-	muxpkg "github.com/grovetools/core/pkg/mux"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/repo"
 	"github.com/grovetools/core/pkg/sessions"
@@ -1750,15 +1749,29 @@ func (s *Server) writePtyWithRetry(ctx context.Context, jobID, ptyID string, dat
 }
 
 // effectiveMux returns the mux to use for routing input/interrupt to a
-// session. An explicit session.Mux wins; otherwise we fall back to the
-// legacy implicit inference (PtyID→treemux, TmuxTarget→tmux) so pre-upgrade
-// sessions still work until they end naturally.
+// session.
+//
+// A recorded PtyID outranks everything, including an explicit session.Mux: it
+// is only ever set when this daemon itself created the PTY on the tuimux
+// daemon, so it is a fact about a live route, while Mux is a label that
+// history has proven can be wrong. A treemux/tuimux-hosted claw whose delivery
+// record was stamped `tmux` by an older `flow agent claw` is exactly that case
+// — routing it by the label ran tmux send-keys against a pane that never
+// existed. Both out-of-process mux names ("treemux", "tuimux") mean the same
+// direct-PTY tier; only a genuine tmux pane routes through send-keys.
+// Otherwise we fall back to the legacy implicit inference (TmuxTarget→tmux) so
+// pre-upgrade sessions still work until they end naturally.
 func effectiveMux(session *models.Session) string {
-	if session.Mux != "" {
-		return session.Mux
-	}
 	if session.PtyID != "" {
 		return models.MuxTreemux
+	}
+	switch session.Mux {
+	case models.MuxTreemux, models.MuxTuimux:
+		return models.MuxTreemux
+	case models.MuxTmux:
+		return models.MuxTmux
+	case models.MuxNone:
+		return models.MuxNone
 	}
 	if session.TmuxTarget != "" {
 		return models.MuxTmux
@@ -1771,21 +1784,33 @@ func effectiveMux(session *models.Session) string {
 // session lacks muxing details. This is the shared lookup that input, interrupt
 // and capture routing all depend on to reach out-of-process agent PTYs. Returns
 // nil if no session can be resolved.
+//
+// Enrichment is a per-field backfill, never a wholesale overwrite: the store
+// entry is the live record and the persisted one can be stale, so delivery
+// state only ever fills a blank. When the store knows more than the persisted
+// record does, the record is refreshed in place — that self-heals a
+// channel-enabled session whose PTY was created (or re-adopted) after its
+// delivery state was first written, which is what left inbound Signal messages
+// routing to a synthesized tmux target.
 func (s *Server) resolveSessionForRouting(jobID string) *models.Session {
 	session := s.engine.Store().GetSession(jobID)
 	if session == nil {
-		session = s.sessionFromDeliveryState(jobID)
+		return s.sessionFromDeliveryState(jobID)
 	}
-	if session == nil {
-		return nil
+	info := channels.GetSessionDelivery(jobID)
+	if info == nil {
+		return session
 	}
-	if effectiveMux(session) == models.MuxNone {
-		if info := channels.GetSessionDelivery(jobID); info != nil {
-			session.Mux = info.Mux
-			session.TmuxTarget = info.TmuxTarget
-			session.PtyID = info.PtyID
-		}
+	if session.PtyID == "" {
+		session.PtyID = info.PtyID
 	}
+	if session.TmuxTarget == "" {
+		session.TmuxTarget = info.TmuxTarget
+	}
+	if session.Mux == "" {
+		session.Mux = info.Mux
+	}
+	channels.SyncSessionDelivery(jobID, session.Mux, session.TmuxTarget, session.PtyID)
 	return session
 }
 
@@ -1859,10 +1884,12 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 		return fmt.Errorf("treemux route unavailable for session %s (no live PTY, no connected terminal)", jobID)
 
 	case models.MuxTmux:
-		if session.TmuxTarget == "" {
-			return fmt.Errorf("tmux target missing for session %s", jobID)
+		engine, socket, err := resolveTmuxRoute(ctx, session)
+		if err != nil {
+			return err
 		}
-		if err := agentstream.SendInput(ctx, session.TmuxTarget, rawInput, agentstream.WithInputMode(inputMode)); err != nil {
+		if err := agentstream.SendInput(ctx, session.TmuxTarget, rawInput,
+			agentstream.WithInputMode(inputMode), agentstream.WithEngine(engine)); err != nil {
 			return err
 		}
 		s.ulog.Debug("Injected input into agent").
@@ -1870,6 +1897,7 @@ func (s *Server) SendSessionInput(ctx context.Context, jobID, rawInput string) e
 			Field("mux", mux).
 			Field("tier", "tmux").
 			Field("tmux_target", session.TmuxTarget).
+			Field("tmux_socket", socket).
 			Field("input_len", len(rawInput)).
 			Log(ctx)
 		return nil
@@ -1886,10 +1914,7 @@ func (s *Server) SendSessionInterrupt(ctx context.Context, jobID string) error {
 	if s.engine == nil {
 		return fmt.Errorf("engine not initialized")
 	}
-	session := s.engine.Store().GetSession(jobID)
-	if session == nil {
-		session = s.sessionFromDeliveryState(jobID)
-	}
+	session := s.resolveSessionForRouting(jobID)
 	if session == nil {
 		return fmt.Errorf("session not found: %s", jobID)
 	}
@@ -1935,12 +1960,9 @@ func (s *Server) SendSessionInterrupt(ctx context.Context, jobID string) error {
 		return fmt.Errorf("treemux route unavailable for interrupt on session %s", jobID)
 
 	case models.MuxTmux:
-		if session.TmuxTarget == "" {
-			return fmt.Errorf("tmux target missing for session %s", jobID)
-		}
-		engine, err := muxpkg.NewTmuxEngine()
+		engine, socket, err := resolveTmuxRoute(ctx, session)
 		if err != nil {
-			return fmt.Errorf("tmux not available: %w", err)
+			return err
 		}
 		if err := engine.SendKeys(ctx, session.TmuxTarget, "C-c"); err != nil {
 			return err
@@ -1950,6 +1972,7 @@ func (s *Server) SendSessionInterrupt(ctx context.Context, jobID string) error {
 			Field("mux", mux).
 			Field("tier", "tmux").
 			Field("tmux_target", session.TmuxTarget).
+			Field("tmux_socket", socket).
 			Log(ctx)
 		return nil
 

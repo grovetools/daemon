@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -381,6 +382,12 @@ func (m *Manager) EnableChannel(_ context.Context, jobID string, channelNames ..
 			return fmt.Errorf("unknown channel %q", ch)
 		}
 	}
+	// Snapshot how to reach this session now that it is channel-enabled.
+	// state.json is the only routing datum that survives a daemon restart, and
+	// it is read by any daemon whose in-memory store never saw the session, so
+	// a claw that never records mux/pty_id here leaves inbound messages with
+	// nothing to route by.
+	m.saveSessionDelivery(jobID)
 	return nil
 }
 
@@ -848,13 +855,20 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 	}
 
 	if sockPath, ok := m.lookupInboundRoute(targetJobID); ok && sockPath != "" && sockPath != m.socketPath {
-		if err := m.forwardSessionInput(ctx, sockPath, targetJobID, taggedText); err != nil {
-			m.ulog.Warn("Cross-daemon inbound forward failed — purging route").
+		if staleRoute, err := m.forwardSessionInput(ctx, sockPath, targetJobID, taggedText); err != nil {
+			log := m.ulog.Warn("Cross-daemon inbound forward failed").
 				Err(err).
 				Field("job_id", targetJobID).
 				Field("socket", sockPath).
-				Log(ctx)
-			_ = m.removeInboundRoute(targetJobID)
+				Field("stale_route", staleRoute)
+			log.Log(ctx)
+			// Only a route that cannot lead anywhere is worth discarding. A
+			// delivery failure from a daemon that does own the session (its
+			// recorded mux is wrong, its PTY is gone) is a delivery problem;
+			// dropping the route on top of it would also lose the address.
+			if staleRoute {
+				_ = m.removeInboundRoute(targetJobID)
+			}
 			m.recordInbound(msg.Source, resolvedVia, targetJobID, err.Error(), false)
 			return
 		}
@@ -1168,11 +1182,9 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 				}
 			case store.UpdateSessionTmuxTarget:
 				// Persist delivery info to state.json for restart resilience.
-				// Save directly from the payload — the store may not have
-				// the session yet (e.g., claw before session collector runs).
 				if payload, ok := u.Payload.(*store.SessionTmuxTargetPayload); ok {
 					if m.isActive(payload.JobID) {
-						m.saveSessionDeliveryDirect(payload.JobID, "tmux", payload.TmuxTarget, "")
+						m.saveSessionDeliveryTmuxTarget(payload.JobID, payload.TmuxTarget)
 					}
 				}
 			case store.UpdateJobsDiscovered:
@@ -1219,8 +1231,15 @@ func (m *Manager) isSandboxScope() bool {
 		strings.HasPrefix(m.scope, "/tmp/")
 }
 
-// saveSessionDelivery persists a session's mux/target to state.json.
+// saveSessionDelivery persists a session's mux/target to state.json. Called
+// when a channel is enabled: state.json is what routing falls back to after a
+// restart (and on any daemon whose in-memory store never saw the session), so
+// the record has to be written from the live session — mux and pty_id
+// included — the moment the session becomes reachable over a channel.
 func (m *Manager) saveSessionDelivery(jobID string) {
+	if m.store == nil {
+		return
+	}
 	session := m.store.GetSession(jobID)
 	if session == nil {
 		return
@@ -1228,34 +1247,93 @@ func (m *Manager) saveSessionDelivery(jobID string) {
 	if session.Mux == "" && session.TmuxTarget == "" && session.PtyID == "" {
 		return
 	}
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	state, err := loadChannelState()
-	if err != nil {
-		return
-	}
-	state.SessionDelivery[jobID] = SessionDeliveryInfo{
+	writeSessionDelivery(jobID, SessionDeliveryInfo{
 		Mux:        session.Mux,
 		TmuxTarget: session.TmuxTarget,
 		PtyID:      session.PtyID,
-	}
-	_ = saveStateAtomic(state)
+	}, false)
 }
 
-// saveSessionDeliveryDirect persists delivery info from explicit values
-// instead of reading from the store (which may not have the session yet).
-func (m *Manager) saveSessionDeliveryDirect(jobID, mux, tmuxTarget, ptyID string) {
+// saveSessionDeliveryTmuxTarget records a tmux target against a session's
+// delivery state without disturbing what is already known about how to reach
+// it.
+//
+// The old version of this wrote {mux: "tmux", pty_id: ""} unconditionally, so
+// a single `flow agent claw` — which stamped a synthesized tmux pane name onto
+// every agent, including out-of-process ones — silently demoted a live
+// treemux/tuimux session's persisted route to a tmux pane that never existed.
+// Inbound Signal messages then ran send-keys against nothing. The tmux target
+// is now additive: mux and pty_id come from the live session, fall back to
+// whatever was already recorded, and only settle on "tmux" when a tmux target
+// really is all anyone knows.
+func (m *Manager) saveSessionDeliveryTmuxTarget(jobID, tmuxTarget string) {
+	var mux, ptyID string
+	if m.store != nil {
+		if session := m.store.GetSession(jobID); session != nil {
+			mux, ptyID = session.Mux, session.PtyID
+		}
+	}
+
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	state, err := loadChannelState()
 	if err != nil {
 		return
 	}
-	state.SessionDelivery[jobID] = SessionDeliveryInfo{
+	prev := state.SessionDelivery[jobID]
+	if ptyID == "" {
+		ptyID = prev.PtyID
+	}
+	if mux == "" {
+		mux = prev.Mux
+	}
+	if mux == "" && ptyID == "" {
+		mux = models.MuxTmux
+	}
+	next := SessionDeliveryInfo{Mux: mux, TmuxTarget: tmuxTarget, PtyID: ptyID}
+	if next == prev {
+		return
+	}
+	state.SessionDelivery[jobID] = next
+	_ = saveStateAtomic(state)
+}
+
+// SyncSessionDelivery refreshes an EXISTING delivery record with a session's
+// live route. Routing calls it with what the in-memory store knows, so a
+// channel-enabled session whose PTY was created — or re-adopted after an
+// upgrade — later than its delivery record heals itself instead of routing
+// forever by a stale mux label. It never creates a record: a session with no
+// channel enabled has no business in state.json, and DisableChannel is what
+// takes records out again.
+func SyncSessionDelivery(jobID, mux, tmuxTarget, ptyID string) {
+	writeSessionDelivery(jobID, SessionDeliveryInfo{
 		Mux:        mux,
 		TmuxTarget: tmuxTarget,
 		PtyID:      ptyID,
+	}, true)
+}
+
+// writeSessionDelivery persists info for jobID, skipping the write when
+// nothing changed. With requireExisting set it only refreshes a record that is
+// already there.
+func writeSessionDelivery(jobID string, info SessionDeliveryInfo, requireExisting bool) {
+	if info == (SessionDeliveryInfo{}) {
+		return
 	}
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	state, err := loadChannelState()
+	if err != nil {
+		return
+	}
+	prev, ok := state.SessionDelivery[jobID]
+	if requireExisting && !ok {
+		return
+	}
+	if ok && prev == info {
+		return
+	}
+	state.SessionDelivery[jobID] = info
 	_ = saveStateAtomic(state)
 }
 
@@ -1512,7 +1590,12 @@ func (m *Manager) lookupInboundRoute(jobID string) (string, bool) {
 // forwardSessionInput POSTs /api/sessions/{jobID}/input to the given scoped
 // daemon socket. Used by the global daemon to hand inbound Signal messages
 // to the scoped daemon that actually owns the session's PTY.
-func (m *Manager) forwardSessionInput(ctx context.Context, socketPath, jobID, input string) error {
+//
+// The first return value reports whether the failure means the ROUTE is wrong
+// (unreachable daemon, or one that has never heard of the session) as opposed
+// to a live daemon failing to deliver — only the former should cost the
+// session its route.
+func (m *Manager) forwardSessionInput(ctx context.Context, socketPath, jobID, input string) (bool, error) {
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -1524,23 +1607,39 @@ func (m *Manager) forwardSessionInput(ctx context.Context, socketPath, jobID, in
 	}
 	body, err := json.Marshal(map[string]string{"input": input})
 	if err != nil {
-		return err
+		return false, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		"http://unix/api/sessions/"+jobID+"/input", bytes.NewReader(body))
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		// The socket is unreachable: the scoped daemon is gone, so the route is
+		// what's wrong.
+		return true, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("scoped daemon returned %s", resp.Status)
+		// Carry the scoped daemon's own explanation across the hop. Without it
+		// the operator sees a bare "returned 500 Internal Server Error" and has
+		// to go read the other daemon's log to learn that, say, the session's
+		// recorded tmux pane does not exist.
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		reason := strings.TrimSpace(string(detail))
+		if reason == "" {
+			reason = resp.Status
+		}
+		// A 404 means that daemon does not have the session — the route is
+		// stale. Anything else is a live daemon failing to deliver: keep the
+		// route so the next message still reaches the daemon that owns the
+		// session.
+		stale := resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone
+		return stale, fmt.Errorf("scoped daemon at %s returned %s: %s", socketPath, resp.Status, reason)
 	}
-	return nil
+	return false, nil
 }
 
 // stripClawFrontmatter removes channels and autonomous blocks from a job
