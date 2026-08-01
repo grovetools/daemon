@@ -19,10 +19,25 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/daemon/internal/daemon/assistant"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/memory/pkg/memory"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	// DefaultAssistantPlan is the assistant plan name assumed when an
+	// ecosystem's grove.toml carries no [assistant] block (spec §3.1).
+	DefaultAssistantPlan = "steward"
+	// memoryDirName is the assistant memory directory inside its plan's
+	// notebook home, mirroring assistant.Supervisor.MemoryDir.
+	memoryDirName = "memory"
+	// memoryDocType is what a file under that directory is indexed as. It is
+	// the same doc type `memory write` records (memory/pkg/memory/store.go),
+	// so agent-authored facts stay distinguishable from human notebook notes
+	// in search, display, and per-type scoping.
+	memoryDocType = "memory"
 )
 
 // IndexJob represents a file to be indexed into the memory store.
@@ -201,6 +216,17 @@ func (h *MemoryHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace
 			addDir(dir, node)
 		}
 
+		// The standing assistant's memory directory (assistant-pane spec §3.5
+		// layer 1). Without this the whole memory loop is broken: the assistant
+		// drops a fact as a file, nothing indexes it, and neither `grove_memory`
+		// search nor the <related_memories> injected at the next handoff can
+		// ever see it. It is watched separately from the note types above
+		// because it is not an nb note type at all — it hangs off the workspace
+		// beside plans/, at <workspace>/<plan>/memory.
+		if dir := h.assistantMemoryDir(node); dir != "" {
+			addDir(dir, node)
+		}
+
 		// Code source directories: ecosystem sub-projects and standalone projects
 		// that contain source code (detected via language-specific project markers)
 		if node.IsEcosystemChild() || node.Kind == workspace.KindStandaloneProject || node.Kind == workspace.KindStandaloneProjectWorktree {
@@ -256,6 +282,37 @@ func (h *MemoryHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace
 	})
 
 	return paths
+}
+
+// assistantMemoryDir returns <workspace>/<plan>/memory for node's ecosystem, or
+// "" when the node is not an ecosystem (the assistant is ecosystem-scoped, spec
+// §3.1) or the notebook layout cannot be resolved.
+//
+// The plan name comes from the ecosystem's [assistant] block so an ecosystem
+// that renamed its assistant plan is still indexed; DefaultAssistantPlan is the
+// spec's proposed name and applies to ecosystems running the Phase 0 shape,
+// where the memory directory exists before the daemon block does. A directory
+// that does not exist is never watched, so guessing costs nothing.
+func (h *MemoryHandler) assistantMemoryDir(node *workspace.WorkspaceNode) string {
+	if node == nil || !node.IsEcosystem() {
+		return ""
+	}
+	plansDir, err := h.locator.GetPlansDir(node)
+	if err != nil || plansDir == "" {
+		return ""
+	}
+	workspaceDir := filepath.Dir(plansDir)
+	if workspaceDir == "" || workspaceDir == "." || workspaceDir == string(filepath.Separator) {
+		return ""
+	}
+	plan := DefaultAssistantPlan
+	// The block is read from the node's own checkout: an ecosystem worktree
+	// carries its own grove.toml, and its notebook workspace is the root
+	// ecosystem's (getContextNodeForPath), which is exactly the pairing here.
+	if cfg, err := assistant.LoadConfig(node.Path); err == nil && cfg != nil && cfg.Plan != "" {
+		plan = cfg.Plan
+	}
+	return filepath.Join(workspaceDir, plan, memoryDirName)
 }
 
 func (h *MemoryHandler) MatchesEvent(event fsnotify.Event) bool {
@@ -644,16 +701,7 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 			metadataBytes, _ = json.Marshal(manifest)
 		}
 	} else {
-		docType = "note"
-		if strings.Contains(job.Path, "/skills/") {
-			docType = "skill"
-		} else if strings.Contains(job.Path, "/concepts/") {
-			docType = "concept"
-		} else if strings.Contains(job.Path, "/plans/") {
-			docType = "plan"
-		} else if strings.Contains(job.Path, "/issues/") {
-			docType = "issue"
-		}
+		docType = notebookDocType(job.Path)
 	}
 
 	chunks := memory.ChunkDocument(content, memory.DefaultChunkConfig())
@@ -781,6 +829,31 @@ func (h *MemoryHandler) processJob(ctx context.Context, job IndexJob) {
 			"reused":         len(chunks) - len(textsToEmbed),
 		})
 		h.broadcastMemoryEvent("upsert", job.Path)
+	}
+}
+
+// notebookDocType classifies a non-code notebook file by the directory it
+// lives in.
+//
+// Order is load-bearing: the note-type segments are checked before the
+// assistant memory directory, so a concept named "memory"
+// (concepts/memory/overview.md) stays a concept and only a file that matched no
+// note type — i.e. one under <workspace>/<plan>/memory — is indexed as a
+// memory fact.
+func notebookDocType(path string) string {
+	switch {
+	case strings.Contains(path, "/skills/"):
+		return "skill"
+	case strings.Contains(path, "/concepts/"):
+		return "concept"
+	case strings.Contains(path, "/plans/"):
+		return "plan"
+	case strings.Contains(path, "/issues/"):
+		return "issue"
+	case strings.Contains(path, "/"+memoryDirName+"/"):
+		return memoryDocType
+	default:
+		return "note"
 	}
 }
 
