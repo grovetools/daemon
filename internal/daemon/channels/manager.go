@@ -99,19 +99,34 @@ type Manager struct {
 	// resolves the mux + PTY/tmux target internally).
 	SendInput func(ctx context.Context, jobID, message string) error
 
-	// EnsureAssistant, when set, is poked whenever inbound could not be
-	// delivered to any live agent — no active claws, or a delivery that
-	// failed. With a standing assistant claw registered, that case IS mail
-	// for the assistant: the claw is gone because its session died, and the
-	// supervisor is the thing that brings it back (assistant-pane spec §3.3
-	// "ensure on inbound"). It is called asynchronously and never blocks the
-	// inbound path.
+	// EnsureAssistant, when set, runs one ensure pass of the LOCAL assistant
+	// supervisor and reports whether it produced a live chain. Inbound that
+	// reached no live agent is, for an ecosystem with a standing assistant
+	// claw, mail for the assistant: the claw is gone because its session died,
+	// and the supervisor is the thing that brings it back (assistant-pane spec
+	// §3.3, §3.4 "ensure on inbound").
 	//
-	// This wires the TRIGGER only. Routing untagged inbound to a configured
-	// default claw, and queueing the message for delivery on attach, are
-	// phase 3 (spec §3.4) — today the message that woke the assistant is
-	// still dropped, and the sender is told so by the existing reply path.
-	EnsureAssistant func(reason string)
+	// It is synchronous and returns an error because the sender is owed an
+	// answer: a launch that fails is reported back over Signal rather than
+	// leaving a phone with silence. Callers on the inbound path always invoke
+	// it from the flush goroutine, never inline.
+	//
+	// Only the daemon that owns the assistant has this wired. When the
+	// assistant lives in another (scoped) daemon, ensureAssistant forwards to
+	// its socket instead — see default_claw.go.
+	EnsureAssistant func(ctx context.Context, reason string) error
+
+	// IsDefaultClawJob reports whether a job belongs to this daemon's
+	// assistant, so enabling its channel also registers it as the ecosystem's
+	// default claw. Nil on every daemon with no [assistant] block, which is
+	// the default.
+	IsDefaultClawJob func(jobID string) bool
+
+	// assistantQueue holds inbound parked while the assistant comes up, and
+	// assistantFlushing says whether a flush goroutine already owns it. Both
+	// are guarded by m.mu; see assistant_queue.go.
+	assistantQueue    []queuedInbound
+	assistantFlushing bool
 
 	recentInbound    [10]models.InboundRecord
 	recentInboundIdx int
@@ -436,6 +451,15 @@ func (m *Manager) enableSignal(jobID string) error {
 		}
 	}
 
+	// A claw on an assistant job is the ecosystem's default claw (spec §3.4).
+	// Registering it HERE — rather than on a supervisor tick — means the record
+	// tracks the chain exactly: the supervisor re-claws after every launch and
+	// every handoff, so each new head registers itself the moment it becomes
+	// reachable, which is also the moment queued inbound may be delivered.
+	if m.IsDefaultClawJob != nil && m.IsDefaultClawJob(jobID) {
+		m.markDefaultClawJob(jobID)
+	}
+
 	m.ulog.Info("Channel enabled for session").Field("channel", "signal").Field("job_id", jobID).Log(m.ctx)
 	return nil
 }
@@ -480,6 +504,11 @@ func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
 
 	// Clean up persisted delivery info
 	m.removeSessionDelivery(jobID)
+
+	// The assistant's claw going away does not retire the ENDPOINT: the
+	// ecosystem still has an assistant, and knowing that is what routes the
+	// next inbound message into ensure-on-inbound instead of dropping it.
+	m.clearDefaultClawJob(jobID)
 }
 
 // Send sends a message via the appropriate channel and records the route.
@@ -816,25 +845,67 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 				targetJobID = id
 			}
 			resolvedVia = "single_active_fallback"
-		} else if count > 1 {
-			m.mu.Unlock()
-			m.ulog.Warn("Inbound message unroutable — multiple active agents").
-				Field("active_sessions", count).
-				Log(ctx)
-			m.recordInbound(msg.Source, "dropped", "", "multiple active agents", false)
-			m.replyWithAgentList(msg.Source, msg.GroupID, activeIDs)
-			return
 		} else {
 			m.mu.Unlock()
-			m.ulog.Warn("Inbound message dropped — no active agents").Log(ctx)
-			m.recordInbound(msg.Source, "dropped", "", "no active agents", false)
-			m.pokeAssistant("inbound_no_agents")
+			m.routeUnresolved(ctx, msg, text, activeIDs)
 			return
 		}
 	}
 
 	m.mu.Unlock()
 
+	m.deliverInbound(ctx, targetJobID, resolvedVia, msg, text, false)
+}
+
+// routeUnresolved handles inbound the cascade could not address: nothing
+// active, or several claws active and no quote or @tag to choose between them.
+//
+// Before phase 3 both cases ended in a drop. They now end at the ecosystem's
+// DEFAULT CLAW when it has one (spec §3.4): ad-hoc feature claws keep their
+// @tag/quote discipline, and the standing assistant catches everything else, so
+// an untagged "make me a plan for X" texted from a phone lands on exactly the
+// agent whose job is making plans. A drop is still the answer for an ecosystem
+// that never opted in.
+func (m *Manager) routeUnresolved(ctx context.Context, msg channels.InboundMessage, text string, activeIDs map[string]bool) {
+	claw := LoadDefaultClaw()
+
+	if jobID, ok := m.liveDefaultClaw(); ok {
+		m.ulog.Info("Inbound routed to the default claw").
+			Field("job_id", jobID).
+			Field("plan", claw.Plan).
+			Field("active_sessions", len(activeIDs)).
+			Log(ctx)
+		m.deliverInbound(ctx, jobID, "default_claw", msg, text, false)
+		return
+	}
+
+	// The ecosystem has an assistant, it just is not up. That is mail, not an
+	// error: wake the supervisor, park the message, deliver it on attach.
+	if claw.IsEndpoint() {
+		m.queueForAssistant(msg, text, "inbound_no_assistant")
+		return
+	}
+
+	if len(activeIDs) > 1 {
+		m.ulog.Warn("Inbound message unroutable — multiple active agents").
+			Field("active_sessions", len(activeIDs)).
+			Log(ctx)
+		m.recordInbound(msg.Source, "dropped", "", "multiple active agents", false)
+		m.replyWithAgentList(msg.Source, msg.GroupID, activeIDs)
+		return
+	}
+	m.ulog.Warn("Inbound message dropped — no active agents").Log(ctx)
+	m.recordInbound(msg.Source, "dropped", "", "no active agents", false)
+	m.pokeAssistant("inbound_no_agents")
+}
+
+// deliverInbound tags a message with its channel provenance and delivers it to
+// targetJobID, forwarding across daemons when the session lives elsewhere.
+//
+// fromQueue marks a message that already came out of the ensure-on-inbound
+// buffer. Such a message must never be re-queued on failure — that is a loop —
+// so its sender gets the error instead.
+func (m *Manager) deliverInbound(ctx context.Context, targetJobID, resolvedVia string, msg channels.InboundMessage, text string, fromQueue bool) {
 	m.ulog.Info("Inbound message routed").
 		Field("job_id", targetJobID).
 		Field("resolved_via", resolvedVia).
@@ -885,6 +956,7 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 				_ = m.removeInboundRoute(targetJobID)
 			}
 			m.recordInbound(msg.Source, resolvedVia, targetJobID, err.Error(), false)
+			m.onUndeliverable(targetJobID, msg, text, fromQueue, err)
 			return
 		}
 		m.ulog.Success("Signal message forwarded to scoped daemon").
@@ -933,13 +1005,33 @@ func (m *Manager) handleInbound(msg channels.InboundMessage) {
 			Field("job_id", targetJobID).
 			Log(ctx)
 		m.recordInbound(msg.Source, resolvedVia, targetJobID, err.Error(), false)
-		// A claw whose session no longer accepts input is a dead agent with a
-		// live route. If it was the assistant's, the supervisor can fix it.
-		m.pokeAssistant("inbound_undeliverable")
+		m.onUndeliverable(targetJobID, msg, text, fromQueue, err)
 		return
 	}
 	m.ulog.Success("Signal message injected").Field("job_id", targetJobID).Log(ctx)
 	m.recordInbound(msg.Source, resolvedVia, targetJobID, "", true)
+}
+
+// onUndeliverable handles a message that was addressed correctly and still did
+// not arrive. A claw whose session no longer accepts input is a dead agent with
+// a live route; when it is the ASSISTANT's, that is the exact condition
+// ensure-on-inbound exists for, so the message goes back into the queue behind
+// a supervisor poke rather than being lost. For any other agent there is
+// nothing to restart, so the poke stays the best-effort nudge it was.
+func (m *Manager) onUndeliverable(targetJobID string, msg channels.InboundMessage, text string, fromQueue bool, cause error) {
+	if !fromQueue {
+		if claw := LoadDefaultClaw(); claw.IsEndpoint() && claw.JobID == targetJobID {
+			// The registration is a fossil: the session behind it is gone.
+			// Retire it so the flush waits for a genuinely new claw.
+			m.clearDefaultClawJob(targetJobID)
+			m.queueForAssistant(msg, text, "inbound_undeliverable")
+			return
+		}
+		m.pokeAssistant("inbound_undeliverable")
+		return
+	}
+	m.replyOverSignal(msg.Source, msg.GroupID,
+		fmt.Sprintf("Assistant could not receive your message: %v", cause))
 }
 
 // pokeAssistant asks the assistant supervisor to ensure a live assistant, off
@@ -949,7 +1041,12 @@ func (m *Manager) pokeAssistant(reason string) {
 	if m.EnsureAssistant == nil {
 		return
 	}
-	go m.EnsureAssistant(reason)
+	go func() {
+		if err := m.EnsureAssistant(context.Background(), reason); err != nil {
+			m.ulog.Warn("Assistant ensure failed").Err(err).
+				Field("reason", reason).Log(context.Background())
+		}
+	}()
 }
 
 // startSignalChannel starts the signal-cli daemon process.
@@ -1475,6 +1572,7 @@ type ChannelState struct {
 	InboundRoutes   map[string]string              `json:"inbound_routes"`             // jobID → socketPath
 	QuoteRoutes     map[int64]string               `json:"quote_routes"`               // timestamp → jobID
 	SessionDelivery map[string]SessionDeliveryInfo `json:"session_delivery,omitempty"` // jobID → delivery info
+	DefaultClaw     *DefaultClawInfo               `json:"default_claw,omitempty"`     // the ecosystem's standing assistant claw
 }
 
 func stateFilePath() string {

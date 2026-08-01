@@ -1055,10 +1055,28 @@ func newGrovedStartCmd() *cobra.Command {
 					if chMgr != nil {
 						// Inbound that reached no live agent is, for an
 						// ecosystem with a standing assistant claw, the
-						// assistant's mail. Poke the ensure loop.
-						chMgr.EnsureAssistant = assistantSup.Trigger
+						// assistant's mail. Ensure a live chain, and say why
+						// when that fails — the sender is owed an answer
+						// (spec §3.4 ensure-on-inbound).
+						chMgr.EnsureAssistant = func(ectx context.Context, reason string) error {
+							_, err := assistantSup.Ensure(ectx, reason, false)
+							return err
+						}
 					}
 					if assistantSup.Enabled() {
+						if chMgr != nil {
+							// Claim the ecosystem's default claw (spec §3.4).
+							// The endpoint is published even while the
+							// assistant is down: it is what tells the global
+							// daemon's inbound cascade that unresolved mail
+							// has somewhere to go and somewhere to wake.
+							plan := assistantSup.Status().Plan
+							chMgr.RegisterDefaultClaw(plan)
+							chMgr.IsDefaultClawJob = func(jobID string) bool {
+								sess := st.GetSession(jobID)
+								return sess != nil && sess.PlanName == plan
+							}
+						}
 						ulog.Info("Assistant supervisor registered").
 							Field("plan", assistantSup.Status().Plan).
 							Field("plan_dir", assistantSup.PlanDir()).

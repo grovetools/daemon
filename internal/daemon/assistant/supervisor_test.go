@@ -616,3 +616,24 @@ func TestTriggerCoalesces(t *testing.T) {
 		t.Errorf("pending triggers = %d, want 1", got)
 	}
 }
+
+// The channel-provenance action policy (spec §3.7) rides in every seeded
+// prompt. A standing claw makes the Signal exposure permanent, so the rule
+// that separates "ask for work" from "destroy things" has to be permanent too
+// — and it has to name the tag it keys on, because the tag is the only signal
+// the agent gets about where an instruction came from.
+func TestSeedPromptCarriesTheChannelProvenancePolicy(t *testing.T) {
+	cfg := (&Config{Enabled: true, Plan: "steward"}).withDefaults()
+	s := NewSupervisor(cfg, filepath.Join(t.TempDir(), "plans", "steward"), &fakeFlow{})
+
+	prompt := s.seedPrompt(nil)
+
+	if !strings.Contains(prompt, "[via Signal from <name>]") {
+		t.Errorf("seed prompt never names the provenance tag the policy keys on:\n%s", prompt)
+	}
+	for _, want := range []string{"deleting or archiving a plan", "force operation", "confirmation IN THE TUI PANE"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("seed prompt is missing %q from the destructive-action policy:\n%s", want, prompt)
+		}
+	}
+}

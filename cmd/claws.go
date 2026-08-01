@@ -26,7 +26,7 @@ func newGrovedClawsCmd() *cobra.Command {
 		Long: `List every agent currently designated as a Signal claw.
 
 Reads the consolidated channel state at
-$(groved state-dir)/channels/state.json, which holds three tables:
+$(groved state-dir)/channels/state.json, which holds four tables:
   inbound_routes   — jobID→scoped-daemon-socket for cross-daemon inbound
                      forwarding (written by scoped daemons when a user
                      claws a session)
@@ -34,6 +34,9 @@ $(groved state-dir)/channels/state.json, which holds three tables:
                      for quote-reply routing)
   session_delivery — jobID→mux/target, the delivery address routing falls
                      back to after a daemon restart
+  default_claw     — the ecosystem's standing assistant: where inbound goes
+                     when no quote or @tag resolves it, and whose supervisor
+                     is woken when it is not up
 
 Also reports signal-cli daemon health and the list of running groveds
 so you can tell which daemon owns each claw-enabled session.`,
@@ -114,6 +117,27 @@ so you can tell which daemon owns each claw-enabled session.`,
 						mux = "(unset)"
 					}
 					fmt.Printf("  %-30s → %s %s\n", j, mux, target)
+				}
+			}
+			fmt.Println()
+
+			// --- default_claw (the standing assistant) ------------------------
+			fmt.Println("Default claw (state.json default_claw):")
+			switch {
+			case stateErr != nil:
+				fmt.Println("  (unavailable)")
+			case state.DefaultClaw == nil || state.DefaultClaw.Plan == "":
+				fmt.Println("  (none — unresolved inbound is dropped, not routed)")
+			default:
+				dc := state.DefaultClaw
+				fmt.Printf("  plan %s  [%s]\n", dc.Plan, displayScope(dc.Scope))
+				if dc.JobID == "" {
+					fmt.Println("  registered claw: (none — inbound queues and wakes the supervisor)")
+				} else {
+					fmt.Printf("  registered claw: %s\n", dc.JobID)
+				}
+				if dc.Socket != "" {
+					fmt.Printf("  supervisor socket: %s\n", filepath.Base(dc.Socket))
 				}
 			}
 			fmt.Println()
@@ -216,12 +240,22 @@ type sessionDelivery struct {
 	PtyID      string `json:"pty_id,omitempty"`
 }
 
+// defaultClaw mirrors channels.DefaultClawInfo: the ecosystem's standing
+// assistant claw, where unresolved inbound goes instead of being dropped.
+type defaultClaw struct {
+	JobID  string `json:"job_id,omitempty"`
+	Plan   string `json:"plan,omitempty"`
+	Scope  string `json:"scope,omitempty"`
+	Socket string `json:"socket,omitempty"`
+}
+
 // channelState mirrors channels.ChannelState. Integer map keys are encoded as
 // JSON strings, so quote_routes decodes as map[string]string here.
 type channelState struct {
 	InboundRoutes   map[string]string          `json:"inbound_routes"`
 	QuoteRoutes     map[string]string          `json:"quote_routes"`
 	SessionDelivery map[string]sessionDelivery `json:"session_delivery"`
+	DefaultClaw     *defaultClaw               `json:"default_claw,omitempty"`
 }
 
 func emptyChannelState() *channelState {
