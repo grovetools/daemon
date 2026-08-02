@@ -176,6 +176,10 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 				ew.ActiveBinary = existing.ActiveBinary
 				ew.CxStats = existing.CxStats
 				ew.GitRemoteURL = existing.GitRemoteURL
+				// Same rule as the other copy-forwards: the poller emits review
+				// state only on change, so a rescan that dropped it would blank
+				// the workspace until the forge state next moved.
+				ew.ReviewStats = existing.ReviewStats
 			}
 			enrichedMap[node.Path] = ew
 		}

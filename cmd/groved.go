@@ -1259,6 +1259,16 @@ func newGrovedStartCmd() *cobra.Command {
 					go unifiedWatcher.Start(ctx)
 				}
 
+				// 7.5b. Forge poller: the global daemon's read-only view of PR +
+				// checks state for the ecosystem's repos. Gated twice over
+				// (explicit config opt-in AND a present `gh`) — see
+				// startForgePoller. Outside the unified-watcher block on
+				// purpose: it is a polling goroutine, not a filesystem handler,
+				// and a failed watcher must not silently take it with it.
+				if scope == "" {
+					startForgePoller(ctx, st, cfg, ulog)
+				}
+
 				// 7.6. Log retention janitor: sweep dated *.log files older than the
 				// configured retention out of the state logs dir, on start and then
 				// every 24h. Judged by filename date (fallback ModTime); today's

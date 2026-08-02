@@ -207,6 +207,10 @@ func (h *WorkspaceHandler) triggerRefresh() {
 				ew.ActiveBinary = existing.ActiveBinary
 				ew.CxStats = existing.CxStats
 				ew.GitRemoteURL = existing.GitRemoteURL
+				// Forge review state survives a structural rescan: the poller
+				// only re-emits it on change, so dropping it here would leave
+				// the workspace at "unknown" until the forge state next moved.
+				ew.ReviewStats = existing.ReviewStats
 			}
 			enrichedMap[node.Path] = ew
 		}

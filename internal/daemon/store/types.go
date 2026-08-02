@@ -141,6 +141,9 @@ const (
 	// Payload: *SyncConflictPayload.
 	UpdateSyncConflict UpdateType = "sync_conflict"
 
+	// Forge poller cache change (see store/forge.go). Payload: *ForgeStatePayload.
+	UpdateForgeState UpdateType = "forge_state"
+
 	// Satellite connection-health update — emitted by the satellite ConnManager
 	// (daemon/internal/daemon/satellite) on every dial/keepalive/backoff state
 	// transition. The store records the latest payload into State.Satellites and

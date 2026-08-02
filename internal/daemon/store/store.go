@@ -383,6 +383,9 @@ func (s *Store) ApplyUpdate(u Update) {
 				if d.GitRemoteURL != nil {
 					ws.GitRemoteURL = *d.GitRemoteURL
 				}
+				if d.ReviewStats != nil {
+					ws.ReviewStats = d.ReviewStats
+				}
 			}
 		}
 

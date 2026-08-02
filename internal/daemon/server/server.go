@@ -2770,6 +2770,18 @@ func convertUpdatePayload(u store.Update) *apiStateUpdate {
 			Payload:    u.Payload,
 		}
 
+	// Forge poller cache change — passthrough so the PRs page, the nav review
+	// column and the treemux badge see forge state over SSE. Mirrors
+	// sync_conflict. Payload: *store.ForgeStatePayload, carrying only the repos
+	// that changed; the daemon keeps no forge state of its own (the projection
+	// it does keep, models.ReviewStats, rides workspaces_delta).
+	case store.UpdateForgeState:
+		return &apiStateUpdate{
+			UpdateType: "forge_state",
+			Source:     u.Source,
+			Payload:    u.Payload,
+		}
+
 	// Satellite connection-health transition (C17) — passthrough so the treemux
 	// badge and (P10) `grove status` see it over SSE. Mirrors sync_conflict.
 	case store.UpdateSatelliteStatus:
