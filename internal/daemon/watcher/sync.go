@@ -259,7 +259,7 @@ func (h *SyncHandler) SyncSubscriptions() (string, []config.SyncWorkspace) {
 //     disk (an existing replica or bootstrap-precreated dirs is the strongest
 //     signal of which notebook the workspace belongs to);
 //  2. the notebook referenced by a configured grove (what discovery's
-//     assignNotebookName would have produced for a child of that grove),
+//     config.ResolveNotebook would have produced for a child of that grove),
 //     groves visited in sorted order for determinism;
 //  3. empty — the locator then falls back to notebooks.rules.default and the
 //     builtin default, exactly as it does for any node without a match.
