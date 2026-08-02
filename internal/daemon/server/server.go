@@ -163,6 +163,13 @@ type Server struct {
 	// tuimux is unavailable. Atomic to match the late-wired deps above.
 	tuimuxReEnsure atomic.Pointer[tuimuxReEnsureFn]
 
+	// forgeSource is the running forge poller's read seam, wired via
+	// SetForgeSnapshotter on the global daemon when the poller actually
+	// started. Nil is meaningful: GET /api/forge/state answers enabled=false
+	// rather than an empty list (see forge.go). Atomic like the other
+	// late-wired boot deps above.
+	forgeSource atomic.Pointer[forgeReadSeam]
+
 	// Memory store + embedder are wired via SetMemoryStore so /api/memory/*
 	// handlers can serve the same instance the MemoryHandler watcher uses.
 	memStore    memory.DocumentStore
@@ -438,6 +445,7 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	// so a sandboxed provisioner can delegate the ~/.claude.json write it cannot
 	// perform itself. See handleSeedTrust for the security rationale.
 	mux.HandleFunc("/api/trust/seed", unixOnly(s.handleSeedTrust))
+	mux.HandleFunc("/api/forge/state", s.handleGetForgeState)
 	mux.HandleFunc("/api/notes/index", s.handleNoteIndex)
 	mux.HandleFunc("/api/notes/event", s.handleNoteEvent)
 	// Workflow/subagent aggregation endpoints. Served on the 0600 unix

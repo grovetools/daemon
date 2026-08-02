@@ -1266,7 +1266,15 @@ func newGrovedStartCmd() *cobra.Command {
 				// purpose: it is a polling goroutine, not a filesystem handler,
 				// and a failed watcher must not silently take it with it.
 				if scope == "" {
-					startForgePoller(ctx, st, cfg, ulog)
+					// Wire the poller's read seam onto the HTTP server so
+					// GET /api/forge/state can serve the cache. Registering it
+					// ONLY when the poller actually started is what makes the
+					// endpoint able to say "poller off" — a surface that gets an
+					// empty repo list with no such signal renders it as "no pull
+					// requests" (STATE.md D4).
+					if poller := startForgePoller(ctx, st, cfg, ulog); poller != nil {
+						srv.SetForgeSnapshotter(poller.ProviderName(), poller)
+					}
 				}
 
 				// 7.6. Log retention janitor: sweep dated *.log files older than the

@@ -23,20 +23,23 @@ import (
 //     call time, which the poller records as unknown/stale (D4) rather than as
 //     "no pull requests".
 //
-// It returns nothing and reports nothing upward: a poller that cannot start is
-// a feature that stays off, not a daemon that fails to boot.
-func startForgePoller(ctx context.Context, st *store.Store, cfg *config.Config, ulog *grovelogging.UnifiedLogger) {
+// It reports nothing upward as an error: a poller that cannot start is a
+// feature that stays off, not a daemon that fails to boot. It DOES return the
+// running poller (nil when off) so the caller can wire its read seam onto the
+// HTTP server — a nil return is what makes GET /api/forge/state answer
+// "enabled: false" instead of an empty, indistinguishable-from-no-PRs list.
+func startForgePoller(ctx context.Context, st *store.Store, cfg *config.Config, ulog *grovelogging.UnifiedLogger) *forgepoll.Poller {
 	forgeCfg, err := cfg.Forge()
 	if err != nil {
 		ulog.Warn("Failed to parse [forge] config, forge poller disabled").Err(err).Log(ctx)
-		return
+		return nil
 	}
 	if !forgeCfg.PollEnabled() {
-		return
+		return nil
 	}
 	if !github.Available() {
 		ulog.Info("Forge poller enabled but the gh CLI is not on PATH; poller stays off").Log(ctx)
-		return
+		return nil
 	}
 
 	poller, err := forgepoll.New(forgepoll.Options{
@@ -47,7 +50,8 @@ func startForgePoller(ctx context.Context, st *store.Store, cfg *config.Config, 
 	})
 	if err != nil {
 		ulog.Warn("Failed to construct forge poller, forge state disabled").Err(err).Log(ctx)
-		return
+		return nil
 	}
 	go poller.Start(ctx)
+	return poller
 }

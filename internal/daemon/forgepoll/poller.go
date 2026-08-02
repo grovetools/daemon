@@ -236,6 +236,11 @@ func (p *Poller) Snapshot() []store.ForgeRepoState {
 	return p.cache.snapshot(p.now())
 }
 
+// ProviderName reports which forge provider this poller is running. The HTTP
+// read surface publishes it alongside the cache so a consumer can name the
+// source of a stale or unknown entry instead of attributing it to "the forge".
+func (p *Poller) ProviderName() string { return p.provider.Name() }
+
 // target binds a workspace path to the repo identity its remote resolves to.
 // Several worktrees of the same repository share one identity, and the poller
 // fetches that repository once.
