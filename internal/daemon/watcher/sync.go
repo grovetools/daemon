@@ -11,8 +11,13 @@
 //     opened lazily by ensureDB the first time a subscription appears, which is
 //     what lets a first-ever `grove join` take effect on the next config reload
 //     instead of requiring a daemon restart (contract §1 Q7, boot gate).
-//   - Notebook-read-only: this handler never writes to the notebook tree.
-//     All writes go to sync.db under ~/.local/share/grove.
+//   - Notebook-read-only, with exactly one carve-out: this handler never
+//     writes to the USER's notes. All capture writes go to sync.db under
+//     ~/.local/share/grove. The single exception is the machine presence note
+//     (registry.go), which writes machines/<own-id>.md into the reserved
+//     registry workspace — this machine's own document, in a workspace that
+//     exists for nothing else, single-writer by construction. It is not the
+//     user's note and the rule it looks like it breaks was never about it.
 //   - Global daemon only: sync.db is owned by the global daemon, like
 //     memory.db; scoped daemons proxy /api/sync/* to global.
 package watcher
@@ -103,6 +108,15 @@ type SyncHandler struct {
 	baseCtx     context.Context
 	maintenance atomic.Bool
 	drainMu     sync.Mutex
+
+	// Registry presence writer (registry.go). registryKick coalesces
+	// structural-change triggers; registryInterval and registryNow are test
+	// seams (zero values select the production ticker and the wall clock).
+	// registryWarned is touched only from the writer goroutine.
+	registryKick     chan struct{}
+	registryInterval time.Duration
+	registryNow      func() time.Time
+	registryWarned   bool
 }
 
 // NewSyncHandler creates a SyncHandler. Both syncCfg and db may be nil: the
@@ -130,6 +144,7 @@ func NewSyncHandler(st *store.Store, cfg *config.Config, syncCfg *config.SyncCon
 		firstSeen:    make(map[string]time.Time),
 		pipelines:    make(map[string]context.CancelFunc),
 		aePasses:     make(map[string]*syncdb.AntiEntropyPass),
+		registryKick: make(chan struct{}, 1),
 	}
 	if db != nil {
 		h.db.Store(db)
@@ -197,6 +212,9 @@ func (h *SyncHandler) ensureDB() *syncdb.DB {
 	h.ulog.Info("Sync database opened").
 		Field("origin_id", db.OriginID()).
 		StructuredOnly().Emit()
+	// origin_id only becomes knowable here, and the note records it so a wiped
+	// sync.db reads as "same machine, new origin" rather than a new machine.
+	h.kickRegistry()
 	return db
 }
 
@@ -730,6 +748,10 @@ func (h *SyncHandler) HandleStoreUpdate(update store.Update) {
 			// waiting for the transport tick. Dormant on nil/empty config.
 			h.ensureDB()
 		}
+		// A config reload is the structural change the writer cannot observe
+		// any other way: subscriptions and ecosystem declarations both live in
+		// config, and both belong in this machine's presence note.
+		h.kickRegistry()
 	case store.UpdateNoteEvent:
 		event, ok := update.Payload.(*models.NoteEvent)
 		if !ok || event == nil {
@@ -803,6 +825,11 @@ func (h *SyncHandler) handleNoteEvent(ctx context.Context, event *models.NoteEve
 func (h *SyncHandler) OnStart(ctx context.Context) {
 	h.baseCtx = ctx
 	go h.transportLoop(ctx)
+	// The presence writer runs independently of the transport: a machine with
+	// no reachable server should still keep its own note current locally, so
+	// that whatever it was doing while offline replicates the moment the
+	// server comes back.
+	h.startRegistryWriter(ctx)
 }
 
 // transportLoop connects to the sync server (retrying quietly — sync stays
@@ -967,6 +994,21 @@ func (h *SyncHandler) ensurePipelines() {
 
 		if sub != nil && sub.Pull {
 			pull := syncdb.NewPullPipeline(sub, client, db, h.ulog)
+			// Own-note guard (registry-role subscriptions only): an inbound
+			// event for machines/<our id>.md cannot be a legitimate
+			// replication of our own write, because the registry is
+			// single-writer. Dropped and surfaced, never applied — see
+			// PullPipeline.guardOwnRegistryNote for why this is detection
+			// rather than prevention under the interim trust model.
+			pull.OwnMachineID = machine.ID()
+			pull.OnRegistryForeignWrite = func(ws, path, detail string) {
+				h.broadcastConflict(&store.SyncConflictPayload{
+					Kind:      syncdb.ConflictKindRegistryForeignWrite,
+					Workspace: ws,
+					Path:      path,
+					Detail:    detail,
+				})
+			}
 			go h.runWithRecovery(pctx, name, "pull", func() error {
 				return pull.RunPullLoop(pctx, root)
 			})

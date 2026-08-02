@@ -12,6 +12,7 @@ import (
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/paths"
+	"github.com/grovetools/core/pkg/registry"
 	"github.com/grovetools/core/pkg/syncproto"
 )
 
@@ -24,6 +25,20 @@ type PullPipeline struct {
 	db       *DB
 	log      *logging.UnifiedLogger
 	pollWait time.Duration
+
+	// OwnMachineID is this host's durable identity (core/pkg/machine). It is
+	// the input to the own-note guard below and is only consulted for a
+	// role = "registry" subscription; empty disables the guard, which is
+	// exactly the pre-identity behavior.
+	OwnMachineID string
+
+	// OnRegistryForeignWrite is called when the guard drops an inbound event
+	// for this machine's own registry note. The watcher wires it to
+	// broadcastConflict; nil is a legal no-op, and the artifact is written
+	// either way. Plain-typed (no store import) for the same reason
+	// PushPipeline.OnOversizeSkipped is: the pipeline must not depend on the
+	// daemon's store package.
+	OnRegistryForeignWrite func(workspace, path, detail string)
 }
 
 // NewPullPipeline creates a pull pipeline for a workspace.
@@ -192,6 +207,9 @@ func (p *PullPipeline) snaphotResync(ctx context.Context, workspaceRoot string) 
 // applyEvent applies a single event: creates, updates, moves, or deletes a document.
 // Merge conflicts during update are recorded as conflict artifacts.
 func (p *PullPipeline) applyEvent(ctx context.Context, workspaceRoot string, ev *syncproto.SyncEvent) error {
+	if p.guardOwnRegistryNote(ctx, ev) {
+		return nil
+	}
 	switch ev.Type {
 	case syncproto.EventDocumentCreated:
 		return p.applyCreate(ctx, workspaceRoot, ev)
@@ -451,22 +469,94 @@ func (p *PullPipeline) applyPrefixDelete(ctx context.Context, workspaceRoot stri
 	return p.db.DeletePrefix(p.ws.Name, ev.Path)
 }
 
-// recordConflict writes a conflict artifact to disk at ~/.local/state/grove/sync/conflicts/.
-// Emits an UpdateSyncConflict SSE event for TUI display.
+// guardOwnRegistryNote drops an inbound event that would overwrite THIS
+// machine's own presence note, and reports whether it did.
+//
+// # Why the guard exists
+//
+// The registry is single-writer by construction: a machine writes only
+// machines/<its own id>.md, which is what makes per-document OCC sufficient
+// and conflicts impossible. An inbound event for our own path therefore
+// cannot be a legitimate replication of our own write — the push pipeline
+// never round-trips our own documents back through pull — so it is another
+// party writing a document only this machine may write.
+//
+// # Why it is detection and not prevention
+//
+// It cannot be prevention. Under the interim trust model every token
+// grove-syncd issues is the owner and can write any path (getUserPrefixes
+// short-circuits for user_id 1; CreateToken cannot assign a user), so the
+// server will accept that write and hand it to us. All this side can do is
+// refuse to APPLY it and leave evidence: the artifact on disk plus a
+// registry_foreign_write conflict on the SSE feed. Real enforcement is the
+// device-principal phase, where the server rejects a push to machines/<d>.md
+// unless the pushing token's device principal is <d>.
+//
+// The guard is scoped to role = "registry" subscriptions. A machines/ path in
+// an ordinary notebook workspace is just a document, and dropping it there
+// would be a silent data-loss bug rather than a safety property.
+func (p *PullPipeline) guardOwnRegistryNote(ctx context.Context, ev *syncproto.SyncEvent) bool {
+	if p.ws == nil || p.ws.Role != config.SyncRoleRegistry || p.OwnMachineID == "" {
+		return false
+	}
+	own := registry.NotePath(p.OwnMachineID)
+	// PrevPath covers a move whose DESTINATION is our note: renaming a foreign
+	// document onto our path is the same write by another spelling.
+	if ev.Path != own && ev.PrevPath != own {
+		return false
+	}
+
+	detail := fmt.Sprintf(
+		"inbound %s event for this machine's own registry note was dropped; the registry is single-writer",
+		ev.Type)
+	p.log.Warn("registry foreign write rejected").
+		Field("workspace", p.ws.Name).
+		Field("path", own).
+		Field("type", string(ev.Type)).
+		Field("document_id", ev.DocumentID).
+		Log(ctx)
+
+	// The rejected content IS the evidence, so it is what the artifact holds.
+	if err := p.recordConflictArtifact(ctx, own, ev.DocumentID,
+		ConflictKindRegistryForeignWrite, ev.Content); err != nil {
+		p.log.Warn("failed to record registry conflict artifact").
+			Field("path", own).Err(err).Log(ctx)
+	}
+	if p.OnRegistryForeignWrite != nil {
+		p.OnRegistryForeignWrite(p.ws.Name, own, detail)
+	}
+	return true
+}
+
+// recordConflict writes a merge-conflict artifact to disk at
+// ~/.local/state/grove/sync/conflicts/.
 func (p *PullPipeline) recordConflict(ctx context.Context, workspaceRoot, path, docID string, localContent []byte) error {
+	return p.recordConflictArtifact(ctx, path, docID, ConflictKindMerge, localContent)
+}
+
+// recordConflictArtifact writes one conflict artifact. The kind rides in the
+// filename because the conflicts endpoint rebuilds its rows from these files
+// and has nothing else to read (see conflict_artifact.go).
+func (p *PullPipeline) recordConflictArtifact(ctx context.Context, relPath, docID, kind string, content []byte) error {
 	// Create conflicts directory: ~/.local/state/grove/sync/conflicts/{workspace}/
 	conflictDir := filepath.Join(paths.StateDir(), "sync", "conflicts", p.ws.Name)
 	if err := os.MkdirAll(conflictDir, 0o700); err != nil {
 		return fmt.Errorf("failed to create conflict directory: %w", err)
 	}
 
-	// Write conflict artifact: {path}.{uuid}.conflict.md
-	conflictFile := filepath.Join(conflictDir, fmt.Sprintf("%s.%s.conflict.md", path, docID))
-	if err := writeFile(conflictFile, localContent, time.Time{}); err != nil {
+	conflictFile := filepath.Join(conflictDir, filepath.FromSlash(conflictArtifactName(relPath, docID, kind)))
+	if err := os.MkdirAll(filepath.Dir(conflictFile), 0o700); err != nil {
+		return fmt.Errorf("failed to create conflict directory: %w", err)
+	}
+	if err := writeFile(conflictFile, content, time.Time{}); err != nil {
 		return fmt.Errorf("failed to write conflict artifact: %w", err)
 	}
 
-	p.log.Info("conflict recorded").Field("workspace", p.ws.Name).Field("path", path).Field("artifact", conflictFile).Log(ctx)
+	p.log.Info("conflict recorded").
+		Field("workspace", p.ws.Name).
+		Field("path", relPath).
+		Field("kind", kind).
+		Field("artifact", conflictFile).Log(ctx)
 	// TODO: Emit store.UpdateSyncConflict SSE event
 	return nil
 }

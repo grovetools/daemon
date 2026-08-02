@@ -314,10 +314,15 @@ func (s *Server) handleSyncOutbox(w http.ResponseWriter, r *http.Request) {
 // BaseContent is the "base" leg of the conflict inspector's diff; the "local"
 // leg is ArtifactContent and the "server head" leg is fetched separately.
 type syncConflictResponse struct {
-	Workspace       string `json:"workspace"`
-	Path            string `json:"path"`        // original wire path of the conflicted document
-	DocumentID      string `json:"document_id"` // parsed from the artifact filename
-	Artifact        string `json:"artifact"`    // artifact filename, workspace-relative (slash form)
+	Workspace  string `json:"workspace"`
+	Path       string `json:"path"`        // original wire path of the conflicted document
+	DocumentID string `json:"document_id"` // parsed from the artifact filename
+	// Kind is what went wrong: "merge" (the historical case) or one of the
+	// named kinds, e.g. "registry_foreign_write". It is parsed back out of the
+	// artifact filename, because this endpoint is artifact-backed and the
+	// filename is the only thing that outlives the SSE broadcast.
+	Kind            string `json:"kind,omitempty"`
+	Artifact        string `json:"artifact"` // artifact filename, workspace-relative (slash form)
 	ArtifactContent string `json:"artifact_content"`
 	BaseContent     string `json:"base_content,omitempty"` // 3-way base from sync_documents, when resolvable
 }
@@ -379,14 +384,13 @@ func (s *Server) handleSyncConflicts(w http.ResponseWriter, r *http.Request) {
 			}
 			rel = filepath.ToSlash(rel)
 
-			// Artifact name is "<path>.<document_id>.conflict.md"; the
-			// document id is the segment after the final dot of the stem.
-			stem := strings.TrimSuffix(rel, ".conflict.md")
-			idx := strings.LastIndex(stem, ".")
-			if idx < 0 {
+			// The writer and this reader share one naming scheme
+			// (syncdb.ParseConflictArtifactName), so the kind a conflict was
+			// broadcast with is the kind this endpoint reports.
+			origPath, docID, kind, ok := syncdb.ParseConflictArtifactName(rel)
+			if !ok {
 				return nil // unparseable name — skip rather than guess
 			}
-			origPath, docID := stem[:idx], stem[idx+1:]
 
 			content, err := os.ReadFile(p)
 			if err != nil {
@@ -397,6 +401,7 @@ func (s *Server) handleSyncConflicts(w http.ResponseWriter, r *http.Request) {
 				Workspace:       workspace,
 				Path:            origPath,
 				DocumentID:      docID,
+				Kind:            kind,
 				Artifact:        rel,
 				ArtifactContent: string(content),
 			}

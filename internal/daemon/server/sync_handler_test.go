@@ -287,6 +287,68 @@ func TestHandleSyncConflicts(t *testing.T) {
 	if c.BaseContent != "base body" {
 		t.Errorf("base content: got %q want %q", c.BaseContent, "base body")
 	}
+	// A legacy name carries no kind segment and must report the kind it always
+	// implicitly had — otherwise every artifact already on disk reads as
+	// "unknown" after this change.
+	if c.Kind != syncdb.ConflictKindMerge {
+		t.Errorf("kind: got %q want %q", c.Kind, syncdb.ConflictKindMerge)
+	}
+}
+
+// TestHandleSyncConflictsReportsKind closes the contract's open flag #6:
+// store.SyncConflictPayload carries a Kind that models.SyncConflict lacked,
+// and this endpoint is ARTIFACT-BACKED — it rebuilds every row from the file
+// on disk, so a kind that lived only on the SSE broadcast was lost the moment
+// a subscriber looked away. The kind rides in the artifact filename, and this
+// is the test that it survives the round trip into the REST feed the TUI
+// conflicts table reads.
+func TestHandleSyncConflictsReportsKind(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GROVE_HOME", home)
+
+	db, _ := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	t.Cleanup(func() { _ = db.Close() })
+	s := New(false)
+	s.SetSyncDB(db)
+
+	const docID = "99999999-2222-3333-4444-555555555555"
+	conflictDir := filepath.Join(paths.StateDir(), "sync", "conflicts", "registry", "machines")
+	if err := os.MkdirAll(conflictDir, 0o700); err != nil {
+		t.Fatalf("mkdir conflicts: %v", err)
+	}
+	artifact := filepath.Join(conflictDir,
+		"01KZ00TTW1TDT7X9ABCDEFGHJK.md."+docID+"."+syncdb.ConflictKindRegistryForeignWrite+".conflict.md")
+	if err := os.WriteFile(artifact, []byte("the rejected note"), 0o600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sync/conflicts", nil)
+	w := httptest.NewRecorder()
+	s.handleSyncConflicts(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	var conflicts []syncConflictResponse
+	if err := json.NewDecoder(w.Body).Decode(&conflicts); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(conflicts) != 1 {
+		t.Fatalf("expected 1 conflict, got %d (%+v)", len(conflicts), conflicts)
+	}
+	c := conflicts[0]
+	if c.Kind != syncdb.ConflictKindRegistryForeignWrite {
+		t.Errorf("kind: got %q want %q", c.Kind, syncdb.ConflictKindRegistryForeignWrite)
+	}
+	// The kind segment must not be mistaken for part of the path or the id.
+	if c.Path != "machines/01KZ00TTW1TDT7X9ABCDEFGHJK.md" {
+		t.Errorf("path: got %q", c.Path)
+	}
+	if c.DocumentID != docID {
+		t.Errorf("document_id: got %q want %q", c.DocumentID, docID)
+	}
+	if c.ArtifactContent != "the rejected note" {
+		t.Errorf("artifact content: got %q", c.ArtifactContent)
+	}
 }
 
 func TestHandleSyncConflictsEmptyWhenNoStore(t *testing.T) {
