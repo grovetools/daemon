@@ -55,6 +55,15 @@ type ForgeRepoState struct {
 	// LastError is the most recent failure text, present whenever the last
 	// attempt failed.
 	LastError string `json:"last_error,omitempty"`
+	// ConsecutiveFailures is how many sweeps in a row have failed for this
+	// repo. Zero after any success.
+	ConsecutiveFailures int `json:"consecutive_failures,omitempty"`
+	// NextAttemptAt is when the poller will try this repo again. It is the
+	// honest name for the quiet period after an outage: the per-repo backoff is
+	// exponential (2^n intervals, capped), so a repo that failed a few times in
+	// a row is deliberately not retried for minutes. Zero means "at the next
+	// sweep". A surface that omits this renders that silence as a hang.
+	NextAttemptAt time.Time `json:"next_attempt_at,omitempty"`
 }
 
 // ForgeStatePayload is the Payload of an UpdateForgeState broadcast: the repo

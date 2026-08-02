@@ -229,11 +229,35 @@ func (p *Poller) Sweep(ctx context.Context) {
 	p.project(ctx, targets)
 }
 
-// Snapshot returns the whole cache as it stands. It is the seam a read-only
-// HTTP surface (the git-viewer PRs page) reads through; nothing in this wave
-// mutates through it.
+// Snapshot returns the whole cache as it stands, with each entry's live
+// backoff state stamped on. It is the seam a read-only HTTP surface (the
+// git-viewer PRs page) reads through; nothing in this wave mutates through it.
 func (p *Poller) Snapshot() []store.ForgeRepoState {
-	return p.cache.snapshot(p.now())
+	return p.withBackoff(p.cache.snapshot(p.now()))
+}
+
+// withBackoff stamps each entry with the poller's per-repo failure count and
+// next attempt time.
+//
+// Backoff lives here rather than in the cache because it is the POLLER's
+// schedule, not the forge's answer. Stamping it on the way out is what lets a
+// surface say "quiet until 14:51" instead of showing a stale row that looks
+// stuck: after a few failures the next try is 2^n intervals away, so restoring
+// connectivity does not produce fresh data on the next sweep, and a consumer
+// with no view of the schedule cannot tell that designed silence apart from a
+// wedged poller.
+func (p *Poller) withBackoff(states []store.ForgeRepoState) []store.ForgeRepoState {
+	if len(states) == 0 {
+		return states
+	}
+	p.backoffMu.Lock()
+	defer p.backoffMu.Unlock()
+	for i := range states {
+		key := states[i].Repo
+		states[i].ConsecutiveFailures = p.failures[key]
+		states[i].NextAttemptAt = p.nextTry[key]
+	}
+	return states
 }
 
 // ProviderName reports which forge provider this poller is running. The HTTP
@@ -382,10 +406,15 @@ func (p *Poller) read(ctx context.Context, repo forge.Repo) (prs []forge.PullReq
 // broadcast emits an SSE frame for the entries that materially changed. No
 // change, no frame — that is the restart/duplicate discipline.
 func (p *Poller) broadcast(ctx context.Context) {
-	changed := p.cache.changed(p.now())
+	changed := p.withBackoff(p.cache.changed(p.now()))
 	if len(changed) == 0 {
 		return
 	}
+	// NOTE: backoff is stamped onto the frame but deliberately absent from the
+	// cache fingerprint. A repo failing the same way twice is not new
+	// information and must not generate a frame per sweep; the current schedule
+	// is always readable from GET /api/forge/state, which is where a surface
+	// asks "how long is this quiet period".
 	p.store.ApplyUpdate(store.Update{
 		Type:    store.UpdateForgeState,
 		Source:  "forge_poller",

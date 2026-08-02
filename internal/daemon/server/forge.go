@@ -93,9 +93,11 @@ func convertForgeRepoStates(in []store.ForgeRepoState) []models.ForgeRepoState {
 			// stay nil. A nil PRs means "never successfully fetched", and
 			// normalizing it to an empty slice here would tell the client the
 			// forge reported zero pull requests.
-			PRs:       e.PRs,
-			Checks:    e.Checks,
-			LastError: e.LastError,
+			PRs:                 e.PRs,
+			Checks:              e.Checks,
+			LastError:           e.LastError,
+			ConsecutiveFailures: e.ConsecutiveFailures,
+			NextAttemptAt:       e.NextAttemptAt,
 		})
 	}
 	return out
