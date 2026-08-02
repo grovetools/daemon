@@ -22,15 +22,24 @@ import (
 	"time"
 
 	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/pkg/machine"
 	"github.com/grovetools/core/pkg/paths"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
 )
 
 // SetSyncDB wires the sync database into the server so /api/sync/* handlers
-// can serve it. Called from cmd/groved.go on the global daemon only, and
-// only when sync is configured (the dark gate).
+// can serve it. Called on the global daemon only, from the watcher's deferred
+// open (SyncHandler.SetDeferredDB) the first time a sync subscription exists —
+// which may be at boot, or later on the config reload a first-ever `grove join`
+// triggers. Until then every handler sees a nil DB and reports sync as
+// unconfigured, exactly as before.
 func (s *Server) SetSyncDB(db *syncdb.DB) {
-	s.syncDB = db
+	s.syncDB.Store(db)
+}
+
+// syncDatabase returns the wired sync database, or nil while sync is dormant.
+func (s *Server) syncDatabase() *syncdb.DB {
+	return s.syncDB.Load()
 }
 
 // SetSyncKick wires the watcher SyncHandler's anti-entropy kick into the
@@ -55,11 +64,35 @@ func (s *Server) SetSyncMaintenance(begin func(context.Context) error, end func(
 	s.syncEndMaintenance = end
 }
 
+// SetSyncSubscriptions wires the watcher SyncHandler's live subscription view
+// (server URL + per-workspace pull/mode) into the server so GET
+// /api/sync/status can report where each workspace syncs and in which
+// direction. A function, not a captured config, so a hot reload is reflected
+// without a daemon restart. Nil-safe: without it the status payload simply
+// omits the server and direction fields, exactly as it did before.
+func (s *Server) SetSyncSubscriptions(subs func() (string, []config.SyncWorkspace)) {
+	s.syncSubscriptions = subs
+}
+
 // syncStatusResponse is the GET /api/sync/status payload.
 type syncStatusResponse struct {
-	Enabled           bool                  `json:"enabled"`
-	DBPath            string                `json:"db_path,omitempty"`
-	OriginID          string                `json:"origin_id,omitempty"`
+	Enabled bool   `json:"enabled"`
+	DBPath  string `json:"db_path,omitempty"`
+	// MachineName/MachineID are this host's identity: the config-held display
+	// name (machine.toml, hostname default) and the state-held ULID. They are
+	// reported even when sync is disabled — identity does not depend on sync
+	// being configured. Surfaces render them together as "name (short id)",
+	// never the name alone: names collide across machines restored from one
+	// dotfiles repo.
+	MachineName string `json:"machine_name,omitempty"`
+	MachineID   string `json:"machine_id,omitempty"`
+	// OriginID is the per-sync.db install id and dies with that DB — a
+	// diagnostic (same MachineID + new OriginID = wiped sync.db), not this
+	// machine's identity.
+	OriginID string `json:"origin_id,omitempty"`
+	// Server is the configured grove-syncd base URL — the "where" behind the
+	// counters. Empty when the subscription view is not wired.
+	Server            string                `json:"server,omitempty"`
 	Documents         int                   `json:"documents"`
 	DocumentsDiverged int                   `json:"documents_diverged"`
 	OutboxPending     int                   `json:"outbox_pending"`
@@ -72,6 +105,16 @@ type syncWorkspaceStatus struct {
 	Cursor       int64                     `json:"cursor"`
 	LastSyncedAt time.Time                 `json:"last_synced_at,omitzero"`
 	Hydration    *syncdb.HydrationProgress `json:"hydration,omitempty"`
+	// Pull and Mode mirror the subscription this workspace syncs under
+	// (config.SyncWorkspace): Pull=false is push-only, Mode filters what is
+	// subscribed. Zero values when the workspace has sync.db state but no
+	// matching subscription (e.g. a subscription removed from sync.toml).
+	Pull bool   `json:"pull,omitempty"`
+	Mode string `json:"mode,omitempty"`
+	// Role is the subscription's relationship: satellite, peer, or registry.
+	// Empty is a legacy role-less entry (push-only) — or a workspace with no
+	// matching subscription at all.
+	Role string `json:"role,omitempty"`
 }
 
 // handleSyncStatus handles GET /api/sync/status.
@@ -87,35 +130,58 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out := syncStatusResponse{}
-	if s.syncDB != nil {
+	// Machine identity is reported unconditionally: it exists whether or not
+	// sync is configured, and the ID is minted here if this is the first
+	// process on the host to ask for it.
+	out := syncStatusResponse{
+		MachineName: config.ResolveMachineName(),
+		MachineID:   machine.ID(),
+	}
+	if s.syncDatabase() != nil {
 		out.Enabled = true
-		out.DBPath = s.syncDB.Path()
-		out.OriginID = s.syncDB.OriginID()
-		if n, err := s.syncDB.CountDocuments(); err == nil {
+		out.DBPath = s.syncDatabase().Path()
+		out.OriginID = s.syncDatabase().OriginID()
+		if n, err := s.syncDatabase().CountDocuments(); err == nil {
 			out.Documents = n
 		}
-		if n, err := s.syncDB.CountDocumentsDiverged(); err == nil {
+		if n, err := s.syncDatabase().CountDocumentsDiverged(); err == nil {
 			out.DocumentsDiverged = n
 		}
 		// OutboxPending is the TOTAL count, parked included — a parked entry is
 		// still unsynced state, so hiding it would let waitForSync (and the
 		// cluster harness) pass while data is stuck. OutboxParked splits out the
 		// parked subset for the grove-status parked line and the S3 assertion.
-		if n, err := s.syncDB.CountOutbox(); err == nil {
+		if n, err := s.syncDatabase().CountOutbox(); err == nil {
 			out.OutboxPending = n
 		}
-		if n, err := s.syncDB.CountOutboxParked(); err == nil {
+		if n, err := s.syncDatabase().CountOutboxParked(); err == nil {
 			out.OutboxParked = n
 		}
-		if states, err := s.syncDB.ListStates(); err == nil {
+		// Subscription overlay: the rows are still driven by sync.db state
+		// (a subscription with no state row does not appear, as before) —
+		// the config only annotates them with direction and mode.
+		subsByName := map[string]config.SyncWorkspace{}
+		if s.syncSubscriptions != nil {
+			server, subs := s.syncSubscriptions()
+			out.Server = server
+			for _, sub := range subs {
+				subsByName[sub.Name] = sub
+			}
+		}
+		if states, err := s.syncDatabase().ListStates(); err == nil {
 			for _, st := range states {
-				out.Workspaces = append(out.Workspaces, syncWorkspaceStatus{
+				ws := syncWorkspaceStatus{
 					Name:         st.Workspace,
 					Cursor:       st.Cursor,
 					LastSyncedAt: st.LastSyncedAt,
 					Hydration:    syncdb.HydrationStatus(st.Workspace),
-				})
+				}
+				if sub, ok := subsByName[st.Workspace]; ok {
+					ws.Pull = sub.Pull
+					ws.Mode = sub.Mode
+					ws.Role = sub.Role
+				}
+				out.Workspaces = append(out.Workspaces, ws)
 			}
 		}
 	}
@@ -151,12 +217,12 @@ func (s *Server) handleSyncDocuments(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
 
-	docs, err := s.syncDB.ListDocuments(r.URL.Query().Get("workspace"))
+	docs, err := s.syncDatabase().ListDocuments(r.URL.Query().Get("workspace"))
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to list documents: %v", err), http.StatusInternalServerError)
 		return
@@ -210,12 +276,12 @@ func (s *Server) handleSyncOutbox(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
 
-	entries, err := s.syncDB.ListOutbox(r.URL.Query().Get("workspace"), 0)
+	entries, err := s.syncDatabase().ListOutbox(r.URL.Query().Get("workspace"), 0)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to list outbox: %v", err), http.StatusInternalServerError)
 		return
@@ -270,7 +336,7 @@ func (s *Server) handleSyncConflicts(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -334,7 +400,7 @@ func (s *Server) handleSyncConflicts(w http.ResponseWriter, r *http.Request) {
 				Artifact:        rel,
 				ArtifactContent: string(content),
 			}
-			if doc, derr := s.syncDB.GetDocument(docID); derr == nil && doc != nil {
+			if doc, derr := s.syncDatabase().GetDocument(docID); derr == nil && doc != nil {
 				resp.BaseContent = string(doc.BaseContent)
 			}
 			out = append(out, resp)
@@ -365,7 +431,7 @@ func (s *Server) handleSyncAllow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -384,7 +450,7 @@ func (s *Server) handleSyncAllow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.syncDB.SetQuarantineOverride(req.Workspace, req.Path); err != nil {
+	if err := s.syncDatabase().SetQuarantineOverride(req.Workspace, req.Path); err != nil {
 		http.Error(w, fmt.Sprintf("failed to set quarantine override: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -408,7 +474,7 @@ func (s *Server) handleSyncDisallowQuarantine(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -427,7 +493,7 @@ func (s *Server) handleSyncDisallowQuarantine(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := s.syncDB.RemoveQuarantineOverride(req.Workspace, req.Path); err != nil {
+	if err := s.syncDatabase().RemoveQuarantineOverride(req.Workspace, req.Path); err != nil {
 		http.Error(w, fmt.Sprintf("failed to remove quarantine override: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -484,7 +550,10 @@ func (s *Server) historyClient(ctx context.Context) (*syncdb.Client, error) {
 	if err != nil || cfg == nil {
 		return nil, fmt.Errorf("sync is not configured")
 	}
-	return syncdb.NewClientFromConfig(ctx, cfg, "", s.syncDB.OriginID(), "", nil)
+	// Same DeviceID/OriginID split as the watcher's transport client: the
+	// machine ULID identifies the host across sync.db rebuilds. The server
+	// may keep discarding it — rendezvous stays dumb.
+	return syncdb.NewClientFromConfig(ctx, cfg, machine.ID(), s.syncDatabase().OriginID(), "", nil)
 }
 
 // handleSyncHistory handles GET /api/sync/history?workspace=W&path=P by
@@ -498,7 +567,7 @@ func (s *Server) handleSyncHistory(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -538,7 +607,7 @@ func (s *Server) handleSyncRestore(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -555,7 +624,7 @@ func (s *Server) handleSyncRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc, err := s.syncDB.GetDocumentByPath(workspace, path)
+	doc, err := s.syncDatabase().GetDocumentByPath(workspace, path)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("document lookup failed: %v", err), http.StatusInternalServerError)
 		return
@@ -599,7 +668,7 @@ func (s *Server) handleSyncAdopt(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -619,7 +688,7 @@ func (s *Server) handleSyncAdopt(w http.ResponseWriter, r *http.Request) {
 
 	// Must be a tracked document (mirrors handleSyncRestore). AdoptDocument does
 	// not error on zero rows affected, so this existence check is load-bearing.
-	doc, err := s.syncDB.GetDocumentByPath(req.Workspace, req.Path)
+	doc, err := s.syncDatabase().GetDocumentByPath(req.Workspace, req.Path)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("document lookup failed: %v", err), http.StatusInternalServerError)
 		return
@@ -633,7 +702,7 @@ func (s *Server) handleSyncAdopt(w http.ResponseWriter, r *http.Request) {
 	// for this path (e.g. the merged payload has not yet drained), adopting to
 	// the server head would drop the user's merged-in lines from the hub. In the
 	// normal flow the parked entry drains before the user reaches for adopt.
-	if n, err := s.syncDB.CountOutboxForPath(req.Workspace, req.Path); err != nil {
+	if n, err := s.syncDatabase().CountOutboxForPath(req.Workspace, req.Path); err != nil {
 		http.Error(w, fmt.Sprintf("outbox lookup failed: %v", err), http.StatusInternalServerError)
 		return
 	} else if n > 0 {
@@ -677,7 +746,7 @@ func (s *Server) handleSyncAdopt(w http.ResponseWriter, r *http.Request) {
 	// says "clean" before the CLI writes the file; if the CLI write then fails,
 	// the next reconcile sweep sees diskHash != last_synced_hash and re-enqueues
 	// — self-healing, acceptable.
-	if err := s.syncDB.AdoptDocument(req.Workspace, req.Path, snap.ID, snap.Version, snap.Hash, content); err != nil {
+	if err := s.syncDatabase().AdoptDocument(req.Workspace, req.Path, snap.ID, snap.Version, snap.Hash, content); err != nil {
 		http.Error(w, fmt.Sprintf("adopt failed: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -721,7 +790,7 @@ func (s *Server) currentReturnManifest(ctx context.Context, workspaces []string)
 	if err != nil {
 		return syncdb.ReturnManifest{}, err
 	}
-	return syncdb.BuildReturnManifest(ctx, client, s.syncDB, workspaces)
+	return syncdb.BuildReturnManifest(ctx, client, s.syncDatabase(), workspaces)
 }
 
 func returnEscrowDir(satellite string) (string, error) {
@@ -759,7 +828,7 @@ func (s *Server) handleSyncIncoming(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -794,7 +863,7 @@ func (s *Server) handleSyncEscrow(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -858,7 +927,7 @@ func (s *Server) handleSyncApply(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDB == nil || s.syncWorkspaceRoots == nil {
+	if s.syncDatabase() == nil || s.syncWorkspaceRoots == nil {
 		http.Error(w, "sync apply is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -900,7 +969,7 @@ func (s *Server) handleSyncApply(w http.ResponseWriter, r *http.Request) {
 	// seen. The local hash preconditions cannot catch this on their own — the
 	// manifest's base_hash tracks the watcher-updated content hash, so a
 	// locally-edited-but-unpushed file still matches.
-	if pending, pendErr := s.syncDB.PendingReturnPush(current); pendErr != nil {
+	if pending, pendErr := s.syncDatabase().PendingReturnPush(current); pendErr != nil {
 		http.Error(w, fmt.Sprintf("outbox lookup failed: %v", pendErr), http.StatusInternalServerError)
 		return
 	} else if pending != "" {
@@ -937,7 +1006,7 @@ func (s *Server) handleSyncApply(w http.ResponseWriter, r *http.Request) {
 	}
 	counts, err := syncdb.ApplyReturnEscrow(escrowPath, current.Generation, syncdb.ReturnApplyOptions{
 		WorkspaceRoots: roots,
-		Reconcile:      s.syncDB.ReconcileReturnEscrow,
+		Reconcile:      s.syncDatabase().ReconcileReturnEscrow,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("apply failed (verified escrow retained at %s): %v", escrowPath, err), http.StatusConflict)
@@ -1022,10 +1091,10 @@ func (s *Server) handleSyncMaintenance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pending, parked, diverged := 0, 0, 0
-	if s.syncDB != nil {
-		pending, _ = s.syncDB.CountOutbox()
-		parked, _ = s.syncDB.CountOutboxParked()
-		diverged, _ = s.syncDB.CountDocumentsDiverged()
+	if s.syncDatabase() != nil {
+		pending, _ = s.syncDatabase().CountOutbox()
+		parked, _ = s.syncDatabase().CountOutboxParked()
+		diverged, _ = s.syncDatabase().CountDocumentsDiverged()
 	}
 	s.maintenanceMu.RLock()
 	draining := s.maintenanceTargets[req.Target]
@@ -1054,7 +1123,7 @@ func (s *Server) handleSyncRepush(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDB == nil {
+	if s.syncDatabase() == nil {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -1074,9 +1143,9 @@ func (s *Server) handleSyncRepush(w http.ResponseWriter, r *http.Request) {
 		err        error
 	)
 	if req.Workspace == "" {
-		reset, workspaces, err = s.syncDB.ResetForRepushAll()
+		reset, workspaces, err = s.syncDatabase().ResetForRepushAll()
 	} else {
-		reset, err = s.syncDB.ResetForRepush(req.Workspace)
+		reset, err = s.syncDatabase().ResetForRepush(req.Workspace)
 		workspaces = []string{req.Workspace}
 	}
 	if err != nil {

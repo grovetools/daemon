@@ -21,6 +21,7 @@ import (
 	grovelogging "github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/logging/logutil"
+	"github.com/grovetools/core/pkg/machine"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/sessions"
@@ -448,6 +449,24 @@ func newGrovedStartCmd() *cobra.Command {
 			// where cm.Start's goroutines belong. satCM stays nil only on scoped
 			// daemons and when the registry fails to LOAD (config error —
 			// satellites disabled until fixed and the daemon restarted).
+			// Machine identity: mint-or-read the durable, non-portable ULID in
+			// $XDG_STATE_HOME/grove/machine.json. Whichever runs first — the
+			// daemon or a `grove machine init` — mints; everyone after reads.
+			// The global daemon does it unconditionally (identity is not a
+			// sync feature) so the ID exists before any sync client, status
+			// handler, or CLI asks. A failure here is non-fatal: sync clients
+			// fall back to an empty DeviceID, exactly the pre-identity wire.
+			if scope == "" {
+				if id, ierr := machine.EnsureIdentity(); ierr != nil {
+					ulog.Warn("Failed to resolve machine identity").Err(ierr).Log(ctx)
+				} else {
+					ulog.Info("Machine identity").
+						Field("machine_id", id.ID).
+						Field("machine_name", config.ResolveMachineName()).
+						StructuredOnly().Log(ctx)
+				}
+			}
+
 			var satCM *satellite.ConnManager
 			if scope == "" {
 				if reg, rerr := satellite.LoadRegistry(cfg); rerr != nil {
@@ -1182,32 +1201,44 @@ func newGrovedStartCmd() *cobra.Command {
 					}
 
 					// Register SyncHandler for notebook sync change capture.
-					// DARK BY DEFAULT: it registers only when a sync config with
-					// workspace subscriptions exists (~/.config/grove/sync.toml),
-					// which Phase 0 ships no enable-path for — without it, no
-					// watcher, no sync.db, zero behavior change. Like memory.db,
-					// sync.db is owned by the global daemon only; scoped daemons
-					// proxy /api/sync/* to global.
+					// DARK BY DEFAULT, but no longer BOOT-GATED: the handler is
+					// constructed unconditionally on the global daemon and stays
+					// dormant while ~/.config/grove/sync.toml carries no
+					// workspace subscriptions — no watches, no sync.db, no
+					// transport, zero behavior change. sync.db is opened lazily
+					// by the handler (SetDeferredDB) the first time a
+					// subscription exists.
+					//
+					// The old gate decided at boot, so a first-ever `grove join`
+					// wrote a perfectly valid sync.toml that nothing picked up
+					// until the daemon was restarted. The config reload the join
+					// already triggers now wakes the handler in place. Like
+					// memory.db, sync.db is owned by the global daemon only;
+					// scoped daemons proxy /api/sync/* to global.
 					if scope == "" {
-						if syncCfg, err := config.LoadSyncConfig(); err != nil {
-							ulog.Warn("Failed to load sync config, sync disabled").Err(err).Log(ctx)
-						} else if syncCfg != nil && len(syncCfg.Workspaces) > 0 {
-							syncDB, err := syncdb.Open(syncdb.DefaultDBPath())
-							if err != nil {
-								ulog.Warn("Failed to open sync database, sync disabled").Err(err).Log(ctx)
-							} else {
-								syncHandler := watcher.NewSyncHandler(st, cfg, syncCfg, syncDB, 0, 0)
-								unifiedWatcher.Register(syncHandler)
-								srv.SetSyncDB(syncDB)
-								srv.SetSyncKick(syncHandler.KickAntiEntropy)
-								srv.SetSyncWorkspaceRoots(syncHandler.WorkspaceRoots)
-								srv.SetSyncMaintenance(syncHandler.BeginMaintenance, syncHandler.EndMaintenance)
-								ulog.Info("Sync handler registered with unified watcher").
-									Field("workspaces", len(syncCfg.Workspaces)).
-									Field("origin_id", syncDB.OriginID()).
-									Log(ctx)
-							}
+						syncCfg, err := config.LoadSyncConfig()
+						if err != nil {
+							ulog.Warn("Failed to load sync config, sync starts dormant").Err(err).Log(ctx)
+							syncCfg = nil
 						}
+						syncHandler := watcher.NewSyncHandler(st, cfg, syncCfg, nil, 0, 0)
+						syncHandler.SetDeferredDB(
+							func() (*syncdb.DB, error) { return syncdb.Open(syncdb.DefaultDBPath()) },
+							srv.SetSyncDB,
+						)
+						unifiedWatcher.Register(syncHandler)
+						srv.SetSyncKick(syncHandler.KickAntiEntropy)
+						srv.SetSyncSubscriptions(syncHandler.SyncSubscriptions)
+						srv.SetSyncWorkspaceRoots(syncHandler.WorkspaceRoots)
+						srv.SetSyncMaintenance(syncHandler.BeginMaintenance, syncHandler.EndMaintenance)
+						workspaces := 0
+						if syncCfg != nil {
+							workspaces = len(syncCfg.Workspaces)
+						}
+						ulog.Info("Sync handler registered with unified watcher").
+							Field("workspaces", workspaces).
+							Field("dormant", workspaces == 0).
+							Log(ctx)
 					}
 
 					// Start the satellite ConnManager (P7 federation transport) that

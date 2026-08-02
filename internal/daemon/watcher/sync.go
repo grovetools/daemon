@@ -5,9 +5,12 @@
 //
 // Standing rules baked in here:
 //
-//   - Dark by default: the handler is only constructed and registered when
-//     a sync config with workspace subscriptions exists (see cmd/groved.go);
-//     no config, no watcher, no sync.db.
+//   - Dark by default: the handler is constructed unconditionally by the global
+//     daemon but stays DORMANT while no sync config with workspace
+//     subscriptions exists — no watches, no sync.db, no transport. sync.db is
+//     opened lazily by ensureDB the first time a subscription appears, which is
+//     what lets a first-ever `grove join` take effect on the next config reload
+//     instead of requiring a daemon restart (contract §1 Q7, boot gate).
 //   - Notebook-read-only: this handler never writes to the notebook tree.
 //     All writes go to sync.db under ~/.local/share/grove.
 //   - Global daemon only: sync.db is owned by the global daemon, like
@@ -29,6 +32,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/machine"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/syncproto"
 	"github.com/grovetools/core/pkg/workspace"
@@ -56,8 +60,20 @@ type SyncHandler struct {
 	store   *store.Store
 	cfg     *config.Config
 	locator *workspace.NotebookLocator
-	db      *syncdb.DB
 	ulog    *logging.UnifiedLogger
+
+	// db is written once, possibly long after construction (see ensureDB), and
+	// read from the watcher, transport, and maintenance goroutines — atomic for
+	// the same reason the server's late-wired deps are. Nil means dormant;
+	// every reader goes through database() and nil-checks.
+	db atomic.Pointer[syncdb.DB]
+	// dbOpener/dbReady are installed by SetDeferredDB on the global daemon:
+	// open sync.db on first need, then publish it to the HTTP server. Both nil
+	// in tests and wherever the DB is supplied up front.
+	dbOpener     func() (*syncdb.DB, error)
+	dbReady      func(*syncdb.DB)
+	dbOpenMu     sync.Mutex
+	dbOpenFailed bool
 
 	syncCfg   *config.SyncConfig
 	syncCfgMu sync.RWMutex
@@ -89,8 +105,9 @@ type SyncHandler struct {
 	drainMu     sync.Mutex
 }
 
-// NewSyncHandler creates a SyncHandler. Callers gate construction on sync
-// configuration presence (the dark gate lives at the registration site).
+// NewSyncHandler creates a SyncHandler. Both syncCfg and db may be nil: the
+// handler is then dormant, and stays dormant until a config reload brings
+// subscriptions and (with SetDeferredDB installed) ensureDB opens sync.db.
 // quietMs/maxWaitMs <= 0 select the defaults (2s quiet / 15s max latency).
 func NewSyncHandler(st *store.Store, cfg *config.Config, syncCfg *config.SyncConfig, db *syncdb.DB, quietMs, maxWaitMs int) *SyncHandler {
 	if quietMs <= 0 {
@@ -100,11 +117,10 @@ func NewSyncHandler(st *store.Store, cfg *config.Config, syncCfg *config.SyncCon
 		maxWaitMs = defaultSyncMaxWaitMs
 	}
 
-	return &SyncHandler{
+	h := &SyncHandler{
 		store:        st,
 		cfg:          cfg,
 		locator:      workspace.NewNotebookLocator(cfg),
-		db:           db,
 		ulog:         logging.NewUnifiedLogger("groved.watcher.sync"),
 		syncCfg:      syncCfg,
 		watchedPaths: make(map[string]*syncWatch),
@@ -115,6 +131,73 @@ func NewSyncHandler(st *store.Store, cfg *config.Config, syncCfg *config.SyncCon
 		pipelines:    make(map[string]context.CancelFunc),
 		aePasses:     make(map[string]*syncdb.AntiEntropyPass),
 	}
+	if db != nil {
+		h.db.Store(db)
+	}
+	return h
+}
+
+// SetDeferredDB installs the lazy sync.db opener. The global daemon constructs
+// the SyncHandler unconditionally — before it knows whether sync is configured
+// — and hands it these two hooks instead of an open database: open is called at
+// most once, the first time a non-empty subscription list is observed, and
+// ready then publishes the DB to the HTTP server. Without this the daemon had
+// to decide at boot, so a first-ever `grove join` wrote a valid sync.toml that
+// nothing picked up until the next restart.
+func (h *SyncHandler) SetDeferredDB(open func() (*syncdb.DB, error), ready func(*syncdb.DB)) {
+	h.dbOpenMu.Lock()
+	defer h.dbOpenMu.Unlock()
+	h.dbOpener = open
+	h.dbReady = ready
+}
+
+// database returns the open sync database, or nil while dormant.
+func (h *SyncHandler) database() *syncdb.DB { return h.db.Load() }
+
+// hasSubscriptions reports whether the live config carries any subscription —
+// the condition that wakes a dormant handler.
+func (h *SyncHandler) hasSubscriptions() bool {
+	h.syncCfgMu.RLock()
+	defer h.syncCfgMu.RUnlock()
+	return h.syncCfg != nil && len(h.syncCfg.Workspaces) > 0
+}
+
+// ensureDB returns the sync database, opening it on first need once the config
+// carries at least one subscription. It returns nil while the handler is
+// dormant (no subscriptions, no opener installed, or the open failed) — every
+// caller nil-checks. Open failures are retried on the next call; only the log
+// is rate-limited to one warning.
+func (h *SyncHandler) ensureDB() *syncdb.DB {
+	if db := h.database(); db != nil {
+		return db
+	}
+
+	h.dbOpenMu.Lock()
+	defer h.dbOpenMu.Unlock()
+	if db := h.database(); db != nil {
+		return db // another goroutine won the race
+	}
+	if h.dbOpener == nil || !h.hasSubscriptions() {
+		return nil
+	}
+
+	db, err := h.dbOpener()
+	if err != nil {
+		if !h.dbOpenFailed {
+			h.dbOpenFailed = true
+			h.ulog.Warn("Failed to open sync database, sync stays dormant").Err(err).Emit()
+		}
+		return nil
+	}
+	h.dbOpenFailed = false
+	h.db.Store(db)
+	if h.dbReady != nil {
+		h.dbReady(db)
+	}
+	h.ulog.Info("Sync database opened").
+		Field("origin_id", db.OriginID()).
+		StructuredOnly().Emit()
+	return db
 }
 
 func (h *SyncHandler) Name() string {
@@ -145,6 +228,23 @@ func (h *SyncHandler) subscriptionsSnapshot() []config.SyncWorkspace {
 		return nil
 	}
 	return slices.Clone(h.syncCfg.Workspaces)
+}
+
+// SyncSubscriptions returns the configured sync server URL alongside a copy of
+// the current subscription list — the same snapshot subscriptionsSnapshot
+// takes, read under one lock so the URL and the workspaces can never straddle
+// a hot reload. Wired into the HTTP server (SetSyncSubscriptions) so GET
+// /api/sync/status can answer "where is this syncing, and in which direction"
+// instead of only "how much is queued". Reads the live config rather than a
+// value captured at wiring time, so an UpdateConfigReload is reflected without
+// a daemon restart.
+func (h *SyncHandler) SyncSubscriptions() (string, []config.SyncWorkspace) {
+	h.syncCfgMu.RLock()
+	defer h.syncCfgMu.RUnlock()
+	if h.syncCfg == nil {
+		return "", nil
+	}
+	return h.syncCfg.Server, slices.Clone(h.syncCfg.Workspaces)
 }
 
 // syntheticNodeFor builds a WorkspaceNode for a subscribed workspace that code
@@ -363,15 +463,27 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 		maps.Copy(newWatches, computeWorkspaceWatches(sub, dirs))
 	}
 
-	// Pull subscriptions not covered by code discovery (pure notes satellite:
+	// Subscriptions not covered by code discovery (pure notes satellite:
 	// nothing under any grove path) are still config-locatable: resolve their
-	// content dirs through a synthetic node so the pulled replica's own tree is
-	// watched — VM-side edits get captured and pushed just like on a machine
+	// content dirs through a synthetic node so the workspace's own tree is
+	// watched — local edits get captured and pushed just like on a machine
 	// where discovery works. computeWorkspaceWatches only registers stat-able
-	// dirs, so this is a no-op until the pull pipeline materializes the tree
-	// (the periodic refresh picks it up afterwards).
+	// dirs, so this is a no-op until the tree exists (for a pull replica, until
+	// the pull pipeline materializes it; the periodic refresh picks it up
+	// afterwards).
+	//
+	// This loop deliberately does NOT filter on sub.Pull. Push-only
+	// subscriptions were the F8 residual: configuredPullRoots covers the
+	// pull side only, so a push-only notebook workspace that discovery never
+	// yields (no .git under any grove path — a bare notebook) got no watches
+	// here and, because ensurePipelines derives its roots from this watch set,
+	// no push pipeline either. It went silently dark in both directions. The
+	// nodeWorkspaceRoot resolution below is the real gate: a subscription whose
+	// root config cannot locate is still skipped. Pull remains strictly
+	// opt-in — ensurePipelines still starts a pull loop only for sub.Pull, so
+	// the legacy push-only invariant is untouched.
 	for _, sub := range h.subscriptionsSnapshot() {
-		if covered[sub.Name] || !sub.Pull || sub.Mode == config.SyncModeSearchOnly {
+		if covered[sub.Name] || sub.Mode == config.SyncModeSearchOnly {
 			continue
 		}
 		node := h.syntheticNodeFor(sub.Name)
@@ -502,6 +614,12 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 	if watch == nil || !watch.space.Included(rel) {
 		return
 	}
+	// A watch exists, so a subscription exists — open sync.db if this is the
+	// first capture since the handler woke up.
+	db := h.ensureDB()
+	if db == nil {
+		return
+	}
 
 	fi, err := os.Stat(absPath)
 	if err != nil {
@@ -537,7 +655,7 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 	// EnqueueOutbox. The anti-entropy reconcile's walkLocalTree calls the same
 	// helper, so watch and reconcile can never disagree about the doc space or
 	// the quarantine judgement.
-	reason, err := syncdb.InsertAndEnqueue(h.db, watch.workspace, rel, content, fi.ModTime())
+	reason, err := syncdb.InsertAndEnqueue(db, watch.workspace, rel, content, fi.ModTime())
 	if err != nil {
 		h.ulog.Warn("Failed to record sync change").Err(err).Field("path", rel).Log(ctx)
 		return
@@ -570,11 +688,15 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 // immediately — keeping it alive until push-ack would collide with the
 // sync_documents UNIQUE(workspace, path) constraint on delete-then-recreate.
 func (h *SyncHandler) recordDelete(ctx context.Context, ws, rel string) {
-	doc, err := h.db.GetDocumentByPath(ws, rel)
+	db := h.database()
+	if db == nil {
+		return
+	}
+	doc, err := db.GetDocumentByPath(ws, rel)
 	if err != nil || doc == nil {
 		return
 	}
-	if _, err := h.db.EnqueueOutbox(&syncdb.OutboxEntry{
+	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{
 		DocumentID:  doc.DocumentID,
 		Workspace:   ws,
 		EventType:   syncproto.EventDocumentDeleted,
@@ -584,7 +706,7 @@ func (h *SyncHandler) recordDelete(ctx context.Context, ws, rel string) {
 		h.ulog.Warn("Failed to enqueue sync delete").Err(err).Field("path", rel).Log(ctx)
 		return
 	}
-	if err := h.db.DeleteDocument(doc.DocumentID); err != nil {
+	if err := db.DeleteDocument(doc.DocumentID); err != nil {
 		h.ulog.Warn("Failed to delete sync document").Err(err).Field("path", rel).Log(ctx)
 	}
 }
@@ -603,6 +725,10 @@ func (h *SyncHandler) HandleStoreUpdate(update store.Update) {
 			h.syncCfgMu.Lock()
 			h.syncCfg = syncCfg // nil drops all subscriptions → handler goes dormant
 			h.syncCfgMu.Unlock()
+			// Wake immediately on the reload that first brings subscriptions
+			// (a `grove join` on a machine that has never synced) rather than
+			// waiting for the transport tick. Dormant on nil/empty config.
+			h.ensureDB()
 		}
 	case store.UpdateNoteEvent:
 		event, ok := update.Payload.(*models.NoteEvent)
@@ -630,13 +756,17 @@ func (h *SyncHandler) handleNoteEvent(ctx context.Context, event *models.NoteEve
 	if prevWatch == nil || newWatch == nil {
 		return
 	}
+	db := h.ensureDB()
+	if db == nil {
+		return
+	}
 	if !newWatch.space.Included(newRel) {
 		// Moved out of sync scope — record as a delete of the old path.
 		h.recordDelete(ctx, prevWatch.workspace, prevRel)
 		return
 	}
 
-	doc, err := h.db.GetDocumentByPath(prevWatch.workspace, prevRel)
+	doc, err := db.GetDocumentByPath(prevWatch.workspace, prevRel)
 	if err != nil {
 		h.ulog.Warn("Failed to query sync document for move").Err(err).Field("path", prevRel).Log(ctx)
 		return
@@ -647,7 +777,7 @@ func (h *SyncHandler) handleNoteEvent(ctx context.Context, event *models.NoteEve
 		return
 	}
 
-	if err := h.db.MoveDocument(doc.DocumentID, newRel); err != nil {
+	if err := db.MoveDocument(doc.DocumentID, newRel); err != nil {
 		h.ulog.Warn("Failed to move sync document").Err(err).Field("path", newRel).Log(ctx)
 		return
 	}
@@ -657,7 +787,7 @@ func (h *SyncHandler) handleNoteEvent(ctx context.Context, event *models.NoteEve
 	if fi, err := os.Stat(event.Path); err == nil {
 		mtime = fi.ModTime()
 	}
-	if _, err := h.db.EnqueueOutbox(&syncdb.OutboxEntry{
+	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{
 		DocumentID:  doc.DocumentID,
 		Workspace:   newWatch.workspace,
 		EventType:   syncproto.EventDocumentMoved,
@@ -689,6 +819,20 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 	dialFailures := 0
 
 	for {
+		// Open sync.db if a config reload has brought subscriptions since the
+		// last tick. Nil = still dormant: no client, no pipelines, nothing to
+		// do until a subscription appears. This tick is what makes a
+		// first-ever join take effect without a daemon restart.
+		db := h.ensureDB()
+		if db == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			continue
+		}
+
 		h.clientMu.RLock()
 		ready := h.client != nil
 		h.clientMu.RUnlock()
@@ -698,7 +842,13 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 			cfg := h.syncCfg
 			h.syncCfgMu.RUnlock()
 			if cfg != nil {
-				client, err := syncdb.NewClientFromConfig(ctx, cfg, "", h.db.OriginID(), "", h.ulog)
+				// DeviceID is this machine's durable identity (ULID in
+				// state), distinct from OriginID (per-sync.db install id that
+				// dies with the DB). It rides CapabilitiesRequest/PushRequest;
+				// the server is free to keep discarding it — rendezvous stays
+				// dumb — but the wire now carries "which machine" so a wiped
+				// sync.db is diagnosable as same machine, new origin.
+				client, err := syncdb.NewClientFromConfig(ctx, cfg, machine.ID(), db.OriginID(), "", h.ulog)
 				if err != nil {
 					dialFailures++
 					if err.Error() != lastDialErr {
@@ -714,7 +864,7 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 					// full document set instead of enqueueing UPDATEs the
 					// empty server rejects. (Mid-run recreates are caught by
 					// the same check re-run in each anti-entropy pass.)
-					if _, err := syncdb.CheckServerEpoch(ctx, h.db, client.ServerEpoch(), h.ulog); err != nil {
+					if _, err := syncdb.CheckServerEpoch(ctx, db, client.ServerEpoch(), h.ulog); err != nil {
 						h.ulog.Warn("sync server epoch check failed").Err(err).Log(ctx)
 					}
 					h.clientMu.Lock()
@@ -747,7 +897,11 @@ func (h *SyncHandler) ensurePipelines() {
 	h.clientMu.RLock()
 	client := h.client
 	h.clientMu.RUnlock()
-	if client == nil || h.baseCtx == nil {
+	// A client only exists once the DB is open (transportLoop connects after
+	// ensureDB), so db is non-nil here — the check keeps that ordering explicit
+	// rather than assumed.
+	db := h.database()
+	if client == nil || db == nil || h.baseCtx == nil {
 		return
 	}
 
@@ -784,7 +938,7 @@ func (h *SyncHandler) ensurePipelines() {
 
 		sub := h.subscription(name)
 
-		push := syncdb.NewPushPipeline(h.db, client, name, h.ulog, syncdb.PushConfig{})
+		push := syncdb.NewPushPipeline(db, client, name, h.ulog, syncdb.PushConfig{})
 		// Surface server-ceiling oversize skips as a sync_conflict SSE update
 		// (convertToAPIUpdate already forwards UpdateSyncConflict). The quiet
 		// per-workspace MaxFileSize skip stays in flush; this is the loud one.
@@ -812,7 +966,7 @@ func (h *SyncHandler) ensurePipelines() {
 		})
 
 		if sub != nil && sub.Pull {
-			pull := syncdb.NewPullPipeline(sub, client, h.db, h.ulog)
+			pull := syncdb.NewPullPipeline(sub, client, db, h.ulog)
 			go h.runWithRecovery(pctx, name, "pull", func() error {
 				return pull.RunPullLoop(pctx, root)
 			})
@@ -821,7 +975,7 @@ func (h *SyncHandler) ensurePipelines() {
 		// Build the reconcile with the same per-workspace DocSpace the watcher
 		// uses (sub is already resolved above), so walk coverage and reconcile
 		// coverage judge the doc space identically.
-		ae := syncdb.NewAntiEntropyPass(h.db, client, name, root, syncdb.NewDocSpace(sub), h.ulog, syncdb.AntiEntropyConfig{})
+		ae := syncdb.NewAntiEntropyPass(db, client, name, root, syncdb.NewDocSpace(sub), h.ulog, syncdb.AntiEntropyConfig{})
 		h.pipelinesMu.Lock()
 		h.aePasses[name] = ae
 		h.pipelinesMu.Unlock()
@@ -836,8 +990,8 @@ func (h *SyncHandler) ensurePipelines() {
 		// Materialize the sync_state row immediately so /api/sync/status
 		// reflects the subscription as soon as transport starts (readiness
 		// probes key on this; rows otherwise appear only on first activity).
-		if cur, err := h.db.GetWorkspaceCursor(name); err == nil {
-			_ = h.db.UpdateWorkspaceCursor(name, cur)
+		if cur, err := db.GetWorkspaceCursor(name); err == nil {
+			_ = db.UpdateWorkspaceCursor(name, cur)
 		}
 
 		h.ulog.Info("sync transport started").
@@ -874,6 +1028,10 @@ func (h *SyncHandler) BeginMaintenance(ctx context.Context) error {
 	if client == nil {
 		return fmt.Errorf("sync server disconnected")
 	}
+	db := h.database()
+	if db == nil {
+		return fmt.Errorf("sync is not configured")
+	}
 	roots := make(map[string]string)
 	h.pathsMutex.RLock()
 	for _, w := range h.watchedPaths {
@@ -898,7 +1056,7 @@ func (h *SyncHandler) BeginMaintenance(ctx context.Context) error {
 				return fmt.Errorf("reconcile %s: %w", name, err)
 			}
 		}
-		push := syncdb.NewPushPipeline(h.db, client, name, h.ulog, syncdb.PushConfig{})
+		push := syncdb.NewPushPipeline(db, client, name, h.ulog, syncdb.PushConfig{})
 		for {
 			n, err := push.DrainOutbox(ctx, root)
 			if err != nil {

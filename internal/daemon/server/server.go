@@ -169,15 +169,23 @@ type Server struct {
 	memEmbedder memory.Embedder
 	memDBPath   string
 
-	// syncDB is wired via SetSyncDB on the global daemon when sync is
+	// syncDB is wired via SetSyncDB on the global daemon when sync becomes
 	// configured (dark by default — no sync config, no DB). Scoped daemons
-	// leave it nil and proxy /api/sync/* to the global daemon.
-	syncDB *syncdb.DB
+	// leave it nil and proxy /api/sync/* to the global daemon. Atomic like the
+	// other late-wired deps above: the watcher opens sync.db lazily — possibly
+	// long after boot, when a first-ever `grove join` lands — and stores it
+	// here while HTTP handlers are already serving.
+	syncDB atomic.Pointer[syncdb.DB]
 
 	// syncKick (SetSyncKick) triggers an immediate anti-entropy pass for a
 	// workspace ("" = all) after /api/sync/repush voids synced state. Nil
 	// when sync is not configured; then the hourly tick picks the reset up.
-	syncKick             func(workspace string)
+	syncKick func(workspace string)
+	// syncSubscriptions (SetSyncSubscriptions) reads the watcher's live sync
+	// config — server URL plus per-workspace pull/mode — so /api/sync/status
+	// can say where each workspace syncs. Nil when sync is not configured;
+	// then the status payload omits those fields.
+	syncSubscriptions    func() (string, []config.SyncWorkspace)
 	syncWorkspaceRoots   func([]string) (map[string]string, error)
 	syncBeginMaintenance func(context.Context) error
 	syncEndMaintenance   func()
@@ -472,6 +480,10 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	mux.HandleFunc("/api/memory/analysis/duplicates", s.handleMemoryAnalysisDuplicates)
 	mux.HandleFunc("/api/memory/analysis/notebooks", s.handleMemoryAnalysisNotebooks)
 	mux.HandleFunc("/api/memory/analysis/context", s.handleMemoryAnalysisContext)
+	// Machine identity + declared intent (unix socket only: it is this host's
+	// inventory). Every daemon can answer it — the reconciliation reads
+	// config and the filesystem, not sync.db — so it is NOT scope-proxied.
+	mux.HandleFunc("/api/machine", unixOnly(s.handleMachineStatus))
 	// Sync endpoints — unix socket only (sync state is content-adjacent
 	// metadata; never expose it on the unauthenticated TCP listener).
 	// Scoped daemons proxy these to the global daemon, which owns sync.db.

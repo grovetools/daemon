@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/syncproto"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
@@ -138,6 +139,89 @@ func TestHandleSyncOutbox(t *testing.T) {
 	}
 	if len(filtered) != 1 || filtered[0].DocumentID != "d2" {
 		t.Fatalf("expected only the 'other' workspace entry, got %+v", filtered)
+	}
+}
+
+// TestHandleSyncStatusReportsServerAndDirection proves /api/sync/status
+// answers "where is this syncing": the configured server URL plus each
+// workspace's subscription direction (pull) and mode, overlaid onto the
+// sync.db-driven rows by name. A workspace with state but no subscription
+// keeps zero values rather than borrowing another entry's.
+func TestHandleSyncStatusReportsServerAndDirection(t *testing.T) {
+	db, _ := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	t.Cleanup(func() { _ = db.Close() })
+	s := New(false)
+	s.SetSyncDB(db)
+
+	for ws, cursor := range map[string]int64{"notes": 7, "wiki": 3, "orphan": 1} {
+		if err := db.SetCursor(ws, cursor); err != nil {
+			t.Fatalf("set cursor %s: %v", ws, err)
+		}
+	}
+	s.SetSyncSubscriptions(func() (string, []config.SyncWorkspace) {
+		return "https://sync.example.com", []config.SyncWorkspace{
+			{Name: "notes", Pull: true, Mode: "full", Role: config.SyncRolePeer},
+			{Name: "wiki", Mode: "search-only"}, // legacy: no role
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sync/status", nil)
+	w := httptest.NewRecorder()
+	s.handleSyncStatus(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	var out syncStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Server != "https://sync.example.com" {
+		t.Errorf("server: got %q want https://sync.example.com", out.Server)
+	}
+	byName := map[string]syncWorkspaceStatus{}
+	for _, ws := range out.Workspaces {
+		byName[ws.Name] = ws
+	}
+	if ws := byName["notes"]; !ws.Pull || ws.Mode != "full" || ws.Role != config.SyncRolePeer {
+		t.Errorf("notes: got pull=%v mode=%q role=%q want true/full/peer", ws.Pull, ws.Mode, ws.Role)
+	}
+	// A legacy (role-less) subscription reports an empty role — the TUI renders
+	// it as a bare glyph rather than inventing a relationship it never declared.
+	if ws := byName["wiki"]; ws.Pull || ws.Mode != "search-only" || ws.Role != "" {
+		t.Errorf("wiki: got pull=%v mode=%q role=%q want false/search-only/empty", ws.Pull, ws.Mode, ws.Role)
+	}
+	if ws := byName["orphan"]; ws.Pull || ws.Mode != "" || ws.Role != "" {
+		t.Errorf("orphan (no subscription): got pull=%v mode=%q role=%q want zero values", ws.Pull, ws.Mode, ws.Role)
+	}
+}
+
+// TestHandleSyncStatusWithoutSubscriptions proves the pre-existing payload is
+// unchanged when the subscription view is not wired (nil-safe): no server, no
+// direction, and the workspace rows still come from sync.db.
+func TestHandleSyncStatusWithoutSubscriptions(t *testing.T) {
+	db, _ := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	t.Cleanup(func() { _ = db.Close() })
+	s := New(false)
+	s.SetSyncDB(db)
+	if err := db.SetCursor("notes", 4); err != nil {
+		t.Fatalf("set cursor: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sync/status", nil)
+	w := httptest.NewRecorder()
+	s.handleSyncStatus(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	var out syncStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Server != "" {
+		t.Errorf("server should be empty without a subscription view, got %q", out.Server)
+	}
+	if len(out.Workspaces) != 1 || out.Workspaces[0].Name != "notes" || out.Workspaces[0].Cursor != 4 {
+		t.Fatalf("workspace rows changed: %+v", out.Workspaces)
 	}
 }
 

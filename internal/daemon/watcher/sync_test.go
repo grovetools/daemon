@@ -283,14 +283,14 @@ func TestSyntheticNodeNotebookResolution(t *testing.T) {
 	}
 }
 
-// TestComputeWatchPathsSyntheticPullCoverage: once a pull pipeline has
+// TestComputeWatchPathsSyntheticCoverage: once a pull pipeline has
 // materialized the replica tree, ComputeWatchPaths must cover it via the
 // synthetic (config-derived) path even with zero discovered workspaces — so
-// satellite-side edits are captured and pushed. Also asserts the
+// satellite-side edits are captured and pushed. Push-only subscriptions get the
+// same treatment (see TestComputeWatchPathsPushOnlyBareNotebook), and the
 // discovery-driven path is unchanged: a discovered node covers its own
-// subscription (no duplicate/synthetic entries), and a pull=false
-// subscription gains no synthetic watches.
-func TestComputeWatchPathsSyntheticPullCoverage(t *testing.T) {
+// subscription, with no duplicate synthetic entries.
+func TestComputeWatchPathsSyntheticCoverage(t *testing.T) {
 	notebookRoot := t.TempDir()
 	wsRoot := filepath.Join(notebookRoot, "workspaces", "pulled")
 	for _, d := range []string{"inbox", "plans"} {
@@ -298,8 +298,8 @@ func TestComputeWatchPathsSyntheticPullCoverage(t *testing.T) {
 			t.Fatalf("mkdir: %v", err)
 		}
 	}
-	// A second, push-only workspace tree that exists on disk but must NOT be
-	// picked up synthetically (discovery owns the push side).
+	// A second, push-only workspace tree that exists on disk. It is picked up
+	// synthetically too — see the F8 note in ComputeWatchPaths.
 	pushRoot := filepath.Join(notebookRoot, "workspaces", "pushonly")
 	if err := os.MkdirAll(filepath.Join(pushRoot, "inbox"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -318,20 +318,18 @@ func TestComputeWatchPathsSyntheticPullCoverage(t *testing.T) {
 
 	h := NewSyncHandler(nil, satelliteConfig(notebookRoot), syncCfg, db, 50, 500)
 
-	// Zero discovered workspaces: only the pull subscription's tree is watched.
+	// Zero discovered workspaces: both subscriptions' trees are watched.
 	paths := h.ComputeWatchPaths(nil)
 	got := make(map[string]bool, len(paths))
 	for _, p := range paths {
 		got[p] = true
 	}
-	for _, want := range []string{wsRoot, filepath.Join(wsRoot, "inbox"), filepath.Join(wsRoot, "plans")} {
+	for _, want := range []string{
+		wsRoot, filepath.Join(wsRoot, "inbox"), filepath.Join(wsRoot, "plans"),
+		pushRoot, filepath.Join(pushRoot, "inbox"),
+	} {
 		if !got[want] {
-			t.Errorf("synthetic pull coverage: missing watch for %q (got %v)", want, paths)
-		}
-	}
-	for p := range got {
-		if strings.HasPrefix(p, pushRoot) {
-			t.Errorf("push-only workspace watched synthetically: %q", p)
+			t.Errorf("synthetic coverage: missing watch for %q (got %v)", want, paths)
 		}
 	}
 	w, rel := h.lookupWatch(filepath.Join(wsRoot, "inbox", "note.md"))
@@ -357,6 +355,73 @@ func TestComputeWatchPathsSyntheticPullCoverage(t *testing.T) {
 	}
 	if !got[pushRoot] || !got[filepath.Join(pushRoot, "inbox")] {
 		t.Errorf("discovery-driven push path regressed: %v", paths)
+	}
+}
+
+// TestComputeWatchPathsPushOnlyBareNotebook is the F8 residual made executable:
+// a notebook-only workspace with pull = false. Nothing under any grove path
+// yields it, so code discovery never produces a WorkspaceNode for it, and
+// configuredPullRoots skips it because it is not a pull target. Before the fix
+// the synthetic loop's `!sub.Pull` filter dropped it too, so it got no watches —
+// and because ensurePipelines derives its roots from this same watch set, no
+// push pipeline either. A bare notebook simply never synced outbound.
+//
+// It must now get watches, and the watch must carry the workspace root so
+// ensurePipelines can spawn its push transport. Pull stays off: this asserts
+// only the capture side, and ensurePipelines still gates its pull loop on
+// sub.Pull, so the legacy push-only invariant is untouched.
+func TestComputeWatchPathsPushOnlyBareNotebook(t *testing.T) {
+	notebookRoot := t.TempDir()
+	wsRoot := filepath.Join(notebookRoot, "workspaces", "bare")
+	for _, d := range []string{"inbox", "plans"} {
+		if err := os.MkdirAll(filepath.Join(wsRoot, d), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+
+	syncCfg := &config.SyncConfig{Workspaces: []config.SyncWorkspace{
+		{Name: "bare"}, // legacy push-only: no Pull, no Role, no Mode
+	}}
+
+	db, err := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatalf("open sync db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	h := NewSyncHandler(nil, satelliteConfig(notebookRoot), syncCfg, db, 50, 500)
+
+	// configuredPullRoots is pull-side only — it must still ignore this
+	// subscription, which is precisely why the watch loop has to cover it.
+	if roots := h.configuredPullRoots(); len(roots) != 0 {
+		t.Fatalf("configuredPullRoots = %v, want empty for a push-only subscription", roots)
+	}
+
+	// Zero discovered workspaces, exactly as on a machine with no source tree.
+	paths := h.ComputeWatchPaths(nil)
+	got := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		got[p] = true
+	}
+	for _, want := range []string{wsRoot, filepath.Join(wsRoot, "inbox"), filepath.Join(wsRoot, "plans")} {
+		if !got[want] {
+			t.Errorf("push-only bare notebook: missing watch for %q (got %v)", want, paths)
+		}
+	}
+
+	// The watch must resolve to the workspace root, which is what
+	// ensurePipelines reads to start the push transport.
+	w, rel := h.lookupWatch(filepath.Join(wsRoot, "inbox", "note.md"))
+	if w == nil || w.workspace != "bare" || w.root != wsRoot || rel != "inbox/note.md" {
+		t.Fatalf("push-only watch lookup: got (%+v, %q), want workspace=bare root=%q rel=inbox/note.md", w, rel, wsRoot)
+	}
+
+	// search-only still keeps no local replica, pull or not.
+	h.syncCfg = &config.SyncConfig{Workspaces: []config.SyncWorkspace{
+		{Name: "bare", Mode: config.SyncModeSearchOnly},
+	}}
+	if paths := h.ComputeWatchPaths(nil); len(paths) != 0 {
+		t.Errorf("search-only push subscription got watches: %v", paths)
 	}
 }
 
@@ -397,25 +462,25 @@ func TestSyncFlushHashGating(t *testing.T) {
 
 	// First flush: document_created.
 	h.flush(ctx, notePath)
-	entries, _ := h.db.ListOutbox("testws", 0)
+	entries, _ := h.database().ListOutbox("testws", 0)
 	if len(entries) != 1 || entries[0].EventType != syncproto.EventDocumentCreated {
 		t.Fatalf("expected 1 created event, got %+v", entries)
 	}
-	doc, _ := h.db.GetDocumentByPath("testws", "notes/inbox/idea.md")
+	doc, _ := h.database().GetDocumentByPath("testws", "notes/inbox/idea.md")
 	if doc == nil || doc.DocumentID == "" {
 		t.Fatalf("expected tracked document, got %+v", doc)
 	}
 
 	// Same content: hash-gated, no new outbox row.
 	h.flush(ctx, notePath)
-	if entries, _ = h.db.ListOutbox("testws", 0); len(entries) != 1 {
+	if entries, _ = h.database().ListOutbox("testws", 0); len(entries) != 1 {
 		t.Fatalf("hash-gate failed: expected 1 entry, got %d", len(entries))
 	}
 
 	// Changed content: document_updated with the SAME document id.
 	writeFile(t, notePath, "second draft")
 	h.flush(ctx, notePath)
-	entries, _ = h.db.ListOutbox("testws", 0)
+	entries, _ = h.database().ListOutbox("testws", 0)
 	if len(entries) != 2 || entries[1].EventType != syncproto.EventDocumentUpdated {
 		t.Fatalf("expected created+updated, got %+v", entries)
 	}
@@ -442,7 +507,7 @@ func TestSyncDebounceCoalescing(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		entries, _ := h.db.ListOutbox("testws", 0)
+		entries, _ := h.database().ListOutbox("testws", 0)
 		if len(entries) > 0 {
 			if len(entries) != 1 {
 				t.Fatalf("debounce failed to coalesce: %d outbox entries", len(entries))
@@ -471,10 +536,10 @@ func TestSyncSecretQuarantine(t *testing.T) {
 	h.flush(ctx, notePath)
 
 	// Quarantined: nothing reaches the outbox or the identity map.
-	if entries, _ := h.db.ListOutbox("testws", 0); len(entries) != 0 {
+	if entries, _ := h.database().ListOutbox("testws", 0); len(entries) != 0 {
 		t.Fatalf("quarantined file reached outbox: %+v", entries)
 	}
-	if doc, _ := h.db.GetDocumentByPath("testws", "notes/leaky.md"); doc != nil {
+	if doc, _ := h.database().GetDocumentByPath("testws", "notes/leaky.md"); doc != nil {
 		t.Fatalf("quarantined file tracked in sync_documents: %+v", doc)
 	}
 
@@ -495,7 +560,7 @@ func TestSyncSecretQuarantine(t *testing.T) {
 	// Once the secret is removed the file syncs normally.
 	writeFile(t, notePath, "remote token: managed via token_command now\n")
 	h.flush(ctx, notePath)
-	if entries, _ := h.db.ListOutbox("testws", 0); len(entries) != 1 {
+	if entries, _ := h.database().ListOutbox("testws", 0); len(entries) != 1 {
 		t.Fatalf("cleaned file did not sync: %+v", entries)
 	}
 }
@@ -508,7 +573,7 @@ func TestSyncDeleteCapture(t *testing.T) {
 	writeFile(t, notePath, "ephemeral")
 	h.flush(ctx, notePath)
 
-	doc, _ := h.db.GetDocumentByPath("testws", "notes/gone.md")
+	doc, _ := h.database().GetDocumentByPath("testws", "notes/gone.md")
 	if doc == nil {
 		t.Fatal("expected tracked document before delete")
 	}
@@ -518,20 +583,20 @@ func TestSyncDeleteCapture(t *testing.T) {
 	}
 	h.flush(ctx, notePath)
 
-	entries, _ := h.db.ListOutbox("testws", 0)
+	entries, _ := h.database().ListOutbox("testws", 0)
 	if len(entries) != 2 || entries[1].EventType != syncproto.EventDocumentDeleted {
 		t.Fatalf("expected created+deleted, got %+v", entries)
 	}
 	if entries[1].DocumentID != doc.DocumentID {
 		t.Fatalf("delete event has wrong document id: %+v", entries[1])
 	}
-	if doc, _ := h.db.GetDocumentByPath("testws", "notes/gone.md"); doc != nil {
+	if doc, _ := h.database().GetDocumentByPath("testws", "notes/gone.md"); doc != nil {
 		t.Fatalf("document still tracked after delete: %+v", doc)
 	}
 
 	// Deleting an untracked path records nothing.
 	h.flush(ctx, filepath.Join(wsRoot, "notes", "never-existed.md"))
-	if entries, _ := h.db.ListOutbox("testws", 0); len(entries) != 2 {
+	if entries, _ := h.database().ListOutbox("testws", 0); len(entries) != 2 {
 		t.Fatalf("untracked delete produced outbox entries: %+v", entries)
 	}
 }
@@ -545,7 +610,7 @@ func TestSyncTypedMoveEvent(t *testing.T) {
 	writeFile(t, oldPath, "task body")
 	h.flush(ctx, oldPath)
 
-	doc, _ := h.db.GetDocumentByPath("testws", "notes/inbox/task.md")
+	doc, _ := h.database().GetDocumentByPath("testws", "notes/inbox/task.md")
 	if doc == nil {
 		t.Fatal("expected tracked document before move")
 	}
@@ -564,7 +629,7 @@ func TestSyncTypedMoveEvent(t *testing.T) {
 		},
 	})
 
-	entries, _ := h.db.ListOutbox("testws", 0)
+	entries, _ := h.database().ListOutbox("testws", 0)
 	if len(entries) != 2 {
 		t.Fatalf("expected created+moved, got %+v", entries)
 	}
@@ -577,10 +642,10 @@ func TestSyncTypedMoveEvent(t *testing.T) {
 	}
 
 	// Identity map follows the rename: same UUID, new path.
-	if old, _ := h.db.GetDocumentByPath("testws", "notes/inbox/task.md"); old != nil {
+	if old, _ := h.database().GetDocumentByPath("testws", "notes/inbox/task.md"); old != nil {
 		t.Fatalf("old path still tracked after move: %+v", old)
 	}
-	cur, _ := h.db.GetDocumentByPath("testws", "notes/current/task.md")
+	cur, _ := h.database().GetDocumentByPath("testws", "notes/current/task.md")
 	if cur == nil || cur.DocumentID != doc.DocumentID {
 		t.Fatalf("new path not tracked with stable id: %+v", cur)
 	}
@@ -588,7 +653,7 @@ func TestSyncTypedMoveEvent(t *testing.T) {
 	// Hash-gate: the follow-up fsnotify create on the new path is a no-op
 	// because the content hash is unchanged.
 	h.flush(ctx, newPath)
-	if entries, _ := h.db.ListOutbox("testws", 0); len(entries) != 2 {
+	if entries, _ := h.database().ListOutbox("testws", 0); len(entries) != 2 {
 		t.Fatalf("post-move flush was not hash-gated: %+v", entries)
 	}
 }
@@ -608,13 +673,13 @@ func TestSyncDeleteCapturesBaseVersion(t *testing.T) {
 	writeFile(t, notePath, "pushed content")
 	h.flush(ctx, notePath)
 
-	doc, _ := h.db.GetDocumentByPath("testws", "notes/synced.md")
+	doc, _ := h.database().GetDocumentByPath("testws", "notes/synced.md")
 	if doc == nil {
 		t.Fatal("expected tracked document before delete")
 	}
 	// Server confirms the create at version 6 (what the push pipeline records
 	// on an accepted push).
-	if err := h.db.MarkDocumentSynced(doc.DocumentID, 6, doc.ContentHash, []byte("pushed content")); err != nil {
+	if err := h.database().MarkDocumentSynced(doc.DocumentID, 6, doc.ContentHash, []byte("pushed content")); err != nil {
 		t.Fatalf("MarkDocumentSynced: %v", err)
 	}
 
@@ -623,7 +688,7 @@ func TestSyncDeleteCapturesBaseVersion(t *testing.T) {
 	}
 	h.flush(ctx, notePath)
 
-	entries, _ := h.db.ListOutbox("testws", 0)
+	entries, _ := h.database().ListOutbox("testws", 0)
 	if len(entries) != 2 || entries[1].EventType != syncproto.EventDocumentDeleted {
 		t.Fatalf("expected created+deleted, got %+v", entries)
 	}
@@ -632,7 +697,7 @@ func TestSyncDeleteCapturesBaseVersion(t *testing.T) {
 	}
 	// The identity-map row is still dropped at enqueue time (keeping it alive
 	// would break delete-then-recreate on UNIQUE(workspace, path)).
-	if doc, _ := h.db.GetDocumentByPath("testws", "notes/synced.md"); doc != nil {
+	if doc, _ := h.database().GetDocumentByPath("testws", "notes/synced.md"); doc != nil {
 		t.Fatalf("document still tracked after delete: %+v", doc)
 	}
 }
