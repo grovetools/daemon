@@ -185,7 +185,12 @@ type Server struct {
 	// config — server URL plus per-workspace pull/mode — so /api/sync/status
 	// can say where each workspace syncs. Nil when sync is not configured;
 	// then the status payload omits those fields.
-	syncSubscriptions    func() (string, []config.SyncWorkspace)
+	syncSubscriptions func() (string, []config.SyncWorkspace)
+	// syncAuthFailure (SetSyncAuthFailure) reads the watcher's token-rejection
+	// state so /api/sync/status can say "the server is rejecting this
+	// machine's token" instead of reporting a plausible-looking idle sync.
+	// Nil when sync is not configured; then the status payload omits it.
+	syncAuthFailure      func() (string, time.Time, bool)
 	syncWorkspaceRoots   func([]string) (map[string]string, error)
 	syncBeginMaintenance func(context.Context) error
 	syncEndMaintenance   func()

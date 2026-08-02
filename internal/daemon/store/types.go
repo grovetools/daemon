@@ -279,7 +279,12 @@ type MemoryReindexPayload struct {
 // subscribers. In Phase 0 only secret quarantine fires; pull conflicts
 // arrive with the Phase 1 sync server.
 type SyncConflictPayload struct {
-	Kind       string `json:"kind"` // "secret_quarantine" | "conflict" | "oversize_skipped" | "diverged"
+	// Kind is the event class. Not all of these are document conflicts — this
+	// is the sync system's general "something needs a human" feed:
+	// "secret_quarantine" | "conflict" | "oversize_skipped" | "diverged" |
+	// "registry_foreign_write" | "auth_failed". The last is transport-wide
+	// rather than per-document, so it carries no Workspace or Path.
+	Kind       string `json:"kind"`
 	Workspace  string `json:"workspace"`
 	Path       string `json:"path"` // slash-normalized workspace-relative path
 	DocumentID string `json:"document_id,omitempty"`

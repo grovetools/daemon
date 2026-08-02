@@ -74,6 +74,15 @@ func (s *Server) SetSyncSubscriptions(subs func() (string, []config.SyncWorkspac
 	s.syncSubscriptions = subs
 }
 
+// SetSyncAuthFailure wires the watcher SyncHandler's token-rejection state
+// into the server so GET /api/sync/status reports the stale-token trap
+// (contract §3 P2b) instead of a status that looks merely idle: a rejected
+// token stops replication completely while every counter stays plausible.
+// Nil-safe: without it the payload omits the field, as it did before.
+func (s *Server) SetSyncAuthFailure(auth func() (string, time.Time, bool)) {
+	s.syncAuthFailure = auth
+}
+
 // syncStatusResponse is the GET /api/sync/status payload.
 type syncStatusResponse struct {
 	Enabled bool   `json:"enabled"`
@@ -92,7 +101,13 @@ type syncStatusResponse struct {
 	OriginID string `json:"origin_id,omitempty"`
 	// Server is the configured grove-syncd base URL — the "where" behind the
 	// counters. Empty when the subscription view is not wired.
-	Server            string                `json:"server,omitempty"`
+	Server string `json:"server,omitempty"`
+	// AuthError is the stale-token trap made visible: non-empty when the
+	// server is currently rejecting this machine's bearer token (401), in
+	// which case NOTHING is replicating no matter how healthy the counters
+	// below look. AuthErrorSince marks when the rejection started.
+	AuthError         string                `json:"auth_error,omitempty"`
+	AuthErrorSince    time.Time             `json:"auth_error_since,omitzero"`
 	Documents         int                   `json:"documents"`
 	DocumentsDiverged int                   `json:"documents_diverged"`
 	OutboxPending     int                   `json:"outbox_pending"`
@@ -136,6 +151,14 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	out := syncStatusResponse{
 		MachineName: config.ResolveMachineName(),
 		MachineID:   machine.ID(),
+	}
+	// Reported outside the Enabled branch on purpose: a token rejection is
+	// exactly the state in which sync.db can look fine and nothing replicates.
+	if s.syncAuthFailure != nil {
+		if detail, since, failing := s.syncAuthFailure(); failing {
+			out.AuthError = detail
+			out.AuthErrorSince = since
+		}
 	}
 	if s.syncDatabase() != nil {
 		out.Enabled = true

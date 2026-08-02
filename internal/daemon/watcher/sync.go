@@ -51,6 +51,12 @@ import (
 const (
 	defaultSyncQuietMs   = 2000
 	defaultSyncMaxWaitMs = 15000
+
+	// defaultEpochProbeInterval is how often a connected transport re-runs the
+	// capabilities handshake purely to compare server epochs. It bounds how
+	// long a recreated server can go unnoticed by a machine with nothing to
+	// push; the anti-entropy pass is the hourly backstop, not the detector.
+	defaultEpochProbeInterval = 1 * time.Minute
 )
 
 // syncWatch maps a watched directory to its sync workspace subscription.
@@ -108,6 +114,23 @@ type SyncHandler struct {
 	baseCtx     context.Context
 	maintenance atomic.Bool
 	drainMu     sync.Mutex
+
+	// Token-rejection state (sync_auth.go): the stale-token trap's detection,
+	// reporting, and reconnect-backoff machinery. transportInterval and the
+	// two authRetry bounds are test seams — zero values select the production
+	// reconnect cadence and backoff window.
+	authMu            sync.Mutex
+	auth              syncAuthState
+	transportInterval time.Duration
+	authRetryBase     time.Duration
+	authRetryMax      time.Duration
+
+	// Server-epoch re-probe (probeServerEpoch): rate limiter for the periodic
+	// handshake that catches a server recreated under a running daemon.
+	// epochProbeInterval is a test seam; zero selects the production cadence.
+	epochProbeMu       sync.Mutex
+	epochProbedAt      time.Time
+	epochProbeInterval time.Duration
 
 	// Registry presence writer (registry.go). registryKick coalesces
 	// structural-change triggers; registryInterval and registryNow are test
@@ -743,6 +766,11 @@ func (h *SyncHandler) HandleStoreUpdate(update store.Update) {
 			h.syncCfgMu.Lock()
 			h.syncCfg = syncCfg // nil drops all subscriptions → handler goes dormant
 			h.syncCfgMu.Unlock()
+			// A reload is very often the operator's ANSWER to a rejected
+			// token — a new token, a new token_command, a different server.
+			// Clear the backoff so the next tick tries it immediately instead
+			// of sitting out the rest of a ten-minute window.
+			h.clearAuthBackoff()
 			// Wake immediately on the reload that first brings subscriptions
 			// (a `grove join` on a machine that has never synced) rather than
 			// waiting for the transport tick. Dormant on nil/empty config.
@@ -835,8 +863,17 @@ func (h *SyncHandler) OnStart(ctx context.Context) {
 // transportLoop connects to the sync server (retrying quietly — sync stays
 // passive and the outbox accumulates until the server is reachable), then
 // keeps per-workspace pipelines in step with discovered workspaces.
+//
+// "Quietly" holds for a server that is merely down. It does NOT hold for a
+// server that rejects our token: that failure never fixes itself, so it is
+// reported once, loudly, with its remediation, and reconnects back off instead
+// of hammering a handshake every tick (sync_auth.go).
 func (h *SyncHandler) transportLoop(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
+	interval := h.transportInterval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Failed dials repeat every tick for as long as the server is down, so
@@ -860,6 +897,14 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 			continue
 		}
 
+		// A live pipeline was rejected: the cached client holds a dead token
+		// and nothing downstream of it can recover while it survives. Drop it
+		// and its pipelines so this loop rebuilds them below against a token
+		// resolved fresh from config.
+		if h.takeTransportReset() {
+			h.resetTransport(ctx)
+		}
+
 		h.clientMu.RLock()
 		ready := h.client != nil
 		h.clientMu.RUnlock()
@@ -868,7 +913,7 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 			h.syncCfgMu.RLock()
 			cfg := h.syncCfg
 			h.syncCfgMu.RUnlock()
-			if cfg != nil {
+			if cfg != nil && h.authConnectDue(time.Now()) {
 				// DeviceID is this machine's durable identity (ULID in
 				// state), distinct from OriginID (per-sync.db install id that
 				// dies with the DB). It rides CapabilitiesRequest/PushRequest;
@@ -876,13 +921,28 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 				// dumb — but the wire now carries "which machine" so a wiped
 				// sync.db is diagnosable as same machine, new origin.
 				client, err := syncdb.NewClientFromConfig(ctx, cfg, machine.ID(), db.OriginID(), "", h.ulog)
-				if err != nil {
+				switch {
+				case syncdb.IsAuthError(err):
+					// The stale-token trap: a recreated server rejects every
+					// token minted against its predecessor. Retrying cannot
+					// fix it, so say so once, with the fix, and back off. This
+					// is not a reachability failure — the server answered — so
+					// it deliberately does not touch the dial-failure counter.
+					h.noteAuthFailure(ctx, authSourceHandshake, err)
+				case err != nil:
 					dialFailures++
 					if err.Error() != lastDialErr {
 						lastDialErr = err.Error()
 						h.ulog.Debug("sync server not reachable yet (suppressing repeats until the error changes)").Err(err).StructuredOnly().Log(ctx)
 					}
-				} else {
+				default:
+					h.noteAuthSuccess(ctx)
+					// A live pipeline that meets a rejected token must be able
+					// to reach the transport owner; the handshake above ran
+					// before any hook could exist, so install it now.
+					client.SetAuthFailureHook(func(authErr error) {
+						h.noteAuthFailure(ctx, authSourcePipeline, authErr)
+					})
 					// Epoch guard, BEFORE the client goes live: a recreated
 					// server (fresh, empty DB) advertises a new epoch in the
 					// handshake NewClientFromConfig just performed; comparing
@@ -897,12 +957,19 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 					h.clientMu.Lock()
 					h.client = client
 					h.clientMu.Unlock()
+					// The handshake just above IS this connection's first epoch
+					// probe; start the re-probe clock here so the next tick
+					// does not immediately repeat it.
+					h.epochProbeMu.Lock()
+					h.epochProbedAt = time.Now()
+					h.epochProbeMu.Unlock()
 					h.ulog.Info("sync server connected").Field("server", cfg.Server).Field("failed_dials", dialFailures).StructuredOnly().Log(ctx)
 					lastDialErr = ""
 					dialFailures = 0
 				}
 			}
 		} else {
+			h.probeServerEpoch(ctx, db)
 			h.ensurePipelines()
 		}
 
@@ -911,6 +978,61 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+// probeServerEpoch re-runs the capabilities handshake on a slow cadence and
+// feeds its epoch to CheckServerEpoch, so a server recreated UNDER a running
+// daemon is noticed in about a minute rather than at the next hourly
+// anti-entropy tick.
+//
+// Why this is needed at all: the connect-time check only fires when a client
+// is built, and transportLoop builds one exactly once. Nothing else on a quiet
+// push-only machine talks to the server — no local edits means no pushes — so
+// a wiped-and-restarted server was invisible until anti-entropy came round,
+// and until then the machine's whole document set existed nowhere but locally.
+// The per-document "unknown document" self-heal in the push pipeline only
+// covers documents something happened to push.
+//
+// The cost is one small JSON round trip per minute per daemon; a reconnect
+// storm is not: the probe reuses the live client and never rebuilds it.
+func (h *SyncHandler) probeServerEpoch(ctx context.Context, db *syncdb.DB) {
+	interval := h.epochProbeInterval
+	if interval <= 0 {
+		interval = defaultEpochProbeInterval
+	}
+
+	h.epochProbeMu.Lock()
+	if time.Since(h.epochProbedAt) < interval {
+		h.epochProbeMu.Unlock()
+		return
+	}
+	h.epochProbedAt = time.Now()
+	h.epochProbeMu.Unlock()
+
+	h.clientMu.RLock()
+	client := h.client
+	h.clientMu.RUnlock()
+	if client == nil {
+		return
+	}
+
+	caps, err := client.Capabilities(ctx, "")
+	if err != nil {
+		// An auth failure here is the mid-run token rejection; the client's
+		// hook has already reported it. Anything else is a transport blip the
+		// next probe retries.
+		return
+	}
+	reset, err := syncdb.CheckServerEpoch(ctx, db, caps.ServerEpoch, h.ulog)
+	if err != nil {
+		h.ulog.Warn("sync server epoch probe failed").Err(err).Log(ctx)
+		return
+	}
+	if reset {
+		// Every workspace was just voided with an empty outbox. Sweep them all
+		// now — that sweep IS the re-push.
+		h.KickAntiEntropy("")
 	}
 }
 
@@ -1018,6 +1140,11 @@ func (h *SyncHandler) ensurePipelines() {
 		// uses (sub is already resolved above), so walk coverage and reconcile
 		// coverage judge the doc space identically.
 		ae := syncdb.NewAntiEntropyPass(db, client, name, root, syncdb.NewDocSpace(sub), h.ulog, syncdb.AntiEntropyConfig{})
+		// A recreated server is detected by whichever pass handshakes first,
+		// but CheckServerEpoch voids EVERY workspace's synced state and
+		// clears their outboxes. Fan the sweep out so the others re-push in
+		// this cycle rather than sitting empty until their own hourly tick.
+		ae.OnEpochReset = h.kickAntiEntropyExcept
 		h.pipelinesMu.Lock()
 		h.aePasses[name] = ae
 		h.pipelinesMu.Unlock()

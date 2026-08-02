@@ -35,6 +35,15 @@ type AntiEntropyPass struct {
 	// interval ticker (buffered 1: concurrent kicks coalesce). Used by the
 	// manual /api/sync/repush endpoint after it voids synced state.
 	kick chan struct{}
+
+	// OnEpochReset is called with this workspace's name when Run's handshake
+	// detected a recreated server and voided the local synced state. The
+	// detection is per-pass but the reset is GLOBAL (ResetForRepushAll), so
+	// every other workspace has just had its synced state voided and its
+	// outbox cleared with no pass scheduled — the owner uses this to kick
+	// them, instead of leaving them un-pushed until their own hourly tick.
+	// Optional; nil means the other workspaces wait for their tick.
+	OnEpochReset func(workspace string)
 }
 
 // NewAntiEntropyPass constructs an anti-entropy reconciler. space is the same
@@ -72,6 +81,11 @@ func (a *AntiEntropyPass) Kick() {
 	}
 }
 
+// KickPending reports whether an immediate pass has been requested and not yet
+// consumed by RunAntiEntropyLoop. Non-destructive — it neither consumes the
+// kick nor blocks — so callers that fan kicks out can verify who got one.
+func (a *AntiEntropyPass) KickPending() bool { return len(a.kick) > 0 }
+
 // Run performs a single anti-entropy reconciliation pass: fetches the server
 // snapshot and diffs against the local filesystem, updating sync state for
 // matching files and enqueueing divergent ones.
@@ -86,8 +100,15 @@ func (a *AntiEntropyPass) Run(ctx context.Context) error {
 	// handshake failure is not fatal to the pass — the snapshot fetch below
 	// fails the same way if the server is truly unreachable.
 	if caps, err := a.client.Capabilities(ctx, ""); err == nil {
-		if _, err := CheckServerEpoch(ctx, a.db, caps.ServerEpoch, a.log); err != nil {
+		reset, err := CheckServerEpoch(ctx, a.db, caps.ServerEpoch, a.log)
+		if err != nil {
 			a.log.Warn("anti-entropy: server epoch check failed").Err(err).Log(ctx)
+		}
+		// The reset was global; this pass only sweeps THIS workspace. Tell the
+		// owner so the others get swept in this cycle too — they are now
+		// voided with an empty outbox, i.e. maximally un-replicated.
+		if reset && a.OnEpochReset != nil {
+			a.OnEpochReset(a.workspace)
 		}
 	}
 

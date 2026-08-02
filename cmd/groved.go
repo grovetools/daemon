@@ -1229,6 +1229,7 @@ func newGrovedStartCmd() *cobra.Command {
 						unifiedWatcher.Register(syncHandler)
 						srv.SetSyncKick(syncHandler.KickAntiEntropy)
 						srv.SetSyncSubscriptions(syncHandler.SyncSubscriptions)
+						srv.SetSyncAuthFailure(syncHandler.AuthFailure)
 						srv.SetSyncWorkspaceRoots(syncHandler.WorkspaceRoots)
 						srv.SetSyncMaintenance(syncHandler.BeginMaintenance, syncHandler.EndMaintenance)
 						workspaces := 0

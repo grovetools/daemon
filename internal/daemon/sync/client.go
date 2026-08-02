@@ -8,16 +8,61 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	neturl "net/url"
+	"strings"
+	gosync "sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/syncproto"
 )
+
+// ErrUnauthorized classifies a 401 from the sync server: the bearer token was
+// REJECTED, as opposed to the server being unreachable. The distinction is the
+// whole stale-token trap — a server destroyed and recreated mints fresh
+// tokens, and every subsequent handshake fails with 401 forever. Without a
+// machine-readable classification the transport loop cannot tell "not up yet"
+// (retry quietly, it will fix itself) from "your token is dead" (retry forever
+// and nothing will ever fix itself), so it logged both at debug and spun.
+//
+// Callers test with IsAuthError; every client method that talks to the server
+// wraps its 401 through authStatusError so the sentinel survives the
+// fmt.Errorf chains between the HTTP call and the transport loop.
+var ErrUnauthorized = errors.New("sync server rejected the token")
+
+// IsAuthError reports whether err was caused by the server rejecting the
+// bearer token (HTTP 401), anywhere in its wrap chain.
+func IsAuthError(err error) bool { return errors.Is(err, ErrUnauthorized) }
+
+// isAuthStatus reports whether an HTTP status means "the token was rejected".
+//
+// 401 ONLY, deliberately. 403 is the server's AUTHORIZATION answer — a token
+// it recognizes, for a user with no grant on this workspace (getUserPrefixes,
+// sync/pkg/server/handlers.go) — and its remediation is a share grant, not a
+// new token. Classifying it here was tried and reverted: it told operators of
+// perfectly valid share-scoped clients to mint a replacement token, and it put
+// their transport in a permanent tear-down-and-reconnect cycle (observed on
+// the cluster's share-scoped dev-c, which 403s on every pull by design).
+// Grant surfacing belongs to the share work, not to the stale-token path.
+func isAuthStatus(code int) bool {
+	return code == http.StatusUnauthorized
+}
+
+// authStatusError builds the error for a rejected request, carrying the
+// ErrUnauthorized sentinel plus the server's own explanation.
+func authStatusError(op string, code int, body []byte) error {
+	detail := strings.TrimSpace(string(body))
+	if detail == "" {
+		detail = http.StatusText(code)
+	}
+	return fmt.Errorf("%s rejected with status %d (%s): %w", op, code, detail, ErrUnauthorized)
+}
 
 // ClientConfig wraps the configuration needed to initialize a sync client.
 type ClientConfig struct {
@@ -41,7 +86,52 @@ type Client struct {
 	// server-side wait or every quiet poll dies awaiting headers exactly
 	// when the server would respond (the general client's 30s == wait).
 	pollClient *http.Client
-	caps       *syncproto.CapabilitiesResponse // Cached from handshake
+
+	// caps is the cached handshake response. Atomic because it is WRITTEN by
+	// re-handshakes on a shared, live client — the anti-entropy pass and the
+	// transport's server-epoch probe both re-run Capabilities — while push,
+	// pull, and blob goroutines READ it for their size ceilings. A plain field
+	// is a data race between them.
+	caps atomic.Pointer[syncproto.CapabilitiesResponse]
+
+	// onAuthFailure is notified whenever the server rejects this client's
+	// token. The handshake happens before any owner can install a hook, so
+	// this only ever fires for the LIVE pipelines (push/pull/snapshot/blob) —
+	// which is exactly the case the transport loop cannot otherwise see: it
+	// caches a connected client and never re-handshakes, so a token revoked
+	// or invalidated mid-run left every pipeline 401-ing forever with no path
+	// back short of a daemon restart. Must not block; SetAuthFailureHook's
+	// callers only flag state.
+	authHookMu    gosync.Mutex
+	onAuthFailure func(error)
+}
+
+// SetAuthFailureHook installs the callback invoked when the server rejects
+// this client's token on any request. Called by the transport owner right
+// after construction; nil clears it. The hook runs on the calling pipeline's
+// goroutine, so it must return promptly.
+func (c *Client) SetAuthFailureHook(fn func(error)) {
+	c.authHookMu.Lock()
+	c.onAuthFailure = fn
+	c.authHookMu.Unlock()
+}
+
+// rejectIfUnauthorized returns a classified error (and notifies the hook) when
+// resp carries a token-rejection status, or nil to let the caller continue.
+// It consumes resp.Body only in the rejection case.
+func (c *Client) rejectIfUnauthorized(op string, resp *http.Response) error {
+	if !isAuthStatus(resp.StatusCode) {
+		return nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	err := authStatusError(op, resp.StatusCode, body)
+	c.authHookMu.Lock()
+	hook := c.onAuthFailure
+	c.authHookMu.Unlock()
+	if hook != nil {
+		hook(err)
+	}
+	return err
 }
 
 // NewClient constructs a new sync client.
@@ -85,6 +175,9 @@ func (c *Client) Capabilities(ctx context.Context, clientVersion string) (*syncp
 	}
 	defer resp.Body.Close()
 
+	if err := c.rejectIfUnauthorized("capabilities request", resp); err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("capabilities request failed with status %d: %s", resp.StatusCode, string(body))
@@ -103,14 +196,14 @@ func (c *Client) Capabilities(ctx context.Context, clientVersion string) (*syncp
 		return nil, fmt.Errorf("server does not support protocol version %d", syncproto.ProtocolVersion)
 	}
 
-	c.caps = &capResp
+	c.caps.Store(&capResp)
 	return &capResp, nil
 }
 
 // Push uploads a batch of outbox entries to the server. Returns the
 // per-event results in the same order as the input events.
 func (c *Client) Push(ctx context.Context, workspace string, events []syncproto.SyncEvent) (*syncproto.PushResponse, error) {
-	if c.caps == nil {
+	if c.caps.Load() == nil {
 		return nil, fmt.Errorf("capabilities handshake not performed; call Capabilities() first")
 	}
 
@@ -132,8 +225,8 @@ func (c *Client) Push(ctx context.Context, workspace string, events []syncproto.
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, fmt.Errorf("push request failed: unauthorized (invalid token)")
+	if err := c.rejectIfUnauthorized("push request", resp); err != nil {
+		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -171,8 +264,8 @@ func (c *Client) PushBlob(ctx context.Context, hash string, data []byte) error {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("blob upload failed: unauthorized (invalid token)")
+	if err := c.rejectIfUnauthorized("blob upload", resp); err != nil {
+		return err
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
@@ -200,8 +293,8 @@ func (c *Client) Snapshot(ctx context.Context, workspace string) (*syncproto.Sna
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, fmt.Errorf("snapshot request failed: unauthorized (invalid token)")
+	if err := c.rejectIfUnauthorized("snapshot request", resp); err != nil {
+		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -239,8 +332,8 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body inter
 // MaxInlineSize returns the server's maximum inline content size, or the
 // protocol default if capabilities have not been negotiated.
 func (c *Client) MaxInlineSize() int64 {
-	if c.caps != nil && c.caps.Capabilities.MaxInlineSize > 0 {
-		return c.caps.Capabilities.MaxInlineSize
+	if caps := c.caps.Load(); caps != nil && caps.Capabilities.MaxInlineSize > 0 {
+		return caps.Capabilities.MaxInlineSize
 	}
 	return 256 * 1024 // 256KB default
 }
@@ -250,8 +343,8 @@ func (c *Client) MaxInlineSize() int64 {
 // client-side" sentinel: DrainOutbox skips its oversize check entirely against
 // such servers, preserving today's behavior.
 func (c *Client) MaxBlobSize() int64 {
-	if c.caps != nil {
-		return c.caps.Capabilities.MaxBlobSize
+	if caps := c.caps.Load(); caps != nil {
+		return caps.Capabilities.MaxBlobSize
 	}
 	return 0
 }
@@ -261,16 +354,16 @@ func (c *Client) MaxBlobSize() int64 {
 // server. CheckServerEpoch compares it with the persisted last-seen epoch to
 // detect a recreated server.
 func (c *Client) ServerEpoch() string {
-	if c.caps != nil {
-		return c.caps.ServerEpoch
+	if caps := c.caps.Load(); caps != nil {
+		return caps.ServerEpoch
 	}
 	return ""
 }
 
 // SupportsBlobs reports whether the server supports the blob tier.
 func (c *Client) SupportsBlobs() bool {
-	if c.caps != nil {
-		return c.caps.Capabilities.Blobs
+	if caps := c.caps.Load(); caps != nil {
+		return caps.Capabilities.Blobs
 	}
 	return false
 }
@@ -341,6 +434,9 @@ func (c *Client) PullEvents(ctx context.Context, workspace string, cursor int64,
 	// RunPullLoop's resync branch unreachable — a wiped client spun on
 	// "pull failed ... status 410" forever instead of snapshot-resyncing.
 	// Every other non-200 stays an error.
+	if err := c.rejectIfUnauthorized("pull request", resp); err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusGone {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("pull request failed with status %d: %s", resp.StatusCode, string(body))
@@ -369,6 +465,9 @@ func (c *Client) FetchBlob(ctx context.Context, hash string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
+	if err := c.rejectIfUnauthorized("blob fetch", resp); err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("blob fetch failed with status %d: %s", resp.StatusCode, string(body))
@@ -412,6 +511,9 @@ func (c *Client) History(ctx context.Context, workspace, path string) ([]History
 	}
 	defer resp.Body.Close()
 
+	if err := c.rejectIfUnauthorized("history request", resp); err != nil {
+		return nil, err
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("history request failed with status %d: %s", resp.StatusCode, string(body))
@@ -441,6 +543,9 @@ func (c *Client) HistoryBlob(ctx context.Context, workspace, documentID string, 
 	}
 	defer resp.Body.Close()
 
+	if err := c.rejectIfUnauthorized("history blob request", resp); err != nil {
+		return nil, err
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("version %d not found for document %s", version, documentID)
 	}
