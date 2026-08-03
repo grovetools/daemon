@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -72,6 +73,11 @@ type ClientConfig struct {
 	OriginID   string
 	Logger     *logging.UnifiedLogger
 	HTTPClient *http.Client
+	// TLSConfig, when non-nil, is applied to BOTH the general client and the
+	// long-poll client. It carries the pinned root pool for a self-signed
+	// deployment (config.SyncConfig.CACert); nil means the system trust
+	// store, which is what a publicly-trusted server wants.
+	TLSConfig *tls.Config
 }
 
 // Client is an HTTP wrapper for grove-syncd push/pull endpoints.
@@ -136,12 +142,25 @@ func (c *Client) rejectIfUnauthorized(op string, resp *http.Response) error {
 
 // NewClient constructs a new sync client.
 func NewClient(cfg ClientConfig) *Client {
+	// One transport for both clients so a pinned root pool cannot end up
+	// applied to the general client but not to the long-poll one — the pull
+	// pipeline lives entirely on pollClient, so a half-applied TLS config
+	// would fail exactly the traffic that matters.
+	var transport http.RoundTripper
+	if cfg.TLSConfig != nil {
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.TLSClientConfig = cfg.TLSConfig
+		transport = t
+	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: transport,
 		}
+	} else if transport != nil && cfg.HTTPClient.Transport == nil {
+		cfg.HTTPClient.Transport = transport
 	}
-	pollClient := &http.Client{Timeout: 90 * time.Second}
+	pollClient := &http.Client{Timeout: 90 * time.Second, Transport: transport}
 	return &Client{
 		serverURL:  cfg.ServerURL,
 		token:      cfg.Token,
@@ -384,12 +403,18 @@ func NewClientFromConfig(ctx context.Context, cfg *config.SyncConfig, deviceID, 
 		return nil, fmt.Errorf("sync token not configured")
 	}
 
+	tlsCfg, err := cfg.TLSClientConfig()
+	if err != nil {
+		return nil, err
+	}
+
 	client := NewClient(ClientConfig{
 		ServerURL: cfg.Server,
 		Token:     token,
 		DeviceID:  deviceID,
 		OriginID:  originID,
 		Logger:    logger,
+		TLSConfig: tlsCfg,
 	})
 
 	// Perform handshake
