@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -1377,7 +1378,9 @@ func runLogRetentionJanitor(ctx context.Context, ulog *grovelogging.UnifiedLogge
 }
 
 // rotateOversizedLogs archives and truncates active *.log files over maxBytes.
-// Existing part files are ignored. Best-effort walking mirrors sweepOldLogs.
+// Archives are gzip-compressed (JSON logs shrink ~25x, and a part file only
+// exists for postmortem reading). Existing part files are ignored.
+// Best-effort walking mirrors sweepOldLogs.
 func rotateOversizedLogs(logsDir string, maxBytes int64, now time.Time) (rotated int, firstErr error) {
 	if maxBytes <= 0 {
 		return 0, nil
@@ -1394,7 +1397,7 @@ func rotateOversizedLogs(logsDir string, maxBytes int64, now time.Time) (rotated
 			return nil
 		}
 		base := strings.TrimSuffix(path, ".log")
-		archive := fmt.Sprintf("%s-part-%s.log", base, now.Format("20060102T150405.000000000"))
+		archive := fmt.Sprintf("%s-part-%s.log.gz", base, now.Format("20060102T150405.000000000"))
 		src, err := os.Open(path)
 		if err != nil {
 			if firstErr == nil {
@@ -1404,7 +1407,11 @@ func rotateOversizedLogs(logsDir string, maxBytes int64, now time.Time) (rotated
 		}
 		dst, err := os.OpenFile(archive, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
-			_, err = io.CopyN(dst, src, info.Size())
+			gz := gzip.NewWriter(dst)
+			_, err = io.CopyN(gz, src, info.Size())
+			if closeErr := gz.Close(); err == nil {
+				err = closeErr
+			}
 		}
 		_ = src.Close()
 		if dst != nil {
@@ -1431,16 +1438,17 @@ func rotateOversizedLogs(logsDir string, maxBytes int64, now time.Time) (rotated
 	return rotated, firstErr
 }
 
-// sweepOldLogs walks logsDir recursively and deletes every *.log file that
-// logFileExpired judges older than retentionDays. Best-effort: unreadable
-// entries are skipped; the first removal error is reported alongside whatever
-// was deleted. A missing logsDir is a no-op.
+// sweepOldLogs walks logsDir recursively and deletes every *.log (and
+// *.log.gz part archive) file that logFileExpired judges older than
+// retentionDays. Best-effort: unreadable entries are skipped; the first
+// removal error is reported alongside whatever was deleted. A missing logsDir
+// is a no-op.
 func sweepOldLogs(logsDir string, retentionDays int, now time.Time) (deleted int, freed int64, firstErr error) {
 	if _, err := os.Stat(logsDir); err != nil {
 		return 0, 0, nil
 	}
 	_ = filepath.WalkDir(logsDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".log") {
+		if err != nil || d.IsDir() || (!strings.HasSuffix(d.Name(), ".log") && !strings.HasSuffix(d.Name(), ".log.gz")) {
 			return nil
 		}
 		info, ierr := d.Info()

@@ -212,19 +212,20 @@ func (w *UnifiedWatcher) refreshWatches() {
 	}
 
 	// Remove watches no longer needed by any handler
+	removed := 0
 	for p := range w.watchCounts {
 		if desiredCounts[p] == 0 {
 			if err := w.fsWatcher.Remove(p); err != nil {
 				w.ulog.Debug("Failed to remove watch").Err(err).Field("path", p).Log(ctx)
 			}
 			delete(w.watchCounts, p)
-			// Watch-registration boundary: add/remove transitions are rare and
-			// are the evidence a live log needs to prove fsnotify coverage.
-			w.ulog.Info("Watch removed").Field("path", p).Log(ctx)
+			removed++
+			w.ulog.Debug("Watch removed").Field("path", p).Log(ctx)
 		}
 	}
 
 	// Add new watches or update reference counts
+	added := 0
 	for p, count := range desiredCounts {
 		if w.watchCounts[p] == 0 {
 			// Skip paths that don't exist on disk
@@ -236,11 +237,19 @@ func (w *UnifiedWatcher) refreshWatches() {
 				w.ulog.Warn("Failed to watch path").Err(err).Field("path", p).Log(ctx)
 			} else {
 				w.watchCounts[p] = count
-				w.ulog.Info("Watch added").Field("path", p).Log(ctx)
+				added++
+				w.ulog.Debug("Watch added").Field("path", p).Log(ctx)
 			}
 		} else {
 			w.watchCounts[p] = count
 		}
+	}
+
+	// Watch-registration boundary: one aggregate line per refresh keeps the
+	// evidence of fsnotify coverage in the live log without a per-path line
+	// for every workspace rescan (which ran to thousands of lines a day).
+	if added > 0 || removed > 0 {
+		w.ulog.Info("Watch set updated").Field("added", added).Field("removed", removed).Field("total", len(w.watchCounts)).Log(ctx)
 	}
 }
 

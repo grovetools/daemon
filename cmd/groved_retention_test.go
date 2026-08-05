@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"compress/gzip"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -98,11 +100,20 @@ func TestRotateOversizedLogsCopyTruncatesActiveFile(t *testing.T) {
 	if info, err := os.Stat(active); err != nil || info.Size() != 0 {
 		t.Fatalf("active log not truncated: info=%v err=%v", info, err)
 	}
-	parts, err := filepath.Glob(filepath.Join(dir, "system-2026-07-01-part-*.log"))
+	parts, err := filepath.Glob(filepath.Join(dir, "system-2026-07-01-part-*.log.gz"))
 	if err != nil || len(parts) != 1 {
 		t.Fatalf("parts=%v err=%v", parts, err)
 	}
-	if got, err := os.ReadFile(parts[0]); err != nil || string(got) != string(content) {
+	f, err := os.Open(parts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("archive is not gzip: %v", err)
+	}
+	if got, err := io.ReadAll(gz); err != nil || string(got) != string(content) {
 		t.Fatalf("archive=%q err=%v", got, err)
 	}
 	rotated, err = rotateOversizedLogs(dir, 5, time.Unix(1001, 0))
@@ -132,6 +143,7 @@ func TestSweepOldLogs(t *testing.T) {
 	expired1 := filepath.Join(dir, "system-2026-05-01.log")
 	expired2 := filepath.Join(wsDir, "workspace-2026-06-10.log")
 	expiredUndated := filepath.Join(dir, "old-undated.log")
+	expiredPartGz := filepath.Join(dir, "system-2026-05-01-part-20260501T120000.000000000.log.gz")
 	keptToday := filepath.Join(dir, "system-2026-07-01.log")
 	keptRecent := filepath.Join(dir, "system-2026-06-25.log")
 	keptNotLog := filepath.Join(dir, "system-2026-05-01.txt")
@@ -139,6 +151,7 @@ func TestSweepOldLogs(t *testing.T) {
 	write(expired1, now)
 	write(expired2, now)
 	write(expiredUndated, now.AddDate(0, 0, -60))
+	write(expiredPartGz, now.AddDate(0, 0, -60)) // undated suffix, expires by mtime
 	write(keptToday, now)
 	write(keptRecent, now)
 	write(keptNotLog, now.AddDate(0, 0, -60))
@@ -147,13 +160,13 @@ func TestSweepOldLogs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sweepOldLogs error: %v", err)
 	}
-	if deleted != 3 {
-		t.Errorf("deleted = %d, want 3", deleted)
+	if deleted != 4 {
+		t.Errorf("deleted = %d, want 4", deleted)
 	}
-	if freed != 6 { // 3 files x 2 bytes
-		t.Errorf("freed = %d, want 6", freed)
+	if freed != 8 { // 4 files x 2 bytes
+		t.Errorf("freed = %d, want 8", freed)
 	}
-	for _, gone := range []string{expired1, expired2, expiredUndated} {
+	for _, gone := range []string{expired1, expired2, expiredUndated, expiredPartGz} {
 		if _, err := os.Stat(gone); !os.IsNotExist(err) {
 			t.Errorf("%s should have been deleted", gone)
 		}

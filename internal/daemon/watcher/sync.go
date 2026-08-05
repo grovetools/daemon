@@ -682,6 +682,12 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
+	// Failed dials repeat every tick for as long as the server is down, so
+	// log only on state changes: the first failure, a changed error, and the
+	// eventual connect (with how many dials it took).
+	var lastDialErr string
+	dialFailures := 0
+
 	for {
 		h.clientMu.RLock()
 		ready := h.client != nil
@@ -694,7 +700,11 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 			if cfg != nil {
 				client, err := syncdb.NewClientFromConfig(ctx, cfg, "", h.db.OriginID(), "", h.ulog)
 				if err != nil {
-					h.ulog.Debug("sync server not reachable yet").Err(err).StructuredOnly().Log(ctx)
+					dialFailures++
+					if err.Error() != lastDialErr {
+						lastDialErr = err.Error()
+						h.ulog.Debug("sync server not reachable yet (suppressing repeats until the error changes)").Err(err).StructuredOnly().Log(ctx)
+					}
 				} else {
 					// Epoch guard, BEFORE the client goes live: a recreated
 					// server (fresh, empty DB) advertises a new epoch in the
@@ -710,7 +720,9 @@ func (h *SyncHandler) transportLoop(ctx context.Context) {
 					h.clientMu.Lock()
 					h.client = client
 					h.clientMu.Unlock()
-					h.ulog.Info("sync server connected").Field("server", cfg.Server).StructuredOnly().Log(ctx)
+					h.ulog.Info("sync server connected").Field("server", cfg.Server).Field("failed_dials", dialFailures).StructuredOnly().Log(ctx)
+					lastDialErr = ""
+					dialFailures = 0
 				}
 			}
 		} else {
