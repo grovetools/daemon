@@ -198,6 +198,14 @@ func TestFlowHoldLifecycleIsNotLostToDebounce(t *testing.T) {
 		}
 	}
 
+	// The edge under test is the INDEX publish: a lifecycle mutation must ride
+	// its own plan-index revision instead of waiting out the enrichment
+	// debounce. Waiting on the projected workspace delta instead would be
+	// ambiguous — the aggregated PlanStats pass reads the same plan config off
+	// disk and writes the same PlanStats field, so it can beat the index
+	// publish to the identical-looking delta and satisfy the wait without the
+	// publish having happened at all. The workspace deltas are still consumed,
+	// because their cross-targeting is the other half of this test.
 	awaitLifecycle := func(want string) {
 		t.Helper()
 		deadline := time.NewTimer(time.Second)
@@ -205,17 +213,29 @@ func TestFlowHoldLifecycleIsNotLostToDebounce(t *testing.T) {
 		for {
 			select {
 			case update := <-ch:
-				if update.Type != store.UpdateWorkspacesDelta || update.Source != "flow_watcher" {
+				if update.Source != "flow_watcher" {
 					continue
 				}
-				deltas := update.Payload.([]*models.WorkspaceDelta)
-				for _, delta := range deltas {
-					if delta.PlanStats != nil && delta.PlanStats.PlanStatus == "hold" &&
-						(delta.Path == twin.member || delta.Path == target.owner || delta.Path == unrelatedPath) {
-						t.Fatalf("lifecycle delta cross-targeted preserved path %q", delta.Path)
+				switch update.Type {
+				case store.UpdateWorkspacesDelta:
+					for _, delta := range update.Payload.([]*models.WorkspaceDelta) {
+						if delta.PlanStats != nil && delta.PlanStats.PlanStatus == "hold" &&
+							(delta.Path == twin.member || delta.Path == target.owner || delta.Path == unrelatedPath) {
+							t.Fatalf("lifecycle delta cross-targeted preserved path %q", delta.Path)
+						}
 					}
-					if delta.Path == target.member && delta.PlanStats != nil && delta.PlanStats.PlanStatus == want {
-						return
+				case store.UpdatePlanIndexDelta:
+					for _, summary := range update.Payload.(*models.PlanIndexDelta).Upserts {
+						if summary.PlanDir != target.planDir {
+							continue
+						}
+						lifecycle := summary.Lifecycle
+						if lifecycle == "live" {
+							lifecycle = ""
+						}
+						if lifecycle == want {
+							return
+						}
 					}
 				}
 			case <-deadline.C:

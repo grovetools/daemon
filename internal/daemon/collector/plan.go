@@ -63,10 +63,10 @@ func (c *PlanCollector) Run(ctx context.Context, st *store.Store, updates chan<-
 			lastFullScan = time.Now()
 		}
 
-		planStats, err := enrichment.FetchPlanStatsMap()
-		if err != nil {
-			return
-		}
+		// Node set from the store, not a fresh discovery: the workspace
+		// collector already owns the filesystem walk, and it is the same
+		// snapshot the deltas below are diffed against.
+		planStats := enrichment.FetchPlanStatsMap(store.WorkspaceNodesOf(state.Workspaces), nil)
 
 		// Build case-insensitive focus map
 		focusLower := make(map[string]struct{}, len(focus))

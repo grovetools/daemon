@@ -5,9 +5,12 @@ import (
 	"path/filepath"
 	"testing"
 
+	coreconfig "github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/pkg/worktreeregistry"
+	"github.com/grovetools/core/util/pathutil"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 )
 
 // TestResolvePerNodePlanStats_SiblingsGetOwnActivePlan is the HUD wrong-plan
@@ -46,15 +49,23 @@ func TestPlanStatusForNodeUsesExactRegistryAssociation(t *testing.T) {
 	held := &workspace.WorkspaceNode{Path: heldPath, Kind: workspace.KindEcosystemSubProjectWorktree}
 	unrelated := &workspace.WorkspaceNode{Path: unrelatedPath, Kind: workspace.KindEcosystemSubProjectWorktree}
 	parent := &workspace.WorkspaceNode{Path: owner, Kind: workspace.KindEcosystemRoot}
-	if got := planStatusForNode(plansDir, held); got != "hold" {
+	pass := newTestPass()
+	if got := pass.planStatusForNode(plansDir, held); got != "hold" {
 		t.Fatalf("held member status=%q", got)
 	}
-	if got := planStatusForNode(plansDir, unrelated); got != "" {
+	if got := pass.planStatusForNode(plansDir, unrelated); got != "" {
 		t.Fatalf("unrelated same-name worktree inherited status %q", got)
 	}
-	if got := planStatusForNode(plansDir, parent); got != "" {
+	if got := pass.planStatusForNode(plansDir, parent); got != "" {
 		t.Fatalf("parent inherited held status %q", got)
 	}
+}
+
+// newTestPass builds a pass the way FetchPlanStatsMap does. It must be created
+// AFTER the test's registry entries are saved: a pass snapshots the registry
+// once at construction, which is the whole point of it.
+func newTestPass() *planStatsPass {
+	return newPlanStatsPass(workspace.NewNotebookLocator(nil))
 }
 
 func TestResolvePerNodePlanStats_SiblingsGetOwnActivePlan(t *testing.T) {
@@ -162,12 +173,166 @@ func TestAssociatedPlanDirUsesCanonicalRegistryResolver(t *testing.T) {
 	}
 
 	node := &workspace.WorkspaceNode{Path: filepath.Join(container, "alpha-repo"), Kind: workspace.KindEcosystemSubProjectWorktree}
-	if got := associatedPlanDirForNode(node); got != planDir {
+	pass := newTestPass()
+	if got := pass.associatedPlanDirForNode(node); got != planDir {
 		t.Fatalf("associatedPlanDirForNode = %q, want %q", got, planDir)
 	}
 	// The status read must go through the canonical plan dir, not the
 	// (deliberately bogus) plans root the caller derived for this node.
-	if got := planStatusForNode(filepath.Join(root, "not-a-plans-root"), node); got != "hold" {
+	if got := pass.planStatusForNode(filepath.Join(root, "not-a-plans-root"), node); got != "hold" {
 		t.Fatalf("planStatusForNode = %q, want hold", got)
+	}
+}
+
+// TestFetchPlanStatsMapUsesOnlyInjectedNodes is the discovery-removal
+// regression. FetchPlanStatsMap used to run its own workspace.DiscoverAll on
+// every call, so its output was keyed by whatever happened to be on the
+// filesystem rather than by what the caller asked about. It must now answer
+// for EXACTLY the node set it is handed — that is what lets the daemon reuse
+// the store's already-discovered workspaces instead of re-walking disk on
+// every plan-file event.
+func TestFetchPlanStatsMapUsesOnlyInjectedNodes(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	wsPath := filepath.Join(t.TempDir(), "workspace")
+	node := &workspace.WorkspaceNode{Name: "workspace", Path: wsPath, Kind: workspace.KindStandaloneProject}
+
+	// Materialize the plan where THIS host's notebook layout puts it, rather
+	// than assuming local mode: the assertion under test is about the node set,
+	// and hard-coding .notebook/plans would make it fail on a centralized
+	// notebook config for reasons that have nothing to do with discovery.
+	cfg, err := coreconfig.LoadDefault()
+	if err != nil {
+		cfg = &coreconfig.Config{}
+	}
+	plansDir, err := workspace.NewNotebookLocator(cfg).GetPlansDir(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planDir := filepath.Join(plansDir, "alpha")
+	if err := os.MkdirAll(planDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(planDir, "01-job.md"),
+		[]byte("---\nid: j1\nstatus: running\n---\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := FetchPlanStatsMap([]*workspace.WorkspaceNode{node}, nil)
+	if len(stats) != 1 {
+		t.Fatalf("stats covered %d paths, want exactly the 1 injected node: %v", len(stats), stats)
+	}
+	got := stats[wsPath]
+	if got == nil {
+		t.Fatalf("no stats for injected node %q", wsPath)
+	}
+	if got.TotalPlans != 1 || got.Running != 1 {
+		t.Fatalf("stats = %+v, want TotalPlans=1 Running=1", got)
+	}
+
+	// A nil node in the set (a store row restored before discovery re-saw it)
+	// must be skipped, not panic the whole pass.
+	if stats := FetchPlanStatsMap([]*workspace.WorkspaceNode{nil, node}, nil); len(stats) != 1 {
+		t.Fatalf("nil node changed the result set: %v", stats)
+	}
+	// An empty node set is a legitimate pre-discovery state, not an error.
+	if stats := FetchPlanStatsMap(nil, nil); len(stats) != 0 {
+		t.Fatalf("empty node set produced %d entries", len(stats))
+	}
+}
+
+// TestPlanStatsPassLoadsRegistryOnce pins the per-pass hoist: the worktree
+// registry is read ONCE when the pass is built, not once per node (it was
+// being loaded several times per node — via PlanForPath, planStatusForNode and
+// plan.ResolveTarget — at 600 nodes a pass). Deleting the entry from disk
+// after construction proves the answers come from the snapshot.
+func TestPlanStatsPassLoadsRegistryOnce(t *testing.T) {
+	groveHome := t.TempDir()
+	t.Setenv("GROVE_HOME", groveHome)
+
+	owner := t.TempDir()
+	container := filepath.Join(owner, ".grove-worktrees", "alpha")
+	memberA := filepath.Join(container, "repo-a")
+	memberB := filepath.Join(container, "repo-b")
+	for _, dir := range []string{memberA, memberB} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := worktreeregistry.Save(&worktreeregistry.Entry{AbsPath: container, Plan: "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+
+	pass := newTestPass()
+
+	entries, err := worktreeregistry.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if err := worktreeregistry.Delete(pathutil.WorktreeID(entry.AbsPath)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if remaining, _ := worktreeregistry.ListAll(); len(remaining) != 0 {
+		t.Fatalf("registry not cleared: %d entries", len(remaining))
+	}
+
+	for _, node := range []*workspace.WorkspaceNode{
+		{Path: memberA, Kind: workspace.KindEcosystemSubProjectWorktree},
+		{Path: memberB, Kind: workspace.KindEcosystemSubProjectWorktree},
+	} {
+		plan, ok := pass.registeredPlanForNode(node)
+		if !ok || plan != "alpha" {
+			t.Fatalf("node %s: registeredPlanForNode = (%q, %v), want (alpha, true) from the pass snapshot",
+				node.Path, plan, ok)
+		}
+	}
+}
+
+// TestPlanStatsPassMemoizesPerContainer pins the other half of the hoist: the
+// plan-dir derivation reaches plan.ResolveTarget, which loads and JSON-schema
+// validates a grove.toml. It is a function of the worktree container root
+// alone, so sibling member checkouts of one container must resolve it once
+// between them, not once each.
+func TestPlanStatsPassMemoizesPerContainer(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+
+	owner := t.TempDir()
+	container := filepath.Join(owner, ".grove-worktrees", "alpha")
+	siblings := []string{filepath.Join(container, "repo-a"), filepath.Join(container, "repo-b")}
+	for _, dir := range siblings {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pass := newTestPass()
+	for _, dir := range siblings {
+		pass.associatedPlanDirForNode(&workspace.WorkspaceNode{Path: dir, Kind: workspace.KindEcosystemSubProjectWorktree})
+	}
+
+	if len(pass.planDirByRoot) != 1 {
+		t.Fatalf("memoized %d plan dirs for one container, want 1: %v", len(pass.planDirByRoot), pass.planDirByRoot)
+	}
+	if _, ok := pass.planDirByRoot[container]; !ok {
+		t.Fatalf("memo not keyed by the container root %q: %v", container, pass.planDirByRoot)
+	}
+}
+
+// TestFetchPlanStatsMapRecordsTelemetry pins the counter that makes this pass
+// visible on /api/system/stats. Before it, a pass that had grown to seconds
+// and ran every few seconds left no number anywhere.
+func TestFetchPlanStatsMapRecordsTelemetry(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+
+	before, _, _, _ := telemetry.PlanStatsPass.Snapshot()
+	FetchPlanStatsMap([]*workspace.WorkspaceNode{
+		{Name: "ws", Path: t.TempDir(), Kind: workspace.KindStandaloneProject},
+	}, nil)
+	after, _, _, _ := telemetry.PlanStatsPass.Snapshot()
+	if after != before+1 {
+		t.Fatalf("planstats.pass.count went %d -> %d, want +1", before, after)
 	}
 }

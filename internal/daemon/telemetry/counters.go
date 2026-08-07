@@ -112,6 +112,15 @@ var (
 	SSEInitialSent    = Default().Counter("sse.initial.sent")
 	SSEInitialSkipped = Default().Counter("sse.initial.skipped")
 
+	// Aggregated plan-stats enrichment: one pass recounts every workspace's
+	// plan/job totals. It is kicked by plan-file events on a short debounce and
+	// used to be invisible — only the synchronous plan-index refresh it hangs
+	// off was logged — so a pass that had grown to seconds could run every few
+	// seconds without leaving a number anywhere. These are that number.
+	PlanStatsPass           = Default().Stat("planstats.pass")
+	PlanStatsWorkspaces     = Default().Counter("planstats.pass.workspaces")
+	planStatsWorkspacesLast = Default().Gauge("planstats.pass.workspaces_last")
+
 	// Transcript parsing (the rescan-loop signature).
 	TranscriptConsidered = Default().RateCounter("transcript.considered")
 	TranscriptParsed     = Default().RateCounter("transcript.parses")
@@ -191,6 +200,16 @@ func RecordBlobHash(o BlobHashObservation) {
 		Default().Warnings().Raise(o.Repo, CondLargeBlobHash,
 			fmt.Sprintf("%s (%s) — consider .gitignore", o.LargestPath, humanBytes(o.LargestBytes)))
 	}
+}
+
+// RecordPlanStatsPass records one aggregated PlanStats pass over n workspaces.
+// n is recorded even for an empty pass (unlike RecordGitSweep's n<=0 guard):
+// "the pass ran and saw nothing" is itself a diagnosis, and dropping those
+// samples would make mean_ms report only the expensive passes.
+func RecordPlanStatsPass(n int, d time.Duration) {
+	PlanStatsPass.ObserveDuration(d)
+	PlanStatsWorkspaces.Add(int64(n))
+	planStatsWorkspacesLast.Set(float64(n))
 }
 
 // RecordWatcherBatch records one debounce batch from the unified watcher.

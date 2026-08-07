@@ -134,6 +134,35 @@ func (s *Store) GetWorkspaces() []*models.EnrichedWorkspace {
 	return result
 }
 
+// WorkspaceNodes returns the discovered workspace node behind every enriched
+// workspace, skipping entries that carry none (a persisted row restored before
+// discovery has re-seen it).
+//
+// This is the store's answer to "which workspaces exist", and it is the ONLY
+// answer enrichment producers should use. Workspace discovery is a filesystem
+// walk that classifies and config-parses every workspace; the workspace
+// collector owns it and publishes the result here, so a producer that re-runs
+// its own DiscoverAll pays that whole cost again for a set it could have read.
+func (s *Store) WorkspaceNodes() []*workspace.WorkspaceNode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return WorkspaceNodesOf(s.state.Workspaces)
+}
+
+// WorkspaceNodesOf is the pure projection behind WorkspaceNodes, exported so a
+// producer that already holds a Get() snapshot computes its node set from the
+// SAME snapshot it will diff its results against.
+func WorkspaceNodesOf(workspaces map[string]*models.EnrichedWorkspace) []*workspace.WorkspaceNode {
+	nodes := make([]*workspace.WorkspaceNode, 0, len(workspaces))
+	for _, ws := range workspaces {
+		if ws == nil || ws.WorkspaceNode == nil {
+			continue
+		}
+		nodes = append(nodes, ws.WorkspaceNode)
+	}
+	return nodes
+}
+
 // GetSessions returns a slice of all sessions.
 func (s *Store) GetSessions() []*models.Session {
 	s.mu.RLock()

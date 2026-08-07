@@ -64,10 +64,10 @@ type FlowHandler struct {
 	// refreshRunMu (only touched inside runRefresh).
 	dirCache map[string]*dirScanResult
 
-	// Aggregated-PlanStats pass bookkeeping. The stats leg runs a full
-	// workspace discovery, so it executes on its own goroutine with
+	// Aggregated-PlanStats pass bookkeeping. The stats leg re-reads every
+	// plans directory on disk, so it executes on its own goroutine with
 	// trailing-run coalescing — never under refreshRunMu, where it would
-	// delay synchronous lifecycle publishes behind disk discovery.
+	// delay synchronous lifecycle publishes behind that disk work.
 	statsMu      sync.Mutex
 	statsRunning bool
 	statsQueued  bool
@@ -540,8 +540,8 @@ func (h *FlowHandler) refresh() {
 // runRefresh rebuilds and publishes the plan index, then updates the
 // aggregated PlanStats enrichment. Ordering is deliberate: the row projection
 // is built from cheap per-directory scans and already-collected daemon state,
-// and is published BEFORE the PlanStats pass, whose full workspace discovery
-// is the expensive leg and must never gate first-row availability.
+// and is published BEFORE the PlanStats pass, which recounts every plans
+// directory in the portfolio and must never gate first-row availability.
 func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 	h.refreshRunMu.Lock()
 	defer h.refreshRunMu.Unlock()
@@ -648,10 +648,9 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 	h.scanSeq.Add(1)
 
 	// Aggregated PlanStats enrichment. Overlay-only passes changed nothing on
-	// disk, so the expensive discovery-backed recount is skipped for them.
-	// The pass runs asynchronously: it needs a full workspace discovery, and
-	// holding refreshRunMu for that would queue the next synchronous
-	// lifecycle publish behind disk-walking.
+	// disk, so the recount is skipped for them. The pass runs asynchronously:
+	// holding refreshRunMu across its disk reads would queue the next
+	// synchronous lifecycle publish behind them.
 	if all || rescanned > 0 || len(scopeDirs) > 0 {
 		h.kickPlanStats()
 	}
@@ -686,10 +685,9 @@ func (h *FlowHandler) kickPlanStats() {
 }
 
 func (h *FlowHandler) planStatsLoop() {
-	ctx := context.Background()
 	for {
 		seq := h.scanSeq.Load()
-		h.refreshPlanStats(ctx, seq)
+		h.refreshPlanStats(seq)
 		h.statsMu.Lock()
 		if h.statsQueued {
 			h.statsQueued = false
@@ -708,17 +706,17 @@ func (h *FlowHandler) planStatsLoop() {
 	}
 }
 
-// refreshPlanStats recomputes the aggregated per-workspace PlanStats. This is
-// the discovery-backed enrichment leg; it runs off the refresh mutex so its
-// cost never delays row publishes. seq fences staleness: results computed
-// from disk state older than the latest index publish are discarded (the
-// trailing loop run recomputes them).
-func (h *FlowHandler) refreshPlanStats(ctx context.Context, seq uint64) {
-	planStats, err := enrichment.FetchPlanStatsMap()
-	if err != nil {
-		h.ulog.Error("Failed to fetch plan stats").Err(err).Log(ctx)
-		return
-	}
+// refreshPlanStats recomputes the aggregated per-workspace PlanStats. It runs
+// off the refresh mutex so its cost never delays row publishes. seq fences
+// staleness: results computed from disk state older than the latest index
+// publish are discarded (the trailing loop run recomputes them).
+//
+// The workspace set comes from the store, never from a fresh
+// workspace.DiscoverAll: this pass fires on a 2s debounce behind plan-file
+// events, and re-walking/re-classifying every workspace on disk each time was
+// the daemon's dominant allocation (and therefore GC, and therefore CPU) load.
+func (h *FlowHandler) refreshPlanStats(seq uint64) {
+	planStats := enrichment.FetchPlanStatsMap(h.store.WorkspaceNodes(), h.locator)
 	if h.scanSeq.Load() != seq {
 		return
 	}

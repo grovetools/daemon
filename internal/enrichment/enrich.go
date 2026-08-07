@@ -54,18 +54,24 @@ func EnrichWorkspaces(ctx context.Context, nodes []*workspace.WorkspaceNode, opt
 		enriched[i] = &models.EnrichedWorkspace{WorkspaceNode: node}
 	}
 
+	// Both note counts and plan stats resolve a node's notebook directory, so
+	// the config load and locator are hoisted to one per call.
+	var locator *workspace.NotebookLocator
+	if opts.FetchNoteCounts || opts.FetchPlanStats {
+		cfg, _ := config.LoadDefault()
+		locator = workspace.NewNotebookLocator(cfg)
+	}
+
 	// Fetch note counts (indexed by workspace name)
 	var noteCountsByName map[string]*models.NoteCounts
 	if opts.FetchNoteCounts {
-		cfg, _ := config.LoadDefault()
-		locator := workspace.NewNotebookLocator(cfg)
 		noteCountsByName = CountNotesInProcess(nodes, locator)
 	}
 
 	// Fetch plan stats (indexed by path)
 	var planStatsMap map[string]*models.PlanStats
 	if opts.FetchPlanStats {
-		planStatsMap, _ = FetchPlanStatsMap()
+		planStatsMap = FetchPlanStatsMap(nodes, locator)
 	}
 
 	// Fetch release info and binary status (both use grove list)
