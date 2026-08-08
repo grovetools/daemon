@@ -23,6 +23,7 @@ import (
 	"github.com/grovetools/core/pkg/logging/logutil"
 	"github.com/grovetools/core/pkg/machine"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/pairwatch"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/workspace"
@@ -36,7 +37,6 @@ import (
 	daemonhooks "github.com/grovetools/daemon/internal/daemon/hooks"
 	"github.com/grovetools/daemon/internal/daemon/jobrunner"
 	"github.com/grovetools/daemon/internal/daemon/logstreamer"
-	"github.com/grovetools/daemon/internal/daemon/pairwatch"
 	"github.com/grovetools/daemon/internal/daemon/pidfile"
 	"github.com/grovetools/daemon/internal/daemon/satellite"
 	"github.com/grovetools/daemon/internal/daemon/server"
@@ -283,6 +283,12 @@ func newGrovedStartCmd() *cobra.Command {
 
 			autoShutdown, _ := cmd.Flags().GetBool("auto-shutdown")
 			pairPID, _ := cmd.Flags().GetInt("pair-with-pid")
+			if pairPID <= 0 {
+				// A sandbox that exports GROVE_DAEMON_PAIR_PID pairs every
+				// daemon born inside it, including one launched by a bare
+				// `groved start` that no factory rewrote the argv for.
+				pairPID = daemon.PairPIDFromEnv()
+			}
 			readyFd, _ := cmd.Flags().GetInt("ready-fd")
 			// The inherited readiness fd arrives without CLOEXEC (the parent
 			// passed it deliberately). Mark it now, before any boot step can
@@ -1707,6 +1713,7 @@ func probeTuimux(e daemonEntry) string {
 
 func newGrovedStatusCmd() *cobra.Command {
 	var prune bool
+	var fixtures bool
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "List all groved daemons (running and stale)",
@@ -1715,6 +1722,10 @@ each daemon is running. Running daemons show PID, scope, age, and socket
 path. Stale pidfiles (PID gone, file left behind) are listed separately.
 
 Pass --prune to remove stale pidfiles. Stale sockets are also unlinked.
+
+Pass --fixtures to additionally census daemons that this enumeration cannot
+see at all: those a test harness spawned inside a sandboxed HOME, whose
+pidfiles and sockets live under /tmp rather than the real state dir.
 
 Exits 0 if at least one running daemon is found; exits 1 if none.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1810,6 +1821,26 @@ Exits 0 if at least one running daemon is found; exits 1 if none.`,
 				}
 			}
 
+			// Fixture daemons are structurally invisible to everything above:
+			// the enumeration walks pidfiles under the REAL state dir, while a
+			// fixture's pidfile and socket live inside a sandboxed HOME under
+			// /tmp. That is why seven of them accumulated unnoticed until
+			// somebody read `ps` during a performance investigation. This is a
+			// census only — collecting them is `tend clean`'s job, because the
+			// harnesses that own them are tend's.
+			if fixtures {
+				found, ferr := daemon.FindFixtureDaemons()
+				if ferr != nil {
+					return fmt.Errorf("scanning fixture namespaces: %w", ferr)
+				}
+				fmt.Println()
+				fmt.Println("Fixture daemons (sandboxed test namespaces under /tmp):")
+				fmt.Print(daemon.FormatFixtureDaemons(found))
+				if len(found) > 0 {
+					fmt.Println("\nCollect abandoned ones with: tend clean --dry-run")
+				}
+			}
+
 			if len(running) == 0 {
 				os.Exit(1)
 			}
@@ -1817,6 +1848,8 @@ Exits 0 if at least one running daemon is found; exits 1 if none.`,
 		},
 	}
 	cmd.Flags().BoolVar(&prune, "prune", false, "Remove stale pidfiles (and their orphaned sockets)")
+	cmd.Flags().BoolVar(&fixtures, "fixtures", false,
+		"Also census daemons serving sockets inside test-fixture namespaces (/tmp/tend-*, /tmp/tendlab-*, /tmp/tuipilot-*)")
 	return cmd
 }
 
