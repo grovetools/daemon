@@ -2,12 +2,17 @@ package sync
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/devicekey"
 	"github.com/grovetools/core/pkg/syncproto"
 )
 
@@ -66,6 +71,39 @@ func TestAuthErrorClassification(t *testing.T) {
 	})
 }
 
+func TestNewClientFromConfigTriesDeviceBeforeTokenCommand(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	key, err := devicekey.Ensure()
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := syncproto.DecodeDevicePublicKey(key.PublicKeyString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(state, "token-command-ran")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sync/identity":
+			_ = json.NewEncoder(w).Encode(syncproto.IdentityResponse{ServerEpoch: "epoch-1", ProtocolVersions: syncproto.SupportedProtocolVersions()})
+		case "/sync/capabilities":
+			writeDeviceCapabilities(t, w, r, public, "device-session")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config.SyncConfig{Server: srv.URL, TokenCommand: "printf leaked > " + strconv.Quote(marker) + "; exit 1"}
+	if _, err := NewClientFromConfig(context.Background(), cfg, key.DeviceID(), "origin", "test", logging.NewUnifiedLogger("test")); err != nil {
+		t.Fatalf("device-first startup failed: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("legacy token command ran before successful v2 handshake: %v", err)
+	}
+}
+
 // TestAuthFailureHookFiresForLivePipelines covers the half the handshake
 // cannot see: transportLoop caches a connected client and never re-handshakes,
 // so a token revoked (or a server recreated) UNDER a running daemon only ever
@@ -82,7 +120,7 @@ func TestAuthFailureHookFiresForLivePipelines(t *testing.T) {
 		if r.URL.Path == "/sync/capabilities" {
 			handshakes++
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"capabilities":{"protocol_versions":[` + itoa(syncproto.ProtocolVersion) + `]}}`))
+			_, _ = w.Write([]byte(`{"protocol_version":` + itoa(syncproto.ProtocolVersionLegacy) + `,"capabilities":{"protocol_versions":[` + itoa(syncproto.ProtocolVersionLegacy) + `]}}`))
 			return
 		}
 		http.Error(w, "token revoked", http.StatusUnauthorized)

@@ -23,7 +23,8 @@ func serveSnapshotStub(t *testing.T, manifest *syncproto.SnapshotManifest) *http
 		switch r.URL.Path {
 		case "/sync/capabilities":
 			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
-				Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}},
+				ProtocolVersion: syncproto.ProtocolVersionLegacy,
+				Capabilities:    syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersionLegacy}},
 			})
 		case "/sync/snapshot":
 			_ = json.NewEncoder(w).Encode(manifest)

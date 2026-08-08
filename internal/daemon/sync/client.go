@@ -5,8 +5,10 @@ package sync
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	neturl "net/url"
+	"os"
 	"strings"
 	gosync "sync"
 	"sync/atomic"
@@ -21,6 +24,7 @@ import (
 
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/devicekey"
 	"github.com/grovetools/core/pkg/syncproto"
 )
 
@@ -65,12 +69,20 @@ func authStatusError(op string, code int, body []byte) error {
 	return fmt.Errorf("%s rejected with status %d (%s): %w", op, code, detail, ErrUnauthorized)
 }
 
+// DeviceSigner is the private-key capability needed for a v2 handshake.
+// devicekey.Key implements it without exposing private key material.
+type DeviceSigner interface {
+	DeviceID() string
+	Sign([]byte) []byte
+}
+
 // ClientConfig wraps the configuration needed to initialize a sync client.
 type ClientConfig struct {
 	ServerURL  string
 	Token      string
 	DeviceID   string
 	OriginID   string
+	Signer     DeviceSigner
 	Logger     *logging.UnifiedLogger
 	HTTPClient *http.Client
 	// TLSConfig, when non-nil, is applied to BOTH the general client and the
@@ -83,11 +95,25 @@ type ClientConfig struct {
 // Client is an HTTP wrapper for grove-syncd push/pull endpoints.
 type Client struct {
 	serverURL  string
-	token      string
 	deviceID   string
 	originID   string
+	signer     DeviceSigner
 	log        *logging.UnifiedLogger
 	httpClient *http.Client
+
+	// bearer is either the configured legacy credential or a short-lived v2
+	// session. Every request reads it under authMu so a refresh is immediately
+	// visible to push, pull, snapshot, history, and blob goroutines alike.
+	authMu      gosync.RWMutex
+	bearer      string
+	staticToken string
+	session     bool
+
+	// refreshMu coalesces only a currently in-flight refresh. Waiters share its
+	// result, but a later call may retry after a transient failure clears.
+	refreshMu       gosync.Mutex
+	refreshBearer   string
+	refreshInFlight *sessionRefresh
 	// pollClient serves long-poll pulls: its timeout must exceed the
 	// server-side wait or every quiet poll dies awaiting headers exactly
 	// when the server would respond (the general client's 30s == wait).
@@ -162,61 +188,166 @@ func NewClient(cfg ClientConfig) *Client {
 	}
 	pollClient := &http.Client{Timeout: 90 * time.Second, Transport: transport}
 	return &Client{
-		serverURL:  cfg.ServerURL,
-		token:      cfg.Token,
-		deviceID:   cfg.DeviceID,
-		originID:   cfg.OriginID,
-		log:        cfg.Logger,
-		httpClient: cfg.HTTPClient,
-		pollClient: pollClient,
+		serverURL:   cfg.ServerURL,
+		deviceID:    cfg.DeviceID,
+		originID:    cfg.OriginID,
+		signer:      cfg.Signer,
+		log:         cfg.Logger,
+		httpClient:  cfg.HTTPClient,
+		pollClient:  pollClient,
+		bearer:      cfg.Token,
+		staticToken: cfg.Token,
 	}
 }
 
 // Capabilities performs the handshake with the server, caching the response
-// for future blob-size decisions.
+// for future blob-size decisions. A device signer prefers v2; v1 is attempted
+// only when a real legacy token is available.
 func (c *Client) Capabilities(ctx context.Context, clientVersion string) (*syncproto.CapabilitiesResponse, error) {
+	if c.signer != nil {
+		capResp, err := c.deviceCapabilities(ctx, clientVersion)
+		if err == nil {
+			return capResp, nil
+		}
+		if c.staticToken == "" {
+			return nil, err
+		}
+	}
+	return c.legacyCapabilities(ctx, clientVersion)
+}
+
+func (c *Client) legacyCapabilities(ctx context.Context, clientVersion string) (*syncproto.CapabilitiesResponse, error) {
+	if c.staticToken == "" {
+		return nil, fmt.Errorf("sync authentication not configured: no device key or legacy token")
+	}
+	offered := []int{syncproto.ProtocolVersionLegacy}
 	req := &syncproto.CapabilitiesRequest{
 		ClientName:       "groved",
 		ClientVersion:    clientVersion,
-		ProtocolVersions: []int{syncproto.ProtocolVersion},
+		ProtocolVersions: offered,
 		OriginID:         c.originID,
 		DeviceID:         c.deviceID,
 	}
-
-	httpReq, err := c.newRequest(ctx, "POST", "/sync/capabilities", req)
+	httpReq, err := c.jsonRequest(ctx, "POST", "/sync/capabilities", req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create capabilities request: %w", err)
 	}
-
-	resp, err := c.httpClient.Do(httpReq)
+	httpReq.Header.Set("Authorization", "Bearer "+c.staticToken)
+	capResp, err := c.readCapabilities("capabilities request", httpReq, offered)
 	if err != nil {
-		return nil, fmt.Errorf("capabilities request failed: %w", err)
+		return nil, err
+	}
+	c.setBearer(c.staticToken, false)
+	c.caps.Store(capResp)
+	return capResp, nil
+}
+
+func (c *Client) deviceCapabilities(ctx context.Context, clientVersion string) (*syncproto.CapabilitiesResponse, error) {
+	if c.signer == nil {
+		return nil, fmt.Errorf("device signer not configured")
+	}
+	if c.deviceID != "" && c.signer.DeviceID() != c.deviceID {
+		return nil, fmt.Errorf("device signer belongs to %q, client device is %q", c.signer.DeviceID(), c.deviceID)
+	}
+
+	identityReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.serverURL+"/sync/identity", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create identity request: %w", err)
+	}
+	identityResp, err := c.httpClient.Do(identityReq)
+	if err != nil {
+		return nil, fmt.Errorf("identity request failed: %w", err)
+	}
+	defer identityResp.Body.Close()
+	if identityResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(identityResp.Body)
+		return nil, fmt.Errorf("identity request failed with status %d: %s", identityResp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var identity syncproto.IdentityResponse
+	if err := json.NewDecoder(identityResp.Body).Decode(&identity); err != nil {
+		return nil, fmt.Errorf("failed to decode identity response: %w", err)
+	}
+	if identity.ServerEpoch == "" || !containsVersion(identity.ProtocolVersions, syncproto.ProtocolVersionDeviceSession) {
+		return nil, fmt.Errorf("server does not advertise device-session protocol v%d", syncproto.ProtocolVersionDeviceSession)
+	}
+
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("failed to create capabilities nonce: %w", err)
+	}
+	offered := syncproto.SupportedProtocolVersions()
+	req := syncproto.CapabilitiesRequest{
+		ClientName:       "groved",
+		ClientVersion:    clientVersion,
+		ProtocolVersions: offered,
+		OriginID:         c.originID,
+		DeviceID:         c.signer.DeviceID(),
+		ServerEpoch:      identity.ServerEpoch,
+		Timestamp:        syncproto.CanonicalTimestamp(time.Now()),
+		Nonce:            base64.StdEncoding.EncodeToString(nonce),
+	}
+	payload, err := syncproto.CanonicalCapabilities(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to canonicalize capabilities proof: %w", err)
+	}
+	if err := syncproto.SetCapabilitiesSignature(&req, c.signer.Sign(payload)); err != nil {
+		return nil, fmt.Errorf("failed to sign capabilities proof: %w", err)
+	}
+	httpReq, err := c.jsonRequest(ctx, "POST", "/sync/capabilities", &req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create capabilities request: %w", err)
+	}
+	capResp, err := c.readCapabilities("device capabilities request", httpReq, offered)
+	if err != nil {
+		return nil, err
+	}
+	if capResp.ProtocolVersion != syncproto.ProtocolVersionDeviceSession || capResp.SessionToken == "" {
+		return nil, fmt.Errorf("device capabilities response did not establish a v2 session")
+	}
+	if capResp.ServerEpoch != identity.ServerEpoch {
+		return nil, fmt.Errorf("server epoch changed during device handshake")
+	}
+	c.setBearer(capResp.SessionToken, true)
+	c.caps.Store(capResp)
+	return capResp, nil
+}
+
+func (c *Client) readCapabilities(op string, req *http.Request, offered []int) (*syncproto.CapabilitiesResponse, error) {
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s failed: %w", op, err)
 	}
 	defer resp.Body.Close()
-
-	if err := c.rejectIfUnauthorized("capabilities request", resp); err != nil {
+	if err := c.rejectIfUnauthorized(op, resp); err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("capabilities request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("%s failed with status %d: %s", op, resp.StatusCode, string(body))
 	}
-
 	var capResp syncproto.CapabilitiesResponse
 	if err := json.NewDecoder(resp.Body).Decode(&capResp); err != nil {
 		return nil, fmt.Errorf("failed to decode capabilities response: %w", err)
 	}
-
 	if capResp.Error != "" {
 		return nil, fmt.Errorf("server capabilities error: %s", capResp.Error)
 	}
-
-	if !capResp.Capabilities.SupportsVersion(syncproto.ProtocolVersion) {
-		return nil, fmt.Errorf("server does not support protocol version %d", syncproto.ProtocolVersion)
+	if !containsVersion(offered, capResp.ProtocolVersion) {
+		return nil, fmt.Errorf("server selected unoffered protocol version %d", capResp.ProtocolVersion)
 	}
-
-	c.caps.Store(&capResp)
+	if !capResp.Capabilities.SupportsVersion(capResp.ProtocolVersion) {
+		return nil, fmt.Errorf("server selected protocol version %d without advertising it", capResp.ProtocolVersion)
+	}
 	return &capResp, nil
+}
+
+func containsVersion(versions []int, wanted int) bool {
+	for _, version := range versions {
+		if version == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 // Push uploads a batch of outbox entries to the server. Returns the
@@ -238,7 +369,7 @@ func (c *Client) Push(ctx context.Context, workspace string, events []syncproto.
 		return nil, fmt.Errorf("failed to create push request: %w", err)
 	}
 
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.doAuthenticated(ctx, c.httpClient, "push request", replayableRequest(httpReq))
 	if err != nil {
 		return nil, fmt.Errorf("push request failed: %w", err)
 	}
@@ -274,10 +405,9 @@ func (c *Client) PushBlob(ctx context.Context, hash string, data []byte) error {
 		return fmt.Errorf("failed to create blob upload request: %w", err)
 	}
 
-	httpReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
 	httpReq.Header.Set("Content-Type", "application/octet-stream")
 
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.doAuthenticated(ctx, c.httpClient, "blob upload", replayableRequest(httpReq))
 	if err != nil {
 		return fmt.Errorf("blob upload request failed: %w", err)
 	}
@@ -304,9 +434,7 @@ func (c *Client) Snapshot(ctx context.Context, workspace string) (*syncproto.Sna
 		return nil, fmt.Errorf("failed to create snapshot request: %w", err)
 	}
 
-	httpReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
-
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.doAuthenticated(ctx, c.httpClient, "snapshot request", replayableRequest(httpReq))
 	if err != nil {
 		return nil, fmt.Errorf("snapshot request failed: %w", err)
 	}
@@ -329,23 +457,132 @@ func (c *Client) Snapshot(ctx context.Context, workspace string) (*syncproto.Sna
 	return &manifest, nil
 }
 
-// newRequest is a helper that constructs an authenticated HTTP request with
-// a JSON body.
-func (c *Client) newRequest(ctx context.Context, method, path string, body interface{}) (*http.Request, error) {
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(body); err != nil {
-		return nil, err
+type requestFactory func() (*http.Request, error)
+
+type sessionRefresh struct {
+	done chan struct{}
+	err  error
+}
+
+func replayableRequest(req *http.Request) requestFactory {
+	return func() (*http.Request, error) {
+		clone := req.Clone(req.Context())
+		if req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, err
+			}
+			clone.Body = body
+		}
+		return clone, nil
+	}
+}
+
+func (c *Client) currentBearer() (string, bool) {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.bearer, c.session
+}
+
+func (c *Client) setBearer(bearer string, session bool) {
+	c.authMu.Lock()
+	c.bearer = bearer
+	c.session = session
+	c.authMu.Unlock()
+}
+
+// refreshSession coalesces all simultaneous 401s for the same session bearer
+// into one signed handshake. Only the in-flight operation is shared: once it
+// finishes, failures are forgotten so a later request can recover normally.
+func (c *Client) refreshSession(ctx context.Context, rejected string) error {
+	c.refreshMu.Lock()
+	current, session := c.currentBearer()
+	if session && current != rejected {
+		c.refreshMu.Unlock()
+		return nil
+	}
+	if !session {
+		c.refreshMu.Unlock()
+		return ErrUnauthorized
+	}
+	if c.refreshInFlight != nil && c.refreshBearer == rejected {
+		call := c.refreshInFlight
+		c.refreshMu.Unlock()
+		select {
+		case <-call.done:
+			return call.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
-	url := fmt.Sprintf("%s%s", c.serverURL, path)
-	req, err := http.NewRequestWithContext(ctx, method, url, &buf)
+	call := &sessionRefresh{done: make(chan struct{})}
+	c.refreshBearer = rejected
+	c.refreshInFlight = call
+	c.refreshMu.Unlock()
+
+	_, call.err = c.deviceCapabilities(ctx, "")
+
+	c.refreshMu.Lock()
+	close(call.done)
+	c.refreshInFlight = nil
+	c.refreshBearer = ""
+	c.refreshMu.Unlock()
+	return call.err
+}
+
+// doAuthenticated applies the current synchronized bearer to one request. A
+// rejected device session is refreshed and retried exactly once. Legacy 401s
+// are returned unchanged for the existing classifier and failure hook.
+func (c *Client) doAuthenticated(ctx context.Context, hc *http.Client, op string, makeRequest requestFactory) (*http.Response, error) {
+	req, err := makeRequest()
 	if err != nil {
 		return nil, err
 	}
+	bearer, session := c.currentBearer()
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusUnauthorized || !session {
+		return resp, nil
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if err := c.refreshSession(ctx, bearer); err != nil {
+		return nil, fmt.Errorf("%s session refresh failed: %w", op, err)
+	}
+	retry, err := makeRequest()
+	if err != nil {
+		return nil, err
+	}
+	refreshed, _ := c.currentBearer()
+	retry.Header.Set("Authorization", "Bearer "+refreshed)
+	return hc.Do(retry)
+}
 
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
+func (c *Client) jsonRequest(ctx context.Context, method, path string, body interface{}) (*http.Request, error) {
+	var buf bytes.Buffer
+	if body != nil {
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			return nil, err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.serverURL+path, &buf)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	return req, nil
+}
+
+// newRequest constructs an authenticated JSON request. The bearer is applied
+// by doAuthenticated at send time, never captured here.
+func (c *Client) newRequest(ctx context.Context, method, path string, body interface{}) (*http.Request, error) {
+	return c.jsonRequest(ctx, method, path, body)
 }
 
 // MaxInlineSize returns the server's maximum inline content size, or the
@@ -387,22 +624,26 @@ func (c *Client) SupportsBlobs() bool {
 	return false
 }
 
-// NewClientFromConfig constructs a Client from a SyncConfig, resolving the
-// token and validating the server URL.
+// NewClientFromConfig constructs a Client from a SyncConfig. Device auth is
+// attempted before a legacy credential is resolved, so a stale token command
+// cannot block or leak through an otherwise valid v2 startup.
 func NewClientFromConfig(ctx context.Context, cfg *config.SyncConfig, deviceID, originID, clientVersion string, logger *logging.UnifiedLogger) (*Client, error) {
 	if cfg.Server == "" {
 		return nil, fmt.Errorf("sync server URL not configured")
 	}
 
-	token, err := cfg.ResolveToken()
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve sync token: %w", err)
+	var signer DeviceSigner
+	var err error
+	if keyPath := devicekey.Path(); keyPath != "" {
+		if _, statErr := os.Lstat(keyPath); statErr == nil {
+			signer, err = devicekey.Load()
+			if err != nil {
+				return nil, fmt.Errorf("failed to load device key: %w", err)
+			}
+		} else if !os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("failed to inspect device key: %w", statErr)
+		}
 	}
-
-	if token == "" {
-		return nil, fmt.Errorf("sync token not configured")
-	}
-
 	tlsCfg, err := cfg.TLSClientConfig()
 	if err != nil {
 		return nil, err
@@ -410,18 +651,45 @@ func NewClientFromConfig(ctx context.Context, cfg *config.SyncConfig, deviceID, 
 
 	client := NewClient(ClientConfig{
 		ServerURL: cfg.Server,
-		Token:     token,
 		DeviceID:  deviceID,
 		OriginID:  originID,
+		Signer:    signer,
 		Logger:    logger,
 		TLSConfig: tlsCfg,
 	})
 
-	// Perform handshake
-	if _, err := client.Capabilities(ctx, clientVersion); err != nil {
-		return nil, fmt.Errorf("capabilities handshake failed: %w", err)
+	if signer != nil {
+		if _, deviceErr := client.deviceCapabilities(ctx, clientVersion); deviceErr == nil {
+			return client, nil
+		} else {
+			token, tokenErr := cfg.ResolveToken()
+			if tokenErr != nil {
+				return nil, fmt.Errorf("legacy sync credential resolution failed after device authentication was unavailable: %w", tokenErr)
+			}
+			if token == "" {
+				return nil, fmt.Errorf("capabilities handshake failed: %w", deviceErr)
+			}
+			client.staticToken = token
+			client.setBearer(token, false)
+			if _, legacyErr := client.legacyCapabilities(ctx, clientVersion); legacyErr != nil {
+				return nil, fmt.Errorf("capabilities handshake failed: device authentication unavailable and legacy fallback failed: %w", legacyErr)
+			}
+			return client, nil
+		}
 	}
 
+	token, err := cfg.ResolveToken()
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve legacy sync credential: %w", err)
+	}
+	if token == "" {
+		return nil, fmt.Errorf("sync authentication not configured: no device key or legacy token")
+	}
+	client.staticToken = token
+	client.setBearer(token, false)
+	if _, err := client.legacyCapabilities(ctx, clientVersion); err != nil {
+		return nil, fmt.Errorf("capabilities handshake failed: %w", err)
+	}
 	return client, nil
 }
 
@@ -447,7 +715,7 @@ func (c *Client) PullEvents(ctx context.Context, workspace string, cursor int64,
 		return nil, fmt.Errorf("failed to create pull request: %w", err)
 	}
 
-	resp, err := c.pollClient.Do(httpReq)
+	resp, err := c.doAuthenticated(ctx, c.pollClient, "pull request", replayableRequest(httpReq))
 	if err != nil {
 		return nil, fmt.Errorf("pull request failed: %w", err)
 	}
@@ -484,7 +752,7 @@ func (c *Client) FetchBlob(ctx context.Context, hash string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to create blob fetch request: %w", err)
 	}
 
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.doAuthenticated(ctx, c.httpClient, "blob fetch", replayableRequest(httpReq))
 	if err != nil {
 		return nil, fmt.Errorf("blob fetch failed: %w", err)
 	}
@@ -528,9 +796,7 @@ func (c *Client) History(ctx context.Context, workspace, path string) ([]History
 	if err != nil {
 		return nil, fmt.Errorf("failed to create history request: %w", err)
 	}
-	httpReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
-
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.doAuthenticated(ctx, c.httpClient, "history request", replayableRequest(httpReq))
 	if err != nil {
 		return nil, fmt.Errorf("history request failed: %w", err)
 	}
@@ -560,9 +826,7 @@ func (c *Client) HistoryBlob(ctx context.Context, workspace, documentID string, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create history blob request: %w", err)
 	}
-	httpReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
-
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.doAuthenticated(ctx, c.httpClient, "history blob request", replayableRequest(httpReq))
 	if err != nil {
 		return nil, fmt.Errorf("history blob request failed: %w", err)
 	}

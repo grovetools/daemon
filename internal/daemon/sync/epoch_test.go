@@ -135,8 +135,9 @@ func serveEpochStoreStub(t *testing.T, epoch *string, docs map[string]*occDoc) *
 		case "/sync/capabilities":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
-				ServerEpoch:  *epoch,
-				Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}},
+				ServerEpoch:     *epoch,
+				ProtocolVersion: syncproto.ProtocolVersionLegacy,
+				Capabilities:    syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersionLegacy}},
 			})
 		case "/sync/snapshot":
 			w.Header().Set("Content-Type", "application/json")

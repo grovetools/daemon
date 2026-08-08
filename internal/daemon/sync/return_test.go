@@ -21,7 +21,7 @@ func returnTestClient(t *testing.T, epoch string, snaps map[string]syncproto.Sna
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/sync/capabilities":
-			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}}, ServerEpoch: epoch})
+			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{ProtocolVersion: syncproto.ProtocolVersionLegacy, Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersionLegacy}}, ServerEpoch: epoch})
 		case "/sync/snapshot":
 			_ = json.NewEncoder(w).Encode(snaps[r.URL.Query().Get("workspace")])
 		case "/sync/history/blob":

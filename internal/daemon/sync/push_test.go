@@ -25,7 +25,8 @@ func servePushStub(t *testing.T, push func(req *syncproto.PushRequest) *syncprot
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/sync/capabilities" {
 			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
-				Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}},
+				ProtocolVersion: syncproto.ProtocolVersionLegacy,
+				Capabilities:    syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersionLegacy}},
 			})
 			return
 		}
@@ -444,7 +445,8 @@ func serveRebaseStub(t *testing.T, push func(req *syncproto.PushRequest) *syncpr
 		case "/sync/capabilities":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
-				Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}},
+				ProtocolVersion: syncproto.ProtocolVersionLegacy,
+				Capabilities:    syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersionLegacy}},
 			})
 		case "/sync/push":
 			w.Header().Set("Content-Type", "application/json")
@@ -943,7 +945,8 @@ func serveOCCStoreStub(t *testing.T, docs map[string]*occDoc, record func(ev syn
 		case "/sync/capabilities":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
-				Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}},
+				ProtocolVersion: syncproto.ProtocolVersionLegacy,
+				Capabilities:    syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersionLegacy}},
 			})
 		case "/sync/push":
 			w.Header().Set("Content-Type", "application/json")

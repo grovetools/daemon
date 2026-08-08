@@ -25,8 +25,9 @@ func serveBlobCeilingStub(t *testing.T, maxInline, maxBlob int64, pushCount *ato
 		switch r.URL.Path {
 		case "/sync/capabilities":
 			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
+				ProtocolVersion: syncproto.ProtocolVersionLegacy,
 				Capabilities: syncproto.Capabilities{
-					ProtocolVersions: []int{syncproto.ProtocolVersion},
+					ProtocolVersions: []int{syncproto.ProtocolVersionLegacy},
 					Blobs:            true,
 					MaxInlineSize:    maxInline,
 					MaxBlobSize:      maxBlob,
@@ -226,7 +227,8 @@ func TestClientMaxBlobSize(t *testing.T) {
 	oldSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
-			Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}, Blobs: true},
+			ProtocolVersion: syncproto.ProtocolVersionLegacy,
+			Capabilities:    syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersionLegacy}, Blobs: true},
 		})
 	}))
 	defer oldSrv.Close()
