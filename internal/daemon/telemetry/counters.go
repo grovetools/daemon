@@ -120,6 +120,22 @@ var (
 	PlanStatsPass           = Default().Stat("planstats.pass")
 	PlanStatsWorkspaces     = Default().Counter("planstats.pass.workspaces")
 	planStatsWorkspacesLast = Default().Gauge("planstats.pass.workspaces_last")
+	// Event triage in FRONT of that pass. A plans directory is written into
+	// continuously by whatever agents are running under it — job logs, chat
+	// transcripts, `.artifacts/` output — and none of that is readable by the
+	// plan index or the stats recount, both of which open a strictly bounded
+	// set of files. suppressed counts the events dropped on that ground before
+	// they could arm the refresh debounce; read it against
+	// planstats.events.kept, whose ratio is how much of the plan-file event
+	// stream was pure churn.
+	PlanStatsEventsKept       = Default().RateCounter("planstats.events.kept")
+	PlanStatsEventsSuppressed = Default().RateCounter("planstats.events.suppressed")
+	// PlanStatsDeferred counts passes the rate floor pushed onto a trailing
+	// timer rather than running immediately. Every increment is one whole
+	// portfolio recount that did not happen, so this is the floor's yield —
+	// and because the trailing run always fires, it is a deferral count, never
+	// a drop count.
+	PlanStatsDeferred = Default().Counter("planstats.pass.deferred")
 
 	// Transcript parsing (the rescan-loop signature).
 	TranscriptConsidered = Default().RateCounter("transcript.considered")
@@ -211,6 +227,22 @@ func RecordPlanStatsPass(n int, d time.Duration) {
 	PlanStatsWorkspaces.Add(int64(n))
 	planStatsWorkspacesLast.Set(float64(n))
 }
+
+// RecordPlanStatsEvents records one classified batch of plan-directory events:
+// kept are the ones something the flow watcher publishes can actually read,
+// suppressed the ones provably invisible to both readers.
+func RecordPlanStatsEvents(kept, suppressed int) {
+	if kept > 0 {
+		PlanStatsEventsKept.Add(int64(kept))
+	}
+	if suppressed > 0 {
+		PlanStatsEventsSuppressed.Add(int64(suppressed))
+	}
+}
+
+// RecordPlanStatsDeferred records one aggregated-PlanStats pass held back by
+// the rate floor and handed to its trailing timer instead.
+func RecordPlanStatsDeferred() { PlanStatsDeferred.Inc() }
 
 // RecordWatcherBatch records one debounce batch from the unified watcher.
 func RecordWatcherBatch(raw int) {

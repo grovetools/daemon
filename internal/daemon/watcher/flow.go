@@ -1,7 +1,9 @@
 package watcher
 
 import (
+	"bufio"
 	"context"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,6 +24,7 @@ import (
 	"github.com/grovetools/core/util/frontmatter"
 	"github.com/grovetools/daemon/internal/daemon/jobattr"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 	"github.com/grovetools/daemon/internal/enrichment"
 	"github.com/grovetools/flow/pkg/orchestration"
 )
@@ -71,11 +74,44 @@ type FlowHandler struct {
 	statsMu      sync.Mutex
 	statsRunning bool
 	statsQueued  bool
+	// statsQueuedForce remembers that the coalesced debt came from a
+	// correctness path (cold start, reconciliation ticker), so the trailing
+	// run inherits that path's exemption from the rate floor instead of
+	// being throttled as if it were churn.
+	statsQueuedForce bool
+	// statsMinInterval is the rate floor: the minimum wall-clock spacing
+	// between the STARTS of two stats passes. Zero disables it, restoring
+	// "every lifecycle event recounts the portfolio". statsLastRun is stamped
+	// when a pass starts (rate of starts is what the floor bounds), and
+	// statsFloorTimer carries the single trailing run owed while the floor
+	// holds — the reason a floor can never lose an update.
+	statsMinInterval time.Duration
+	statsLastRun     time.Time
+	statsFloorTimer  *time.Timer
+	// clock and statsPass are the seams the floor's tests drive: a fake clock
+	// makes the floor observable without sleeping through it, and an
+	// injectable pass counts runs without a populated store behind them.
+	clock     func() time.Time
+	statsPass func(seq uint64)
+	// jobMetaHash memoizes each job file's last-seen frontmatter, keyed by
+	// resolved path. It is what lets a chat transcript append — a WRITE on a
+	// file the index genuinely reads — be recognized as inert.
+	jobMetaMu   sync.Mutex
+	jobMetaHash map[string]uint64
+
 	// scanSeq increments on every index publish; the async stats pass uses it
 	// as a fence so results read from disk before a newer publish are
 	// discarded instead of clobbering fresher lifecycle state.
 	scanSeq atomic.Uint64
 }
+
+// defaultPlanStatsMinInterval is the rate floor applied when the daemon config
+// says nothing. Plan rows in the TUI do NOT ride it — they are published by
+// the synchronous index refresh on its 2s debounce — so what this bounds is
+// how often aggregated per-workspace job counts can move. Half a minute is
+// well inside the "nobody notices" band for a count, and it is the difference
+// between one portfolio-wide recount per lifecycle event and one per minute.
+const defaultPlanStatsMinInterval = 30 * time.Second
 
 // dirScanResult is the disk-derived portion of one plans directory's rows.
 // Selected/RunningSessions/bindings/git are overlays recomputed on every
@@ -91,14 +127,28 @@ func NewFlowHandler(st *store.Store, cfg *config.Config, debounceMs int) *FlowHa
 		debounceMs = 2000
 	}
 
-	return &FlowHandler{
-		store:        st,
-		cfg:          cfg,
-		locator:      workspace.NewNotebookLocator(cfg),
-		ulog:         logging.NewUnifiedLogger("groved.watcher.flow"),
-		watchedPaths: make(map[string]*workspace.WorkspaceNode),
-		debounceMs:   debounceMs,
+	h := &FlowHandler{
+		store:            st,
+		cfg:              cfg,
+		locator:          workspace.NewNotebookLocator(cfg),
+		ulog:             logging.NewUnifiedLogger("groved.watcher.flow"),
+		watchedPaths:     make(map[string]*workspace.WorkspaceNode),
+		debounceMs:       debounceMs,
+		statsMinInterval: defaultPlanStatsMinInterval,
+		clock:            time.Now,
 	}
+	h.statsPass = h.refreshPlanStats
+	return h
+}
+
+// SetPlanStatsMinInterval overrides the aggregated-PlanStats rate floor.
+// A non-positive duration disables the floor, which is the behaviour that
+// existed before it: every lifecycle event recounts the whole portfolio.
+func (h *FlowHandler) SetPlanStatsMinInterval(d time.Duration) *FlowHandler {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+	h.statsMinInterval = d
+	return h
 }
 
 func (h *FlowHandler) Name() string {
@@ -203,27 +253,62 @@ func (h *FlowHandler) MatchesEvent(event fsnotify.Event) bool {
 }
 
 // resolveFlowWatchPath returns the stable filesystem spelling fsnotify uses.
+//
+// EvalSymlinks needs the path to exist, and the events that matter most to the
+// index are precisely the ones whose leaf does not: a removed job file, the
+// old name of a rename. Returning the unresolved spelling for those would fail
+// every comparison against a watch set built from resolved paths whenever the
+// notebook is reached through a symlink, so the deepest ancestor that DOES
+// exist is resolved and the remainder re-attached.
 func resolveFlowWatchPath(path string) string {
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
+	path = filepath.Clean(path)
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		path = resolved
+		return filepath.Clean(resolved)
 	}
-	return filepath.Clean(path)
+	parent := filepath.Dir(path)
+	if parent == path {
+		return path
+	}
+	return filepath.Join(resolveFlowWatchPath(parent), filepath.Base(path))
 }
 
 // HandleEvents triggers a debounced plan stats refresh when plan files change.
 // It also parses modified/created .md files to instantly discover new jobs.
+//
+// Two filters stand in front of the refresh, because a plans directory under a
+// running agent is written into continuously and almost none of it can move
+// anything this handler publishes:
+//
+//   - by path (classifyPlanEvent): only the files the index and the stats
+//     recount actually open;
+//   - by content (absorbJobFile): a job `.md` whose frontmatter came back
+//     byte-identical. This is the loud one — an agent appends its chat
+//     transcript to the very file whose frontmatter the index reads, and both
+//     readers stop at the closing fence, so the append changes nothing.
+//
+// Only when something survives both is the refresh armed.
 func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event) error {
-	h.ulog.Debug("Plan file changes detected").Field("count", len(events)).Log(ctx)
+	batch := h.classifyEvents(events)
+	if len(batch.kept) == 0 {
+		telemetry.RecordPlanStatsEvents(0, batch.suppressed)
+		h.logSuppressed(ctx, batch, 0)
+		return nil
+	}
+	h.ulog.Debug("Plan file changes detected").Field("count", len(batch.kept)).Log(ctx)
 
 	var discoveredJobs []*models.JobInfo
 	lifecycleChanged := false
-	affectedDirs := h.affectedPlansDirs(events)
+	affectedDirs := make(map[string]struct{})
+	inert := 0
 
-	for _, event := range events {
-		if (filepath.Base(event.Name) == ".grove-plan.yml" || filepath.Base(event.Name) == "config.yml") &&
+	for _, classified := range batch.kept {
+		event := classified.event
+		relevant := true
+
+		if classified.class == planEventConfig &&
 			(event.Op&fsnotify.Write != 0 || event.Op&fsnotify.Create != 0 || event.Op&fsnotify.Rename != 0 || event.Op&fsnotify.Remove != 0) {
 			lifecycleChanged = true
 			// Event-match boundary: plan-config mutations are the hold/unhold
@@ -238,82 +323,29 @@ func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 		// fsnotify can watch the new directory, so this bare dir-create is the
 		// ONLY signal we get — treat it as a lifecycle edge rather than
 		// letting the new row wait out the enrichment debounce.
-		if event.Op&fsnotify.Create != 0 && !lifecycleChanged && h.isDirectPlanDirCreate(event.Name) {
+		if classified.class == planEventMembership && event.Op&fsnotify.Create != 0 &&
+			!lifecycleChanged && isPlanDirCreate(classified.path) {
 			lifecycleChanged = true
 			h.ulog.Info("Plan directory created").
 				Field("path", event.Name).
 				Log(ctx)
 		}
-		if !strings.HasSuffix(event.Name, ".md") {
+		// A job-file write only matters if its frontmatter moved. Removals and
+		// renames are not content edits and always matter: they change the
+		// plan's job set and its directory mtime.
+		if classified.class == planEventJob && event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+			relevant = h.absorbJobFile(classified, &discoveredJobs)
+		}
+
+		if !relevant {
+			inert++
 			continue
 		}
-		if event.Op&fsnotify.Write == 0 && event.Op&fsnotify.Create == 0 {
-			continue
-		}
-
-		base := filepath.Base(event.Name)
-		if base == "spec.md" || base == "README.md" {
-			continue
-		}
-
-		file, err := os.Open(event.Name)
-		if err != nil {
-			continue
-		}
-
-		meta, err := frontmatter.Parse(file)
-		_ = file.Close()
-
-		if err == nil && meta.ID != "" {
-			submittedAt := meta.StartedAt
-			if submittedAt.IsZero() {
-				submittedAt = meta.UpdatedAt
-			}
-			if submittedAt.IsZero() {
-				submittedAt = time.Now()
-			}
-
-			planDir := filepath.Dir(event.Name)
-			job := &models.JobInfo{
-				ID:          meta.ID,
-				Title:       meta.Title,
-				Type:        models.JobType(meta.Type),
-				Status:      meta.Status,
-				PlanDir:     planDir,
-				PlanName:    filepath.Base(planDir),
-				JobFile:     base,
-				SubmittedAt: submittedAt,
-			}
-
-			if len(meta.Channels) > 0 {
-				job.Channels = meta.Channels
-			}
-
-			// Attribute the job to a workspace. This is the same computation
-			// the JobCollector performs on its periodic sweep, and both
-			// publish under the same store key with last-write-wins, so it
-			// MUST go through the shared jobattr rule: any divergence makes a
-			// job's recorded workspace flip depending on which producer ran
-			// most recently.
-			//
-			// The plans directory only identifies the plan's OWNER workspace
-			// (one ecosystem, many members). The job's own frontmatter
-			// `worktree:` is the higher authority for which checkout the job
-			// actually runs in, resolved within the owner's ecosystem and
-			// deliberately degrading to the owner — never to a stranger — when
-			// the name is missing, unknown, or ambiguous.
-			h.pathsMutex.RLock()
-			owner := h.ownerForPath(resolveFlowWatchPath(event.Name))
-			index := h.watchedNodes
-			h.pathsMutex.RUnlock()
-			if owner != nil {
-				job.WorkDir, job.Repo, job.Branch, _ = jobattr.JobWorkspace(
-					index, owner, meta.Worktree, owner.Path, owner.Name)
-			}
-
-			discoveredJobs = append(discoveredJobs, job)
-		}
+		affectedDirs[classified.plansDir] = struct{}{}
 	}
+
+	telemetry.RecordPlanStatsEvents(len(batch.kept)-inert, batch.suppressed+inert)
+	h.logSuppressed(ctx, batch, inert)
 
 	if len(discoveredJobs) > 0 {
 		h.store.ApplyUpdate(store.Update{
@@ -328,68 +360,378 @@ func (h *FlowHandler) HandleEvents(ctx context.Context, events []fsnotify.Event)
 		// enrichment. A debounced rescan can collapse hold→unhold into one live
 		// snapshot, so publish each observed config mutation synchronously.
 		h.triggerLifecycleRefresh(affectedDirs)
-	} else {
+	} else if len(affectedDirs) > 0 {
 		h.scheduleRefresh(affectedDirs, false, time.Duration(h.debounceMs)*time.Millisecond)
 	}
 	return nil
 }
 
-// isDirectPlanDirCreate reports whether path is a just-created directory that
-// sits immediately under a watched plans directory (or its .archive
-// container) — i.e. a new plan row, not organizational churn deeper inside an
-// existing plan.
-func (h *FlowHandler) isDirectPlanDirCreate(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil || !info.IsDir() {
-		return false
+func (h *FlowHandler) logSuppressed(ctx context.Context, batch classifiedPlanBatch, inert int) {
+	if batch.suppressed+inert == 0 {
+		return
 	}
-	if strings.HasPrefix(filepath.Base(path), ".") {
-		return false
-	}
-	parent := resolveFlowWatchPath(filepath.Dir(path))
-	if filepath.Base(parent) == ".archive" {
-		parent = filepath.Dir(parent)
-	}
-
-	h.pathsMutex.RLock()
-	defer h.pathsMutex.RUnlock()
-	seen := make(map[string]struct{})
-	for _, wsNode := range h.watchedPaths {
-		plansDir, err := h.locator.GetPlansDir(wsNode)
-		if err != nil || plansDir == "" {
-			continue
-		}
-		if _, dup := seen[plansDir]; dup {
-			continue
-		}
-		seen[plansDir] = struct{}{}
-		if parent == resolveFlowWatchPath(plansDir) {
-			return true
-		}
-	}
-	return false
+	h.ulog.Debug("Plan events suppressed as non-lifecycle").
+		Field("unreadable_path", batch.suppressed).
+		Field("unchanged_frontmatter", inert).
+		Field("kept", len(batch.kept)-inert).
+		Field("sample", batch.suppressedSample).
+		Log(ctx)
 }
 
-// affectedPlansDirs maps event paths back to the plans directories they touch,
-// so the follow-up refresh only re-reads those directories from disk.
-func (h *FlowHandler) affectedPlansDirs(events []fsnotify.Event) map[string]struct{} {
-	dirs := make(map[string]struct{})
+// absorbJobFile reads one job file's frontmatter and reports whether it moved
+// since this daemon last saw the file. A changed (or first-seen) frontmatter
+// also publishes the job, which is how a new job reaches clients without
+// waiting for the JobCollector's sweep.
+func (h *FlowHandler) absorbJobFile(classified classifiedPlanEvent, jobs *[]*models.JobInfo) bool {
+	raw, meta, parsed := jobFrontmatter(classified.event.Name)
+	if !h.jobFrontmatterChanged(classified.path, raw) {
+		return false
+	}
+
+	base := filepath.Base(classified.event.Name)
+	if !parsed || meta.ID == "" || base == "spec.md" || base == "README.md" {
+		// Nothing to publish, but the file is new to us (or genuinely
+		// changed), so the refresh still runs.
+		return true
+	}
+
+	submittedAt := meta.StartedAt
+	if submittedAt.IsZero() {
+		submittedAt = meta.UpdatedAt
+	}
+	if submittedAt.IsZero() {
+		submittedAt = time.Now()
+	}
+
+	planDir := filepath.Dir(classified.event.Name)
+	job := &models.JobInfo{
+		ID:          meta.ID,
+		Title:       meta.Title,
+		Type:        models.JobType(meta.Type),
+		Status:      meta.Status,
+		PlanDir:     planDir,
+		PlanName:    filepath.Base(planDir),
+		JobFile:     base,
+		SubmittedAt: submittedAt,
+	}
+	if len(meta.Channels) > 0 {
+		job.Channels = meta.Channels
+	}
+
+	// Attribute the job to a workspace. This is the same computation the
+	// JobCollector performs on its periodic sweep, and both publish under the
+	// same store key with last-write-wins, so it MUST go through the shared
+	// jobattr rule: any divergence makes a job's recorded workspace flip
+	// depending on which producer ran most recently.
+	//
+	// The plans directory only identifies the plan's OWNER workspace (one
+	// ecosystem, many members). The job's own frontmatter `worktree:` is the
+	// higher authority for which checkout the job actually runs in, resolved
+	// within the owner's ecosystem and deliberately degrading to the owner —
+	// never to a stranger — when the name is missing, unknown, or ambiguous.
+	h.pathsMutex.RLock()
+	owner := h.ownerForPath(classified.path)
+	index := h.watchedNodes
+	h.pathsMutex.RUnlock()
+	if owner != nil {
+		job.WorkDir, job.Repo, job.Branch, _ = jobattr.JobWorkspace(
+			index, owner, meta.Worktree, owner.Path, owner.Name)
+	}
+
+	*jobs = append(*jobs, job)
+	return true
+}
+
+// maxFrontmatterBytes bounds what jobFrontmatter will treat as a frontmatter
+// block. A job file's frontmatter is a few hundred bytes; anything past this
+// is a file whose opening fence is not really frontmatter, and reading it
+// would defeat the point of stopping at the closing fence.
+const maxFrontmatterBytes = 64 << 10
+
+// maxJobMetaMemo bounds the frontmatter memo. A portfolio has thousands of job
+// files, not millions, but a daemon runs for weeks and job files come and go,
+// so the table is dropped wholesale rather than grown without bound; the cost
+// of a reset is one extra refresh per job file next written.
+const maxJobMetaMemo = 20000
+
+// jobFrontmatter returns one job file's raw frontmatter block and its parsed
+// view. It stops at the closing fence, so a multi-megabyte chat transcript
+// costs one small read — which is the entire reason the comparison is
+// affordable on every write event.
+//
+// The RAW block is what gets compared, not the parsed DocMetadata: flow's own
+// LoadJobMeta reads fields this parser does not, and a change to one of those
+// (a `depends_on` edit, say) must not look unchanged here.
+func jobFrontmatter(path string) (raw string, meta frontmatter.DocMetadata, ok bool) {
+	file, err := os.Open(path) //nolint:gosec // G304: path from the watched plans tree
+	if err != nil {
+		return "", meta, false
+	}
+	defer func() { _ = file.Close() }()
+
+	var block strings.Builder
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 8<<10), maxFrontmatterBytes)
+	inside := false
+	closed := false
+	preamble := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "---" {
+			if !inside {
+				inside = true
+				continue
+			}
+			closed = true
+			break
+		}
+		if !inside {
+			// frontmatter.Parse gives up when no opening fence appears in the
+			// first few lines; matching that keeps the two in agreement about
+			// what counts as a job file.
+			if preamble++; preamble > 5 {
+				return "", meta, false
+			}
+			continue
+		}
+		block.WriteString(line)
+		block.WriteByte('\n')
+		if block.Len() > maxFrontmatterBytes {
+			return "", meta, false
+		}
+	}
+	if !closed {
+		// A half-written file: no closing fence yet. Reporting "no
+		// frontmatter" would memoize an empty block, and the completing write
+		// then reads as a change — which is exactly the desired outcome.
+		return "", meta, false
+	}
+	raw = block.String()
+	meta, err = frontmatter.ParseString("---\n" + raw + "---\n")
+	if err != nil {
+		return raw, meta, false
+	}
+	return raw, meta, true
+}
+
+// jobFrontmatterChanged records path's frontmatter and reports whether it
+// differs from what this daemon last saw there. A first sighting always counts
+// as changed: the daemon cannot know whether it missed an edit while down.
+func (h *FlowHandler) jobFrontmatterChanged(path, raw string) bool {
+	sum := fnv.New64a()
+	_, _ = sum.Write([]byte(raw))
+	digest := sum.Sum64()
+
+	h.jobMetaMu.Lock()
+	defer h.jobMetaMu.Unlock()
+	if h.jobMetaHash == nil {
+		h.jobMetaHash = make(map[string]uint64)
+	}
+	if len(h.jobMetaHash) >= maxJobMetaMemo {
+		h.jobMetaHash = make(map[string]uint64)
+	}
+	previous, seen := h.jobMetaHash[path]
+	h.jobMetaHash[path] = digest
+	return !seen || previous != digest
+}
+
+// isPlanDirCreate reports whether a membership-class create event is a
+// just-created DIRECTORY, i.e. a new plan row rather than a stray file
+// dropped into a plans root. Everything else the old spelling of this check
+// established — direct child of a watched plans directory (or of its .archive
+// container), not hidden — the classifier has already proven, so what is left
+// is the one probe that needs the filesystem.
+func isPlanDirCreate(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// planEventClass is what one filesystem event under a plans directory can
+// change in the two things hanging off this handler: the plan index
+// (scanPlansDir → loadIndexedPlans → orchestration.LoadPlanLenient) and the
+// aggregated PlanStats enrichment (enrichment.countPlanStats →
+// processPlanCounts).
+//
+// Both readers open a strictly bounded, shallow set of files, and neither
+// descends below a plan root: they enumerate the plans directory, then read
+// each plan's config and its TOP-LEVEL `.md` files. Everything deeper — the
+// `.artifacts/` tree a running agent writes into continuously, job logs, chat
+// transcripts, `.claude/` — is invisible to both, which is why an allowlist
+// (rather than a denylist of known-noisy names) is the honest filter here: a
+// new kind of agent output cannot silently start costing a portfolio recount.
+type planEventClass int
+
+const (
+	// planEventNone is an event neither reader can observe. Dropped before it
+	// arms the refresh debounce.
+	planEventNone planEventClass = iota
+	// planEventJob is a top-level plan `.md`: job frontmatter, and therefore
+	// the job's status, type and channels as well as the plan's job counts.
+	planEventJob
+	// planEventConfig is a plan's config file: hold/unhold, worktree binding,
+	// finished status. This is the only class published synchronously.
+	planEventConfig
+	// planEventMembership is an entry directly under a plans directory (or its
+	// .archive container) — a plan appearing, disappearing or being renamed.
+	planEventMembership
+	// planEventOther is allowlisted lifecycle input that is none of the above.
+	// Today that is `rules/`: nothing in this file reads it, but it is written
+	// once per job rather than continuously, so allowing it costs nothing and
+	// keeps a future reader of those files honest.
+	planEventOther
+)
+
+const (
+	// planConfigFilename mirrors orchestration's constant of the same name.
+	// legacyPlanConfigFilename is the older spelling enrichment's
+	// processPlanCounts still reads for the finished check.
+	planConfigFilename       = ".grove-plan.yml"
+	legacyPlanConfigFilename = "config.yml"
+	archiveDirName           = ".archive"
+	planRulesDirName         = "rules"
+)
+
+// classifiedPlanEvent is one surviving event plus the work already done to
+// judge it: the resolved path and the plans directory that owns it.
+type classifiedPlanEvent struct {
+	event fsnotify.Event
+	path  string
+	// plansDir is the UNRESOLVED spelling, keyed the way runRefresh keys its
+	// targets map. A resolved scope key would silently match nothing there.
+	plansDir string
+	class    planEventClass
+}
+
+// classifiedPlanBatch is one HandleEvents batch after path triage.
+type classifiedPlanBatch struct {
+	kept             []classifiedPlanEvent
+	suppressed       int
+	suppressedSample string
+}
+
+// classifyEvents resolves each event to its owning plans directory and judges
+// what it can change. It replaces the old affectedPlansDirs, doing the same
+// owner resolution once for the whole batch instead of once per consumer, and
+// memoizing GetPlansDir per owner node.
+func (h *FlowHandler) classifyEvents(events []fsnotify.Event) classifiedPlanBatch {
+	var batch classifiedPlanBatch
+
+	type plansDirPair struct{ raw, resolved string }
+	resolvedFor := make(map[*workspace.WorkspaceNode]plansDirPair)
+
 	h.pathsMutex.RLock()
 	defer h.pathsMutex.RUnlock()
 	for _, event := range events {
+		path := resolveFlowWatchPath(event.Name)
 		// One event belongs to exactly one plans directory, so the enclosing
 		// watch entry has to be the most specific one — first-match-over-a-map
 		// could scope the follow-up rescan to a different directory than the
 		// one that actually changed and leave the real edit unindexed.
-		owner := h.ownerForPath(resolveFlowWatchPath(event.Name))
+		owner := h.ownerForPath(path)
 		if owner == nil {
+			batch.suppress(event)
 			continue
 		}
-		if plansDir, err := h.locator.GetPlansDir(owner); err == nil && plansDir != "" {
-			dirs[plansDir] = struct{}{}
+		dirs, memoized := resolvedFor[owner]
+		if !memoized {
+			if raw, err := h.locator.GetPlansDir(owner); err == nil && raw != "" {
+				dirs = plansDirPair{raw: raw, resolved: resolveFlowWatchPath(raw)}
+			}
+			resolvedFor[owner] = dirs
 		}
+		if dirs.raw == "" {
+			batch.suppress(event)
+			continue
+		}
+		class := classifyPlanEvent(dirs.resolved, path)
+		if class == planEventNone {
+			batch.suppress(event)
+			continue
+		}
+		batch.kept = append(batch.kept, classifiedPlanEvent{
+			event: event, path: path, plansDir: dirs.raw, class: class,
+		})
 	}
-	return dirs
+	return batch
+}
+
+func (b *classifiedPlanBatch) suppress(event fsnotify.Event) {
+	b.suppressed++
+	if b.suppressedSample == "" {
+		b.suppressedSample = event.Name
+	}
+}
+
+// classifyPlanEvent judges one resolved event path against the plans directory
+// that owns it. plansDir must be the RESOLVED spelling, since eventPath is.
+func classifyPlanEvent(plansDir, eventPath string) planEventClass {
+	rel, err := filepath.Rel(plansDir, eventPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		// The path is not under the plans root we resolved for its owner, so
+		// nothing below can be reasoned about. Errs toward doing the work: a
+		// spurious refresh is cheaper than a lifecycle edge dropped on the
+		// floor by a path shape this function did not anticipate.
+		return planEventOther
+	}
+	if rel == "." {
+		return planEventMembership
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+
+	// .archive is a container, not a plan (loadIndexedPlans descends exactly
+	// one level into it), so shift past it and let archived plans classify
+	// through the same rules as live ones.
+	if parts[0] == archiveDirName {
+		if len(parts) == 1 {
+			return planEventMembership
+		}
+		parts = parts[1:]
+	}
+
+	if len(parts) == 1 {
+		// A direct child of the plans root. Only non-hidden entries can be
+		// plans — loadIndexedPlans and countPlanStats both skip dot-prefixed
+		// names — so the plans root's own hidden clutter (`.flow-jobs.lock`,
+		// `.init-*.output.log`, `.DS_Store`) changes nothing either reader
+		// sees. A non-hidden entry may be a plan appearing or disappearing.
+		if strings.HasPrefix(parts[0], ".") {
+			return planEventNone
+		}
+		return planEventMembership
+	}
+
+	if len(parts) == 2 {
+		return classifyPlanRootEntry(parts[1])
+	}
+
+	// Below a plan root. Both readers skip directory entries outright, so the
+	// entire subtree is unreadable to them: this is where the `.artifacts/`
+	// write storm that motivated the filter lives.
+	if parts[1] == planRulesDirName {
+		return planEventOther
+	}
+	return planEventNone
+}
+
+// classifyPlanRootEntry judges one entry sitting directly in a plan directory.
+// The allowlist is exactly what the two readers open there.
+func classifyPlanRootEntry(name string) planEventClass {
+	switch {
+	case name == planConfigFilename || name == legacyPlanConfigFilename:
+		return planEventConfig
+	case strings.HasSuffix(name, ".md"):
+		return planEventJob
+	case name == planRulesDirName:
+		return planEventOther
+	default:
+		// Job lock files, `.init-journal.json`, the `.artifacts` directory
+		// entry itself. Suppressing these means a plan row's UpdatedAt (the
+		// plan directory's mtime) can lag such a create until the next
+		// lifecycle event or the 5-minute reconciliation ticker — a timestamp,
+		// not a state, and the price of not recounting the portfolio every
+		// time a job takes a lock.
+		return planEventNone
+	}
 }
 
 func (h *FlowHandler) HandleStoreUpdate(update store.Update) {
@@ -652,7 +994,12 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 	// holding refreshRunMu across its disk reads would queue the next
 	// synchronous lifecycle publish behind them.
 	if all || rescanned > 0 || len(scopeDirs) > 0 {
-		h.kickPlanStats()
+		// `all` is the exemption from the rate floor, and it is exactly the
+		// right one: a full rescan is only ever requested by OnStart, the
+		// UpdateWorkspaces cold-start edge and the 5-minute reconciliation
+		// ticker. File churn always arrives scoped, so it can never buy itself
+		// the exemption.
+		h.kickPlanStats(all)
 	}
 
 	elapsed := time.Since(start)
@@ -673,36 +1020,99 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 // kickPlanStats starts (or queues onto) the async aggregated-PlanStats pass.
 // At most one pass runs at a time; kicks during a run coalesce into exactly
 // one trailing run, which re-reads disk and so converges on the final state.
-func (h *FlowHandler) kickPlanStats() {
+//
+// force bypasses the rate floor and is reserved for the correctness paths
+// (see runRefresh).
+func (h *FlowHandler) kickPlanStats(force bool) {
 	h.statsMu.Lock()
 	defer h.statsMu.Unlock()
+	h.startOrDeferStatsLocked(force)
+}
+
+// startOrDeferStatsLocked runs the pass now when nothing forbids it, and
+// otherwise records the debt so that exactly one trailing run happens later —
+// folded into the pass already running, or armed on the floor timer. Both
+// deferrals converge, which is what makes the floor a rate limit rather than
+// a sampling policy: no update is ever lost, only delayed. Callers hold
+// statsMu.
+func (h *FlowHandler) startOrDeferStatsLocked(force bool) {
 	if h.statsRunning {
 		h.statsQueued = true
+		h.statsQueuedForce = h.statsQueuedForce || force
 		return
 	}
+	if wait := h.statsFloorWaitLocked(force); wait > 0 {
+		h.statsQueued = true
+		h.statsQueuedForce = h.statsQueuedForce || force
+		if h.statsFloorTimer == nil {
+			h.statsFloorTimer = time.AfterFunc(wait, h.statsFloorExpired)
+		}
+		telemetry.RecordPlanStatsDeferred()
+		return
+	}
+	h.statsQueued = false
+	h.statsQueuedForce = false
 	h.statsRunning = true
+	h.statsLastRun = h.clock()
 	go h.planStatsLoop()
+}
+
+// statsFloorWaitLocked reports how much longer the rate floor forbids a pass.
+func (h *FlowHandler) statsFloorWaitLocked(force bool) time.Duration {
+	if force || h.statsMinInterval <= 0 || h.statsLastRun.IsZero() {
+		return 0
+	}
+	if elapsed := h.clock().Sub(h.statsLastRun); elapsed < h.statsMinInterval {
+		return h.statsMinInterval - elapsed
+	}
+	return 0
+}
+
+// statsFloorExpired is the trailing run the floor promised.
+func (h *FlowHandler) statsFloorExpired() {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+	h.statsFloorTimer = nil
+	if !h.statsQueued {
+		return
+	}
+	h.startOrDeferStatsLocked(h.statsQueuedForce)
 }
 
 func (h *FlowHandler) planStatsLoop() {
 	for {
 		seq := h.scanSeq.Load()
-		h.refreshPlanStats(seq)
+		h.statsPass(seq)
+
 		h.statsMu.Lock()
-		if h.statsQueued {
-			h.statsQueued = false
-			h.statsMu.Unlock()
-			continue
-		}
-		if h.scanSeq.Load() != seq {
-			// An index publish raced this pass; rerun so the emitted stats
-			// can never lag the last published lifecycle state.
-			h.statsMu.Unlock()
-			continue
-		}
+		// An index publish that raced this pass owes a rerun for the same
+		// reason a queued kick does: the emitted stats can never be allowed to
+		// lag the last published lifecycle state.
+		owed := h.statsQueued || h.scanSeq.Load() != seq
+		force := h.statsQueuedForce
+		h.statsQueued = false
+		h.statsQueuedForce = false
 		h.statsRunning = false
+		if !owed {
+			h.statsMu.Unlock()
+			return
+		}
+		if wait := h.statsFloorWaitLocked(force); wait > 0 {
+			// The rerun is owed but the floor forbids it now. Handing it to
+			// the timer rather than spinning here is what turns a continuous
+			// event stream into one pass per interval.
+			h.statsQueued = true
+			h.statsQueuedForce = force
+			if h.statsFloorTimer == nil {
+				h.statsFloorTimer = time.AfterFunc(wait, h.statsFloorExpired)
+			}
+			telemetry.RecordPlanStatsDeferred()
+			h.statsMu.Unlock()
+			return
+		}
+		h.statsRunning = true
+		h.statsLastRun = h.clock()
 		h.statsMu.Unlock()
-		return
 	}
 }
 

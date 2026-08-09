@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -363,6 +364,12 @@ func newGrovedStartCmd() *cobra.Command {
 			workspaceInterval := 5 * time.Minute
 			planInterval := 5 * time.Minute
 			noteInterval := 5 * time.Minute
+			// The rate floor under the flow watcher's aggregated plan-stats
+			// recount. Unlike the intervals above this is not a poll period —
+			// the recount is event-driven — it is the minimum spacing between
+			// two of them, so a plans directory being written into
+			// continuously cannot keep the portfolio-wide pass running.
+			planStatsMinInterval := 30 * time.Second
 
 			if cfg.Daemon != nil {
 				if cfg.Daemon.GitInterval != "" {
@@ -389,6 +396,16 @@ func newGrovedStartCmd() *cobra.Command {
 					if d, err := time.ParseDuration(cfg.Daemon.NoteInterval); err == nil {
 						noteInterval = d
 					}
+				}
+			}
+			// The floor's override lives in the environment rather than in
+			// core's DaemonConfig because a field there invalidates grove's
+			// generated config schema (see core/CLAUDE.md), which is a third
+			// repo. An explicit 0 removes the floor, restoring "every
+			// lifecycle event recounts the portfolio".
+			if raw := os.Getenv("GROVE_PLANSTATS_MIN_INTERVAL_MS"); raw != "" {
+				if ms, err := strconv.Atoi(raw); err == nil && ms >= 0 {
+					planStatsMinInterval = time.Duration(ms) * time.Millisecond
 				}
 			}
 
@@ -1156,9 +1173,12 @@ func newGrovedStartCmd() *cobra.Command {
 
 					// Register FlowHandler for plan directory watching
 					if isEnabled("plan") {
-						flowHandler := watcher.NewFlowHandler(st, cfg, 2000)
+						flowHandler := watcher.NewFlowHandler(st, cfg, 2000).
+							SetPlanStatsMinInterval(planStatsMinInterval)
 						unifiedWatcher.Register(flowHandler)
-						ulog.Info("Flow handler registered with unified watcher").Log(ctx)
+						ulog.Info("Flow handler registered with unified watcher").
+							Field("plan_stats_min_interval_ms", planStatsMinInterval.Milliseconds()).
+							Log(ctx)
 					}
 
 					// Register NoteHandler for note directory watching
