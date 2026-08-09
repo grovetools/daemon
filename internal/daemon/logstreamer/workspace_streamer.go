@@ -24,6 +24,13 @@ type WorkspaceStreamer struct {
 	logChan       chan logutil.TailedLine
 	mu            sync.RWMutex
 
+	// resync wakes watchWorkspaces between ticks. Subscribing is the one event
+	// that must not wait out the 5s tick: a client opening a workspace-scoped
+	// log stream would otherwise sit blank for up to five seconds while the
+	// tailer it just created demand for did not exist yet. Buffered by 1 and
+	// sent non-blocking — a coalesced wakeup is exactly as good as a queued one.
+	resync chan struct{}
+
 	// ecoMap is the workspace-path -> RootEcosystemPath projection used by
 	// ecosystem-scoped filters. It is refreshed on the tailer sync tick and on
 	// subscribe rather than per line: rebuilding it inside the aggregator meant
@@ -47,6 +54,16 @@ func NewWorkspaceStreamer(st *store.Store, capacity int) *WorkspaceStreamer {
 		activeTailers: make(map[string]context.CancelFunc),
 		logChan:       make(chan logutil.TailedLine, 256),
 		ecoMap:        make(map[string]string),
+		resync:        make(chan struct{}, 1),
+	}
+}
+
+// kickResync asks watchWorkspaces to recompute the demand set now instead of on
+// the next tick. Non-blocking: the channel is a coalescing doorbell, not a queue.
+func (ws *WorkspaceStreamer) kickResync() {
+	select {
+	case ws.resync <- struct{}{}:
+	default:
 	}
 }
 
@@ -75,7 +92,6 @@ func (ws *WorkspaceStreamer) Stop() {
 // (limited to opts.Replay) and a channel for live updates.
 func (ws *WorkspaceStreamer) Subscribe(opts models.LogStreamOptions) ([]logutil.TailedLine, chan logutil.TailedLine) {
 	ws.mu.Lock()
-	defer ws.mu.Unlock()
 
 	ch := make(chan logutil.TailedLine, 100)
 	ws.subscribers[ch] = opts
@@ -84,16 +100,23 @@ func (ws *WorkspaceStreamer) Subscribe(opts models.LogStreamOptions) ([]logutil.
 	// against a stale ecosystem projection.
 	ws.refreshEcoMapLocked()
 	replay := ws.replayLocked(opts)
+	ws.mu.Unlock()
+
+	// This subscription may be the only thing demanding its workspace's tailer.
+	// Kick the sync outside the lock — syncTailers takes ws.mu itself.
+	ws.kickResync()
 	return replay, ch
 }
 
 // Unsubscribe removes a subscriber.
 func (ws *WorkspaceStreamer) Unsubscribe(ch chan logutil.TailedLine) {
 	ws.mu.Lock()
-	defer ws.mu.Unlock()
-
 	delete(ws.subscribers, ch)
 	close(ch)
+	ws.mu.Unlock()
+
+	// Dropping the last reader of a workspace releases its tailer.
+	ws.kickResync()
 }
 
 // runAggregator reads from the shared logChan, writes to the ring buffer,
@@ -133,7 +156,7 @@ func (ws *WorkspaceStreamer) watchWorkspaces(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	// Run immediately on start, then on tick.
+	// Run immediately on start, then on tick or on a subscribe/unsubscribe kick.
 	ws.syncTailers(ctx)
 
 	for {
@@ -142,12 +165,85 @@ func (ws *WorkspaceStreamer) watchWorkspaces(ctx context.Context) {
 			return
 		case <-ticker.C:
 			ws.syncTailers(ctx)
+		case <-ws.resync:
+			ws.syncTailers(ctx)
 		}
 	}
 }
 
+// demandedPathsLocked returns the workspace paths that currently warrant a
+// tailer. Must be called with ws.mu held and ecoMap fresh.
+//
+// Tailing used to be a property of a workspace EXISTING: every discovered
+// workspace got a goroutine, an open directory, and a poll loop, forever. On a
+// 649-workspace machine that was 650 tailers of which essentially none had a
+// reader — 650 goroutines, ~44% of the daemon's total, against a 2000-goroutine
+// budget that was being breached. Heap-wise they were cheap (~15MB), so this is
+// a goroutine/descriptor fix, not the heap fix; see the plan summary.
+//
+// A workspace is demanded when either:
+//
+//   - some subscriber's filter can match it — the client is watching, so lines
+//     must flow now; or
+//   - it has a non-terminal job — work is happening there, so the ring should
+//     be accumulating history for the client that subscribes a moment later.
+//
+// A subscriber with no scope (or "all") demands everything, which is the
+// escape hatch: the aggregate `core logs` view is unchanged, it just no longer
+// costs 650 goroutines when nobody has it open.
+func (ws *WorkspaceStreamer) demandedPathsLocked(workspaces []*models.EnrichedWorkspace, jobs []*models.JobInfo) map[string]bool {
+	demanded := make(map[string]bool, 16)
+
+	// Subscriber-driven demand.
+	wantAll := false
+	for _, opts := range ws.subscribers {
+		switch opts.Scope {
+		case "system":
+			// The system tailer is unconditional; no workspace demand.
+		case "workspace":
+			if opts.Workspace != "" {
+				demanded[opts.Workspace] = true
+			}
+		case "ecosystem":
+			clientEco := ws.ecoMap[opts.Workspace]
+			if clientEco == "" {
+				continue
+			}
+			for path, eco := range ws.ecoMap {
+				if eco == clientEco {
+					demanded[path] = true
+				}
+			}
+		default:
+			// "all" and the empty/unspecified scope both mean everything.
+			wantAll = true
+		}
+	}
+
+	if wantAll {
+		for _, ews := range workspaces {
+			if ews.WorkspaceNode != nil {
+				demanded[ews.Path] = true
+			}
+		}
+		return demanded
+	}
+
+	// Job-driven demand: keep history accruing where work is actually running.
+	for _, job := range jobs {
+		if job == nil || job.WorkDir == "" || isTerminalStatus(job.Status) {
+			continue
+		}
+		demanded[store.NormalizePathKey(job.WorkDir)] = true
+	}
+	return demanded
+}
+
 func (ws *WorkspaceStreamer) syncTailers(ctx context.Context) {
+	// Both store reads happen before ws.mu: the store has its own lock and
+	// must never be acquired underneath this one.
 	workspaces := ws.store.GetWorkspaces()
+	jobs := ws.store.GetJobs()
 
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
@@ -156,16 +252,22 @@ func (ws *WorkspaceStreamer) syncTailers(ctx context.Context) {
 	// list, so it also refreshes the ecosystem projection the filters read.
 	ws.refreshEcoMapLocked()
 
-	// Build set of current workspace paths.
-	currentPaths := make(map[string]bool, len(workspaces)+1)
-	currentPaths["system"] = true
+	demanded := ws.demandedPathsLocked(workspaces, jobs)
+
+	// Only workspaces that both exist and are demanded get a tailer. The
+	// "system" pseudo-workspace is always kept.
+	keep := make(map[string]bool, len(demanded)+1)
+	keep["system"] = true
 
 	for _, ews := range workspaces {
 		if ews.WorkspaceNode == nil {
 			continue
 		}
 		wsPath := ews.Path
-		currentPaths[wsPath] = true
+		if !demanded[wsPath] && !demanded[store.NormalizePathKey(wsPath)] {
+			continue
+		}
+		keep[wsPath] = true
 
 		if _, exists := ws.activeTailers[wsPath]; exists {
 			continue
@@ -179,6 +281,10 @@ func (ws *WorkspaceStreamer) syncTailers(ctx context.Context) {
 		tailCtx, cancel := context.WithCancel(ctx)
 		ws.activeTailers[wsPath] = cancel
 
+		// tailLines=100 means a tailer started on demand replays the last 100
+		// lines into the ring as it opens. That is what keeps the subscriber
+		// that just caused it from seeing an empty window: the backlog arrives
+		// as live lines a moment after the (necessarily empty) replay.
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go logutil.TailDirectory(tailCtx, ews.Name, wsPath, logsDir, ws.logChan, &wg, true, 100)
@@ -202,9 +308,9 @@ func (ws *WorkspaceStreamer) syncTailers(ctx context.Context) {
 		}()
 	}
 
-	// Cancel tailers for workspaces no longer in the store.
+	// Cancel tailers that are gone from the store or no longer demanded.
 	for path, cancel := range ws.activeTailers {
-		if !currentPaths[path] {
+		if !keep[path] {
 			cancel()
 			delete(ws.activeTailers, path)
 		}

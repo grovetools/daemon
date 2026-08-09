@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	netpprof "net/http/pprof"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -588,6 +589,23 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	// Native agent pane relay endpoints
 	mux.HandleFunc("/api/agents/spawn", s.handleAgentSpawn)
 	mux.HandleFunc("/api/agents/", s.handleAgentByID)
+
+	// Runtime profiling, always mounted, unix socket only. Attributing groved's
+	// live heap used to require restarting it with --pprof-port, which kills
+	// every running agent pane — so in practice no audit ever got a heap
+	// profile of the daemon that was actually misbehaving, and retention was
+	// guessed at from goroutine counts. The socket is 0600 and already carries
+	// strictly more sensitive payloads (transcripts, sync state), so exposing
+	// profiles there widens nothing; unixOnly keeps them off the
+	// unauthenticated localhost TCP listener the web viewer uses.
+	//
+	//	curl --unix-socket <sock> http://local/debug/pprof/heap > heap.pb.gz
+	//	go tool pprof -top heap.pb.gz
+	mux.HandleFunc("/debug/pprof/", unixOnly(netpprof.Index))
+	mux.HandleFunc("/debug/pprof/cmdline", unixOnly(netpprof.Cmdline))
+	mux.HandleFunc("/debug/pprof/profile", unixOnly(netpprof.Profile))
+	mux.HandleFunc("/debug/pprof/symbol", unixOnly(netpprof.Symbol))
+	mux.HandleFunc("/debug/pprof/trace", unixOnly(netpprof.Trace))
 
 	handler := h2c.NewHandler(mux, &http2.Server{})
 
