@@ -611,7 +611,7 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 	// sessions, registry bindings, cached git) from current store state.
 	plansByDir := make(map[string][]*orchestration.Plan, len(targets))
 	var summaries []models.PlanSummary
-	registryEntries, _ := worktreeregistry.ListAll()
+	registryEntries, registryErr := worktreeregistry.ListAll()
 	for plansDir, wsNode := range targets {
 		result := h.dirCache[plansDir]
 		if result == nil {
@@ -628,7 +628,7 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 		}
 		plansByDir[plansDir] = result.plans
 	}
-	summaries = applyQualifiedPlanBindings(summaries, registryEntries)
+	summaries = applyQualifiedPlanBindings(summaries, registryEntries, registryErr)
 	summaries = applyCachedPlanGit(summaries, state.Workspaces)
 
 	if len(plansByDir) > 0 {
@@ -929,8 +929,10 @@ func summarizePlan(p *orchestration.Plan, plansDir, workspaceRoot, selectedPlan 
 // applyQualifiedPlanBindings enriches summaries from the one canonical
 // registry-backed resolver. Bare plan names are deliberately never used as a
 // join key: duplicate slugs in different notebook workspaces must retain their
-// own container association.
-func applyQualifiedPlanBindings(summaries []models.PlanSummary, entries []*worktreeregistry.Entry) []models.PlanSummary {
+// own container association. The caller's registry listing (and its error) is
+// passed through so the resolver never repeats the scan; on a failed listing
+// the resolver runs its own, preserving the "registry unavailable" marking.
+func applyQualifiedPlanBindings(summaries []models.PlanSummary, entries []*worktreeregistry.Entry, listErr error) []models.PlanSummary {
 	requests := make([]coreplan.BindingRequest, 0, len(summaries))
 	for _, summary := range summaries {
 		requests = append(requests, coreplan.BindingRequest{
@@ -940,7 +942,10 @@ func applyQualifiedPlanBindings(summaries []models.PlanSummary, entries []*workt
 			Archived:           summary.Archived,
 		})
 	}
-	return applyResolvedPlanBindings(summaries, entries, coreplan.ResolvePlanBindings(requests))
+	if listErr != nil {
+		return applyResolvedPlanBindings(summaries, entries, coreplan.ResolvePlanBindings(requests))
+	}
+	return applyResolvedPlanBindings(summaries, entries, coreplan.ResolvePlanBindingsWithEntries(requests, entries))
 }
 
 // applyCachedPlanGit projects only already-collected daemon status into cheap
