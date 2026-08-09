@@ -12,6 +12,8 @@ import (
 	"net/http/httputil"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -3763,6 +3765,16 @@ func (s *Server) handleNavGroup(w http.ResponseWriter, r *http.Request) {
 		file.Groups[group] = state
 	}
 
+	// No-op short-circuit: nav re-PUTs its current state on every tab focus
+	// and group switch. When nothing changed, skip the whole persist +
+	// regenerate + ReloadAllServers + SSE train — it costs over a second per
+	// call and the broadcast churns every subscribed TUI.
+	if reflect.DeepEqual(prev, file) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "unchanged"})
+		return
+	}
+
 	// Validate (load group configs from nav config for prefix conflict detection).
 	// Diff-aware against prev so pre-existing rule-3 conflicts don't brick all
 	// writes — the user must still be able to edit a file that was persisted
@@ -3827,6 +3839,15 @@ func (s *Server) handleNavLockedKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// No-op short-circuit (same rationale as handleNavGroup): nav re-PUTs
+	// the unchanged locked-keys list constantly; skip persist + regenerate +
+	// reload + broadcast when nothing changed.
+	if slices.Equal(file.LockedKeys, keys) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "unchanged"})
+		return
+	}
+
 	file.LockedKeys = keys
 
 	if err := navbindings.Save(sessionsPath, file); err != nil {
@@ -3877,6 +3898,14 @@ func (s *Server) handleNavLastAccessedGroup(w http.ResponseWriter, r *http.Reque
 	file, err := navbindings.Load(sessionsPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to load bindings: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// No-op short-circuit: skip the write and the SSE broadcast when the
+	// last-accessed group hasn't actually changed.
+	if file.LastAccessedGroup == req.Group {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "unchanged"})
 		return
 	}
 
