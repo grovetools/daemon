@@ -136,6 +136,23 @@ var (
 	// and because the trailing run always fires, it is a deferral count, never
 	// a drop count.
 	PlanStatsDeferred = Default().Counter("planstats.pass.deferred")
+	// Reruns: a pass that finished and immediately owed another one. This is
+	// the treadmill's signature — at 600 workspaces a pass takes seconds, so
+	// anything that reliably owes a rerun makes the pass's own duration the
+	// reason it runs again. Exactly one cause is attributed per rerun, so
+	// planstats.rerun.count == .queued + .seq_race:
+	//
+	//   - queued: a kick arrived while the pass was running and coalesced into
+	//     its trailing run. Legitimate — something asked for a recount.
+	//   - seq_race: no kick, but an index publish moved disk state the stats
+	//     reader can actually observe while the pass was reading it, so the
+	//     pass's answer was already stale on arrival.
+	//
+	// seq_race used to fire on EVERY index publish, including overlay-only
+	// re-projections that touch no plan file; watch it stay near zero.
+	PlanStatsRerun        = Default().Counter("planstats.rerun.count")
+	PlanStatsRerunQueued  = Default().Counter("planstats.rerun.queued")
+	PlanStatsRerunSeqRace = Default().Counter("planstats.rerun.seq_race")
 
 	// Transcript parsing (the rescan-loop signature).
 	TranscriptConsidered = Default().RateCounter("transcript.considered")
@@ -243,6 +260,18 @@ func RecordPlanStatsEvents(kept, suppressed int) {
 // RecordPlanStatsDeferred records one aggregated-PlanStats pass held back by
 // the rate floor and handed to its trailing timer instead.
 func RecordPlanStatsDeferred() { PlanStatsDeferred.Inc() }
+
+// RecordPlanStatsRerun records one pass that owed another as soon as it
+// finished. queued distinguishes the two causes; when both hold, the explicit
+// kick is the one attributed, which keeps the total the sum of its parts.
+func RecordPlanStatsRerun(queued bool) {
+	PlanStatsRerun.Inc()
+	if queued {
+		PlanStatsRerunQueued.Inc()
+		return
+	}
+	PlanStatsRerunSeqRace.Inc()
+}
 
 // RecordWatcherBatch records one debounce batch from the unified watcher.
 func RecordWatcherBatch(raw int) {

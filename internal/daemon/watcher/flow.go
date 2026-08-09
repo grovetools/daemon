@@ -3,10 +3,12 @@ package watcher
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"hash/fnv"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,10 +101,31 @@ type FlowHandler struct {
 	jobMetaMu   sync.Mutex
 	jobMetaHash map[string]uint64
 
-	// scanSeq increments on every index publish; the async stats pass uses it
-	// as a fence so results read from disk before a newer publish are
-	// discarded instead of clobbering fresher lifecycle state.
-	scanSeq atomic.Uint64
+	// statsSeq fences the async stats pass against index publishes that raced
+	// it: a pass whose seq moved read disk state older than the last publish,
+	// so its answer is discarded and recomputed rather than allowed to clobber
+	// fresher lifecycle state.
+	//
+	// It counts STATS-RELEVANT publishes, not all of them, and that difference
+	// is the whole point. Bumping on every publish made the fence a treadmill:
+	// `runRefresh` also fires for overlay-only re-projections (a git delta
+	// landing in the store re-runs the row projection without touching a plan
+	// file), and at 600 workspaces a pass takes seconds, so a publish almost
+	// always raced it and the pass's own duration guaranteed its rerun. What
+	// the stats reader can observe is the plan set and each plan's lifecycle
+	// and job counts (see statsRelevantDigest); only a publish that moved one
+	// of those advances the seq.
+	//
+	// Under-counting is safe by construction and over-counting is merely
+	// wasteful. Any publish that re-read a plans directory ALSO calls
+	// kickPlanStats, so a running pass is already owed a trailing run through
+	// statsQueued; a digest that failed to notice a change costs at most one
+	// briefly-stale emission that the queued rerun then corrects. The seq's
+	// remaining job is the publishes that kick nothing.
+	statsSeq atomic.Uint64
+	// lastStatsInput is the digest statsSeq was last bumped for. Guarded by
+	// refreshRunMu — only runRefresh reads or writes it.
+	lastStatsInput uint64
 }
 
 // defaultPlanStatsMinInterval is the rate floor applied when the daemon config
@@ -119,6 +142,10 @@ const defaultPlanStatsMinInterval = 30 * time.Second
 type dirScanResult struct {
 	plans     []*orchestration.Plan
 	summaries []models.PlanSummary
+	// statsDigest folds the subset of these rows the aggregated-PlanStats
+	// reader can observe. Computed at scan time because that is where the
+	// disk-derived state is: every later stage layers overlays on top.
+	statsDigest uint64
 }
 
 // NewFlowHandler creates a new FlowHandler instance.
@@ -987,7 +1014,17 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 		Payload: &models.PlanIndexSnapshot{ScannedAt: scanAt, Plans: summaries},
 	})
 	publishDone := time.Now()
-	h.scanSeq.Add(1)
+
+	// Fence the async stats pass, but only against publishes it can actually
+	// be wrong about. The digest covers the disk-derived plan state the stats
+	// reader opens; an overlay-only re-projection leaves it identical and so
+	// cannot invalidate a pass that is mid-flight.
+	statsInput := statsInputDigest(targets, h.dirCache)
+	statsMoved := statsInput != h.lastStatsInput
+	if statsMoved {
+		h.lastStatsInput = statsInput
+		h.statsSeq.Add(1)
+	}
 
 	// Aggregated PlanStats enrichment. Overlay-only passes changed nothing on
 	// disk, so the recount is skipped for them. The pass runs asynchronously:
@@ -1011,6 +1048,7 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 		Field("dirs", len(targets)).
 		Field("rescanned", rescanned).
 		Field("full", all).
+		Field("stats_moved", statsMoved).
 		Field("scan_ms", scanDone.Sub(start).Milliseconds()).
 		Field("publish_ms", publishDone.Sub(scanDone).Milliseconds()).
 		Field("total_ms", elapsed.Milliseconds()).
@@ -1081,14 +1119,22 @@ func (h *FlowHandler) statsFloorExpired() {
 
 func (h *FlowHandler) planStatsLoop() {
 	for {
-		seq := h.scanSeq.Load()
+		seq := h.statsSeq.Load()
 		h.statsPass(seq)
 
 		h.statsMu.Lock()
-		// An index publish that raced this pass owes a rerun for the same
-		// reason a queued kick does: the emitted stats can never be allowed to
-		// lag the last published lifecycle state.
-		owed := h.statsQueued || h.scanSeq.Load() != seq
+		// Two things can owe a rerun. A queued kick is a request for one. A
+		// moved statsSeq means a publish changed plan state under this pass
+		// while it read, so refreshPlanStats threw its answer away and the
+		// recount still has to happen — the invariant being that emitted stats
+		// never lag the last published lifecycle state.
+		//
+		// The seq arm is the narrow one now: it fences stats-relevant
+		// publishes only, and every publish that re-read a plans directory has
+		// already queued a kick, so what it uniquely catches is the rare
+		// publish that moved the plan set without kicking.
+		queued := h.statsQueued
+		owed := queued || h.statsSeq.Load() != seq
 		force := h.statsQueuedForce
 		h.statsQueued = false
 		h.statsQueuedForce = false
@@ -1097,6 +1143,7 @@ func (h *FlowHandler) planStatsLoop() {
 			h.statsMu.Unlock()
 			return
 		}
+		telemetry.RecordPlanStatsRerun(queued)
 		if wait := h.statsFloorWaitLocked(force); wait > 0 {
 			// The rerun is owed but the floor forbids it now. Handing it to
 			// the timer rather than spinning here is what turns a continuous
@@ -1118,8 +1165,10 @@ func (h *FlowHandler) planStatsLoop() {
 
 // refreshPlanStats recomputes the aggregated per-workspace PlanStats. It runs
 // off the refresh mutex so its cost never delays row publishes. seq fences
-// staleness: results computed from disk state older than the latest index
-// publish are discarded (the trailing loop run recomputes them).
+// staleness: results computed from plan state older than the latest index
+// publish are discarded (the trailing loop run recomputes them). Only publishes
+// that moved plan state the counts derive from advance the seq, so a git-delta
+// re-projection landing mid-pass no longer throws the pass's work away.
 //
 // The workspace set comes from the store, never from a fresh
 // workspace.DiscoverAll: this pass fires on a 2s debounce behind plan-file
@@ -1127,7 +1176,7 @@ func (h *FlowHandler) planStatsLoop() {
 // the daemon's dominant allocation (and therefore GC, and therefore CPU) load.
 func (h *FlowHandler) refreshPlanStats(seq uint64) {
 	planStats := enrichment.FetchPlanStatsMap(h.store.WorkspaceNodes(), h.locator)
-	if h.scanSeq.Load() != seq {
+	if h.statsSeq.Load() != seq {
 		return
 	}
 
@@ -1243,7 +1292,84 @@ func scanPlansDir(plansDir, workspaceRoot string, scanAt time.Time) *dirScanResu
 		}
 		result.summaries = append(result.summaries, summary)
 	}
+	result.statsDigest = statsRelevantDigest(result.summaries)
 	return result
+}
+
+// statsRelevantDigest folds one directory's rows down to what the aggregated
+// PlanStats reader can see, so two scans that differ only in ways invisible to
+// it compare equal.
+//
+// enrichment.countPlanStats enumerates the non-hidden plan directories under a
+// plans root and, per plan, reads the config for the finished flag and each
+// top-level job's frontmatter status. That is exactly the plan SET, each plan's
+// LIFECYCLE and its JOB COUNTS — everything else on a summary (worktree
+// binding, notes, repos, mtime) is either an overlay or invisible to the
+// counts. Archived plans are excluded because countPlanStats never descends
+// into `.archive`; a plan being archived still moves the digest, since its live
+// entry disappears from the set.
+//
+// A row here is disk-derived by construction: scanPlansDir runs before
+// runRefresh layers on selection, sessions, bindings and git.
+func statsRelevantDigest(summaries []models.PlanSummary) uint64 {
+	rows := make([]string, 0, len(summaries))
+	var row strings.Builder
+	for _, summary := range summaries {
+		if summary.Archived {
+			continue
+		}
+		row.Reset()
+		row.WriteString(summary.PlanName)
+		row.WriteByte(0)
+		row.WriteString(summary.Lifecycle)
+		statuses := make([]string, 0, len(summary.JobCounts))
+		for status := range summary.JobCounts {
+			statuses = append(statuses, status)
+		}
+		sort.Strings(statuses)
+		for _, status := range statuses {
+			row.WriteByte(0)
+			row.WriteString(status)
+			row.WriteByte('=')
+			row.WriteString(strconv.Itoa(summary.JobCounts[status]))
+		}
+		rows = append(rows, row.String())
+	}
+	// Sorted so the digest is a property of the plan set, not of the order
+	// os.ReadDir happened to return it in.
+	sort.Strings(rows)
+
+	sum := fnv.New64a()
+	for _, r := range rows {
+		_, _ = sum.Write([]byte(r))
+		_, _ = sum.Write([]byte{'\n'})
+	}
+	return sum.Sum64()
+}
+
+// statsInputDigest folds the per-directory digests of the CURRENT target set
+// into the one value runRefresh compares across publishes. Keying on targets
+// rather than on the cache means a plans directory leaving the watch set moves
+// the digest even though nothing was rescanned.
+func statsInputDigest(targets map[string]*workspace.WorkspaceNode, cache map[string]*dirScanResult) uint64 {
+	dirs := make([]string, 0, len(targets))
+	for dir := range targets {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+
+	sum := fnv.New64a()
+	var digest [8]byte
+	for _, dir := range dirs {
+		result := cache[dir]
+		if result == nil {
+			continue
+		}
+		_, _ = sum.Write([]byte(dir))
+		binary.LittleEndian.PutUint64(digest[:], result.statsDigest)
+		_, _ = sum.Write(digest[:])
+	}
+	return sum.Sum64()
 }
 
 // countRunningSessions mirrors summarizePlan's live-session overlay for rows
