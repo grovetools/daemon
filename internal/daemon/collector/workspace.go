@@ -180,6 +180,9 @@ func (c *WorkspaceCollector) Run(ctx context.Context, st *store.Store, updates c
 				// state only on change, so a rescan that dropped it would blank
 				// the workspace until the forge state next moved.
 				ew.ReviewStats = existing.ReviewStats
+				// Machine registry projection is also change-only and must survive
+				// structural workspace rescans.
+				ew.MachineSync = existing.MachineSync
 			}
 			enrichedMap[node.Path] = ew
 		}

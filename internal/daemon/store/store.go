@@ -415,6 +415,9 @@ func (s *Store) ApplyUpdate(u Update) {
 				if d.ReviewStats != nil {
 					ws.ReviewStats = d.ReviewStats
 				}
+				if d.MachineSync != nil {
+					ws.MachineSync = d.MachineSync
+				}
 			}
 		}
 

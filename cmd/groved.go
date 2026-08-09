@@ -409,6 +409,10 @@ func newGrovedStartCmd() *cobra.Command {
 			// worktree-scoped daemon.
 			if isEnabled("workspace") {
 				eng.Register(collector.NewWorkspaceCollector(workspaceInterval))
+				// Tier-0 machine sync is a workspace enrichment. It is local and
+				// bounded (registry files + git metadata only), and runs in scoped
+				// daemons too so their workspace API does not silently lose it.
+				eng.Register(collector.NewMachineSyncCollector(0))
 			}
 			if isEnabled("git") {
 				// The global collector owns boot + hourly reconciliation. Scoped

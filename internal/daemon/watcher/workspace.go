@@ -211,6 +211,9 @@ func (h *WorkspaceHandler) triggerRefresh() {
 				// only re-emits it on change, so dropping it here would leave
 				// the workspace at "unknown" until the forge state next moved.
 				ew.ReviewStats = existing.ReviewStats
+				// Machine registry projection is change-only, so preserve it just
+				// like ReviewStats across a structural rescan.
+				ew.MachineSync = existing.MachineSync
 			}
 			enrichedMap[node.Path] = ew
 		}
