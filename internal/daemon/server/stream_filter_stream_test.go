@@ -247,3 +247,79 @@ func TestStreamFilterCanOptIntoSnapshot(t *testing.T) {
 		t.Fatalf("snapshot carried %d workspaces, want 1", len(first.Workspaces))
 	}
 }
+
+// The subscribe-time snapshot is the single largest thing /api/stream ever
+// writes — on a mature host it is the entire enriched-workspace map, megabytes
+// per subscribe. A subscriber that genuinely reads workspace state (treemux's
+// rail, nav) cannot drop it by type, so the only lever left is ?paths=.
+//
+// This asserts the lever works one frame earlier than the delta path: the
+// allow-list prunes the snapshot itself, server-side, before it is marshalled.
+// The unit test covers applyStreamFilter; this covers the handler actually
+// routing the initial frame through it, which is the part a refactor breaks.
+func TestStreamFilterPathsScopeInitialSnapshot(t *testing.T) {
+	sock := shortSocketPath(t)
+	st := store.New()
+	st.ApplyUpdate(store.Update{
+		Type:   store.UpdateWorkspaces,
+		Source: "test",
+		Payload: map[string]*models.EnrichedWorkspace{
+			"/ws/alpha": {WorkspaceNode: &workspace.WorkspaceNode{Path: "/ws/alpha"}},
+			"/ws/beta":  {WorkspaceNode: &workspace.WorkspaceNode{Path: "/ws/beta"}},
+			"/ws/gamma": {WorkspaceNode: &workspace.WorkspaceNode{Path: "/ws/gamma"}},
+		},
+	})
+
+	s := New(false)
+	s.SetEngine(engine.New(st))
+	if err := s.Listen(sock); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	go func() { _ = s.Serve() }()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = s.Shutdown(ctx)
+	}()
+
+	tap := subscribeSSE(t, sock, "types=initial,workspaces_delta&paths=/ws/alpha")
+	first := tap.next(t, 3*time.Second)
+	if first == nil || first.UpdateType != coredaemon.StreamTypeInitial {
+		t.Fatalf("first frame = %+v, want an initial snapshot", first)
+	}
+	if len(first.Workspaces) != 1 || first.Workspaces[0].Path != "/ws/alpha" {
+		t.Fatalf("snapshot carried %d workspaces (%+v), want only /ws/alpha — "+
+			"?paths= is not being applied to the subscribe-time frame",
+			len(first.Workspaces), first.Workspaces)
+	}
+	// Scanned describes what reached the wire, not what the daemon looked at.
+	if first.Scanned != 1 {
+		t.Errorf("snapshot reported Scanned=%d, want 1", first.Scanned)
+	}
+
+	// And the same allow-list keeps applying to the live deltas that follow, so
+	// a scoped subscriber is scoped for the whole connection rather than just
+	// its first frame.
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		st.ApplyUpdate(store.Update{
+			Type:    store.UpdateWorkspacesDelta,
+			Source:  "test",
+			Payload: []*models.WorkspaceDelta{{Path: "/ws/beta"}},
+		})
+		st.ApplyUpdate(store.Update{
+			Type:    store.UpdateWorkspacesDelta,
+			Source:  "test",
+			Payload: []*models.WorkspaceDelta{{Path: "/ws/alpha"}},
+		})
+	}()
+
+	got := tap.next(t, 4*time.Second)
+	if got == nil {
+		t.Fatal("scoped subscriber received no delta")
+	}
+	if len(got.WorkspaceDeltas) != 1 || got.WorkspaceDeltas[0].Path != "/ws/alpha" {
+		t.Fatalf("delta frame = %+v, want only /ws/alpha (a /ws/beta frame here "+
+			"means the path allow-list stopped at the snapshot)", got.WorkspaceDeltas)
+	}
+}

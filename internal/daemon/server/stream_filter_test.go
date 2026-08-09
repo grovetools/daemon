@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 
 	coredaemon "github.com/grovetools/core/pkg/daemon"
@@ -164,6 +165,52 @@ func TestFlowStatusStyleFilterAdmitsOnlyJobAndSessionFrames(t *testing.T) {
 	} {
 		if _, ok := applyStreamFilter(f, &apiStateUpdate{UpdateType: typ}); ok {
 			t.Errorf("non-actionable type %q reached the wire", typ)
+		}
+	}
+}
+
+// treemux is the second converted client, and unlike flow it declares a long
+// list — 24 exact type names, one of them the "initial" snapshot it needs for
+// theme and boot phase. The risk that list carries is a typo or a name that
+// drifted: ?types= is owned by the GLOB matcher (parseTypeFilter), so a
+// declaration is silently useless the moment a name stops matching a real
+// update_type, and the symptom is a feature that quietly stops updating rather
+// than an error anyone sees.
+//
+// This asserts the real server-side path — parse the query treemux actually
+// sends, then match every type against it — rather than the StreamFilter
+// helper, because the query string is what crosses the socket.
+func TestTreemuxStyleTypeQueryAdmitsItsWholeDeclaration(t *testing.T) {
+	// Verbatim from treemux/internal/app/daemon_stream.go daemonStreamFilter().
+	const query = "agent_input,attach_agent_pane,boot_phase,capture_request,config_reload," +
+		"forge_state,full,initial,job_cancelled,job_completed,job_failed,job_pending_user," +
+		"job_started,job_submitted,nav_bindings,note_event,note_index,session,sessions," +
+		"spawn_agent_pane,theme_changed,workflow_children_snapshot,workspaces,workspaces_delta"
+
+	types, err := parseTypeFilter(query)
+	if err != nil {
+		t.Fatalf("parseTypeFilter(%q): %v", query, err)
+	}
+
+	// Every declared name must match. A name that does not is dead weight on
+	// the URL and a silently disabled behaviour in the TUI.
+	for _, typ := range strings.Split(query, ",") {
+		if !types.matches(typ) {
+			t.Errorf("declared type %q does not match its own filter — "+
+				"the glob matcher and the declaration disagree", typ)
+		}
+	}
+
+	// And the families treemux ignores must still be rejected: this is the
+	// saving the declaration exists to buy.
+	for _, typ := range []string{
+		"focus", "plan_index", "skill_sync", "watcher_status", "memory_index",
+		"sync_conflict", "satellite_status", "satellite_snapshot",
+		"workflow_run_discovered", "workflow_agent_started", "workflow_run_completed",
+		"build_queued", "build_started", "build_finished", "job_orphaned",
+	} {
+		if types.matches(typ) {
+			t.Errorf("type %q reached a treemux-style subscriber that ignores it", typ)
 		}
 	}
 }
