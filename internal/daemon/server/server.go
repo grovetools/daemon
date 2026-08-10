@@ -512,12 +512,18 @@ var daemonRoutes = []daemonRoute{
 	{pattern: "/debug/pprof/trace"},
 }
 
+type classifiedRouteRegistrar interface {
+	HandleFunc(pattern string, handler http.HandlerFunc)
+	Handle(pattern string, handler http.Handler)
+}
+
 type classifiedMux struct {
 	mux       *http.ServeMux
 	remaining map[string]struct{}
 }
 
-func newClassifiedMux(mux *http.ServeMux) *classifiedMux {
+func newClassifiedMux() *classifiedMux {
+	mux := http.NewServeMux()
 	remaining := make(map[string]struct{}, len(daemonRoutes))
 	for _, route := range daemonRoutes {
 		if _, duplicate := remaining[route.pattern]; duplicate {
@@ -543,6 +549,10 @@ func (m *classifiedMux) HandleFunc(pattern string, handler http.HandlerFunc) {
 func (m *classifiedMux) Handle(pattern string, handler http.Handler) {
 	m.consume(pattern)
 	m.mux.Handle(pattern, handler)
+}
+
+func (m *classifiedMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	m.mux.ServeHTTP(w, r)
 }
 
 func (m *classifiedMux) assertComplete() {
@@ -593,6 +603,215 @@ func (s *Server) registerConfigDegradedRoutes(mux *http.ServeMux) {
 		}
 		mux.HandleFunc(route.pattern, handler)
 	}
+}
+
+// normalRouteHandler is the only constructor for the daemon's normal API mux.
+// The raw ServeMux is encapsulated by classifiedMux, so registration code can
+// only add a route by consuming its daemonRoutes classification.
+func (s *Server) normalRouteHandler() http.Handler {
+	routes := newClassifiedMux()
+	s.registerNormalRoutes(routes)
+	routes.assertComplete()
+	return routes
+}
+
+// registerNormalRoutes deliberately receives only the classified registrar,
+// never a raw *http.ServeMux. Keep every normal daemon API registration here.
+func (s *Server) registerNormalRoutes(routes classifiedRouteRegistrar) {
+
+	// Health check endpoint.
+	routes.HandleFunc("/health", s.handleHealth)
+
+	// State API endpoints
+	routes.HandleFunc("/api/state", s.handleGetState)
+	routes.HandleFunc("/api/tasks", s.handlePostTaskReport)
+	// Machine-wide build queue endpoints
+	routes.HandleFunc("/api/build/submit", s.handleBuildSubmit)
+	routes.HandleFunc("/api/build/cancel", s.handleBuildCancel)
+	routes.HandleFunc("/api/build/jobs/", s.handleBuildJobSubpath)
+	routes.HandleFunc("/api/workspaces/", s.handleWorkspaceSubpath)
+	routes.HandleFunc("/api/workspaces", s.handleGetWorkspaces)
+	routes.HandleFunc("/api/plans", s.handleGetPlans)
+	routes.HandleFunc("/api/plan-index", s.handleGetPlanIndex)
+	// Session endpoints - order matters! Most specific routes first.
+	routes.HandleFunc("/api/sessions/intent", s.handleSessionIntent)
+	routes.HandleFunc("/api/sessions/confirm", s.handleSessionConfirm)
+	routes.HandleFunc("/api/sessions/", s.handleSessionByID)
+	routes.HandleFunc("/api/sessions", s.handleSessions)
+	routes.HandleFunc("/api/stream", s.handleStreamState)
+	routes.HandleFunc("/api/workspace/hud/stream", s.handleStreamWorkspaceHUD)
+	routes.HandleFunc("/api/config", s.handleGetConfig)
+	routes.HandleFunc("/api/focus", s.handleFocus)
+	routes.HandleFunc("/api/refresh", s.handleRefresh)
+	// Privileged Claude folder-trust seeding — unix socket only. The daemon
+	// derives the trusted paths from the worktree registry (never the caller),
+	// so a sandboxed provisioner can delegate the ~/.claude.json write it cannot
+	// perform itself. See handleSeedTrust for the security rationale.
+	routes.HandleFunc("/api/trust/seed", unixOnly(s.handleSeedTrust))
+	routes.HandleFunc("/api/forge/state", s.handleGetForgeState)
+	routes.HandleFunc("/api/notes/index", s.handleNoteIndex)
+	routes.HandleFunc("/api/notes/event", s.handleNoteEvent)
+	// Workflow/subagent aggregation endpoints. Served on the 0600 unix
+	// socket only (defensive: workflow payloads carry transcript-derived
+	// content — prompts, last assistant messages — that must not be
+	// reachable via the unauthenticated localhost TCP listener).
+	routes.HandleFunc("/api/workflows/event", unixOnly(s.handleWorkflowEvent))
+	routes.HandleFunc("/api/workflows", unixOnly(s.handleGetWorkflows))
+	routes.HandleFunc("/api/subjobs/event", unixOnly(s.handleSubjobEvent))
+	routes.HandleFunc("/api/subjobs", unixOnly(s.handleGetSubjobs))
+	// Aggregated workspace log streaming
+	routes.HandleFunc("/api/logs/stream", s.handleStreamWorkspaceLogs)
+	// Environment management endpoints
+	routes.HandleFunc("/api/env/up", s.handleEnvUp)
+	routes.HandleFunc("/api/env/down", s.handleEnvDown)
+	routes.HandleFunc("/api/env/status", s.handleEnvStatus)
+	// Global-proxy route registration (global daemon only)
+	routes.HandleFunc("/api/proxy/register", s.handleProxyRegister)
+	routes.HandleFunc("/api/proxy/unregister", s.handleProxyUnregister)
+	// Repo ensure endpoint (single-flighted clones).
+	routes.HandleFunc("/api/repos/ensure", s.handleRepoEnsure)
+	// Job management endpoints
+	routes.HandleFunc("/api/jobs/", s.handleJobByID)
+	routes.HandleFunc("/api/jobs", s.handleJobs)
+	// Bounded artifact return. The guest-local job route publishes files;
+	// this laptop-only route forwards over the pinned satellite transport.
+	routes.HandleFunc("/api/satellite-artifacts/fetch", s.handleSatelliteArtifactFetch)
+	// Channel management endpoints
+	routes.HandleFunc("/api/channels/send", s.handleChannelSend)
+	routes.HandleFunc("/api/channels/status", s.handleChannelStatus)
+	routes.HandleFunc("/api/channels/cleanup", s.handleChannelCleanup)
+	// Memory search endpoints
+	routes.HandleFunc("/api/memory/search", s.handleMemorySearch)
+	routes.HandleFunc("/api/memory/coverage", s.handleMemoryCoverage)
+	routes.HandleFunc("/api/memory/status", s.handleMemoryStatus)
+	routes.HandleFunc("/api/memory/reindex", s.handleMemoryReindex)
+	// Memory analysis endpoints
+	routes.HandleFunc("/api/memory/analysis/gc", s.handleMemoryAnalysisGC)
+	routes.HandleFunc("/api/memory/analysis/workspaces", s.handleMemoryAnalysisWorkspaces)
+	routes.HandleFunc("/api/memory/analysis/ecosystems", s.handleMemoryAnalysisEcosystems)
+	routes.HandleFunc("/api/memory/analysis/code", s.handleMemoryAnalysisCode)
+	routes.HandleFunc("/api/memory/analysis/concepts", s.handleMemoryAnalysisConcepts)
+	routes.HandleFunc("/api/memory/analysis/embeddings", s.handleMemoryAnalysisEmbeddings)
+	routes.HandleFunc("/api/memory/analysis/freshness", s.handleMemoryAnalysisFreshness)
+	routes.HandleFunc("/api/memory/analysis/duplicates", s.handleMemoryAnalysisDuplicates)
+	routes.HandleFunc("/api/memory/analysis/notebooks", s.handleMemoryAnalysisNotebooks)
+	routes.HandleFunc("/api/memory/analysis/context", s.handleMemoryAnalysisContext)
+	// Machine identity + declared intent (unix socket only: it is this host's
+	// inventory). Every daemon can answer it — the reconciliation reads
+	// config and the filesystem, not sync.db — so it is NOT scope-proxied.
+	routes.HandleFunc("/api/machine", unixOnly(s.handleMachineStatus))
+	// Sync endpoints — unix socket only (sync state is content-adjacent
+	// metadata; never expose it on the unauthenticated TCP listener).
+	// Scoped daemons proxy these to the global daemon, which owns sync.db.
+	routes.HandleFunc("/api/sync/status", unixOnly(s.handleSyncStatus))
+	routes.HandleFunc("/api/sync/allow", unixOnly(func(w http.ResponseWriter, r *http.Request) {
+		// POST adds a quarantine override, DELETE removes it. ServeMux
+		// panics on duplicate patterns, so dispatch by method here.
+		if r.Method == http.MethodDelete {
+			s.handleSyncDisallowQuarantine(w, r)
+			return
+		}
+		s.handleSyncAllow(w, r)
+	}))
+	routes.HandleFunc("/api/sync/history", unixOnly(s.handleSyncHistory))
+	routes.HandleFunc("/api/sync/restore", unixOnly(s.handleSyncRestore))
+	// Adopt (P5, S5): user-initiated resolution of a diverged document. The
+	// daemon fetches the server head + rolls the merge base; the CLI writes it.
+	routes.HandleFunc("/api/sync/adopt", unixOnly(s.handleSyncAdopt))
+	routes.HandleFunc("/api/sync/incoming", unixOnly(s.handleSyncIncoming))
+	routes.HandleFunc("/api/sync/escrow", unixOnly(s.handleSyncEscrow))
+	routes.HandleFunc("/api/sync/apply", unixOnly(s.handleSyncApply))
+	routes.HandleFunc("/api/sync/maintenance", unixOnly(s.handleSyncMaintenance))
+	// Repush: manual full re-push after a server recreate — voids synced
+	// state (non-diverged docs) and kicks an immediate anti-entropy pass.
+	routes.HandleFunc("/api/sync/repush", unixOnly(s.handleSyncRepush))
+	// Read-only introspection for the dev UI / playground god-view.
+	routes.HandleFunc("/api/sync/documents", unixOnly(s.handleSyncDocuments))
+	routes.HandleFunc("/api/sync/outbox", unixOnly(s.handleSyncOutbox))
+	routes.HandleFunc("/api/sync/conflicts", unixOnly(s.handleSyncConflicts))
+	// Static web viewer files
+	routes.Handle("/web/treemux/", http.StripPrefix("/web/treemux/", daemonweb.TreemuxFileServer()))
+
+	// PTY + hub endpoints — reverse proxied to the standalone tuimux daemon
+	// which owns the PTY master FDs out-of-process. Proxying (rather than
+	// embedding a manager) is what lets agent panes survive a `groved
+	// upgrade`: the tuimux daemon outlives groved, so the successor simply
+	// re-proxies to the same live socket and clients auto-reconnect. The
+	// proxy transparently handles WebSocket upgrades (/api/pty/attach,
+	// /api/pty/subscribe) and SSE (/api/pty/events).
+	// Proxy this daemon's /api/pty/* to ITS OWN scope-keyed tuimux socket so a
+	// scoped daemon's inspector reads only its own PTY map. Empty scope resolves
+	// to the legacy machine-wide socket (backward compat).
+	tuimuxSock := tuimux.ScopedSocketPath(s.scope)
+	ptyProxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = "unix"
+		},
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", tuimuxSock)
+			},
+		},
+	}
+	routes.Handle("/api/pty/", ptyProxy)
+	routes.Handle("/api/hub/", ptyProxy)
+
+	// Nav bindings endpoints
+	routes.HandleFunc("/api/nav/bindings", s.handleNavBindings)
+	routes.HandleFunc("/api/nav/config", s.handleNavConfig)
+	routes.HandleFunc("/api/nav/groups/", s.handleNavGroup)
+	routes.HandleFunc("/api/nav/locked-keys", s.handleNavLockedKeys)
+	routes.HandleFunc("/api/nav/last-accessed", s.handleNavLastAccessedGroup)
+	// Satellite federation read surface (P10, M2 contract C17). This is a
+	// laptop-side READ endpoint returning the global daemon's ConnManager
+	// health map — NOT an inbound verb the laptop invokes on a satellite, so
+	// C3's direction invariant holds. The mux.HandleFunc count increases here
+	// deliberately for this local read surface.
+	routes.HandleFunc("/api/satellites", s.handleSatellites)
+	// Satellite registry hot-reload (write surface, still laptop-side only —
+	// C3's direction invariant holds; nothing here dials INTO a satellite
+	// beyond what the ConnManager already owns). `grove satellite up`/`down`
+	// POST here as their final step so registry changes apply without an
+	// agent-killing daemon restart.
+	routes.HandleFunc("/api/satellites/reload", s.handleSatellitesReload)
+	// System endpoints
+	routes.HandleFunc("/api/system/info", s.handleSystemInfo)
+	routes.HandleFunc("/api/system/stats", s.handleSystemStats)
+	// Seed the stats sampler in the background so the first
+	// /api/system/stats request already has a previous snapshot and
+	// reports interval-true CPU% instead of ps's decaying average. Chosen
+	// over paying the warm-up in the first request: the handler never
+	// blocks on a sampling interval.
+	go func() { _, _ = s.statsCache.get(0) }()
+	routes.HandleFunc("/api/system/boot", s.handleSystemBoot)
+	routes.HandleFunc("/api/system/treemux-status", s.handleTerminalStatus)
+	// Native agent pane relay endpoints
+	routes.HandleFunc("/api/agents/spawn", s.handleAgentSpawn)
+	routes.HandleFunc("/api/agents/", s.handleAgentByID)
+
+	// Runtime profiling, always mounted, unix socket only. Attributing groved's
+	// live heap used to require restarting it with --pprof-port, which kills
+	// every running agent pane — so in practice no audit ever got a heap
+	// profile of the daemon that was actually misbehaving, and retention was
+	// guessed at from goroutine counts. The socket is 0600 and already carries
+	// strictly more sensitive payloads (transcripts, sync state), so exposing
+	// profiles there widens nothing; unixOnly keeps them off the
+	// unauthenticated localhost TCP listener the web viewer uses.
+	//
+	//	curl --unix-socket <sock> http://local/debug/pprof/heap > heap.pb.gz
+	//	go tool pprof -top heap.pb.gz
+	routes.HandleFunc("/debug/pprof/", unixOnly(netpprof.Index))
+	routes.HandleFunc("/debug/pprof/cmdline", unixOnly(netpprof.Cmdline))
+	routes.HandleFunc("/debug/pprof/profile", unixOnly(netpprof.Profile))
+	routes.HandleFunc("/debug/pprof/symbol", unixOnly(netpprof.Symbol))
+	routes.HandleFunc("/debug/pprof/trace", unixOnly(netpprof.Trace))
+}
+
+func (s *Server) configDegradedRouteHandler() http.Handler {
+	mux := http.NewServeMux()
+	s.registerConfigDegradedRoutes(mux)
+	return mux
 }
 
 // ListenAndServe binds the socket and then blocks serving on it — the
@@ -650,203 +869,14 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 		s.OnReady()
 	}
 
-	mux := http.NewServeMux()
+	var mux http.Handler
 	if s.configError() != nil {
 		// This is intentionally not the normal mux wrapped in middleware. It is
 		// a separately constructed status-only surface whose non-status entries
 		// are inert structured-503 placeholders.
-		s.registerConfigDegradedRoutes(mux)
+		mux = s.configDegradedRouteHandler()
 	} else {
-		routes := newClassifiedMux(mux)
-
-		// Health check endpoint.
-		routes.HandleFunc("/health", s.handleHealth)
-
-		// State API endpoints
-		routes.HandleFunc("/api/state", s.handleGetState)
-		routes.HandleFunc("/api/tasks", s.handlePostTaskReport)
-		// Machine-wide build queue endpoints
-		routes.HandleFunc("/api/build/submit", s.handleBuildSubmit)
-		routes.HandleFunc("/api/build/cancel", s.handleBuildCancel)
-		routes.HandleFunc("/api/build/jobs/", s.handleBuildJobSubpath)
-		routes.HandleFunc("/api/workspaces/", s.handleWorkspaceSubpath)
-		routes.HandleFunc("/api/workspaces", s.handleGetWorkspaces)
-		routes.HandleFunc("/api/plans", s.handleGetPlans)
-		routes.HandleFunc("/api/plan-index", s.handleGetPlanIndex)
-		// Session endpoints - order matters! Most specific routes first.
-		routes.HandleFunc("/api/sessions/intent", s.handleSessionIntent)
-		routes.HandleFunc("/api/sessions/confirm", s.handleSessionConfirm)
-		routes.HandleFunc("/api/sessions/", s.handleSessionByID)
-		routes.HandleFunc("/api/sessions", s.handleSessions)
-		routes.HandleFunc("/api/stream", s.handleStreamState)
-		routes.HandleFunc("/api/workspace/hud/stream", s.handleStreamWorkspaceHUD)
-		routes.HandleFunc("/api/config", s.handleGetConfig)
-		routes.HandleFunc("/api/focus", s.handleFocus)
-		routes.HandleFunc("/api/refresh", s.handleRefresh)
-		// Privileged Claude folder-trust seeding — unix socket only. The daemon
-		// derives the trusted paths from the worktree registry (never the caller),
-		// so a sandboxed provisioner can delegate the ~/.claude.json write it cannot
-		// perform itself. See handleSeedTrust for the security rationale.
-		routes.HandleFunc("/api/trust/seed", unixOnly(s.handleSeedTrust))
-		routes.HandleFunc("/api/forge/state", s.handleGetForgeState)
-		routes.HandleFunc("/api/notes/index", s.handleNoteIndex)
-		routes.HandleFunc("/api/notes/event", s.handleNoteEvent)
-		// Workflow/subagent aggregation endpoints. Served on the 0600 unix
-		// socket only (defensive: workflow payloads carry transcript-derived
-		// content — prompts, last assistant messages — that must not be
-		// reachable via the unauthenticated localhost TCP listener).
-		routes.HandleFunc("/api/workflows/event", unixOnly(s.handleWorkflowEvent))
-		routes.HandleFunc("/api/workflows", unixOnly(s.handleGetWorkflows))
-		routes.HandleFunc("/api/subjobs/event", unixOnly(s.handleSubjobEvent))
-		routes.HandleFunc("/api/subjobs", unixOnly(s.handleGetSubjobs))
-		// Aggregated workspace log streaming
-		routes.HandleFunc("/api/logs/stream", s.handleStreamWorkspaceLogs)
-		// Environment management endpoints
-		routes.HandleFunc("/api/env/up", s.handleEnvUp)
-		routes.HandleFunc("/api/env/down", s.handleEnvDown)
-		routes.HandleFunc("/api/env/status", s.handleEnvStatus)
-		// Global-proxy route registration (global daemon only)
-		routes.HandleFunc("/api/proxy/register", s.handleProxyRegister)
-		routes.HandleFunc("/api/proxy/unregister", s.handleProxyUnregister)
-		// Repo ensure endpoint (single-flighted clones).
-		routes.HandleFunc("/api/repos/ensure", s.handleRepoEnsure)
-		// Job management endpoints
-		routes.HandleFunc("/api/jobs/", s.handleJobByID)
-		routes.HandleFunc("/api/jobs", s.handleJobs)
-		// Bounded artifact return. The guest-local job route publishes files;
-		// this laptop-only route forwards over the pinned satellite transport.
-		routes.HandleFunc("/api/satellite-artifacts/fetch", s.handleSatelliteArtifactFetch)
-		// Channel management endpoints
-		routes.HandleFunc("/api/channels/send", s.handleChannelSend)
-		routes.HandleFunc("/api/channels/status", s.handleChannelStatus)
-		routes.HandleFunc("/api/channels/cleanup", s.handleChannelCleanup)
-		// Memory search endpoints
-		routes.HandleFunc("/api/memory/search", s.handleMemorySearch)
-		routes.HandleFunc("/api/memory/coverage", s.handleMemoryCoverage)
-		routes.HandleFunc("/api/memory/status", s.handleMemoryStatus)
-		routes.HandleFunc("/api/memory/reindex", s.handleMemoryReindex)
-		// Memory analysis endpoints
-		routes.HandleFunc("/api/memory/analysis/gc", s.handleMemoryAnalysisGC)
-		routes.HandleFunc("/api/memory/analysis/workspaces", s.handleMemoryAnalysisWorkspaces)
-		routes.HandleFunc("/api/memory/analysis/ecosystems", s.handleMemoryAnalysisEcosystems)
-		routes.HandleFunc("/api/memory/analysis/code", s.handleMemoryAnalysisCode)
-		routes.HandleFunc("/api/memory/analysis/concepts", s.handleMemoryAnalysisConcepts)
-		routes.HandleFunc("/api/memory/analysis/embeddings", s.handleMemoryAnalysisEmbeddings)
-		routes.HandleFunc("/api/memory/analysis/freshness", s.handleMemoryAnalysisFreshness)
-		routes.HandleFunc("/api/memory/analysis/duplicates", s.handleMemoryAnalysisDuplicates)
-		routes.HandleFunc("/api/memory/analysis/notebooks", s.handleMemoryAnalysisNotebooks)
-		routes.HandleFunc("/api/memory/analysis/context", s.handleMemoryAnalysisContext)
-		// Machine identity + declared intent (unix socket only: it is this host's
-		// inventory). Every daemon can answer it — the reconciliation reads
-		// config and the filesystem, not sync.db — so it is NOT scope-proxied.
-		routes.HandleFunc("/api/machine", unixOnly(s.handleMachineStatus))
-		// Sync endpoints — unix socket only (sync state is content-adjacent
-		// metadata; never expose it on the unauthenticated TCP listener).
-		// Scoped daemons proxy these to the global daemon, which owns sync.db.
-		routes.HandleFunc("/api/sync/status", unixOnly(s.handleSyncStatus))
-		routes.HandleFunc("/api/sync/allow", unixOnly(func(w http.ResponseWriter, r *http.Request) {
-			// POST adds a quarantine override, DELETE removes it. ServeMux
-			// panics on duplicate patterns, so dispatch by method here.
-			if r.Method == http.MethodDelete {
-				s.handleSyncDisallowQuarantine(w, r)
-				return
-			}
-			s.handleSyncAllow(w, r)
-		}))
-		routes.HandleFunc("/api/sync/history", unixOnly(s.handleSyncHistory))
-		routes.HandleFunc("/api/sync/restore", unixOnly(s.handleSyncRestore))
-		// Adopt (P5, S5): user-initiated resolution of a diverged document. The
-		// daemon fetches the server head + rolls the merge base; the CLI writes it.
-		routes.HandleFunc("/api/sync/adopt", unixOnly(s.handleSyncAdopt))
-		routes.HandleFunc("/api/sync/incoming", unixOnly(s.handleSyncIncoming))
-		routes.HandleFunc("/api/sync/escrow", unixOnly(s.handleSyncEscrow))
-		routes.HandleFunc("/api/sync/apply", unixOnly(s.handleSyncApply))
-		routes.HandleFunc("/api/sync/maintenance", unixOnly(s.handleSyncMaintenance))
-		// Repush: manual full re-push after a server recreate — voids synced
-		// state (non-diverged docs) and kicks an immediate anti-entropy pass.
-		routes.HandleFunc("/api/sync/repush", unixOnly(s.handleSyncRepush))
-		// Read-only introspection for the dev UI / playground god-view.
-		routes.HandleFunc("/api/sync/documents", unixOnly(s.handleSyncDocuments))
-		routes.HandleFunc("/api/sync/outbox", unixOnly(s.handleSyncOutbox))
-		routes.HandleFunc("/api/sync/conflicts", unixOnly(s.handleSyncConflicts))
-		// Static web viewer files
-		routes.Handle("/web/treemux/", http.StripPrefix("/web/treemux/", daemonweb.TreemuxFileServer()))
-
-		// PTY + hub endpoints — reverse proxied to the standalone tuimux daemon
-		// which owns the PTY master FDs out-of-process. Proxying (rather than
-		// embedding a manager) is what lets agent panes survive a `groved
-		// upgrade`: the tuimux daemon outlives groved, so the successor simply
-		// re-proxies to the same live socket and clients auto-reconnect. The
-		// proxy transparently handles WebSocket upgrades (/api/pty/attach,
-		// /api/pty/subscribe) and SSE (/api/pty/events).
-		// Proxy this daemon's /api/pty/* to ITS OWN scope-keyed tuimux socket so a
-		// scoped daemon's inspector reads only its own PTY map. Empty scope resolves
-		// to the legacy machine-wide socket (backward compat).
-		tuimuxSock := tuimux.ScopedSocketPath(s.scope)
-		ptyProxy := &httputil.ReverseProxy{
-			Director: func(req *http.Request) {
-				req.URL.Scheme = "http"
-				req.URL.Host = "unix"
-			},
-			Transport: &http.Transport{
-				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-					return net.Dial("unix", tuimuxSock)
-				},
-			},
-		}
-		routes.Handle("/api/pty/", ptyProxy)
-		routes.Handle("/api/hub/", ptyProxy)
-
-		// Nav bindings endpoints
-		routes.HandleFunc("/api/nav/bindings", s.handleNavBindings)
-		routes.HandleFunc("/api/nav/config", s.handleNavConfig)
-		routes.HandleFunc("/api/nav/groups/", s.handleNavGroup)
-		routes.HandleFunc("/api/nav/locked-keys", s.handleNavLockedKeys)
-		routes.HandleFunc("/api/nav/last-accessed", s.handleNavLastAccessedGroup)
-		// Satellite federation read surface (P10, M2 contract C17). This is a
-		// laptop-side READ endpoint returning the global daemon's ConnManager
-		// health map — NOT an inbound verb the laptop invokes on a satellite, so
-		// C3's direction invariant holds. The mux.HandleFunc count increases here
-		// deliberately for this local read surface.
-		routes.HandleFunc("/api/satellites", s.handleSatellites)
-		// Satellite registry hot-reload (write surface, still laptop-side only —
-		// C3's direction invariant holds; nothing here dials INTO a satellite
-		// beyond what the ConnManager already owns). `grove satellite up`/`down`
-		// POST here as their final step so registry changes apply without an
-		// agent-killing daemon restart.
-		routes.HandleFunc("/api/satellites/reload", s.handleSatellitesReload)
-		// System endpoints
-		routes.HandleFunc("/api/system/info", s.handleSystemInfo)
-		routes.HandleFunc("/api/system/stats", s.handleSystemStats)
-		// Seed the stats sampler in the background so the first
-		// /api/system/stats request already has a previous snapshot and
-		// reports interval-true CPU% instead of ps's decaying average. Chosen
-		// over paying the warm-up in the first request: the handler never
-		// blocks on a sampling interval.
-		go func() { _, _ = s.statsCache.get(0) }()
-		routes.HandleFunc("/api/system/boot", s.handleSystemBoot)
-		routes.HandleFunc("/api/system/treemux-status", s.handleTerminalStatus)
-		// Native agent pane relay endpoints
-		routes.HandleFunc("/api/agents/spawn", s.handleAgentSpawn)
-		routes.HandleFunc("/api/agents/", s.handleAgentByID)
-
-		// Runtime profiling, always mounted, unix socket only. Attributing groved's
-		// live heap used to require restarting it with --pprof-port, which kills
-		// every running agent pane — so in practice no audit ever got a heap
-		// profile of the daemon that was actually misbehaving, and retention was
-		// guessed at from goroutine counts. The socket is 0600 and already carries
-		// strictly more sensitive payloads (transcripts, sync state), so exposing
-		// profiles there widens nothing; unixOnly keeps them off the
-		// unauthenticated localhost TCP listener the web viewer uses.
-		//
-		//	curl --unix-socket <sock> http://local/debug/pprof/heap > heap.pb.gz
-		//	go tool pprof -top heap.pb.gz
-		routes.HandleFunc("/debug/pprof/", unixOnly(netpprof.Index))
-		routes.HandleFunc("/debug/pprof/cmdline", unixOnly(netpprof.Cmdline))
-		routes.HandleFunc("/debug/pprof/profile", unixOnly(netpprof.Profile))
-		routes.HandleFunc("/debug/pprof/symbol", unixOnly(netpprof.Symbol))
-		routes.HandleFunc("/debug/pprof/trace", unixOnly(netpprof.Trace))
-		routes.assertComplete()
+		mux = s.normalRouteHandler()
 	}
 
 	handler := h2c.NewHandler(mux, &http2.Server{})

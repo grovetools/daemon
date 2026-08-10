@@ -3,13 +3,107 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestNormalRouteRegistrationIsStructurallyClassified(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate test source")
+	}
+	serverFile := filepath.Join(filepath.Dir(testFile), "server.go")
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, serverFile, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", serverFile, err)
+	}
+
+	functions := make(map[string]*ast.FuncDecl)
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			functions[fn.Name.Name] = fn
+		}
+	}
+	register := functions["registerNormalRoutes"]
+	construct := functions["normalRouteHandler"]
+	if register == nil || construct == nil {
+		t.Fatal("normal route constructor/registrar not found")
+	}
+
+	registrations := 0
+	ast.Inspect(register.Body, func(node ast.Node) bool {
+		sel, ok := node.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if sel.Sel.Name == "mux" || sel.Sel.Name == "NewServeMux" {
+			t.Errorf("normal registrar accesses raw mux at %s", fset.Position(sel.Pos()))
+		}
+		if sel.Sel.Name != "Handle" && sel.Sel.Name != "HandleFunc" {
+			return true
+		}
+		receiver, ok := sel.X.(*ast.Ident)
+		if !ok || receiver.Name != "routes" {
+			t.Errorf("normal route bypasses classified registrar at %s", fset.Position(sel.Pos()))
+			return true
+		}
+		registrations++
+		return true
+	})
+	if registrations != len(daemonRoutes) {
+		t.Fatalf("normal registrar has %d registrations, classified degraded inventory has %d", registrations, len(daemonRoutes))
+	}
+
+	// The constructor may create and return classifiedMux, but must never
+	// reach into its raw ServeMux or register a handler itself. This assertion
+	// makes bypassing the inventory a source-visible test failure rather than
+	// a silent degraded-mode 404.
+	ast.Inspect(construct.Body, func(node ast.Node) bool {
+		sel, ok := node.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if sel.Sel.Name == "mux" || sel.Sel.Name == "NewServeMux" || sel.Sel.Name == "Handle" || sel.Sel.Name == "HandleFunc" {
+			t.Errorf("normal route constructor accesses raw registration surface at %s", fset.Position(sel.Pos()))
+		}
+		return true
+	})
+}
+
+func TestDegradedRouteInventoryOnlyAllowsStatusHandlers(t *testing.T) {
+	allowed := map[string]degradedRouteMode{
+		"/health":          degradedRouteHealth,
+		"/api/config":      degradedRouteConfig,
+		"/api/system/boot": degradedRouteBoot,
+		"/api/sync/status": degradedRouteSyncStatus,
+	}
+	for _, route := range daemonRoutes {
+		want, live := allowed[route.pattern]
+		if live {
+			if route.degradedMode != want {
+				t.Errorf("%s degraded mode = %d, want %d", route.pattern, route.degradedMode, want)
+			}
+			delete(allowed, route.pattern)
+			continue
+		}
+		if route.degradedMode != degradedRouteRejected {
+			t.Errorf("unexpected live degraded route %s (mode %d)", route.pattern, route.degradedMode)
+		}
+	}
+	if len(allowed) != 0 {
+		t.Fatalf("status routes missing from inventory: %v", allowed)
+	}
+}
 
 func TestNormalMuxRegistrationMatchesDegradedRouteTable(t *testing.T) {
 	t.Setenv("GROVE_HOME", t.TempDir())
