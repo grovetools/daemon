@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/pkg/coderoot"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/registry"
 	"github.com/grovetools/core/pkg/workspace"
@@ -32,9 +32,9 @@ func TestProjectMachineSyncTierZeroStatesAndMetadata(t *testing.T) {
 	writeMachineSyncTip(t, repo, "main", localSHA)
 
 	enabled, disabled := true, false
-	machineCfg := &config.MachineConfig{Machine: config.MachineSettings{Roots: map[string]config.MachineRoot{
-		"code": {Path: root, Enabled: &enabled},
-	}}}
+	codeRoots := coderoot.Table{Roots: map[string]coderoot.Root{
+		"code": {Path: root, Scan: true, Enabled: &enabled},
+	}}
 	workspaces := map[string]*models.EnrichedWorkspace{
 		repo: {WorkspaceNode: &workspace.WorkspaceNode{Path: repo, Name: "demo"}},
 	}
@@ -55,7 +55,7 @@ func TestProjectMachineSyncTierZeroStatesAndMetadata(t *testing.T) {
 	}
 
 	now := time.Date(2026, 8, 9, 1, 0, 0, 0, time.UTC)
-	got := projectMachineSync(workspaces, "self", machineCfg, machines, now)[repo]
+	got := projectMachineSync(workspaces, "self", codeRoots, machines, now)[repo]
 	if got == nil {
 		t.Fatal("projection is nil")
 	}
@@ -95,9 +95,9 @@ func TestProjectMachineSyncUnknownNeverEqualsWithoutLocalTip(t *testing.T) {
 	if err := os.MkdirAll(repo, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	machineCfg := &config.MachineConfig{Machine: config.MachineSettings{Roots: map[string]config.MachineRoot{
-		"code": {Path: root},
-	}}}
+	codeRoots := coderoot.Table{Roots: map[string]coderoot.Root{
+		"code": {Path: root, Scan: true},
+	}}
 	remote := registry.Machine{PathID: "remote", Note: &registry.Note{
 		Name: "remote", LastSeen: "not-a-date",
 		Roots: []registry.NoteRoot{{Name: "code", Enabled: true, Exists: true}},
@@ -105,7 +105,7 @@ func TestProjectMachineSyncUnknownNeverEqualsWithoutLocalTip(t *testing.T) {
 	}}
 	got := projectMachineSync(map[string]*models.EnrichedWorkspace{
 		repo: {WorkspaceNode: &workspace.WorkspaceNode{Path: repo}},
-	}, "self", machineCfg, []registry.Machine{remote}, time.Now())[repo]
+	}, "self", codeRoots, []registry.Machine{remote}, time.Now())[repo]
 	if got.Peers[0].State != models.MachineSyncUnknown {
 		t.Fatalf("state = %q, want unknown", got.Peers[0].State)
 	}

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/pkg/coderoot"
 	"github.com/grovetools/core/pkg/machine"
 )
 
@@ -49,8 +50,8 @@ type machineRootState struct {
 // re-statting the filesystem. P6 feeds the same states into the machine note
 // (state = declared-missing) so peers can see the gap too.
 //
-// A machine with no machine.toml is not an error: the response is just the
-// name (hostname default) and the id, with no subscriptions.
+// A machine with no recorded roots is not an error: the response is just the
+// name (hostname default) and the id, with no declared code intent.
 func (s *Server) handleMachineStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -63,9 +64,9 @@ func (s *Server) handleMachineStatus(w http.ResponseWriter, r *http.Request) {
 		ConfigPath: config.MachineConfigPath(),
 	}
 
-	machineCfg, err := config.LoadMachineConfig()
+	codeRoots, err := coderoot.Load()
 	if err != nil {
-		// An unreadable machine.toml is a real operator problem, but identity
+		// Unreadable recorded routing is a real operator problem, but identity
 		// still answers — report what is knowable rather than 500ing the
 		// whole surface.
 		w.Header().Set("Content-Type", "application/json")
@@ -74,7 +75,7 @@ func (s *Server) handleMachineStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for _, st := range config.ReconcileMachineEcosystems(machineCfg) {
+	for _, st := range config.ReconcileCodeRoots(codeRoots) {
 		out.Ecosystems = append(out.Ecosystems, machineEcosystemState{
 			Name:     st.Name,
 			Path:     st.Path,
@@ -84,41 +85,27 @@ func (s *Server) handleMachineStatus(w http.ResponseWriter, r *http.Request) {
 			Enabled:  st.Enabled,
 		})
 	}
-	if machineCfg != nil {
-		for _, name := range sortedMachineRootNames(machineCfg) {
-			root := machineCfg.Machine.Roots[name]
-			path := os.ExpandEnv(root.Path)
-			if abs, err := filepath.Abs(expandHome(path)); err == nil {
-				path = abs
-			}
-			info, statErr := os.Stat(path)
-			out.Roots = append(out.Roots, machineRootState{
-				Name:     name,
-				Path:     path,
-				Notebook: root.Notebook,
-				Enabled:  root.Enabled == nil || *root.Enabled,
-				Exists:   statErr == nil && info.IsDir(),
-			})
+	for _, name := range codeRoots.SortedRootNames() {
+		root := codeRoots.Roots[name]
+		if !root.Scan {
+			continue
 		}
+		path := os.ExpandEnv(root.Path)
+		if abs, err := filepath.Abs(expandHome(path)); err == nil {
+			path = abs
+		}
+		info, statErr := os.Stat(path)
+		out.Roots = append(out.Roots, machineRootState{
+			Name:     name,
+			Path:     path,
+			Notebook: codeRoots.RootNotebook(name),
+			Enabled:  root.Enabled == nil || *root.Enabled,
+			Exists:   statErr == nil && info.IsDir(),
+		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
-}
-
-// sortedMachineRootNames keeps the payload deterministic (map iteration order
-// would otherwise reshuffle the rows on every poll).
-func sortedMachineRootNames(cfg *config.MachineConfig) []string {
-	names := make([]string, 0, len(cfg.Machine.Roots))
-	for name := range cfg.Machine.Roots {
-		names = append(names, name)
-	}
-	for i := 1; i < len(names); i++ {
-		for j := i; j > 0 && names[j] < names[j-1]; j-- {
-			names[j], names[j-1] = names[j-1], names[j]
-		}
-	}
-	return names
 }
 
 // expandHome expands a leading ~/ the way core's config loader does.

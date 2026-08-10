@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/pkg/coderoot"
 	"github.com/grovetools/core/pkg/machine"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/registry"
@@ -81,9 +82,9 @@ func (c *MachineSyncCollector) Run(ctx context.Context, st *store.Store, updates
 
 func (c *MachineSyncCollector) loadAndProject(workspaces map[string]*models.EnrichedWorkspace) map[string]*models.MachineSync {
 	localID := machine.ID()
-	machineCfg, machineErr := config.LoadMachineConfig()
-	if machineErr != nil {
-		return unavailableMachineSync(workspaces, localID, "machine config unavailable")
+	codeRoots, rootsErr := coderoot.Load()
+	if rootsErr != nil {
+		return unavailableMachineSync(workspaces, localID, "code roots unavailable")
 	}
 	cfg, cfgErr := config.LoadDefault()
 	if cfgErr != nil {
@@ -102,7 +103,7 @@ func (c *MachineSyncCollector) loadAndProject(workspaces map[string]*models.Enri
 	if err != nil {
 		return unavailableMachineSync(workspaces, localID, "registry replica unavailable")
 	}
-	return projectMachineSync(workspaces, localID, machineCfg, machines, c.now())
+	return projectMachineSync(workspaces, localID, codeRoots, machines, c.now())
 }
 
 func unavailableMachineSync(workspaces map[string]*models.EnrichedWorkspace, localID, reason string) map[string]*models.MachineSync {
@@ -125,8 +126,8 @@ type machineSyncRoot struct {
 	ecosystem bool
 }
 
-func projectMachineSync(workspaces map[string]*models.EnrichedWorkspace, localID string, machineCfg *config.MachineConfig, machines []registry.Machine, now time.Time) map[string]*models.MachineSync {
-	roots := localMachineSyncRoots(machineCfg)
+func projectMachineSync(workspaces map[string]*models.EnrichedWorkspace, localID string, codeRoots coderoot.Table, machines []registry.Machine, now time.Time) map[string]*models.MachineSync {
+	roots := localMachineSyncRoots(codeRoots)
 	out := make(map[string]*models.MachineSync, len(workspaces))
 	for path, ws := range workspaces {
 		identityPath := path
@@ -158,12 +159,9 @@ func projectMachineSync(workspaces map[string]*models.EnrichedWorkspace, localID
 	return out
 }
 
-func localMachineSyncRoots(cfg *config.MachineConfig) []machineSyncRoot {
-	if cfg == nil {
-		return nil
-	}
+func localMachineSyncRoots(table coderoot.Table) []machineSyncRoot {
 	var roots []machineSyncRoot
-	for _, state := range config.ReconcileMachineEcosystems(cfg) {
+	for _, state := range config.ReconcileCodeRoots(table) {
 		id := "ecosystem-name:" + state.Name
 		if state.Manifest != "" {
 			if card, err := config.LoadEcosystemCard(state.Manifest); err == nil && card != nil && card.ID != "" {
@@ -172,7 +170,11 @@ func localMachineSyncRoots(cfg *config.MachineConfig) []machineSyncRoot {
 		}
 		roots = append(roots, machineSyncRoot{name: state.Name, id: id, path: filepath.Clean(state.Path), ecosystem: true})
 	}
-	for name, root := range cfg.Machine.Roots {
+	for _, name := range table.SortedRootNames() {
+		root := table.Roots[name]
+		if !root.Scan {
+			continue
+		}
 		roots = append(roots, machineSyncRoot{name: name, id: "root:" + name, path: expandMachineSyncPath(root.Path)})
 	}
 	// Longest path first prevents a nested configured root from being claimed

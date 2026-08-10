@@ -28,22 +28,35 @@ func TestHandleMachineStatusReportsReconciledIntent(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	machineTOML := `[machine]
-name = "mbp"
-
-[machine.ecosystems.grovetools]
+	machineTOML := "[machine]\nname = \"mbp\"\n"
+	if err := os.WriteFile(filepath.Join(configDir, "machine.toml"), []byte(machineTOML), 0o644); err != nil {
+		t.Fatalf("write machine.toml: %v", err)
+	}
+	rootsTOML := `[roots.grovetools]
 path = "` + present + `"
 notebook = "grovetools"
 
-[machine.ecosystems.cloud]
+[roots.cloud]
 path = "` + filepath.Join(code, "cloud") + `"
 
-[machine.roots.chickens]
+[roots.chickens]
 path = "` + chickens + `"
+scan = true
 notebook = "nb"
 `
-	if err := os.WriteFile(filepath.Join(configDir, "machine.toml"), []byte(machineTOML), 0o644); err != nil {
-		t.Fatalf("write machine.toml: %v", err)
+	if err := os.WriteFile(filepath.Join(configDir, "roots.toml"), []byte(rootsTOML), 0o644); err != nil {
+		t.Fatalf("write roots.toml: %v", err)
+	}
+	notebooksTOML := `default = "nb"
+
+[notebooks.nb]
+root = "` + t.TempDir() + `"
+
+[notebooks.grovetools]
+root = "` + t.TempDir() + `"
+`
+	if err := os.WriteFile(filepath.Join(configDir, "notebooks.toml"), []byte(notebooksTOML), 0o644); err != nil {
+		t.Fatalf("write notebooks.toml: %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/machine", nil)
