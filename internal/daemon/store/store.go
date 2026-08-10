@@ -793,10 +793,15 @@ func terminalJobUpdateType(status string) (UpdateType, bool) {
 }
 
 // applySessionIntent creates a new session entry from an intent (before agent launch).
+//
+// The recorded Type is the launcher's, not a constant: stamping every
+// registration "interactive_agent" told treemux a headless job had a terminal
+// to attach, which is what opened an empty shell on click instead of the job's
+// transcript stream.
 func (s *Store) applySessionIntent(payload *SessionIntentPayload) {
 	session := &models.Session{
 		ID:               payload.JobID,
-		Type:             "interactive_agent",
+		Type:             models.SessionTypeOrDefault(payload.Type),
 		Provider:         payload.Provider,
 		PID:              0, // Not yet known
 		WorkingDirectory: payload.WorkDir,

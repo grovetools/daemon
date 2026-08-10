@@ -350,6 +350,11 @@ type SessionIntentPayload struct {
 
 	// Mux identifies the multiplexer backing the session's PTY.
 	Mux string `json:"mux,omitempty"`
+
+	// Type is the session shape being registered ("interactive_agent" or
+	// "headless_agent"); see daemon.SessionIntent.Type. Empty means
+	// "interactive_agent" — what every launcher meant before the field existed.
+	Type string `json:"type,omitempty"`
 }
 
 // SessionChannelsPayload contains data for updating session channels.
