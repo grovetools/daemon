@@ -124,13 +124,22 @@ func TestGrovedMalformedRecordedConfigBindsStatusOnly(t *testing.T) {
 	}
 	stateBody, _ := io.ReadAll(stateResp.Body)
 	_ = stateResp.Body.Close()
-	if stateResp.StatusCode != http.StatusServiceUnavailable || !bytes.Contains(stateBody, []byte("engine not initialized")) {
-		t.Fatalf("collector engine unexpectedly exists: status=%d body=%s", stateResp.StatusCode, stateBody)
+	if stateResp.StatusCode != http.StatusServiceUnavailable || !bytes.Contains(stateBody, []byte(`"code":"config_load_failed"`)) {
+		t.Fatalf("state route bypassed status-only mux: status=%d body=%s", stateResp.StatusCode, stateBody)
 	}
 
 	for _, tc := range []struct{ path, body string }{
 		{"/api/jobs", `{}`},
 		{"/api/build/submit", `{}`},
+		{"/api/env/up", `{}`},
+		{"/api/agents/spawn", `{}`},
+		{"/api/repos/ensure", `{}`},
+		{"/api/tasks", `{}`},
+		{"/api/refresh", `{}`},
+		{"/api/channels/send", `{}`},
+		{"/api/sync/allow", `{}`},
+		{"/api/sync/apply", `{}`},
+		{"/api/sync/maintenance", `{}`},
 	} {
 		req, _ := http.NewRequest(http.MethodPost, "http://unix"+tc.path, bytes.NewBufferString(tc.body))
 		resp, err := client.Do(req)

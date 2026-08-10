@@ -5,16 +5,36 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestNormalMuxRegistrationMatchesDegradedRouteTable(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	sock := shortSocketPath(t)
+	s := New(false)
+	// Listen constructs the normal mux through classifiedMux. It panics if a
+	// normal registration is absent from daemonRoutes or a table entry is not
+	// mounted, making that table an exhaustive route contract.
+	if err := s.Listen(sock); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	go func() { _ = s.Serve() }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
 
 func TestConfigDegradedSocketServesStatusAndRejectsSubmissions(t *testing.T) {
 	t.Setenv("GROVE_HOME", t.TempDir())
 	sock := shortSocketPath(t)
 	s := New(false)
 	s.SetConfigDegradation("/tmp/config/roots.toml: roots.bad: expected path")
+	s.SetBootStatus(nil)
 	if err := s.Listen(sock); err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -68,9 +88,37 @@ func TestConfigDegradedSocketServesStatusAndRejectsSubmissions(t *testing.T) {
 		t.Fatalf("sync status implies a pipeline is active: %#v", syncStatus)
 	}
 
-	// These assertions run with no runner or scheduler wired. The config gate
-	// must win and return the same structured reason before either submission
-	// can reach (or implicitly create) a pipeline.
-	assertConfigError("/api/jobs", http.StatusServiceUnavailable, http.MethodPost, `{}`, "error")
-	assertConfigError("/api/build/submit", http.StatusServiceUnavailable, http.MethodPost, `{}`, "error")
+	bootReq, err := http.NewRequest(http.MethodGet, "http://unix/api/system/boot", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootResp, err := client.Do(bootReq)
+	if err != nil {
+		t.Fatalf("GET /api/system/boot: %v", err)
+	}
+	_ = bootResp.Body.Close()
+	if bootResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/system/boot = %d, want 200", bootResp.StatusCode)
+	}
+
+	// Exercise every route in the normal daemon inventory over the real Unix
+	// socket. The degraded mux must replace every non-status handler — reads as
+	// well as mutations — with exactly the same structured 503 response. This
+	// includes all work-starting/submission paths without relying on their
+	// method checks or missing dependencies to fail incidentally.
+	var canonicalError map[string]any
+	for _, route := range daemonRoutes {
+		if route.degradedMode != degradedRouteRejected {
+			continue
+		}
+		got := assertConfigError(route.pattern, http.StatusServiceUnavailable, http.MethodPost, `{}`, "error")
+		errBody := got["error"].(map[string]any)
+		if canonicalError == nil {
+			canonicalError = errBody
+			continue
+		}
+		if !reflect.DeepEqual(errBody, canonicalError) {
+			t.Fatalf("%s returned a different degraded error: got %#v, want %#v", route.pattern, errBody, canonicalError)
+		}
+	}
 }
