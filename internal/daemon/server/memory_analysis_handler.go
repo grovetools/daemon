@@ -175,7 +175,11 @@ func (s *Server) handleMemoryAnalysisEcosystems(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	cfg, _ := config.LoadDefault()
+	cfg, err := config.LoadDefault()
+	if err != nil {
+		http.Error(w, "loading grove config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	var out []*models.EcosystemAnalysis
 	if cfg != nil {
 		for name, src := range cfg.Groves {
@@ -188,11 +192,11 @@ func (s *Server) handleMemoryAnalysisEcosystems(w http.ResponseWriter, r *http.R
 				if !e.IsDir() {
 					continue
 				}
-				analysis.ConfiguredGroves++
+				analysis.ConfiguredRoots++
 				wsName := e.Name()
 				wsPath := filepath.Join(src.Path, wsName)
 				if indexed[wsName] > 0 {
-					analysis.IndexedGroves++
+					analysis.IndexedRoots++
 				} else {
 					analysis.ZeroCoverage = append(analysis.ZeroCoverage, wsName)
 				}
