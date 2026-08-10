@@ -95,7 +95,7 @@ func TestComputeWorkspaceWatchesRecursive(t *testing.T) {
 	}
 
 	// Full mode: every Included dir registered, excluded subtrees absent.
-	full := computeWorkspaceWatches(&config.SyncWorkspace{Name: "testws", Mode: config.SyncModeFull}, dirs)
+	full := computeWorkspaceWatches(&config.SyncWorkspace{Name: "testws", Mode: config.SyncModeFull}, wsRoot, dirs)
 	for _, rel := range []string{"", "quick", "inbox", "daily", "concepts", "plans", "plans/myplan", "plans/myplan/sub", "chats"} {
 		w, ok := full[abs(rel)]
 		if !ok {
@@ -115,7 +115,7 @@ func TestComputeWorkspaceWatchesRecursive(t *testing.T) {
 	}
 
 	// Plans-only mode: only plans/… dirs, syncWatch.root still the workspace root.
-	plansOnly := computeWorkspaceWatches(&config.SyncWorkspace{Name: "testws", Mode: config.SyncModePlansOnly}, dirs)
+	plansOnly := computeWorkspaceWatches(&config.SyncWorkspace{Name: "testws", Mode: config.SyncModePlansOnly}, wsRoot, dirs)
 	if _, ok := plansOnly[abs("plans/myplan/sub")]; !ok {
 		t.Error("plans-only: missing plans/myplan/sub")
 	}
@@ -130,6 +130,25 @@ func TestComputeWorkspaceWatchesRecursive(t *testing.T) {
 		}
 		if w.root != wsRoot {
 			t.Errorf("plans-only: syncWatch.root = %q, want workspace root %q", w.root, wsRoot)
+		}
+	}
+}
+
+func TestComputeWorkspaceWatchesUsesRecordedRootNotFirstStatableDir(t *testing.T) {
+	recorded, dirs := newRecursiveTestWorkspace(t, []string{"inbox"})
+	decoy := filepath.Join(t.TempDir(), "workspaces", "testws")
+	if err := os.MkdirAll(decoy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dirs = append([]workspace.ContentDirectory{{Path: decoy, Type: "notes"}}, dirs...)
+
+	watches := computeWorkspaceWatches(&config.SyncWorkspace{Name: "testws", Mode: config.SyncModeFull}, recorded, dirs)
+	if _, ok := watches[decoy]; ok {
+		t.Fatalf("first stat-able decoy %q became a watch root", decoy)
+	}
+	for path, watch := range watches {
+		if watch.root != recorded {
+			t.Errorf("watch %q root = %q, want recorded root %q", path, watch.root, recorded)
 		}
 	}
 }
@@ -150,7 +169,7 @@ func TestRecursiveWatchFlushS1(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	h := NewSyncHandler(nil, nil, nil, db, 50, 500)
-	h.watchedPaths = computeWorkspaceWatches(&config.SyncWorkspace{Name: "testws", Mode: config.SyncModeFull}, dirs)
+	h.watchedPaths = computeWorkspaceWatches(&config.SyncWorkspace{Name: "testws", Mode: config.SyncModeFull}, wsRoot, dirs)
 
 	ctx := context.Background()
 	quickFile := filepath.Join(wsRoot, "quick", "x.md")
@@ -179,12 +198,13 @@ func TestRecursiveWatchFlushS1(t *testing.T) {
 func satelliteConfig(notebookRoot string) *config.Config {
 	return &config.Config{
 		Groves: map[string]config.GroveSourceConfig{
-			"grovetools": {Path: "/nonexistent/code/grovetools", Notebook: "grovetools"},
+			"grovetools": {Path: "/nonexistent/code/grovetools", Notebook: "grovetools", NotebookRoot: notebookRoot},
 		},
 		Notebooks: &config.NotebooksConfig{
 			Definitions: map[string]*config.Notebook{
 				"grovetools": {RootDir: notebookRoot},
 			},
+			Rules: &config.NotebookRules{Default: "grovetools"},
 		},
 	}
 }
@@ -232,10 +252,9 @@ func TestConfiguredPullRootsZeroDiscovery(t *testing.T) {
 	}
 }
 
-// TestSyntheticNodeNotebookResolution pins the NotebookName preference order:
-// an on-disk workspace root under a definition wins over the grove-referenced
-// notebook; with nothing on disk the grove reference wins; with neither, the
-// node is left for the locator's default fallback chain.
+// TestSyntheticNodeNotebookResolution pins recorded-only routing: an exact
+// compiled root binding wins regardless of same-name directories elsewhere;
+// the explicit default is next; without either, resolution refuses.
 func TestSyntheticNodeNotebookResolution(t *testing.T) {
 	db, err := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
 	if err != nil {
@@ -246,40 +265,44 @@ func TestSyntheticNodeNotebookResolution(t *testing.T) {
 	existingRoot := t.TempDir()
 	cfg := &config.Config{
 		Groves: map[string]config.GroveSourceConfig{
-			"main": {Path: "/nonexistent/code", Notebook: "grove-nb"},
+			"ws": {Path: "/nonexistent/code", Notebook: "grove-nb", NotebookRoot: "/nonexistent/notebooks/grove-nb"},
 		},
 		Notebooks: &config.NotebooksConfig{
 			Definitions: map[string]*config.Notebook{
 				"grove-nb": {RootDir: "/nonexistent/notebooks/grove-nb"},
 				"other-nb": {RootDir: existingRoot},
 			},
+			Rules: &config.NotebookRules{Default: "other-nb"},
 		},
 	}
 	h := NewSyncHandler(nil, cfg, nil, db, 50, 500)
 
-	// Nothing on disk: the grove-referenced notebook wins.
+	// The exact compiled binding wins without an existence probe.
 	if node := h.syntheticNodeFor("ws"); node.NotebookName != "grove-nb" {
 		t.Errorf("no dirs on disk: NotebookName = %q, want grove-nb", node.NotebookName)
 	}
 
-	// The workspace root exists under other-nb: existence wins over the grove
-	// reference.
+	// Even three same-name trees elsewhere cannot override the recorded route.
 	if err := os.MkdirAll(filepath.Join(existingRoot, "workspaces", "ws"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if node := h.syntheticNodeFor("ws"); node.NotebookName != "other-nb" {
-		t.Errorf("existing dir: NotebookName = %q, want other-nb", node.NotebookName)
+	for _, extra := range []string{"third-nb", "fourth-nb"} {
+		if err := os.MkdirAll(filepath.Join(existingRoot, extra, "workspaces", "ws"), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	if node := h.syntheticNodeFor("ws"); node.NotebookName != "grove-nb" {
+		t.Errorf("same-name dirs changed NotebookName to %q, want grove-nb", node.NotebookName)
 	}
 
-	// No groves, no definitions: bare node, locator default fallback applies
-	// (builtin centralized default -> still an absolute, usable root).
-	h.cfg = &config.Config{}
+	// No binding and no recorded default: refuse rather than use a builtin.
+	h = NewSyncHandler(nil, &config.Config{}, nil, db, 50, 500)
 	node := h.syntheticNodeFor("ws")
 	if node.NotebookName != "" {
 		t.Errorf("bare config: NotebookName = %q, want empty", node.NotebookName)
 	}
-	if root := h.nodeWorkspaceRoot(node); root == "" || !filepath.IsAbs(root) {
-		t.Errorf("bare config: nodeWorkspaceRoot = %q, want absolute builtin-default root", root)
+	if root := h.nodeWorkspaceRoot(node); root != "" {
+		t.Errorf("bare config: nodeWorkspaceRoot = %q, want refusal", root)
 	}
 }
 

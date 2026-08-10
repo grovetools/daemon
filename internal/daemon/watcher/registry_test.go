@@ -38,6 +38,9 @@ func registryFixture(t *testing.T, machineTOML string) (*SyncHandler, string, st
 
 [notebooks.definitions.nb]
 root_dir = "`+notebookRoot+`"
+
+[notebooks.rules]
+default = "nb"
 `)
 	if machineTOML != "" {
 		writeTestFile(t, filepath.Join(configDir, "machine.toml"), machineTOML)

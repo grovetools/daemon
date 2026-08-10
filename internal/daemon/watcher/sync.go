@@ -288,47 +288,28 @@ func (h *SyncHandler) SyncSubscriptions() (string, []config.SyncWorkspace) {
 	return h.syncCfg.Server, slices.Clone(h.syncCfg.Workspaces)
 }
 
-// syntheticNodeFor builds a WorkspaceNode for a subscribed workspace that code
-// discovery did not yield (pure notes satellite: sync.toml subscribes to
-// workspaces whose source trees don't exist under any grove path). A notebook
-// workspace's location is fully determined by config — [notebooks.definitions]
-// root_dir + path templates keyed only on the workspace NAME — so a node
-// carrying just Name + a resolved NotebookName is enough for the locator.
-//
-// NotebookName resolution, in preference order:
-//  1. a notebook definition whose resolved workspace root already exists on
-//     disk (an existing replica or bootstrap-precreated dirs is the strongest
-//     signal of which notebook the workspace belongs to);
-//  2. the notebook referenced by a configured grove (what discovery's
-//     config.ResolveNotebook would have produced for a child of that grove),
-//     groves visited in sorted order for determinism;
-//  3. empty — the locator then falls back to notebooks.rules.default and the
-//     builtin default, exactly as it does for any node without a match.
+// syntheticNodeFor builds a node only from recorded routing. An exact compiled
+// code-root binding is literal rung 0; otherwise notebooks.toml's explicit
+// default pointer is allowed. Filesystem existence and sorted map order never
+// select a notebook.
 func (h *SyncHandler) syntheticNodeFor(name string) *workspace.WorkspaceNode {
+	node := &workspace.WorkspaceNode{Name: name}
 	cfg := h.cfg
-	if cfg != nil && cfg.Notebooks != nil && len(cfg.Notebooks.Definitions) > 0 {
-		for _, defName := range slices.Sorted(maps.Keys(cfg.Notebooks.Definitions)) {
-			node := &workspace.WorkspaceNode{Name: name, NotebookName: defName}
-			if root := h.nodeWorkspaceRoot(node); root != "" {
-				if fi, err := os.Stat(root); err == nil && fi.IsDir() {
-					return node
-				}
-			}
-		}
+	if cfg == nil || name == "" {
+		return node
 	}
-	if cfg != nil && cfg.Notebooks != nil && cfg.Notebooks.Definitions != nil {
-		for _, groveName := range slices.Sorted(maps.Keys(cfg.Groves)) {
-			nb := cfg.Groves[groveName].Notebook
-			if nb == "" {
-				continue
-			}
-			if _, ok := cfg.Notebooks.Definitions[nb]; !ok {
-				continue
-			}
-			return &workspace.WorkspaceNode{Name: name, NotebookName: nb}
-		}
+	if grove, ok := cfg.Groves[name]; ok && grove.Notebook != "" && grove.NotebookRoot != "" {
+		node.NotebookName = grove.Notebook
+		return node
 	}
-	return &workspace.WorkspaceNode{Name: name}
+	if cfg.Notebooks == nil || cfg.Notebooks.Rules == nil {
+		return node
+	}
+	notebook := cfg.Notebooks.Rules.Default
+	if definition := cfg.Notebooks.Definitions[notebook]; notebook != "" && definition != nil && definition.RootDir != "" {
+		node.NotebookName = notebook
+	}
+	return node
 }
 
 // nodeWorkspaceRoot resolves a node's workspace root purely from config, with
@@ -416,7 +397,7 @@ func workspaceRootForDir(dir string) string {
 // root in every entry — lookupWatch/flush compute wire paths against it, and
 // that must not change with the walk root. Extracted from ComputeWatchPaths so
 // the S1 reproduction can test it without the locator machinery.
-func computeWorkspaceWatches(sub *config.SyncWorkspace, contentDirs []workspace.ContentDirectory) map[string]*syncWatch {
+func computeWorkspaceWatches(sub *config.SyncWorkspace, recordedRoot string, contentDirs []workspace.ContentDirectory) map[string]*syncWatch {
 	watches := make(map[string]*syncWatch)
 	if sub == nil {
 		return watches
@@ -425,18 +406,9 @@ func computeWorkspaceWatches(sub *config.SyncWorkspace, contentDirs []workspace.
 	// cap), shared across all of the workspace's watched dirs.
 	space := syncdb.NewDocSpace(sub)
 
-	// Derive the workspace root from the first stat-able content dir. The
-	// "notes" entry from GetAllContentDirs is already the workspace root itself
-	// (filepath.Dir of the inbox path), so workspaceRootForDir is a no-op there
-	// and generalizes the plans/chats entries to the same root.
-	var root string
-	for _, dir := range contentDirs {
-		if _, err := os.Stat(dir.Path); err != nil {
-			continue
-		}
-		root = workspaceRootForDir(dir.Path)
-		break
-	}
+	// Root identity comes from the recorded route, never from whichever content
+	// directory happens to stat first this tick.
+	root := recordedRoot
 	if root == "" {
 		return watches
 	}
@@ -501,7 +473,7 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 		// GetAllContentDirs is now the root-resolution source, not the watch
 		// list; the recursive walk (before pathsMutex — a 15k-dir walk must not
 		// hold the lock) produces the actual watch set.
-		maps.Copy(newWatches, computeWorkspaceWatches(sub, dirs))
+		maps.Copy(newWatches, computeWorkspaceWatches(sub, h.nodeWorkspaceRoot(node), dirs))
 	}
 
 	// Subscriptions not covered by code discovery (pure notes satellite:
@@ -535,7 +507,7 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 		if err != nil {
 			continue
 		}
-		maps.Copy(newWatches, computeWorkspaceWatches(&sub, dirs))
+		maps.Copy(newWatches, computeWorkspaceWatches(&sub, h.nodeWorkspaceRoot(node), dirs))
 	}
 
 	h.pathsMutex.Lock()
