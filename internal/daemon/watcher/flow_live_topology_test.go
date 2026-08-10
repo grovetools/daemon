@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -20,8 +21,8 @@ import (
 
 // TestFlowHoldDeliveryFromDiscoveredLiveTopology mirrors the tui-pilot sandbox
 // where Hold→Nav propagation failed three times: workspaces come from the real
-// discovery pipeline (grove.toml groves, no hand-built nodes), plans resolve
-// through a centralized notebook, and the plan fixture is created only AFTER
+// discovery pipeline (recorded roots/notebooks, no hand-built nodes), plans
+// resolve through a centralized notebook, and the plan fixture is created only AFTER
 // the unified watcher has started — exactly like `flow plan init` running
 // against an already-running daemon. The production persistence edge
 // (orchestration.SetHold) must reach the FlowHandler as a filesystem event and
@@ -30,6 +31,8 @@ func TestFlowHoldDeliveryFromDiscoveredLiveTopology(t *testing.T) {
 	sb := t.TempDir()
 	home := filepath.Join(sb, "home")
 	t.Setenv("HOME", home)
+	groveHome := filepath.Join(sb, "grove-home")
+	t.Setenv("GROVE_HOME", groveHome)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(sb, "config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(sb, "data"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(sb, "state"))
@@ -45,20 +48,26 @@ func TestFlowHoldDeliveryFromDiscoveredLiveTopology(t *testing.T) {
 	plansRoot := filepath.Join(notebookRoot, "workspaces", "fixture-repo", "plans")
 	twinPlansRoot := filepath.Join(notebookRoot, "workspaces", "twin-repo", "plans")
 
-	configPath := filepath.Join(sb, "config", "grove", "grove.toml")
-	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+	configDir := filepath.Join(groveHome, "config", "grove")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	configBody := "[onboarding]\ncompleted = true\n" +
-		"[worktree]\nlayout = \"legacy\"\n" +
-		"[groves.code]\npath = \"" + codeRoot + "\"\nenabled = true\nnotebook = \"default\"\ndepth = 1\n" +
-		"[groves.fixture_worktrees]\npath = \"" + filepath.Join(repo, ".grove-worktrees") + "\"\nenabled = true\nnotebook = \"default\"\ndepth = 1\n" +
-		"[groves.twin_worktrees]\npath = \"" + filepath.Join(twinRepo, ".grove-worktrees") + "\"\nenabled = true\nnotebook = \"default\"\ndepth = 1\n" +
-		"[notebooks.definitions.default]\nroot_dir = \"" + notebookRoot + "\"\n" +
-		"[notebooks.rules]\ndefault = \"default\"\n"
-	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(configDir, "grove.toml"), []byte(
+		"[onboarding]\ncompleted = true\n[worktree]\nlayout = \"legacy\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	notebooksBody := "default = \"default\"\n[notebooks.default]\nroot = " + strconv.Quote(notebookRoot) + "\n"
+	if err := os.WriteFile(filepath.Join(configDir, "notebooks.toml"), []byte(notebooksBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rootsBody := "[roots.code]\npath = " + strconv.Quote(codeRoot) + "\nscan = true\ndepth = 1\nnotebook = \"default\"\n" +
+		"[roots.fixture_worktrees]\npath = " + strconv.Quote(filepath.Join(repo, ".grove-worktrees")) + "\nscan = true\ndepth = 1\nnotebook = \"default\"\n" +
+		"[roots.twin_worktrees]\npath = " + strconv.Quote(filepath.Join(twinRepo, ".grove-worktrees")) + "\nscan = true\ndepth = 1\nnotebook = \"default\"\n"
+	if err := os.WriteFile(filepath.Join(configDir, "roots.toml"), []byte(rootsBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.ResetLoadCache()
+	t.Cleanup(config.ResetLoadCache)
 
 	// The parent repositories and the (still plan-free) notebook plans roots
 	// exist before daemon start, mirroring setup-fixture.sh.

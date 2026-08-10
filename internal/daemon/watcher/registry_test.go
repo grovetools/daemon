@@ -34,13 +34,10 @@ func registryFixture(t *testing.T, machineTOML string) (*SyncHandler, string, st
 	if err := os.MkdirAll(filepath.Join(notebookRoot, "workspaces", "registry", "notes"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeTestFile(t, filepath.Join(configDir, "grove.toml"), `name = "fixture"
+	writeTestFile(t, filepath.Join(configDir, "notebooks.toml"), `default = "nb"
 
-[notebooks.definitions.nb]
-root_dir = "`+notebookRoot+`"
-
-[notebooks.rules]
-default = "nb"
+[notebooks.nb]
+root = "`+notebookRoot+`"
 `)
 	if machineTOML != "" {
 		writeTestFile(t, filepath.Join(configDir, "machine.toml"), machineTOML)

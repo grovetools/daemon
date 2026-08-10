@@ -36,8 +36,14 @@ func TestTransportLoopSendsMachineDeviceID(t *testing.T) {
 		case captured <- req:
 		default:
 		}
+		if len(req.ProtocolVersions) != 1 || req.ProtocolVersions[0] != syncproto.ProtocolVersionLegacy {
+			t.Errorf("offered protocol versions = %v, want legacy", req.ProtocolVersions)
+			http.Error(w, "unsupported protocol offer", http.StatusConflict)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{
-			Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersion}},
+			ProtocolVersion: syncproto.ProtocolVersionLegacy,
+			Capabilities:    syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersionLegacy}},
 		})
 	}))
 	t.Cleanup(srv.Close)

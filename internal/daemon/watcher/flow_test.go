@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -110,15 +111,16 @@ func TestFlowHoldLifecycleIsNotLostToDebounce(t *testing.T) {
 
 	notebookRoot := filepath.Join(root, "notebook")
 	codeRoot := filepath.Join(root, "code")
-	configPath := filepath.Join(root, "config", "grove", "grove.toml")
-	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+	configDir := filepath.Join(root, "config", "grove")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	configBody := "[groves.code]\npath = \"" + codeRoot + "\"\nenabled = true\ndepth = 1\nnotebook = \"default\"\n" +
-		"[groves.worktrees]\npath = \"" + codeRoot + "\"\nenabled = true\ndepth = 5\nnotebook = \"default\"\n" +
-		"[notebooks.definitions.default]\nroot_dir = \"" + notebookRoot + "\"\n" +
-		"[notebooks.rules]\ndefault = \"default\"\n"
-	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(configDir, "notebooks.toml"), []byte(
+		"default = \"default\"\n[notebooks.default]\nroot = "+strconv.Quote(notebookRoot)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "roots.toml"), []byte(
+		"[roots.code]\npath = "+strconv.Quote(codeRoot)+"\nscan = true\ndepth = 5\nnotebook = \"default\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg := &config.Config{Notebooks: &config.NotebooksConfig{

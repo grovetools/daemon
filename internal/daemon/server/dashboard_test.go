@@ -4,8 +4,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/grovetools/core/config"
 )
 
 // TestDashboardStaticAssets validates that the embedded SPA is wired onto
@@ -56,6 +60,35 @@ func TestDashboardStaticAssets(t *testing.T) {
 // JSON document with the expected top-level shape even when the daemon
 // has no env state yet (fresh boot).
 func TestDashboardStateEndpointJSON(t *testing.T) {
+	sandbox := t.TempDir()
+	home := filepath.Join(sandbox, "home")
+	groveHome := filepath.Join(sandbox, "grove-home")
+	for name, path := range map[string]string{
+		"HOME": home, "GROVE_HOME": groveHome,
+		"XDG_CONFIG_HOME": filepath.Join(sandbox, "config"),
+		"XDG_DATA_HOME":   filepath.Join(sandbox, "data"),
+		"XDG_STATE_HOME":  filepath.Join(sandbox, "state"),
+		"XDG_CACHE_HOME":  filepath.Join(sandbox, "cache"),
+	} {
+		t.Setenv(name, path)
+	}
+	configDir := filepath.Join(groveHome, "config", "grove")
+	notebookRoot := filepath.Join(home, "notebooks", "fixture")
+	codeRoot := filepath.Join(home, "code", "fixture")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "notebooks.toml"), []byte(
+		"default = \"fixture\"\n[notebooks.fixture]\nroot = \""+notebookRoot+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "roots.toml"), []byte(
+		"[roots.fixture]\npath = \""+codeRoot+"\"\nnotebook = \"fixture\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.ResetLoadCache()
+	t.Cleanup(config.ResetLoadCache)
+
 	s := New(false)
 	mux := http.NewServeMux()
 	s.registerDashboardRoutes(mux)
