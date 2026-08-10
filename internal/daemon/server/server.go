@@ -70,6 +70,16 @@ type RunningConfig struct {
 	StartedAt         time.Time     `json:"started_at"`
 }
 
+// ConfigDegradation is the stable machine-readable reason a daemon is serving
+// status only. Recovery is deliberately restart-only: a process that skipped
+// constructing collectors, queues, watchers, and databases cannot safely grow
+// those subsystems in place after an arbitrary config edit.
+type ConfigDegradation struct {
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Recovery string `json:"recovery"`
+}
+
 // Server manages the daemon's HTTP server over a Unix socket.
 type Server struct {
 	ulog              *logging.UnifiedLogger
@@ -135,6 +145,11 @@ type Server struct {
 	// Done=true (the daemon only reaches that handler once serving, which
 	// under bind-last means boot already finished).
 	bootStatus atomic.Pointer[coredaemon.BootStatus]
+
+	// configDegradation is set once at boot when the canonical config cannot
+	// load. While present, status remains available but every new work
+	// submission is rejected before it can reach a queue or runner.
+	configDegradation atomic.Pointer[ConfigDegradation]
 
 	// sseSubscribers / sseSubscribersFiltered count live /api/stream
 	// subscriptions and how many of those declared a subscribe-time filter.
@@ -359,6 +374,32 @@ func (s *Server) SetBootStatus(status *coredaemon.BootStatus) {
 	s.bootStatus.Store(status)
 }
 
+// SetConfigDegradation puts the server in restart-only status mode.
+func (s *Server) SetConfigDegradation(message string) {
+	s.configDegradation.Store(&ConfigDegradation{
+		Code:     "config_load_failed",
+		Message:  message,
+		Recovery: "fix the configuration and restart groved",
+	})
+}
+
+func (s *Server) configError() *ConfigDegradation {
+	return s.configDegradation.Load()
+}
+
+func (s *Server) rejectSubmitWhenConfigDegraded(w http.ResponseWriter) bool {
+	degraded := s.configError()
+	if degraded == nil {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(struct {
+		Error *ConfigDegradation `json:"error"`
+	}{Error: degraded})
+	return true
+}
+
 // ListenAndServe binds the socket and then blocks serving on it — the
 // original one-shot entrypoint, preserved for the default bind-last boot and
 // for every existing caller/test. It is Listen followed by Serve.
@@ -416,8 +457,20 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 
 	mux := http.NewServeMux()
 
-	// Health check endpoint
+	// Health check endpoint. Preserve the historical plain 200 response when
+	// healthy; a config-broken daemon reports a truthful structured 503 while
+	// continuing to serve status on the socket.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if degraded := s.configError(); degraded != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(struct {
+				Status      string             `json:"status"`
+				Degraded    bool               `json:"degraded"`
+				ConfigError *ConfigDegradation `json:"config_error"`
+			}{Status: "degraded", Degraded: true, ConfigError: degraded})
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
@@ -2966,13 +3019,22 @@ func (s *Server) tryAttachIndexEntry(event *models.NoteEvent) {
 
 // handleGetConfig returns the running configuration as JSON.
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
-	if s.runningConfig == nil {
+	degraded := s.configError()
+	if s.runningConfig == nil && degraded == nil {
 		http.Error(w, "config not initialized", http.StatusServiceUnavailable)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.runningConfig)
+	if degraded == nil {
+		_ = json.NewEncoder(w).Encode(s.runningConfig)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(struct {
+		*RunningConfig
+		Degraded    bool               `json:"degraded"`
+		ConfigError *ConfigDegradation `json:"config_error"`
+	}{RunningConfig: s.runningConfig, Degraded: true, ConfigError: degraded})
 }
 
 // handleFocus handles GET/POST for focused workspaces.
@@ -3069,6 +3131,9 @@ func (s *Server) isMaintenanceTarget(target string) bool {
 
 // handleJobs handles POST (submit) and GET (list) for /api/jobs.
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost && s.rejectSubmitWhenConfigDegraded(w) {
+		return
+	}
 	jr := s.jobRunner.Load()
 	if jr == nil {
 		http.Error(w, "job runner not initialized", http.StatusServiceUnavailable)

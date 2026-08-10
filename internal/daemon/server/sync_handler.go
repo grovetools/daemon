@@ -85,8 +85,10 @@ func (s *Server) SetSyncAuthFailure(auth func() (string, time.Time, bool)) {
 
 // syncStatusResponse is the GET /api/sync/status payload.
 type syncStatusResponse struct {
-	Enabled bool   `json:"enabled"`
-	DBPath  string `json:"db_path,omitempty"`
+	Enabled     bool               `json:"enabled"`
+	Degraded    bool               `json:"degraded,omitempty"`
+	ConfigError *ConfigDegradation `json:"config_error,omitempty"`
+	DBPath      string             `json:"db_path,omitempty"`
 	// MachineName/MachineID are this host's identity: the config-held display
 	// name (machine.toml, hostname default) and the state-held ULID. They are
 	// reported even when sync is disabled — identity does not depend on sync
@@ -151,6 +153,8 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	out := syncStatusResponse{
 		MachineName: config.ResolveMachineName(),
 		MachineID:   machine.ID(),
+		Degraded:    s.configError() != nil,
+		ConfigError: s.configError(),
 	}
 	// Reported outside the Enabled branch on purpose: a token rejection is
 	// exactly the state in which sync.db can look fine and nothing replicates.

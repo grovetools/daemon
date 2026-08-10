@@ -349,11 +349,15 @@ func newGrovedStartCmd() *cobra.Command {
 				}
 			}
 
-			// 2. Load config for daemon settings
+			// 2. Load config for daemon settings. A malformed canonical config is
+			// not a defaults case: defaults would let topology-dependent work run
+			// against an invented topology. Bind a status-only daemon instead and
+			// require an explicit restart after repair.
 			cfg, err := config.LoadDefault()
 			if err != nil {
-				ulog.Warn("Failed to load config, using defaults").Err(err).Log(context.Background())
-				cfg = &config.Config{}
+				ulog.Error("Failed to load config; serving status only until restart").Err(err).Log(context.Background())
+				httpPort, _ := cmd.Flags().GetInt("http-port")
+				return serveConfigDegraded(cmd.Context(), autoShutdown, scope, sockPath, httpPort, readyFd, pairPID, err, ulog)
 			}
 
 			// Parse intervals from config with defaults
@@ -1402,6 +1406,85 @@ func newGrovedStartCmd() *cobra.Command {
 	cmd.Flags().String("ready-at", "boot", "When to consider the daemon ready: 'boot' (default) binds the socket last, after every boot step (historical ordering); 'bind' binds early and streams boot progress while the slow steps run in the background")
 
 	return cmd
+}
+
+// serveConfigDegraded binds the normal daemon socket but intentionally builds
+// none of the topology-dependent graph (Store/Engine collectors, job/build
+// queues, environment manager, watchers, sync/memory databases, or SSH).
+// Recovery is restart-only so normal boot remains the single construction
+// path for that graph.
+func serveConfigDegraded(
+	ctx context.Context,
+	autoShutdown bool,
+	scope, socketPath string,
+	httpPort, readyFd, pairPID int,
+	configErr error,
+	ulog *grovelogging.UnifiedLogger,
+) error {
+	srv := server.New(autoShutdown)
+	srv.SetScope(scope)
+	srv.SetRunningConfig(&server.RunningConfig{StartedAt: time.Now()})
+	srv.SetConfigDegradation(configErr.Error())
+	srv.SetBootStatus(&daemon.BootStatus{Done: true, Err: configErr.Error()})
+
+	var unregisterDaemonHost func()
+	srv.OnReady = func() {
+		if readyFd > 0 {
+			if err := syscall.Close(readyFd); err != nil {
+				ulog.Warn("failed to close ready-fd").Field("fd", readyFd).Err(err).Log(ctx)
+			}
+		}
+		if scope == "" {
+			unregister, err := daemon.RegisterDaemonHost(scope, "groved")
+			if err != nil {
+				ulog.Warn("Failed to register degraded daemon host").Err(err).Log(ctx)
+			} else {
+				unregisterDaemonHost = unregister
+			}
+		}
+	}
+
+	if err := srv.Listen(socketPath, httpPort); err != nil {
+		return fmt.Errorf("degraded server error: %w", err)
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
+	if pairPID > 0 {
+		pairwatch.Watch(ctx, pairPID, func() {
+			select {
+			case stop <- syscall.SIGTERM:
+			default:
+			}
+		})
+	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-stop:
+		case <-srv.TerminalHubShutdownReq():
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if unregisterDaemonHost != nil {
+			unregisterDaemonHost()
+		}
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			ulog.Error("Degraded server shutdown error").Err(err).Log(shutdownCtx)
+		}
+	}()
+
+	ulog.Warn("Daemon listening in config-degraded status-only mode").
+		Field("socket", socketPath).
+		Field("recovery", "restart-only").
+		Err(configErr).
+		Log(ctx)
+	if err := srv.Serve(); err != nil {
+		return fmt.Errorf("degraded server error: %w", err)
+	}
+	return nil
 }
 
 const (

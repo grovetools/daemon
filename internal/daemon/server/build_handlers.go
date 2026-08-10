@@ -23,6 +23,9 @@ func (s *Server) handleBuildSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.rejectSubmitWhenConfigDegraded(w) {
+		return
+	}
 	if s.buildScheduler == nil {
 		http.Error(w, "build queue not initialized", http.StatusServiceUnavailable)
 		return
