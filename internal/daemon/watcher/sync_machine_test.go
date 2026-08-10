@@ -48,12 +48,15 @@ notebook = "machine-nb"
 	t.Cleanup(func() { _ = db.Close() })
 
 	h := NewSyncHandler(nil, cfg, nil, db, 50, 500)
-	node := h.syntheticNodeFor("grovetools")
+	node, err := h.syntheticNodeFor("grovetools")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if node.NotebookName != "machine-nb" {
 		t.Fatalf("syntheticNodeFor NotebookName = %q, want machine-nb (via the compiled grove)", node.NotebookName)
 	}
-	if root := h.nodeWorkspaceRoot(node); root == "" || !filepath.IsAbs(root) {
-		t.Fatalf("nodeWorkspaceRoot = %q, want an absolute root under %s", root, notebookRoot)
+	if root, err := h.nodeWorkspaceRoot(node); err != nil || root == "" || !filepath.IsAbs(root) {
+		t.Fatalf("nodeWorkspaceRoot = %q, %v; want an absolute root under %s", root, err, notebookRoot)
 	}
 }
 

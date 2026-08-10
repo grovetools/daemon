@@ -98,7 +98,10 @@ func (c *MachineSyncCollector) loadAndProject(workspaces map[string]*models.Enri
 	if sub == nil {
 		return unavailableMachineSync(workspaces, localID, "registry subscription unavailable")
 	}
-	root := registry.WorkspaceRoot(cfg, sub.Name)
+	root, err := registry.ResolveWorkspaceRoot(cfg, sub.Name)
+	if err != nil {
+		return unavailableMachineSync(workspaces, localID, "registry routing unavailable")
+	}
 	machines, err := registry.ReadMachines(root, localID)
 	if err != nil {
 		return unavailableMachineSync(workspaces, localID, "registry replica unavailable")

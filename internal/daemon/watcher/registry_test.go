@@ -64,9 +64,13 @@ default = "nb"
 	t.Cleanup(func() { _ = db.Close() })
 
 	h := NewSyncHandler(nil, cfg, syncCfg, db, 50, 500)
-	root := h.nodeWorkspaceRoot(h.syntheticNodeFor("registry"))
-	if root == "" {
-		t.Fatal("fixture could not resolve the registry workspace root")
+	node, err := h.syntheticNodeFor("registry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := h.nodeWorkspaceRoot(node)
+	if err != nil {
+		t.Fatalf("fixture could not resolve the registry workspace root: %v", err)
 	}
 
 	id := machine.ID()

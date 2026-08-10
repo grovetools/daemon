@@ -89,9 +89,11 @@ type SyncHandler struct {
 	syncCfg   *config.SyncConfig
 	syncCfgMu sync.RWMutex
 
-	// Maps watched directory -> subscription info.
-	watchedPaths map[string]*syncWatch
-	pathsMutex   sync.RWMutex
+	// Maps watched directory -> subscription info. routingErrors is the
+	// doctor/status-visible fail-loud condition from the latest refresh.
+	watchedPaths  map[string]*syncWatch
+	routingErrors []string
+	pathsMutex    sync.RWMutex
 
 	quietMs   int
 	maxWaitMs int
@@ -288,43 +290,68 @@ func (h *SyncHandler) SyncSubscriptions() (string, []config.SyncWorkspace) {
 	return h.syncCfg.Server, slices.Clone(h.syncCfg.Workspaces)
 }
 
-// syntheticNodeFor builds a node only from recorded routing. An exact compiled
-// code-root binding is literal rung 0; otherwise notebooks.toml's explicit
-// default pointer is allowed. Filesystem existence and sorted map order never
-// select a notebook.
-func (h *SyncHandler) syntheticNodeFor(name string) *workspace.WorkspaceNode {
-	node := &workspace.WorkspaceNode{Name: name}
+// recordedNotebookRoot returns the authoritative name+root pair. An exact
+// compiled code-root binding is literal rung 0; the recorded default is the
+// only fallback. The compiled NotebookRoot is returned directly, never
+// re-resolved through Definitions by notebook name.
+func (h *SyncHandler) recordedNotebookRoot(name string) (string, string, error) {
 	cfg := h.cfg
 	if cfg == nil || name == "" {
-		return node
+		return "", "", fmt.Errorf("workspace %q has no recorded code-root/notebook binding", name)
 	}
-	if grove, ok := cfg.Groves[name]; ok && grove.Notebook != "" && grove.NotebookRoot != "" {
-		node.NotebookName = grove.Notebook
-		return node
+	if grove, ok := cfg.Groves[name]; ok {
+		if grove.Notebook != "" || grove.NotebookRoot != "" {
+			if grove.Notebook == "" || grove.NotebookRoot == "" {
+				return "", "", fmt.Errorf("workspace %q has an incomplete recorded code-root/notebook binding", name)
+			}
+			return grove.Notebook, grove.NotebookRoot, nil
+		}
 	}
-	if cfg.Notebooks == nil || cfg.Notebooks.Rules == nil {
-		return node
+	if cfg.Notebooks == nil || cfg.Notebooks.Rules == nil || cfg.Notebooks.Rules.Default == "" {
+		return "", "", fmt.Errorf("workspace %q has no recorded code-root/notebook binding or default notebook", name)
 	}
 	notebook := cfg.Notebooks.Rules.Default
-	if definition := cfg.Notebooks.Definitions[notebook]; notebook != "" && definition != nil && definition.RootDir != "" {
-		node.NotebookName = notebook
+	definition := cfg.Notebooks.Definitions[notebook]
+	if definition == nil || definition.RootDir == "" {
+		return "", "", fmt.Errorf("workspace %q routes to default notebook %q without a recorded root", name, notebook)
 	}
-	return node
+	return notebook, definition.RootDir, nil
 }
 
-// nodeWorkspaceRoot resolves a node's workspace root purely from config, with
-// no existence requirement (a pull pipeline must be able to materialize a
-// replica into a tree that doesn't exist yet). It mirrors the root derivation
-// computeWorkspaceWatches performs on stat-able trees: the "notes" content dir
-// (parent of the inbox path) run through workspaceRootForDir. Returns "" when
-// the locator fails or resolves a non-absolute path (a local-mode notebook on
-// a synthetic node has no project path to anchor to — nothing to sync into).
-func (h *SyncHandler) nodeWorkspaceRoot(node *workspace.WorkspaceNode) string {
-	notesDir, err := h.locator.GetNotesDir(node, "inbox")
-	if err != nil || !filepath.IsAbs(notesDir) {
-		return ""
+func (h *SyncHandler) syntheticNodeFor(name string) (*workspace.WorkspaceNode, error) {
+	node := &workspace.WorkspaceNode{Name: name}
+	notebook, _, err := h.recordedNotebookRoot(name)
+	if err != nil {
+		return node, err
 	}
-	return workspaceRootForDir(filepath.Dir(notesDir))
+	node.NotebookName = notebook
+	return node, nil
+}
+
+// nodeWorkspaceRoot consumes a compiled root literally for discovered nodes as
+// well as synthetic subscriptions. It has no existence requirement: pull must
+// be able to materialize a replica into a tree that does not exist yet.
+func (h *SyncHandler) nodeWorkspaceRoot(node *workspace.WorkspaceNode) (string, error) {
+	if node == nil {
+		return "", fmt.Errorf("cannot route a nil workspace node")
+	}
+	_, root, err := h.recordedNotebookRoot(node.Name)
+	if err != nil && node.Path != "" {
+		binding := config.ResolveNotebook(config.NotebookQuery{
+			Path:       node.Path,
+			OwnerPaths: []string{node.ParentProjectPath, node.ParentEcosystemPath, node.RootEcosystemPath},
+		}, h.cfg)
+		if binding.Notebook != "" && binding.NotebookRoot != "" {
+			root, err = binding.NotebookRoot, nil
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("workspace %q has non-absolute recorded notebook root %q", node.Name, root)
+	}
+	return filepath.Join(root, "workspaces", node.Name), nil
 }
 
 // WorkspaceRoots resolves explicitly selected subscribed workspaces to their
@@ -347,10 +374,14 @@ func (h *SyncHandler) WorkspaceRoots(names []string) (map[string]string, error) 
 			return nil, fmt.Errorf("workspace %q is not a sync subscription", name)
 		}
 		if roots[name] == "" {
-			roots[name] = h.nodeWorkspaceRoot(h.syntheticNodeFor(name))
-		}
-		if roots[name] == "" {
-			return nil, fmt.Errorf("cannot resolve configured laptop root for workspace %q", name)
+			node, err := h.syntheticNodeFor(name)
+			if err != nil {
+				return nil, err
+			}
+			roots[name], err = h.nodeWorkspaceRoot(node)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	return roots, nil
@@ -361,17 +392,33 @@ func (h *SyncHandler) WorkspaceRoots(names []string) (map[string]string, error) 
 // code-workspace discovery. Pull targets are notebook workspaces whose paths
 // are fully config-determined; requiring a .git under a grove path to
 // materialize notes was accidental coupling (the empty-~/code satellite bug).
-func (h *SyncHandler) configuredPullRoots() map[string]string {
+func (h *SyncHandler) configuredPullRoots() (map[string]string, error) {
 	roots := make(map[string]string)
 	for _, sub := range h.subscriptionsSnapshot() {
 		if !sub.Pull || sub.Mode == config.SyncModeSearchOnly {
 			continue
 		}
-		if root := h.nodeWorkspaceRoot(h.syntheticNodeFor(sub.Name)); root != "" {
-			roots[sub.Name] = root
+		node, err := h.syntheticNodeFor(sub.Name)
+		if err != nil {
+			return nil, err
 		}
+		root, err := h.nodeWorkspaceRoot(node)
+		if err != nil {
+			return nil, err
+		}
+		roots[sub.Name] = root
 	}
-	return roots
+	return roots, nil
+}
+
+// recordedContentDirs derives standard content paths from the already-routed
+// workspace root, avoiding a notebook-name lookup through the locator.
+func recordedContentDirs(root string) []workspace.ContentDirectory {
+	return []workspace.ContentDirectory{
+		{Path: root, Type: "notes"},
+		{Path: filepath.Join(root, "plans"), Type: "plans"},
+		{Path: filepath.Join(root, "chats"), Type: "chats"},
+	}
 }
 
 // workspaceRootForDir derives the workspace root a content dir belongs to.
@@ -450,6 +497,7 @@ func computeWorkspaceWatches(sub *config.SyncWorkspace, recordedRoot string, con
 func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) []string {
 	newWatches := make(map[string]*syncWatch)
 	covered := make(map[string]bool) // subscription names covered by discovery
+	var routingErrors []string
 
 	for _, ew := range workspaces {
 		node := ew.WorkspaceNode
@@ -466,14 +514,13 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 			continue
 		}
 
-		dirs, err := h.locator.GetAllContentDirs(node)
+		root, err := h.nodeWorkspaceRoot(node)
 		if err != nil {
+			routingErrors = append(routingErrors, err.Error())
 			continue
 		}
-		// GetAllContentDirs is now the root-resolution source, not the watch
-		// list; the recursive walk (before pathsMutex — a 15k-dir walk must not
-		// hold the lock) produces the actual watch set.
-		maps.Copy(newWatches, computeWorkspaceWatches(sub, h.nodeWorkspaceRoot(node), dirs))
+		dirs := recordedContentDirs(root)
+		maps.Copy(newWatches, computeWorkspaceWatches(sub, root, dirs))
 	}
 
 	// Subscriptions not covered by code discovery (pure notes satellite:
@@ -499,20 +546,27 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 		if covered[sub.Name] || sub.Mode == config.SyncModeSearchOnly {
 			continue
 		}
-		node := h.syntheticNodeFor(sub.Name)
-		if h.nodeWorkspaceRoot(node) == "" {
-			continue
-		}
-		dirs, err := h.locator.GetAllContentDirs(node)
+		node, err := h.syntheticNodeFor(sub.Name)
 		if err != nil {
+			routingErrors = append(routingErrors, err.Error())
 			continue
 		}
-		maps.Copy(newWatches, computeWorkspaceWatches(&sub, h.nodeWorkspaceRoot(node), dirs))
+		root, err := h.nodeWorkspaceRoot(node)
+		if err != nil {
+			routingErrors = append(routingErrors, err.Error())
+			continue
+		}
+		dirs := recordedContentDirs(root)
+		maps.Copy(newWatches, computeWorkspaceWatches(&sub, root, dirs))
 	}
 
 	h.pathsMutex.Lock()
 	h.watchedPaths = newWatches
+	h.routingErrors = slices.Clone(routingErrors)
 	h.pathsMutex.Unlock()
+	for _, message := range routingErrors {
+		h.ulog.Error("sync routing configuration error").Field("error", message).Emit()
+	}
 	h.ensurePipelines()
 
 	paths := make([]string, 0, len(newWatches))
@@ -520,6 +574,14 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 		paths = append(paths, p)
 	}
 	return paths
+}
+
+// RoutingErrors exposes fail-loud routing diagnostics to daemon status/doctor
+// adapters without coupling the watcher interface to sync-specific errors.
+func (h *SyncHandler) RoutingErrors() []string {
+	h.pathsMutex.RLock()
+	defer h.pathsMutex.RUnlock()
+	return slices.Clone(h.routingErrors)
 }
 
 // lookupWatch finds the subscription covering an absolute path (deepest
@@ -1040,7 +1102,12 @@ func (h *SyncHandler) ensurePipelines() {
 	// with an empty ~/code, or a replica tree that doesn't exist yet — the
 	// pull pipeline creates it). A discovery-derived root wins when both
 	// exist; in a centralized notebook layout they resolve identically.
-	for name, root := range h.configuredPullRoots() {
+	pullRoots, err := h.configuredPullRoots()
+	if err != nil {
+		h.ulog.Error("sync routing configuration error; pipelines not started").Err(err).Log(h.baseCtx)
+		return
+	}
+	for name, root := range pullRoots {
 		if _, ok := roots[name]; !ok {
 			roots[name] = root
 		}
@@ -1179,7 +1246,11 @@ func (h *SyncHandler) BeginMaintenance(ctx context.Context) error {
 		roots[w.workspace] = w.root
 	}
 	h.pathsMutex.RUnlock()
-	for name, root := range h.configuredPullRoots() {
+	pullRoots, err := h.configuredPullRoots()
+	if err != nil {
+		return err
+	}
+	for name, root := range pullRoots {
 		if _, ok := roots[name]; !ok {
 			roots[name] = root
 		}

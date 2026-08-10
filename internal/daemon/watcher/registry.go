@@ -126,10 +126,14 @@ func (h *SyncHandler) writeRegistryNote(ctx context.Context) {
 		h.warnRegistryOnce(ctx, "registry note skipped: this machine has no identity", nil)
 		return
 	}
-	root := h.nodeWorkspaceRoot(h.syntheticNodeFor(sub.Name))
-	if root == "" {
-		h.warnRegistryOnce(ctx,
-			fmt.Sprintf("registry note skipped: cannot resolve a local root for workspace %q", sub.Name), nil)
+	node, err := h.syntheticNodeFor(sub.Name)
+	if err != nil {
+		h.warnRegistryOnce(ctx, fmt.Sprintf("registry note skipped: cannot resolve a local root for workspace %q", sub.Name), err)
+		return
+	}
+	root, err := h.nodeWorkspaceRoot(node)
+	if err != nil {
+		h.warnRegistryOnce(ctx, fmt.Sprintf("registry note skipped: cannot resolve a local root for workspace %q", sub.Name), err)
 		return
 	}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -237,7 +238,10 @@ func TestConfiguredPullRootsZeroDiscovery(t *testing.T) {
 		t.Fatalf("expected no watch paths for a nonexistent tree, got %v", paths)
 	}
 
-	roots := h.configuredPullRoots()
+	roots, err := h.configuredPullRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := map[string]string{
 		"grovetools": filepath.Join(notebookRoot, "workspaces", "grovetools"),
 		"cloud":      filepath.Join(notebookRoot, "workspaces", "cloud"),
@@ -263,9 +267,10 @@ func TestSyntheticNodeNotebookResolution(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	existingRoot := t.TempDir()
+	literalRoot := filepath.Join(t.TempDir(), "literal-notebooks", "grove-nb")
 	cfg := &config.Config{
 		Groves: map[string]config.GroveSourceConfig{
-			"ws": {Path: "/nonexistent/code", Notebook: "grove-nb", NotebookRoot: "/nonexistent/notebooks/grove-nb"},
+			"ws": {Path: "/nonexistent/code", Notebook: "grove-nb", NotebookRoot: literalRoot},
 		},
 		Notebooks: &config.NotebooksConfig{
 			Definitions: map[string]*config.Notebook{
@@ -277,9 +282,15 @@ func TestSyntheticNodeNotebookResolution(t *testing.T) {
 	}
 	h := NewSyncHandler(nil, cfg, nil, db, 50, 500)
 
-	// The exact compiled binding wins without an existence probe.
-	if node := h.syntheticNodeFor("ws"); node.NotebookName != "grove-nb" {
-		t.Errorf("no dirs on disk: NotebookName = %q, want grove-nb", node.NotebookName)
+	// The exact compiled binding wins without an existence probe, and its root
+	// identity survives a conflicting same-name Definitions entry.
+	node, err := h.syntheticNodeFor("ws")
+	if err != nil || node.NotebookName != "grove-nb" {
+		t.Errorf("no dirs on disk: node=%+v err=%v, want grove-nb", node, err)
+	}
+	wantRoot := filepath.Join(literalRoot, "workspaces", "ws")
+	if root, err := h.nodeWorkspaceRoot(node); err != nil || root != wantRoot {
+		t.Errorf("literal root = %q, %v; want %q without name re-resolution", root, err, wantRoot)
 	}
 
 	// Even three same-name trees elsewhere cannot override the recorded route.
@@ -291,18 +302,31 @@ func TestSyntheticNodeNotebookResolution(t *testing.T) {
 			t.Fatalf("mkdir: %v", err)
 		}
 	}
-	if node := h.syntheticNodeFor("ws"); node.NotebookName != "grove-nb" {
-		t.Errorf("same-name dirs changed NotebookName to %q, want grove-nb", node.NotebookName)
+	if node, err := h.syntheticNodeFor("ws"); err != nil || node.NotebookName != "grove-nb" {
+		t.Errorf("same-name dirs changed node to %+v, %v; want grove-nb", node, err)
+	}
+	if err := os.MkdirAll(filepath.Join(wantRoot, "plans"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h = NewSyncHandler(nil, cfg, &config.SyncConfig{Workspaces: []config.SyncWorkspace{{Name: "ws", Mode: config.SyncModePlansOnly}}}, db, 50, 500)
+	paths := h.ComputeWatchPaths(nil)
+	if !slices.Contains(paths, filepath.Join(wantRoot, "plans")) {
+		t.Errorf("plans-only watch paths = %v, want literal-root plans directory", paths)
 	}
 
-	// No binding and no recorded default: refuse rather than use a builtin.
-	h = NewSyncHandler(nil, &config.Config{}, nil, db, 50, 500)
-	node := h.syntheticNodeFor("ws")
-	if node.NotebookName != "" {
-		t.Errorf("bare config: NotebookName = %q, want empty", node.NotebookName)
+	// No binding and no recorded default is an explicit diagnostic, not an
+	// empty node/root that downstream loops can silently omit.
+	missingSync := &config.SyncConfig{Workspaces: []config.SyncWorkspace{{Name: "ws", Pull: true}}}
+	h = NewSyncHandler(nil, &config.Config{}, missingSync, db, 50, 500)
+	if node, err := h.syntheticNodeFor("ws"); err == nil || node.NotebookName != "" {
+		t.Errorf("bare config: node=%+v err=%v, want missing-binding error", node, err)
 	}
-	if root := h.nodeWorkspaceRoot(node); root != "" {
-		t.Errorf("bare config: nodeWorkspaceRoot = %q, want refusal", root)
+	if roots, err := h.configuredPullRoots(); err == nil || roots != nil {
+		t.Errorf("configuredPullRoots = %v, %v; want explicit missing-binding error", roots, err)
+	}
+	h.ComputeWatchPaths(nil)
+	if errors := h.RoutingErrors(); len(errors) != 1 || !strings.Contains(errors[0], "no recorded code-root/notebook binding") {
+		t.Errorf("RoutingErrors = %v, want doctor-visible missing-binding condition", errors)
 	}
 }
 
@@ -416,8 +440,8 @@ func TestComputeWatchPathsPushOnlyBareNotebook(t *testing.T) {
 
 	// configuredPullRoots is pull-side only — it must still ignore this
 	// subscription, which is precisely why the watch loop has to cover it.
-	if roots := h.configuredPullRoots(); len(roots) != 0 {
-		t.Fatalf("configuredPullRoots = %v, want empty for a push-only subscription", roots)
+	if roots, err := h.configuredPullRoots(); err != nil || len(roots) != 0 {
+		t.Fatalf("configuredPullRoots = %v, %v; want empty for a push-only subscription", roots, err)
 	}
 
 	// Zero discovered workspaces, exactly as on a machine with no source tree.
