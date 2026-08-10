@@ -618,7 +618,6 @@ func (s *Server) normalRouteHandler() http.Handler {
 // registerNormalRoutes deliberately receives only the classified registrar,
 // never a raw *http.ServeMux. Keep every normal daemon API registration here.
 func (s *Server) registerNormalRoutes(routes classifiedRouteRegistrar) {
-
 	// Health check endpoint.
 	routes.HandleFunc("/health", s.handleHealth)
 
