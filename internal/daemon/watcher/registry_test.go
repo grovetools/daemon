@@ -182,11 +182,14 @@ func TestRegistryWriterBumpsOnStructuralChange(t *testing.T) {
 		t.Fatalf("expected no ecosystems: %+v", note.Ecosystems)
 	}
 
-	// Declare an ecosystem that is NOT on disk: the declared-missing state is
-	// the materialization verb's input and must reach the note.
-	writeTestFile(t, filepath.Join(os.Getenv("GROVE_HOME"), "config", "grove", "machine.toml"),
-		"[machine]\nname = \"fixture-a\"\n\n[machine.ecosystems.grovetools]\npath = \"/nonexistent/grovetools\"\n")
-	config.ResetLoadCache()
+	// Declare a specific recorded root that is NOT on disk: the
+	// declared-missing state is the materialization verb's input and must reach
+	// the note.
+	configDir := filepath.Join(os.Getenv("GROVE_HOME"), "config", "grove")
+	writeTestFile(t, filepath.Join(configDir, "notebooks.toml"),
+		"default = \"nb\"\n[notebooks.nb]\nroot = \"/notes\"\n")
+	writeTestFile(t, filepath.Join(configDir, "roots.toml"),
+		"[roots.grovetools]\npath = \"/nonexistent/grovetools\"\n")
 
 	h.writeRegistryNote(t.Context())
 	note, _ = readNote(t, root, id)

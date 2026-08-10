@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/pkg/coderoot"
 	"github.com/grovetools/core/pkg/machine"
 	"github.com/grovetools/core/pkg/registry"
 	"github.com/grovetools/core/version"
@@ -136,14 +137,12 @@ func (h *SyncHandler) writeRegistryNote(ctx context.Context) {
 	if db := h.database(); db != nil {
 		originID = db.OriginID()
 	}
-	// A malformed machine.toml degrades to "nothing declared" rather than
-	// taking presence dark: the operator sees the real error from
-	// `grove machine status`, and a machine with an unreadable intent file is
-	// still a machine worth seeing in the registry.
-	machineCfg, err := config.LoadMachineConfig()
+	// A malformed recorded routing pair degrades to "nothing declared" rather
+	// than taking presence dark; identity remains useful in the registry.
+	codeRoots, err := coderoot.Load()
 	if err != nil {
-		h.warnRegistryOnce(ctx, "registry note: machine config unreadable, recording identity only", err)
-		machineCfg = nil
+		h.warnRegistryOnce(ctx, "registry note: code-root config unreadable, recording identity only", err)
+		codeRoots = coderoot.Table{}
 	}
 
 	note := registry.Build(registry.BuildInput{
@@ -151,7 +150,7 @@ func (h *SyncHandler) writeRegistryNote(ctx context.Context) {
 		Name:          config.ResolveMachineName(),
 		OriginID:      originID,
 		GrovedVersion: version.Version,
-		Machine:       machineCfg,
+		CodeRoots:     codeRoots,
 		Subscriptions: h.subscriptionsSnapshot(),
 	})
 
