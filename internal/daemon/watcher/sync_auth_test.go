@@ -40,7 +40,8 @@ func newTokenServer(t *testing.T) *tokenServer {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"capabilities":{"protocol_versions":[%d]}}`, syncproto.ProtocolVersion)
+		_, _ = fmt.Fprintf(w, `{"protocol_version":%d,"capabilities":{"protocol_versions":[%d]}}`,
+			syncproto.ProtocolVersionLegacy, syncproto.ProtocolVersionLegacy)
 	}))
 	t.Cleanup(ts.Close)
 	return ts
@@ -313,8 +314,8 @@ func TestEpochProbeDetectsARecreatedServerUnderARunningDaemon(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"server_epoch":%q,"capabilities":{"protocol_versions":[%d]}}`,
-			epoch.Load().(string), syncproto.ProtocolVersion)
+		_, _ = fmt.Fprintf(w, `{"protocol_version":%d,"server_epoch":%q,"capabilities":{"protocol_versions":[%d]}}`,
+			syncproto.ProtocolVersionLegacy, epoch.Load().(string), syncproto.ProtocolVersionLegacy)
 	}))
 	defer srv.Close()
 

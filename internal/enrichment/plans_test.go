@@ -3,6 +3,7 @@ package enrichment
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	coreconfig "github.com/grovetools/core/config"
@@ -137,9 +138,14 @@ func TestResolvePerNodePlanStats_SiblingsGetOwnActivePlan(t *testing.T) {
 // init created it), not by joining this node's own plans dir with the plan
 // name (which would qualify by the container basename — the plan name itself).
 func TestAssociatedPlanDirUsesCanonicalRegistryResolver(t *testing.T) {
-	t.Setenv("GROVE_HOME", t.TempDir())
+	groveHome := t.TempDir()
+	t.Setenv("GROVE_HOME", groveHome)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	configDir := filepath.Join(groveHome, "config", "grove")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +170,22 @@ func TestAssociatedPlanDirUsesCanonicalRegistryResolver(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	planDir := filepath.Join(home, ".grove", "notebooks", "nb", "workspaces", "alpha-repo", "plans", "alpha-view")
+	// Plan routing follows the authoritative recorded code-root/notebook pair.
+	// Merely creating a directory at the old ~/.grove/notebooks location must
+	// not influence resolution.
+	notebookRoot := filepath.Join(home, "notebooks", "nb")
+	notebooks := "default = \"nb\"\n[notebooks.nb]\nroot = " + strconv.Quote(notebookRoot) + "\n"
+	roots := "[roots.alpha-repo]\npath = " + strconv.Quote(owner) + "\nnotebook = \"nb\"\n"
+	if err := os.WriteFile(filepath.Join(configDir, "notebooks.toml"), []byte(notebooks), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "roots.toml"), []byte(roots), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	coreconfig.ResetLoadCache()
+	t.Cleanup(coreconfig.ResetLoadCache)
+
+	planDir := filepath.Join(notebookRoot, "workspaces", "alpha-repo", "plans", "alpha-view")
 	if err := os.MkdirAll(planDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
