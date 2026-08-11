@@ -510,6 +510,22 @@ func computeNotespaceWatches(sub *config.SyncWorkspace, recordedRoot string, con
 	return watches
 }
 
+// AdoptedNotespace is the post-mint notification from the daemon adoption
+// handler. It makes an already-subscribed adopted root visible to registration
+// and pipeline creation immediately; the unified watcher's next normal refresh
+// installs the corresponding fsnotify directories.
+func (h *SyncHandler) AdoptedNotespace(root, displayName string) {
+	sub := h.subscription(displayName)
+	if sub == nil || sub.Mode == config.SyncModeSearchOnly {
+		return
+	}
+	watches := computeNotespaceWatches(sub, root, recordedContentDirs(root))
+	h.pathsMutex.Lock()
+	maps.Copy(h.watchedPaths, watches)
+	h.pathsMutex.Unlock()
+	h.ensurePipelines()
+}
+
 // ComputeWatchPaths returns every Included directory of subscribed notespaces
 // (recursively) so the non-recursive fsnotify backend covers the whole tree.
 func (h *SyncHandler) ComputeWatchPaths(notespaces []*models.EnrichedWorkspace) []string {

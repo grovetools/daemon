@@ -217,6 +217,7 @@ type Server struct {
 	// Nil when sync is not configured; then the status payload omits it.
 	syncAuthFailure      func() (string, time.Time, bool)
 	syncDBError          func() string
+	notespaceAdopted     func(root, displayName string)
 	syncNotespaceRoots   func([]string) (map[string]string, error)
 	syncBeginMaintenance func(context.Context) error
 	syncEndMaintenance   func()
@@ -477,6 +478,7 @@ var daemonRoutes = []daemonRoute{
 	{pattern: "/api/memory/analysis/notebooks"},
 	{pattern: "/api/memory/analysis/context"},
 	{pattern: "/api/machine"},
+	{pattern: "/api/notespaces/adopt"},
 	{pattern: "/api/sync/status", degradedMode: degradedRouteSyncStatus},
 	{pattern: "/api/sync/allow"},
 	{pattern: "/api/sync/history"},
@@ -700,6 +702,9 @@ func (s *Server) registerNormalRoutes(routes classifiedRouteRegistrar) {
 	// inventory). Every daemon can answer it — the reconciliation reads
 	// config and the filesystem, not sync.db — so it is NOT scope-proxied.
 	routes.HandleFunc("/api/machine", unixOnly(s.handleMachineStatus))
+	// Explicit post-adopt authority. Missing stamps encountered by discovery
+	// have no route here and remain non-mutating.
+	routes.HandleFunc("/api/notespaces/adopt", unixOnly(s.handleNotespaceAdopt))
 	// Sync endpoints — unix socket only (sync state is content-adjacent
 	// metadata; never expose it on the unauthenticated TCP listener).
 	// Scoped daemons proxy these to the global daemon, which owns sync.db.

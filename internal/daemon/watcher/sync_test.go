@@ -792,6 +792,35 @@ func TestSyncDeleteCapturesBaseVersion(t *testing.T) {
 	}
 }
 
+func TestEnsurePipelinesDoesNotMintAnOrdinaryMissingStamp(t *testing.T) {
+	root := t.TempDir()
+	registrations := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		registrations++
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+	db, err := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	h := NewSyncHandler(store.New(), nil, &config.SyncConfig{Workspaces: []config.SyncWorkspace{{Name: "missing"}}}, db, 50, 500)
+	h.baseCtx = context.Background()
+	h.client = syncdb.NewClient(syncdb.ClientConfig{ServerURL: ts.URL, Token: "fixture", DeviceID: "device", OriginID: "origin"})
+	h.watchedPaths = map[string]*syncWatch{
+		root: {displayName: "missing", root: root, space: syncdb.NewDocSpace(nil)},
+	}
+
+	h.ensurePipelines()
+	if registrations != 0 {
+		t.Fatalf("ordinary missing stamp reached registration %d time(s)", registrations)
+	}
+	if stamp, err := notespacepkg.LoadNotespace(root); err != nil || stamp != nil {
+		t.Fatalf("ordinary missing stamp was mutated: stamp=%+v err=%v", stamp, err)
+	}
+}
+
 func TestEnsurePipelinesRegistersBeforeRoutingAndParksDuplicateID(t *testing.T) {
 	t.Setenv("GROVE_HOME", t.TempDir())
 	const id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"

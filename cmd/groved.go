@@ -1300,6 +1300,7 @@ func newGrovedStartCmd() *cobra.Command {
 						srv.SetSyncSubscriptions(syncHandler.SyncSubscriptions)
 						srv.SetSyncAuthFailure(syncHandler.AuthFailure)
 						srv.SetSyncDBError(syncHandler.SyncDBError)
+						srv.SetNotespaceAdopted(syncHandler.AdoptedNotespace)
 						srv.SetSyncNotespaceRoots(syncHandler.NotespaceRoots)
 						srv.SetSyncMaintenance(syncHandler.BeginMaintenance, syncHandler.EndMaintenance)
 						workspaces := 0
