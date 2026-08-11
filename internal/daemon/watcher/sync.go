@@ -372,30 +372,48 @@ func (h *SyncHandler) nodeNotespaceRoot(node *workspace.WorkspaceNode) (string, 
 // configured laptop notebook roots. It is used by the user-authorized incoming
 // apply boundary; unlike configuredPullRoots it includes push-only laptop
 // subscriptions and never invents a wildcard/default selection.
-func (h *SyncHandler) NotespaceRoots(names []string) (map[string]string, error) {
-	roots := make(map[string]string, len(names))
+func (h *SyncHandler) NotespaceRoots(ids []string) (map[string]string, error) {
+	roots := make(map[string]string, len(ids))
 	h.pathsMutex.RLock()
 	for _, w := range h.watchedPaths {
-		for _, name := range names {
-			if w.notespace == name {
-				roots[name] = w.root
+		for _, id := range ids {
+			if w.notespace == id {
+				roots[id] = w.root
 			}
 		}
 	}
 	h.pathsMutex.RUnlock()
-	for _, name := range names {
-		if h.subscription(name) == nil {
-			return nil, fmt.Errorf("notespace %q is not a sync subscription", name)
+	// Push-only subscriptions may have no active filesystem watch. Resolve every
+	// explicit subscription through recorded topology, then authorize by the
+	// immutable stamp at that root rather than by its display name.
+	missing := false
+	for _, id := range ids {
+		missing = missing || roots[id] == ""
+	}
+	if missing {
+		for _, sub := range h.subscriptionsSnapshot() {
+			node, err := h.syntheticNodeFor(sub.Name)
+			if err != nil {
+				return nil, err
+			}
+			root, err := h.nodeNotespaceRoot(node)
+			if err != nil {
+				return nil, err
+			}
+			stamp, err := notespacepkg.LoadNotespace(root)
+			if err != nil || stamp == nil {
+				continue
+			}
+			for _, id := range ids {
+				if stamp.ID == id {
+					roots[id] = root
+				}
+			}
 		}
-		if roots[name] == "" {
-			node, err := h.syntheticNodeFor(name)
-			if err != nil {
-				return nil, err
-			}
-			roots[name], err = h.nodeNotespaceRoot(node)
-			if err != nil {
-				return nil, err
-			}
+	}
+	for _, id := range ids {
+		if roots[id] == "" {
+			return nil, fmt.Errorf("notespace %q has no registered local root", id)
 		}
 	}
 	return roots, nil

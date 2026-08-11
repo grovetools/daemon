@@ -168,6 +168,16 @@ func (p *PullPipeline) snaphotResync(ctx context.Context, notespaceRoot string) 
 			}
 		}
 		if !adopted {
+			// A recreated server assigns new document ids to re-pushed paths.
+			// Rebind the existing path row before applying the snapshot head so
+			// UNIQUE(notespace,path) cannot strand the pull loop permanently.
+			if localDoc != nil && localDoc.DocumentID != doc.ID {
+				if err := p.db.RemapDocument(localDoc.DocumentID, doc.ID); err != nil {
+					p.log.Error("snapshot identity rebind failed").Field("path", doc.Path).Err(err).Log(ctx)
+					continue
+				}
+				localDoc.DocumentID = doc.ID
+			}
 			// Missing or divergent document: fetch the head content and
 			// materialize it NOW. The cursor jump below skips these
 			// documents' historical events, so anything not fetched here
