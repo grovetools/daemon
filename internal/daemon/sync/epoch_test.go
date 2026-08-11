@@ -27,7 +27,7 @@ func TestCheckServerEpochMatrix(t *testing.T) {
 	seedSyncedDoc := func(t *testing.T, db *DB) {
 		t.Helper()
 		if err := db.InsertDocument(&Document{
-			DocumentID: "doc-1", Workspace: "default", Path: "inbox/a.md",
+			DocumentID: "doc-1", Notespace: "default", Path: "inbox/a.md",
 			ContentHash: "hash", LastSyncedHash: "hash", LastSyncedVersion: 3,
 		}); err != nil {
 			t.Fatalf("InsertDocument: %v", err)
@@ -141,7 +141,7 @@ func serveEpochStoreStub(t *testing.T, epoch *string, docs map[string]*occDoc) *
 			})
 		case "/sync/snapshot":
 			w.Header().Set("Content-Type", "application/json")
-			manifest := &syncproto.SnapshotManifest{Workspace: "default"}
+			manifest := &syncproto.SnapshotManifest{NotespaceID: "default"}
 			for path, d := range docs {
 				manifest.Documents = append(manifest.Documents, syncproto.DocumentSnapshot{
 					ID: d.id, Path: path, Version: d.version, Hash: d.hash, Size: int64(len(d.content)),
@@ -194,7 +194,7 @@ func TestServerRecreateTriggersFullRepush(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := db.InsertDocument(&Document{
-			DocumentID: fmt.Sprintf("doc-stable-%d", i), Workspace: "default", Path: path,
+			DocumentID: fmt.Sprintf("doc-stable-%d", i), Notespace: "default", Path: path,
 			ContentHash: sha(content), LastSyncedHash: sha(content), LastSyncedVersion: 5,
 			BaseContent: content,
 		}); err != nil {

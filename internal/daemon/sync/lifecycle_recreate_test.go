@@ -79,6 +79,16 @@ func (s *recreatableServer) recreate(token string) {
 	if err := st.CreateToken(hex.EncodeToString(sum[:]), "lifecycle-acceptance", syncstore.OwnerUserID); err != nil {
 		s.t.Fatalf("CreateToken: %v", err)
 	}
+	// v3 data routes are fail-closed: preserve this daemon-owned lifecycle
+	// fixture's historical display id by explicitly registering it before any
+	// snapshot/push pipeline runs. Re-register after every server recreation.
+	if out, err := st.Register(syncproto.RegisterRequest{
+		RequestIdentity: syncproto.RequestIdentity{ProtocolVersion: syncproto.ProtocolVersionNotespaceID, IdempotencyKey: "lifecycle-default", DeviceID: "machine-a"},
+		Intent:          syncproto.RegistrationIntentCreateSibling, Subject: "local:lifecycle-default",
+		NotespaceName: "default", Kind: "notes", ProposedNotespaceID: "default",
+	}); err != nil || out.Status != http.StatusOK {
+		s.t.Fatalf("Register default notespace: outcome=%+v err=%v", out, err)
+	}
 	blobs, err := syncstore.NewFSBlobStore(filepath.Join(dir, "blobs"))
 	if err != nil {
 		s.t.Fatalf("NewFSBlobStore: %v", err)
@@ -115,10 +125,10 @@ func connect(t *testing.T, db *DB, url, token string) (*Client, bool) {
 	return client, reset
 }
 
-// serverPaths lists what the server currently holds for a workspace, by path.
-func serverPaths(t *testing.T, client *Client, workspace string) map[string]syncproto.DocumentSnapshot {
+// serverPaths lists what the server currently holds for a notespace, by path.
+func serverPaths(t *testing.T, client *Client, notespace string) map[string]syncproto.DocumentSnapshot {
 	t.Helper()
-	manifest, err := client.Snapshot(context.Background(), workspace)
+	manifest, err := client.Snapshot(context.Background(), notespace)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}

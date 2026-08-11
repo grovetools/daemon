@@ -55,8 +55,8 @@ notebook = "machine-nb"
 	if node.NotebookName != "machine-nb" {
 		t.Fatalf("syntheticNodeFor NotebookName = %q, want machine-nb (via the compiled grove)", node.NotebookName)
 	}
-	if root, err := h.nodeWorkspaceRoot(node); err != nil || root == "" || !filepath.IsAbs(root) {
-		t.Fatalf("nodeWorkspaceRoot = %q, %v; want an absolute root under %s", root, err, notebookRoot)
+	if root, err := h.nodeNotespaceRoot(node); err != nil || root == "" || !filepath.IsAbs(root) {
+		t.Fatalf("nodeNotespaceRoot = %q, %v; want an absolute root under %s", root, err, notebookRoot)
 	}
 }
 

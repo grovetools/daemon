@@ -50,7 +50,7 @@ func TestDocumentLifecycle(t *testing.T) {
 
 	doc := &Document{
 		DocumentID:  "doc-1",
-		Workspace:   "ws",
+		Notespace:   "ws",
 		Path:        "plans/a.md",
 		ContentHash: "hash1",
 	}
@@ -101,9 +101,9 @@ func TestListDocuments(t *testing.T) {
 	db := openTestDB(t)
 
 	docs := []*Document{
-		{DocumentID: "d1", Workspace: "ws", Path: "plans/b.md", ContentHash: "h1", LastSyncedHash: "h1"},
-		{DocumentID: "d2", Workspace: "ws", Path: "plans/a.md", ContentHash: "dirty", LastSyncedHash: "clean"},
-		{DocumentID: "d3", Workspace: "other", Path: "notes/x.md", ContentHash: "h3", LastSyncedHash: "h3"},
+		{DocumentID: "d1", Notespace: "ws", Path: "plans/b.md", ContentHash: "h1", LastSyncedHash: "h1"},
+		{DocumentID: "d2", Notespace: "ws", Path: "plans/a.md", ContentHash: "dirty", LastSyncedHash: "clean"},
+		{DocumentID: "d3", Notespace: "other", Path: "notes/x.md", ContentHash: "h3", LastSyncedHash: "h3"},
 	}
 	for _, d := range docs {
 		if err := db.UpsertDocument(d); err != nil {
@@ -111,7 +111,7 @@ func TestListDocuments(t *testing.T) {
 		}
 	}
 
-	// All workspaces, ordered by workspace then path.
+	// All notespaces, ordered by notespace then path.
 	all, err := db.ListDocuments("")
 	if err != nil {
 		t.Fatalf("ListDocuments(all): %v", err)
@@ -126,7 +126,7 @@ func TestListDocuments(t *testing.T) {
 		}
 	}
 
-	// Workspace filter.
+	// Notespace filter.
 	wsDocs, err := db.ListDocuments("ws")
 	if err != nil {
 		t.Fatalf("ListDocuments(ws): %v", err)
@@ -135,12 +135,12 @@ func TestListDocuments(t *testing.T) {
 		t.Fatalf("expected 2 documents in ws, got %d", len(wsDocs))
 	}
 	for _, d := range wsDocs {
-		if d.Workspace != "ws" {
-			t.Fatalf("filter leaked workspace %q", d.Workspace)
+		if d.Notespace != "ws" {
+			t.Fatalf("filter leaked notespace %q", d.Notespace)
 		}
 	}
 
-	// Empty workspace match returns nothing, not an error.
+	// Empty notespace match returns nothing, not an error.
 	none, err := db.ListDocuments("missing")
 	if err != nil {
 		t.Fatalf("ListDocuments(missing): %v", err)
@@ -150,19 +150,19 @@ func TestListDocuments(t *testing.T) {
 	}
 }
 
-func TestUniqueWorkspacePathConstraint(t *testing.T) {
+func TestUniqueNotespacePathConstraint(t *testing.T) {
 	db := openTestDB(t)
 
-	if err := db.UpsertDocument(&Document{DocumentID: "doc-1", Workspace: "ws", Path: "notes/x.md"}); err != nil {
+	if err := db.UpsertDocument(&Document{DocumentID: "doc-1", Notespace: "ws", Path: "notes/x.md"}); err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
-	// A different UUID claiming the same (workspace, path) must be rejected.
-	if err := db.UpsertDocument(&Document{DocumentID: "doc-2", Workspace: "ws", Path: "notes/x.md"}); err == nil {
-		t.Fatal("expected UNIQUE(workspace, path) violation, got nil error")
+	// A different UUID claiming the same (notespace, path) must be rejected.
+	if err := db.UpsertDocument(&Document{DocumentID: "doc-2", Notespace: "ws", Path: "notes/x.md"}); err == nil {
+		t.Fatal("expected UNIQUE(notespace, path) violation, got nil error")
 	}
-	// Same path in a different workspace is a distinct document.
-	if err := db.UpsertDocument(&Document{DocumentID: "doc-3", Workspace: "other", Path: "notes/x.md"}); err != nil {
-		t.Fatalf("cross-workspace upsert: %v", err)
+	// Same path in a different notespace is a distinct document.
+	if err := db.UpsertDocument(&Document{DocumentID: "doc-3", Notespace: "other", Path: "notes/x.md"}); err != nil {
+		t.Fatalf("cross-notespace upsert: %v", err)
 	}
 }
 
@@ -170,9 +170,9 @@ func TestOutboxQueue(t *testing.T) {
 	db := openTestDB(t)
 
 	for _, e := range []*OutboxEntry{
-		{DocumentID: "d1", Workspace: "ws", EventType: syncproto.EventDocumentCreated, Path: "notes/a.md", ContentHash: "h1"},
-		{DocumentID: "d1", Workspace: "ws", EventType: syncproto.EventDocumentUpdated, Path: "notes/a.md", ContentHash: "h2"},
-		{DocumentID: "d2", Workspace: "other", EventType: syncproto.EventDocumentCreated, Path: "notes/b.md", ContentHash: "h3"},
+		{DocumentID: "d1", Notespace: "ws", EventType: syncproto.EventDocumentCreated, Path: "notes/a.md", ContentHash: "h1"},
+		{DocumentID: "d1", Notespace: "ws", EventType: syncproto.EventDocumentUpdated, Path: "notes/a.md", ContentHash: "h2"},
+		{DocumentID: "d2", Notespace: "other", EventType: syncproto.EventDocumentCreated, Path: "notes/b.md", ContentHash: "h3"},
 	} {
 		if _, err := db.EnqueueOutbox(e); err != nil {
 			t.Fatalf("EnqueueOutbox: %v", err)
@@ -210,7 +210,7 @@ func TestCursorState(t *testing.T) {
 	db := openTestDB(t)
 
 	if st, err := db.GetState("ws"); err != nil || st != nil {
-		t.Fatalf("expected nil state for unsynced workspace, got %+v err=%v", st, err)
+		t.Fatalf("expected nil state for unsynced notespace, got %+v err=%v", st, err)
 	}
 
 	if err := db.SetCursor("ws", 42); err != nil {
@@ -268,18 +268,18 @@ func TestMigrateDocumentsIdempotent(t *testing.T) {
 	}
 	if _, err := raw.Exec(`CREATE TABLE sync_documents (
 		document_id         TEXT PRIMARY KEY,
-		workspace           TEXT NOT NULL,
+		notespace           TEXT NOT NULL,
 		path                TEXT NOT NULL,
 		content_hash        TEXT NOT NULL DEFAULT '',
 		last_synced_hash    TEXT NOT NULL DEFAULT '',
 		last_synced_version INTEGER NOT NULL DEFAULT 0,
 		base_content        BLOB,
 		updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		UNIQUE(workspace, path)
+		UNIQUE(notespace, path)
 	)`); err != nil {
 		t.Fatalf("seed old schema: %v", err)
 	}
-	if _, err := raw.Exec(`INSERT INTO sync_documents (document_id, workspace, path) VALUES ('doc-old', 'default', 'inbox/old.md')`); err != nil {
+	if _, err := raw.Exec(`INSERT INTO sync_documents (document_id, notespace, path) VALUES ('doc-old', 'default', 'inbox/old.md')`); err != nil {
 		t.Fatalf("seed old row: %v", err)
 	}
 	_ = raw.Close()
@@ -311,7 +311,7 @@ func TestMigrateDocumentsIdempotent(t *testing.T) {
 func TestMarkClearDiverged(t *testing.T) {
 	db := openTestDB(t)
 	if err := db.UpsertDocument(&Document{
-		DocumentID: "doc-1", Workspace: "default", Path: "inbox/n.md",
+		DocumentID: "doc-1", Notespace: "default", Path: "inbox/n.md",
 		ContentHash: "local", LastSyncedHash: "server", LastSyncedVersion: 2, BaseContent: []byte("base"),
 	}); err != nil {
 		t.Fatalf("UpsertDocument: %v", err)
@@ -330,7 +330,7 @@ func TestMarkClearDiverged(t *testing.T) {
 
 	// A content-tracking UpsertDocument (ON CONFLICT) must NOT clear diverged.
 	if err := db.UpsertDocument(&Document{
-		DocumentID: "doc-1", Workspace: "default", Path: "inbox/n.md", ContentHash: "local2",
+		DocumentID: "doc-1", Notespace: "default", Path: "inbox/n.md", ContentHash: "local2",
 	}); err != nil {
 		t.Fatalf("UpsertDocument (conflict): %v", err)
 	}
@@ -368,7 +368,7 @@ func TestMarkClearDiverged(t *testing.T) {
 func TestUpdateOutboxEntryContent(t *testing.T) {
 	db := openTestDB(t)
 	id, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-1", Workspace: "default", EventType: syncproto.EventDocumentUpdated,
+		DocumentID: "doc-1", Notespace: "default", EventType: syncproto.EventDocumentUpdated,
 		Path: "inbox/n.md", ContentHash: "old",
 	})
 	if err != nil {
@@ -397,7 +397,7 @@ func TestOutboxBaseVersionMigration(t *testing.T) {
 	if _, err := raw.Exec(`CREATE TABLE sync_outbox (
 		id            INTEGER PRIMARY KEY AUTOINCREMENT,
 		document_id   TEXT NOT NULL DEFAULT '',
-		workspace     TEXT NOT NULL,
+		notespace     TEXT NOT NULL,
 		event_type    TEXT NOT NULL,
 		path          TEXT NOT NULL,
 		prev_path     TEXT NOT NULL DEFAULT '',
@@ -412,7 +412,7 @@ func TestOutboxBaseVersionMigration(t *testing.T) {
 		t.Fatalf("create old-schema table: %v", err)
 	}
 	if _, err := raw.Exec(
-		`INSERT INTO sync_outbox (workspace, event_type, path) VALUES ('default', ?, 'old.md')`,
+		`INSERT INTO sync_outbox (notespace, event_type, path) VALUES ('default', ?, 'old.md')`,
 		syncproto.EventDocumentUpdated); err != nil {
 		t.Fatalf("seed old row: %v", err)
 	}
@@ -427,7 +427,7 @@ func TestOutboxBaseVersionMigration(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-1", Workspace: "default",
+		DocumentID: "doc-1", Notespace: "default",
 		EventType: syncproto.EventDocumentDeleted, Path: "new.md", BaseVersion: 7,
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox on migrated db: %v", err)
@@ -447,7 +447,7 @@ func TestOutboxBaseVersionMigration(t *testing.T) {
 // TestResetForRepush is the recreated-server recovery primitive: every
 // NON-diverged document's server-confirmed state is voided (last_synced_*
 // zeroed → the sweep re-enqueues it as a create) while its document_id is
-// KEPT (stable identities across the recreate), the workspace's obsolete
+// KEPT (stable identities across the recreate), the notespace's obsolete
 // outbox entries are dropped, and the pull cursor resets — with diverged
 // documents (and their outbox entries, which may carry an unpushed merged
 // payload) left strictly untouched.
@@ -457,7 +457,7 @@ func TestResetForRepush(t *testing.T) {
 	seedDoc := func(id, ws, path string, diverged bool) {
 		t.Helper()
 		if err := db.InsertDocument(&Document{
-			DocumentID: id, Workspace: ws, Path: path,
+			DocumentID: id, Notespace: ws, Path: path,
 			ContentHash:    "hash-" + id,
 			LastSyncedHash: "synced-" + id, LastSyncedVersion: 7,
 			BaseContent: []byte("base"), Diverged: diverged,
@@ -468,13 +468,13 @@ func TestResetForRepush(t *testing.T) {
 	seedDoc("doc-1", "default", "inbox/a.md", false)
 	seedDoc("doc-2", "default", "inbox/b.md", false)
 	seedDoc("doc-3", "default", "inbox/c.md", true) // diverged: untouched
-	seedDoc("doc-4", "other", "inbox/d.md", false)  // other workspace: untouched
+	seedDoc("doc-4", "other", "inbox/d.md", false)  // other notespace: untouched
 
 	// Outbox: a parked update against the dead server (obsolete), plus the
 	// diverged doc's entry (must survive — its payload can carry an unpushed
-	// merge) and another workspace's entry (out of scope).
+	// merge) and another notespace's entry (out of scope).
 	staleID, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-1", Workspace: "default",
+		DocumentID: "doc-1", Notespace: "default",
 		EventType: syncproto.EventDocumentUpdated, Path: "inbox/a.md",
 	})
 	if err != nil {
@@ -484,14 +484,14 @@ func TestResetForRepush(t *testing.T) {
 		t.Fatalf("ParkOutbox: %v", err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-3", Workspace: "default",
+		DocumentID: "doc-3", Notespace: "default",
 		EventType: syncproto.EventDocumentUpdated, Path: "inbox/c.md",
 		Payload: "merged bytes",
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox (diverged): %v", err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-4", Workspace: "other",
+		DocumentID: "doc-4", Notespace: "other",
 		EventType: syncproto.EventDocumentUpdated, Path: "inbox/d.md",
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox (other ws): %v", err)
@@ -523,7 +523,7 @@ func TestResetForRepush(t *testing.T) {
 		}
 	}
 
-	// Diverged doc and the other workspace's doc: fully untouched.
+	// Diverged doc and the other notespace's doc: fully untouched.
 	for _, id := range []string{"doc-3", "doc-4"} {
 		doc, err := db.GetDocument(id)
 		if err != nil || doc == nil {
@@ -534,8 +534,8 @@ func TestResetForRepush(t *testing.T) {
 		}
 	}
 
-	// Outbox: the workspace's non-diverged entry is gone; the diverged doc's
-	// entry and the other workspace's entry survive.
+	// Outbox: the notespace's non-diverged entry is gone; the diverged doc's
+	// entry and the other notespace's entry survive.
 	entries, err := db.ListOutbox("", 0)
 	if err != nil {
 		t.Fatalf("ListOutbox: %v", err)
@@ -558,21 +558,21 @@ func TestResetForRepush(t *testing.T) {
 		t.Fatalf("cursor must reset to 0, got %d", st.Cursor)
 	}
 
-	// The all-workspaces variant sweeps the remaining workspace too. (The
+	// The all-notespaces variant sweeps the remaining notespace too. (The
 	// idempotent re-touch of default's already-reset rows is fine — the count
 	// is diagnostic, the state is what matters.)
-	_, workspaces, err := db.ResetForRepushAll()
+	_, notespaces, err := db.ResetForRepushAll()
 	if err != nil {
 		t.Fatalf("ResetForRepushAll: %v", err)
 	}
-	if len(workspaces) != 2 {
-		t.Fatalf("expected 2 workspaces, got %v", workspaces)
+	if len(notespaces) != 2 {
+		t.Fatalf("expected 2 notespaces, got %v", notespaces)
 	}
 	doc, err := db.GetDocument("doc-4")
 	if err != nil || doc == nil {
 		t.Fatalf("GetDocument doc-4: %v", err)
 	}
 	if doc.LastSyncedHash != "" || doc.LastSyncedVersion != 0 {
-		t.Fatalf("doc-4 must be reset by the all-workspaces variant: hash=%q v%d", doc.LastSyncedHash, doc.LastSyncedVersion)
+		t.Fatalf("doc-4 must be reset by the all-notespaces variant: hash=%q v%d", doc.LastSyncedHash, doc.LastSyncedVersion)
 	}
 }

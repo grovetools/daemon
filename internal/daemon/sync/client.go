@@ -48,7 +48,7 @@ func IsAuthError(err error) bool { return errors.Is(err, ErrUnauthorized) }
 // isAuthStatus reports whether an HTTP status means "the token was rejected".
 //
 // 401 ONLY, deliberately. 403 is the server's AUTHORIZATION answer — a token
-// it recognizes, for a user with no grant on this workspace (getUserPrefixes,
+// it recognizes, for a user with no grant on this notespace (getUserPrefixes,
 // sync/pkg/server/handlers.go) — and its remediation is a share grant, not a
 // new token. Classifying it here was tried and reverted: it told operators of
 // perfectly valid share-scoped clients to mint a replacement token, and it put
@@ -301,8 +301,8 @@ func (c *Client) deviceCapabilities(ctx context.Context, clientVersion string) (
 	if err != nil {
 		return nil, err
 	}
-	if capResp.ProtocolVersion != syncproto.ProtocolVersionDeviceSession || capResp.SessionToken == "" {
-		return nil, fmt.Errorf("device capabilities response did not establish a v2 session")
+	if capResp.ProtocolVersion < syncproto.ProtocolVersionDeviceSession || capResp.SessionToken == "" {
+		return nil, fmt.Errorf("device capabilities response did not establish a device session")
 	}
 	if capResp.ServerEpoch != identity.ServerEpoch {
 		return nil, fmt.Errorf("server epoch changed during device handshake")
@@ -350,18 +350,52 @@ func containsVersion(versions []int, wanted int) bool {
 	return false
 }
 
+// Register establishes immutable notespace identity before any data pipeline starts.
+func (c *Client) Register(ctx context.Context, req syncproto.RegisterRequest) (*syncproto.RegisterResponse, error) {
+	if req.ProtocolVersion == 0 {
+		req.ProtocolVersion = syncproto.ProtocolVersionNotespaceID
+	}
+	if req.DeviceID == "" {
+		req.DeviceID = c.deviceID
+	}
+	httpReq, err := c.newRequest(ctx, http.MethodPost, "/sync/register", &req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.doAuthenticated(ctx, c.httpClient, "register request", replayableRequest(httpReq))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := c.rejectIfUnauthorized("register request", resp); err != nil {
+		return nil, err
+	}
+	var out syncproto.RegisterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode register response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK || out.Error != nil {
+		if out.Error != nil {
+			return &out, fmt.Errorf("registration %s: %s", out.Error.Code, out.Error.Message)
+		}
+		return &out, fmt.Errorf("registration failed with status %d", resp.StatusCode)
+	}
+	return &out, nil
+}
+
 // Push uploads a batch of outbox entries to the server. Returns the
 // per-event results in the same order as the input events.
-func (c *Client) Push(ctx context.Context, workspace string, events []syncproto.SyncEvent) (*syncproto.PushResponse, error) {
+func (c *Client) Push(ctx context.Context, notespace string, events []syncproto.SyncEvent) (*syncproto.PushResponse, error) {
 	if c.caps.Load() == nil {
 		return nil, fmt.Errorf("capabilities handshake not performed; call Capabilities() first")
 	}
 
 	req := &syncproto.PushRequest{
-		Workspace: workspace,
-		OriginID:  c.originID,
-		DeviceID:  c.deviceID,
-		Events:    events,
+		ProtocolVersion: syncproto.ProtocolVersionNotespaceID,
+		NotespaceID:     syncproto.NotespaceID(notespace),
+		OriginID:        c.originID,
+		DeviceID:        c.deviceID,
+		Events:          events,
 	}
 
 	httpReq, err := c.newRequest(ctx, "POST", "/sync/push", req)
@@ -389,7 +423,7 @@ func (c *Client) Push(ctx context.Context, workspace string, events []syncproto.
 		return nil, fmt.Errorf("failed to decode push response: %w", err)
 	}
 
-	if pushResp.Error != "" {
+	if pushResp.Error != nil {
 		return nil, fmt.Errorf("server push error: %s", pushResp.Error)
 	}
 
@@ -425,9 +459,9 @@ func (c *Client) PushBlob(ctx context.Context, hash string, data []byte) error {
 	return nil
 }
 
-// Snapshot fetches the server's manifest snapshot for a workspace.
-func (c *Client) Snapshot(ctx context.Context, workspace string) (*syncproto.SnapshotManifest, error) {
-	url := fmt.Sprintf("%s/sync/snapshot?workspace=%s", c.serverURL, workspace)
+// Snapshot fetches the server's manifest snapshot for a notespace.
+func (c *Client) Snapshot(ctx context.Context, notespace string) (*syncproto.SnapshotManifest, error) {
+	url := fmt.Sprintf("%s/sync/snapshot?protocol_version=%d&notespace=%s", c.serverURL, syncproto.ProtocolVersionNotespaceID, neturl.QueryEscape(notespace))
 
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -693,13 +727,14 @@ func NewClientFromConfig(ctx context.Context, cfg *config.SyncConfig, deviceID, 
 	return client, nil
 }
 
-// PullEvents fetches a batch of events from the workspace event log, starting from the given cursor.
+// PullEvents fetches a batch of events from the notespace event log, starting from the given cursor.
 // It uses long-polling if wait is set to > 0 seconds.
-func (c *Client) PullEvents(ctx context.Context, workspace string, cursor int64, limit int, wait time.Duration) (*syncproto.PullResponse, error) {
+func (c *Client) PullEvents(ctx context.Context, notespace string, cursor int64, limit int, wait time.Duration) (*syncproto.PullResponse, error) {
 	req := &syncproto.PullRequest{
-		Workspace: workspace,
-		Cursor:    cursor,
-		Limit:     limit,
+		ProtocolVersion: syncproto.ProtocolVersionNotespaceID,
+		NotespaceID:     syncproto.NotespaceID(notespace),
+		Cursor:          cursor,
+		Limit:           limit,
 	}
 	if wait > 0 {
 		req.Wait = wait.String()
@@ -709,8 +744,8 @@ func (c *Client) PullEvents(ctx context.Context, workspace string, cursor int64,
 	if wait > 0 {
 		waitStr = wait.String()
 	}
-	httpReq, err := c.newRequest(ctx, "GET", fmt.Sprintf("/sync/events?workspace=%s&cursor=%d&limit=%d&wait=%s&origin_id=%s&exclude_origin=%s",
-		neturl.QueryEscape(workspace), cursor, limit, waitStr, neturl.QueryEscape(c.originID), neturl.QueryEscape(c.originID)), nil)
+	httpReq, err := c.newRequest(ctx, "GET", fmt.Sprintf("/sync/events?protocol_version=%d&notespace=%s&cursor=%d&limit=%d&wait=%s&origin_id=%s&exclude_origin=%s",
+		syncproto.ProtocolVersionNotespaceID, neturl.QueryEscape(notespace), cursor, limit, waitStr, neturl.QueryEscape(c.originID), neturl.QueryEscape(c.originID)), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pull request: %w", err)
 	}
@@ -722,7 +757,7 @@ func (c *Client) PullEvents(ctx context.Context, workspace string, cursor int64,
 	defer resp.Body.Close()
 
 	// 410 Gone is a protocol answer, not a transport failure: the cursor
-	// predates the workspace's GC watermark and the body is a decodable
+	// predates the notespace's GC watermark and the body is a decodable
 	// PullResponse carrying snapshot_required=true (C20). Erroring here made
 	// RunPullLoop's resync branch unreachable — a wiped client spun on
 	// "pull failed ... status 410" forever instead of snapshot-resyncing.
@@ -788,9 +823,9 @@ type HistoryEntry struct {
 }
 
 // History returns the descending version history for a document path.
-func (c *Client) History(ctx context.Context, workspace, path string) ([]HistoryEntry, error) {
-	u := fmt.Sprintf("%s/sync/history?workspace=%s&path=%s",
-		c.serverURL, neturl.QueryEscape(workspace), neturl.QueryEscape(path))
+func (c *Client) History(ctx context.Context, notespace, path string) ([]HistoryEntry, error) {
+	u := fmt.Sprintf("%s/sync/history?protocol_version=%d&notespace=%s&path=%s",
+		c.serverURL, syncproto.ProtocolVersionNotespaceID, neturl.QueryEscape(notespace), neturl.QueryEscape(path))
 
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
@@ -818,9 +853,9 @@ func (c *Client) History(ctx context.Context, workspace, path string) ([]History
 }
 
 // HistoryBlob returns the raw content of a document at a specific version.
-func (c *Client) HistoryBlob(ctx context.Context, workspace, documentID string, version int64) ([]byte, error) {
-	u := fmt.Sprintf("%s/sync/history/blob?workspace=%s&document_id=%s&version=%d",
-		c.serverURL, neturl.QueryEscape(workspace), neturl.QueryEscape(documentID), version)
+func (c *Client) HistoryBlob(ctx context.Context, notespace, documentID string, version int64) ([]byte, error) {
+	u := fmt.Sprintf("%s/sync/history/blob?protocol_version=%d&notespace=%s&document_id=%s&version=%d",
+		c.serverURL, syncproto.ProtocolVersionNotespaceID, neturl.QueryEscape(notespace), neturl.QueryEscape(documentID), version)
 
 	httpReq, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {

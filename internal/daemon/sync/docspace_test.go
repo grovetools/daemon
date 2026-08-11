@@ -1,6 +1,8 @@
 package sync
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/grovetools/core/config"
@@ -16,7 +18,7 @@ func TestDocSpaceIncluded(t *testing.T) {
 		excluded bool
 	}{
 		// Default exclusion manifest.
-		{rel: ".obsidian/workspace.json", excluded: true},
+		{rel: ".obsidian/notespace.json", excluded: true},
 		{rel: "notes/.obsidian/app.json", excluded: true},
 		{rel: ".stfolder", excluded: true},
 		{rel: ".stversions/old.md", excluded: true},
@@ -36,7 +38,9 @@ func TestDocSpaceIncluded(t *testing.T) {
 		{rel: "plans/my-plan/01-spec.md", excluded: false},
 		{rel: "chats/session.md", excluded: false},
 		{rel: ".grove/other", excluded: false},
-		// Per-workspace extra globs.
+		{rel: ".notespace.toml", excluded: false},
+		{rel: ".notebook.toml", excluded: false},
+		// Per-notespace extra globs.
 		{rel: "notes/secret-draft.md", extra: []string{"*-draft.md"}, excluded: true},
 		{rel: "private/x.md", extra: []string{"private/"}, excluded: true},
 		{rel: "notes/public.md", extra: []string{"private/"}, excluded: false},
@@ -51,7 +55,7 @@ func TestDocSpaceIncluded(t *testing.T) {
 }
 
 // TestDocSpaceRoute covers the size-based routing decisions on top of the
-// inclusion filter, plus the per-workspace MaxFileSize cap.
+// inclusion filter, plus the per-notespace MaxFileSize cap.
 func TestDocSpaceRoute(t *testing.T) {
 	const kb = 1 << 10
 	cases := []struct {
@@ -76,12 +80,12 @@ func TestDocSpaceRoute(t *testing.T) {
 			rel:  "daily/2026-07-11.md", size: 10, want: RouteSkip,
 		},
 		{
-			name: "over per-workspace cap",
+			name: "over per-notespace cap",
 			ws:   &config.SyncWorkspace{MaxFileSize: 1024},
 			rel:  "quick/big.md", size: 2 * kb, want: RouteSkip,
 		},
 		{
-			name: "under per-workspace cap",
+			name: "under per-notespace cap",
 			ws:   &config.SyncWorkspace{MaxFileSize: 1024},
 			rel:  "quick/ok.md", size: 512, want: RouteInline,
 		},
@@ -109,6 +113,27 @@ func TestDocSpaceRoute(t *testing.T) {
 
 // TestNewDocSpaceNil verifies the nil-subscription all-defaults instance is
 // usable (the watcher test handler and any pre-subscription path rely on it).
+func TestWalkTreeIncludesIdentityDotfiles(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{".notespace.toml", ".notebook.toml"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("stamp"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := map[string]bool{}
+	if err := NewDocSpace(nil).WalkTree(root, nil, func(_ string, rel string, _ os.DirEntry) error {
+		seen[rel] = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{".notespace.toml", ".notebook.toml"} {
+		if !seen[name] {
+			t.Errorf("identity dotfile %s was omitted from walk", name)
+		}
+	}
+}
+
 func TestNewDocSpaceNil(t *testing.T) {
 	d := NewDocSpace(nil)
 	if !d.Included("notes/a.md") {

@@ -14,6 +14,7 @@ import (
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/registry"
+	"github.com/grovetools/core/pkg/syncproto"
 
 	// The REAL grove-syncd, in process. The daemon module does not require the
 	// sync module in go.mod — it does not need to, because every grovetools
@@ -51,6 +52,15 @@ func startSyncServer(t *testing.T) string {
 	sum := sha256.Sum256([]byte(twoOriginToken))
 	if err := st.CreateToken(hex.EncodeToString(sum[:]), "acceptance", syncstore.OwnerUserID); err != nil {
 		t.Fatalf("CreateToken: %v", err)
+	}
+	// v3 servers never create a stream on first push. The registry identity is
+	// established before either origin starts its pipeline.
+	if out, err := st.Register(syncproto.RegisterRequest{
+		RequestIdentity: syncproto.RequestIdentity{ProtocolVersion: syncproto.ProtocolVersionNotespaceID, IdempotencyKey: "registry-fixture", DeviceID: "fixture"},
+		Intent:          syncproto.RegistrationIntentCreateSibling, Subject: "local:registry-fixture",
+		NotespaceName: "registry", Kind: "registry", ProposedNotespaceID: "registry",
+	}); err != nil || out.Status != 200 {
+		t.Fatalf("Register registry notespace: outcome=%+v err=%v", out, err)
 	}
 	blobs, err := syncstore.NewFSBlobStore(filepath.Join(dir, "blobs"))
 	if err != nil {
@@ -138,7 +148,7 @@ func (m *machineOrigin) pullOnce() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	before, _ := m.db.GetWorkspaceCursor("registry")
+	before, _ := m.db.GetNotespaceCursor("registry")
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -148,7 +158,7 @@ func (m *machineOrigin) pullOnce() {
 	stable := 0
 	for stable < 3 {
 		time.Sleep(80 * time.Millisecond)
-		cur, _ := m.db.GetWorkspaceCursor("registry")
+		cur, _ := m.db.GetNotespaceCursor("registry")
 		if cur == before {
 			stable++
 		} else {

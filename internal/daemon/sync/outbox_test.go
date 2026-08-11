@@ -15,7 +15,7 @@ func enqueue(t *testing.T, db *DB, docID, eventType, path, prevPath string) int6
 	t.Helper()
 	id, err := db.EnqueueOutbox(&OutboxEntry{
 		DocumentID: docID,
-		Workspace:  "default",
+		Notespace:  "default",
 		EventType:  eventType,
 		Path:       path,
 		PrevPath:   prevPath,
@@ -301,7 +301,7 @@ func TestMigrateOutboxIdempotent(t *testing.T) {
 	if _, err := raw.Exec(`CREATE TABLE sync_outbox (
 		id           INTEGER PRIMARY KEY AUTOINCREMENT,
 		document_id  TEXT NOT NULL DEFAULT '',
-		workspace    TEXT NOT NULL,
+		notespace    TEXT NOT NULL,
 		event_type   TEXT NOT NULL,
 		path         TEXT NOT NULL,
 		prev_path    TEXT NOT NULL DEFAULT '',
@@ -311,7 +311,7 @@ func TestMigrateOutboxIdempotent(t *testing.T) {
 	)`); err != nil {
 		t.Fatalf("seed old schema: %v", err)
 	}
-	if _, err := raw.Exec(`INSERT INTO sync_outbox (document_id, workspace, event_type, path) VALUES ('doc-old', 'default', ?, 'inbox/old.md')`, syncproto.EventDocumentUpdated); err != nil {
+	if _, err := raw.Exec(`INSERT INTO sync_outbox (document_id, notespace, event_type, path) VALUES ('doc-old', 'default', ?, 'inbox/old.md')`, syncproto.EventDocumentUpdated); err != nil {
 		t.Fatalf("seed old row: %v", err)
 	}
 	_ = raw.Close()

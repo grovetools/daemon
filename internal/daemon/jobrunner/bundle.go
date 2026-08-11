@@ -10,6 +10,7 @@ import (
 
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/pkg/models"
+	notespacepkg "github.com/grovetools/core/pkg/notespace"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/sirupsen/logrus"
 )
@@ -19,20 +20,43 @@ import (
 // files persist on disk (LoadPlan re-stats them at dispatch); they are ordinary
 // replica-notebook content thereafter and converge home via M1 sync (C13).
 func (jr *JobRunner) materializeBundle(ctx context.Context, bundle *models.PlanBundle) (string, error) {
-	planDir, err := resolveReplicaPlanDir(bundle.Workspace, bundle.PlanName)
+	if bundle == nil || bundle.NotespaceID == "" {
+		return "", fmt.Errorf("plan bundle missing notespace id")
+	}
+	planDir, err := resolveReplicaPlanDir(bundle.NotespaceName, bundle.PlanName)
 	if err != nil {
+		return "", err
+	}
+	root := filepath.Dir(filepath.Dir(planDir))
+	if err := validateBundleRoot(root, bundle.NotespaceID); err != nil {
 		return "", err
 	}
 	if err := jr.writeBundleFiles(planDir, bundle); err != nil {
 		return "", err
 	}
 	jr.ulog.Info("Materialized plan bundle").
-		Field("workspace", bundle.Workspace).
+		Field("notespace_id", bundle.NotespaceID).
+		Field("notespace_name", bundle.NotespaceName).
 		Field("plan", bundle.PlanName).
 		Field("plan_dir", planDir).
 		Field("files", len(bundle.Files)).
 		Log(ctx)
 	return planDir, nil
+}
+
+func validateBundleRoot(root, expectedID string) error {
+	stamp, err := notespacepkg.LoadNotespace(root)
+	if err != nil {
+		return fmt.Errorf("loading replica notespace identity: %w", err)
+	}
+	if stamp == nil || stamp.ID != expectedID {
+		found := "missing"
+		if stamp != nil {
+			found = stamp.ID
+		}
+		return fmt.Errorf("plan bundle notespace id %q does not match replica root %s (%s)", expectedID, root, found)
+	}
+	return nil
 }
 
 // resolveReplicaPlanDir resolves <replica notebook>/…/plans/<planName> for the

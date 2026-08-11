@@ -289,7 +289,7 @@ func TestKickAntiEntropyExceptSkipsTheDetector(t *testing.T) {
 	h.kickAntiEntropyExcept("detector")
 
 	if detector.KickPending() {
-		t.Fatal("the detecting workspace was kicked again; it already swept in its own pass")
+		t.Fatal("the detecting notespace was kicked again; it already swept in its own pass")
 	}
 	if !bystander.KickPending() {
 		t.Fatal("the bystander was not kicked — it is voided with an empty outbox and would wait an hour")
@@ -303,7 +303,7 @@ func TestKickAntiEntropyExceptSkipsTheDetector(t *testing.T) {
 // running daemon was invisible until the hourly anti-entropy tick, with the
 // machine's whole document set existing nowhere but locally in the meantime.
 // The transport now re-probes the epoch on a slow cadence and kicks every
-// workspace's sweep when it changes.
+// notespace's sweep when it changes.
 func TestEpochProbeDetectsARecreatedServerUnderARunningDaemon(t *testing.T) {
 	var epoch atomic.Value
 	epoch.Store("epoch-a")
@@ -325,7 +325,7 @@ func TestEpochProbeDetectsARecreatedServerUnderARunningDaemon(t *testing.T) {
 
 	// A document the daemon believes is safely on the server.
 	if err := db.InsertDocument(&syncdb.Document{
-		DocumentID: "doc-1", Workspace: "testws", Path: "inbox/a.md",
+		DocumentID: "doc-1", Notespace: "testws", Path: "inbox/a.md",
 		ContentHash: "h", LastSyncedHash: "h", LastSyncedVersion: 3,
 	}); err != nil {
 		t.Fatal(err)

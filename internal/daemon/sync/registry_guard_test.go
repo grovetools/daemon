@@ -16,7 +16,7 @@ import (
 const guardOwnID = "01KZ00TTW1TDT7X9ABCDEFGHJK"
 
 // newGuardPipeline builds a pull pipeline subscribed to a registry-role
-// workspace, with a sandboxed state dir (conflict artifacts land there) and a
+// notespace, with a sandboxed state dir (conflict artifacts land there) and a
 // recording conflict callback.
 func newGuardPipeline(t *testing.T, role string) (*PullPipeline, *[]string) {
 	t.Helper()
@@ -39,13 +39,13 @@ func newGuardPipeline(t *testing.T, role string) (*PullPipeline, *[]string) {
 	return p, &seen
 }
 
-// conflictFiles lists artifact paths relative to the workspace's conflict
+// conflictFiles lists artifact paths relative to the notespace's conflict
 // directory. It WALKS, matching handleSyncConflicts: an artifact for
 // "machines/<id>.md" nests one directory deep, because the artifact name
 // embeds the document's own wire path.
-func conflictFiles(t *testing.T, workspace string) []string {
+func conflictFiles(t *testing.T, notespace string) []string {
 	t.Helper()
-	dir := filepath.Join(paths.StateDir(), "sync", "conflicts", workspace)
+	dir := filepath.Join(paths.StateDir(), "sync", "conflicts", notespace)
 	var out []string
 	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -160,7 +160,7 @@ func TestGuardLetsOtherMachinesThrough(t *testing.T) {
 }
 
 // TestGuardIsScopedToTheRegistryRole: a machines/<id>.md path inside an
-// ORDINARY notebook workspace is just a document. Dropping it there would be a
+// ORDINARY notebook notespace is just a document. Dropping it there would be a
 // silent data-loss bug, not a safety property.
 func TestGuardIsScopedToTheRegistryRole(t *testing.T) {
 	for _, role := range []string{"", config.SyncRolePeer, config.SyncRoleSatellite} {

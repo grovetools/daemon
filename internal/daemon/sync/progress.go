@@ -5,13 +5,13 @@ import (
 	"time"
 )
 
-// HydrationProgress is a snapshot of one workspace's tree-walk reconcile
+// HydrationProgress is a snapshot of one notespace's tree-walk reconcile
 // (walkLocalTree). The first pass on an empty sync.db is hydration; every pass
 // after catches whatever the live watcher missed. The counters let the
 // freshness benchmark read hydration wall-time and files/sec off
 // /api/sync/status without a bespoke endpoint.
 type HydrationProgress struct {
-	Workspace   string    `json:"workspace"`
+	Notespace   string    `json:"notespace"`
 	Running     bool      `json:"running"`
 	Scanned     int64     `json:"scanned"`
 	Enqueued    int64     `json:"enqueued"`
@@ -21,7 +21,7 @@ type HydrationProgress struct {
 	FilesPerSec float64   `json:"files_per_sec"`
 }
 
-// The reconcile runs inside the watcher's per-workspace pipeline goroutines,
+// The reconcile runs inside the watcher's per-notespace pipeline goroutines,
 // but the HTTP status handler only holds the sync DB. A small package-level
 // registry bridges the two: walkLocalTree writes progress here, and
 // handleSyncStatus reads it via HydrationStatus.
@@ -30,22 +30,22 @@ var (
 	progressByWS = map[string]*HydrationProgress{}
 )
 
-// setHydrationProgress records (a copy of) the latest progress for a workspace.
+// setHydrationProgress records (a copy of) the latest progress for a notespace.
 // Called at walk start, periodically during a long hydration, and at finish.
 func setHydrationProgress(p HydrationProgress) {
 	progressMu.Lock()
 	defer progressMu.Unlock()
 	cp := p
-	progressByWS[p.Workspace] = &cp
+	progressByWS[p.Notespace] = &cp
 }
 
 // HydrationStatus returns a snapshot copy of the latest hydration progress for
-// a workspace, or nil if the reconcile has never run for it. Exported for the
+// a notespace, or nil if the reconcile has never run for it. Exported for the
 // sync status handler.
-func HydrationStatus(workspace string) *HydrationProgress {
+func HydrationStatus(notespace string) *HydrationProgress {
 	progressMu.Lock()
 	defer progressMu.Unlock()
-	p, ok := progressByWS[workspace]
+	p, ok := progressByWS[notespace]
 	if !ok {
 		return nil
 	}

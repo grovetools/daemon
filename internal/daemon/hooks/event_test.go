@@ -170,9 +170,10 @@ func TestNewEventProjectsNoteFields(t *testing.T) {
 		Type:   store.UpdateNoteEvent,
 		Source: "notes",
 		Payload: &models.NoteEvent{
-			Event:     models.NoteEventCreated,
-			Workspace: "grovetools",
-			Path:      "/notes/a.md",
+			Event:         models.NoteEventCreated,
+			NotespaceID:   "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+			NotespaceName: "grovetools",
+			Path:          "/notes/a.md",
 		},
 	}, time.Now())
 

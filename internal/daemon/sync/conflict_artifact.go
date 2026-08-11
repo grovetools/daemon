@@ -2,7 +2,11 @@ package sync
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+
+	"github.com/grovetools/core/pkg/paths"
 )
 
 // Conflict kinds. These are the values that reach a user, both as
@@ -10,7 +14,7 @@ import (
 // the Kind field of GET /api/sync/conflicts.
 //
 // Why they have to be encoded in the FILENAME: the conflicts endpoint is
-// artifact-backed. It scans StateDir/sync/conflicts/<workspace>/ and rebuilds
+// artifact-backed. It scans StateDir/sync/conflicts/<notespace>/ and rebuilds
 // each row from the file it finds, so anything the broadcast payload carried
 // but the file did not was lost the moment the daemon restarted (or, in fact,
 // the moment the SSE subscriber looked away). The kind is the one field that
@@ -28,6 +32,10 @@ const (
 	// such an event can only mean another party wrote a document only this
 	// machine may write. It is dropped, and the artifact is the evidence.
 	ConflictKindRegistryForeignWrite = "registry_foreign_write"
+
+	// ConflictKindRegistration records duplicate physical ids and server-side
+	// registration conflicts. Identity stamps are never document-merged.
+	ConflictKindRegistration = "registration"
 )
 
 // namedConflictKinds are the kinds that appear as a filename segment. Merge is
@@ -36,9 +44,25 @@ const (
 // never collide with one of these words.
 var namedConflictKinds = map[string]bool{
 	ConflictKindRegistryForeignWrite: true,
+	ConflictKindRegistration:         true,
 }
 
 const conflictArtifactSuffix = ".conflict.md"
+
+// WriteRegistrationConflict persists restart-safe evidence under the immutable
+// notespace id. It is intentionally separate from document merge machinery.
+func WriteRegistrationConflict(notespaceID, detail string) (string, error) {
+	dir := filepath.Join(paths.StateDir(), "sync", "conflicts", notespaceID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	name := conflictArtifactName(".notespace.toml", notespaceID, ConflictKindRegistration)
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("# Registration conflict\n\n"+detail+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
 
 // conflictArtifactName builds the artifact filename for one conflict.
 //
@@ -55,7 +79,7 @@ func conflictArtifactName(relPath, docID, kind string) string {
 }
 
 // ParseConflictArtifactName reverses conflictArtifactName for a
-// workspace-relative artifact path. ok is false when the name is not an
+// notespace-relative artifact path. ok is false when the name is not an
 // artifact at all, or when it carries no parseable document id — in which case
 // the caller should skip the file rather than guess at its provenance.
 //

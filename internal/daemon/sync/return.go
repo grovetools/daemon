@@ -21,7 +21,7 @@ const ReturnManifestSchema = "grove.record-return/v1"
 
 type ReturnOperation struct {
 	Type         string    `json:"type"` // create, update, delete, move
-	Workspace    string    `json:"workspace"`
+	Notespace    string    `json:"notespace_id"`
 	DocumentID   string    `json:"document_id"`
 	Path         string    `json:"path"`
 	PreviousPath string    `json:"previous_path,omitempty"`
@@ -37,7 +37,7 @@ type ReturnManifest struct {
 	ServerEpoch    string            `json:"server_epoch"`
 	Generation     string            `json:"generation"`
 	CreatedAt      time.Time         `json:"created_at"`
-	Workspaces     []string          `json:"workspaces"`
+	Notespaces     []string          `json:"notespace_ids"`
 	Operations     []ReturnOperation `json:"operations"`
 	ManifestSHA256 string            `json:"manifest_sha256"`
 }
@@ -56,20 +56,20 @@ func newOperationID() (string, error) {
 }
 
 // BuildReturnManifest compares one coherent set of server snapshots with the
-// laptop's tracked state. Its generation binds the epoch, every workspace
+// laptop's tracked state. Its generation binds the epoch, every notespace
 // cursor, and every server head. A caller must rebuild immediately before a
 // destructive operation; equality of Generation is the TOCTOU interlock.
-func BuildReturnManifest(ctx context.Context, client *Client, db *DB, workspaces []string) (ReturnManifest, error) {
+func BuildReturnManifest(ctx context.Context, client *Client, db *DB, notespaces []string) (ReturnManifest, error) {
 	if client == nil || db == nil {
 		return ReturnManifest{}, fmt.Errorf("sync client and database are required")
 	}
-	if len(workspaces) == 0 {
-		return ReturnManifest{}, fmt.Errorf("at least one workspace is required")
+	if len(notespaces) == 0 {
+		return ReturnManifest{}, fmt.Errorf("at least one notespace is required")
 	}
-	ws := append([]string(nil), workspaces...)
+	ws := append([]string(nil), notespaces...)
 	sort.Strings(ws)
 	ws = compactStrings(ws)
-	m := ReturnManifest{Schema: ReturnManifestSchema, ServerEpoch: client.ServerEpoch(), CreatedAt: time.Now().UTC(), Workspaces: ws}
+	m := ReturnManifest{Schema: ReturnManifestSchema, ServerEpoch: client.ServerEpoch(), CreatedAt: time.Now().UTC(), Notespaces: ws}
 	if m.ServerEpoch == "" {
 		return ReturnManifest{}, fmt.Errorf("sync server did not advertise an epoch")
 	}
@@ -86,7 +86,7 @@ func BuildReturnManifest(ctx context.Context, client *Client, db *DB, workspaces
 			return ReturnManifest{}, fmt.Errorf("snapshot %s: %w", name, err)
 		}
 		sort.Slice(snap.Documents, func(i, j int) bool { return snap.Documents[i].ID < snap.Documents[j].ID })
-		_, _ = fmt.Fprintf(h, "workspace\x00%s\x00%d\x00", name, snap.Cursor)
+		_, _ = fmt.Fprintf(h, "notespace\x00%s\x00%d\x00", name, snap.Cursor)
 		local, err := db.ListDocuments(name)
 		if err != nil {
 			return ReturnManifest{}, err
@@ -103,7 +103,7 @@ func BuildReturnManifest(ctx context.Context, client *Client, db *DB, workspaces
 			_, _ = fmt.Fprintf(h, "%s\x00%s\x00%d\x00%s\x00", d.ID, d.Path, d.Version, d.Hash)
 			ld := byID[d.ID]
 			seen[d.ID] = true
-			op := ReturnOperation{Workspace: name, DocumentID: d.ID, Path: d.Path, HeadHash: d.Hash, HeadVersion: d.Version, Mtime: d.Mtime}
+			op := ReturnOperation{Notespace: name, DocumentID: d.ID, Path: d.Path, HeadHash: d.Hash, HeadVersion: d.Version, Mtime: d.Mtime}
 			switch {
 			case ld == nil:
 				op.Type = "create"
@@ -123,15 +123,15 @@ func BuildReturnManifest(ctx context.Context, client *Client, db *DB, workspaces
 				// deletion. This commonly occurs when a laptop file is archived
 				// before its original identity first syncs: the archived path is
 				// present under a new identity while the stale original row remains.
-				m.Operations = append(m.Operations, ReturnOperation{Type: "delete", Workspace: name, DocumentID: d.DocumentID, Path: d.Path, BaseHash: d.ContentHash})
+				m.Operations = append(m.Operations, ReturnOperation{Type: "delete", Notespace: name, DocumentID: d.DocumentID, Path: d.Path, BaseHash: d.ContentHash})
 			}
 		}
 	}
 	m.Generation = hex.EncodeToString(h.Sum(nil))
 	sort.Slice(m.Operations, func(i, j int) bool {
 		a, b := m.Operations[i], m.Operations[j]
-		if a.Workspace != b.Workspace {
-			return a.Workspace < b.Workspace
+		if a.Notespace != b.Notespace {
+			return a.Notespace < b.Notespace
 		}
 		if a.Path != b.Path {
 			return a.Path < b.Path
@@ -166,29 +166,29 @@ func ValidateReviewedManifest(reviewed, current ReturnManifest) error {
 	if err := current.Validate(); err != nil {
 		return err
 	}
-	if reviewed.Generation != current.Generation || reviewed.ServerEpoch != current.ServerEpoch || !reflect.DeepEqual(reviewed.Workspaces, current.Workspaces) || !reflect.DeepEqual(reviewed.Operations, current.Operations) {
+	if reviewed.Generation != current.Generation || reviewed.ServerEpoch != current.ServerEpoch || !reflect.DeepEqual(reviewed.Notespaces, current.Notespaces) || !reflect.DeepEqual(reviewed.Operations, current.Operations) {
 		return fmt.Errorf("reviewed incoming manifest is stale; review the new generation")
 	}
 	return nil
 }
 
 func (m ReturnManifest) Validate() error {
-	if m.Schema != ReturnManifestSchema || m.OperationID == "" || m.ServerEpoch == "" || len(m.Workspaces) == 0 {
+	if m.Schema != ReturnManifestSchema || m.OperationID == "" || m.ServerEpoch == "" || len(m.Notespaces) == 0 {
 		return fmt.Errorf("invalid record-return manifest identity")
 	}
 	if len(m.Generation) != 64 || !validHexHash(m.Generation) || m.ManifestSHA256 != manifestHash(m) {
 		return fmt.Errorf("record-return manifest hash mismatch")
 	}
-	workspaceSet := make(map[string]bool, len(m.Workspaces))
-	for i, ws := range m.Workspaces {
-		if ws == "" || workspaceSet[ws] || (i > 0 && m.Workspaces[i-1] > ws) {
-			return fmt.Errorf("invalid record-return workspace set")
+	notespaceSet := make(map[string]bool, len(m.Notespaces))
+	for i, ws := range m.Notespaces {
+		if ws == "" || notespaceSet[ws] || (i > 0 && m.Notespaces[i-1] > ws) {
+			return fmt.Errorf("invalid record-return notespace set")
 		}
-		workspaceSet[ws] = true
+		notespaceSet[ws] = true
 	}
 	documents := make(map[string]bool, len(m.Operations))
 	for _, op := range m.Operations {
-		if op.Workspace == "" || !workspaceSet[op.Workspace] || op.DocumentID == "" || documents[op.DocumentID] || validReturnPath(op.Path) != nil {
+		if op.Notespace == "" || !notespaceSet[op.Notespace] || op.DocumentID == "" || documents[op.DocumentID] || validReturnPath(op.Path) != nil {
 			return fmt.Errorf("invalid return operation")
 		}
 		documents[op.DocumentID] = true
@@ -239,13 +239,13 @@ func WriteReturnEscrow(ctx context.Context, client *Client, manifest ReturnManif
 		if op.Type == "delete" {
 			continue
 		}
-		b, err := client.HistoryBlob(ctx, op.Workspace, op.DocumentID, op.HeadVersion)
+		b, err := client.HistoryBlob(ctx, op.Notespace, op.DocumentID, op.HeadVersion)
 		if err != nil {
 			return "", err
 		}
 		sum := sha256.Sum256(b)
 		if hex.EncodeToString(sum[:]) != op.HeadHash {
-			return "", fmt.Errorf("head hash mismatch for %s/%s", op.Workspace, op.Path)
+			return "", fmt.Errorf("head hash mismatch for %s/%s", op.Notespace, op.Path)
 		}
 		escrow.Content[op.DocumentID] = b
 	}
@@ -353,11 +353,11 @@ type ReturnApplyCounts struct {
 	Noop   int `json:"noop"`
 }
 
-// ReturnApplyOptions provides the configured workspace roots and a state
+// ReturnApplyOptions provides the configured notespace roots and a state
 // reconciliation hook. Reconcile runs after filesystem commit while backups
 // still exist; an error rolls the complete filesystem batch back.
 type ReturnApplyOptions struct {
-	WorkspaceRoots map[string]string
+	NotespaceRoots map[string]string
 	Reconcile      func(ReturnEscrow) error
 	BeforeCommit   func(index int, op ReturnOperation) error // test/fault-injection seam
 }
@@ -395,11 +395,11 @@ func secureReturnPath(root, rel string, allowMissingLeaf bool) (string, error) {
 	}
 	ri, err := os.Lstat(absRoot)
 	if err != nil || !ri.IsDir() || ri.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("workspace root %q is not a real directory", root)
+		return "", fmt.Errorf("notespace root %q is not a real directory", root)
 	}
 	dst := filepath.Join(absRoot, filepath.FromSlash(rel))
 	if r, err := filepath.Rel(absRoot, dst); err != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path escapes workspace root: %q", rel)
+		return "", fmt.Errorf("path escapes notespace root: %q", rel)
 	}
 	cur := absRoot
 	parts := strings.Split(filepath.FromSlash(rel), string(filepath.Separator))
@@ -472,17 +472,17 @@ func ApplyReturnEscrow(escrowPath, generation string, opts ReturnApplyOptions) (
 	prepared := make([]preparedReturnOp, 0, len(e.Manifest.Operations))
 	seen := map[string]bool{}
 	for _, op := range e.Manifest.Operations {
-		root, ok := opts.WorkspaceRoots[op.Workspace]
+		root, ok := opts.NotespaceRoots[op.Notespace]
 		if !ok || root == "" {
-			return counts, fmt.Errorf("no configured laptop root for workspace %q", op.Workspace)
+			return counts, fmt.Errorf("no configured laptop root for notespace %q", op.Notespace)
 		}
 		dst, err := secureReturnPath(root, op.Path, true)
 		if err != nil {
 			return counts, err
 		}
-		key := op.Workspace + "\x00" + op.Path
+		key := op.Notespace + "\x00" + op.Path
 		if seen[key] {
-			return counts, fmt.Errorf("multiple return operations target %s/%s", op.Workspace, op.Path)
+			return counts, fmt.Errorf("multiple return operations target %s/%s", op.Notespace, op.Path)
 		}
 		seen[key] = true
 		p := preparedReturnOp{op: op, dst: dst, mode: 0o644}
@@ -490,7 +490,7 @@ func ApplyReturnEscrow(escrowPath, generation string, opts ReturnApplyOptions) (
 		case "create":
 			if _, statErr := os.Lstat(dst); !os.IsNotExist(statErr) {
 				if statErr == nil {
-					return counts, fmt.Errorf("create destination exists: %s/%s", op.Workspace, op.Path)
+					return counts, fmt.Errorf("create destination exists: %s/%s", op.Notespace, op.Path)
 				}
 				return counts, statErr
 			}
@@ -512,10 +512,10 @@ func ApplyReturnEscrow(escrowPath, generation string, opts ReturnApplyOptions) (
 			}
 			hash, mode, hashErr := fileSHA256(dst)
 			if hashErr != nil {
-				return counts, fmt.Errorf("%s precondition for %s/%s: %w", op.Type, op.Workspace, op.Path, hashErr)
+				return counts, fmt.Errorf("%s precondition for %s/%s: %w", op.Type, op.Notespace, op.Path, hashErr)
 			}
 			if hash != op.BaseHash {
-				return counts, fmt.Errorf("local hash drift for %s/%s", op.Workspace, op.Path)
+				return counts, fmt.Errorf("local hash drift for %s/%s", op.Notespace, op.Path)
 			}
 			p.mode = mode
 			if op.Type == "update" {
@@ -533,14 +533,14 @@ func ApplyReturnEscrow(escrowPath, generation string, opts ReturnApplyOptions) (
 			}
 			hash, mode, hashErr := fileSHA256(p.src)
 			if hashErr != nil {
-				return counts, fmt.Errorf("move source precondition for %s/%s: %w", op.Workspace, op.PreviousPath, hashErr)
+				return counts, fmt.Errorf("move source precondition for %s/%s: %w", op.Notespace, op.PreviousPath, hashErr)
 			}
 			if hash != op.BaseHash {
-				return counts, fmt.Errorf("local hash drift for %s/%s", op.Workspace, op.PreviousPath)
+				return counts, fmt.Errorf("local hash drift for %s/%s", op.Notespace, op.PreviousPath)
 			}
 			if _, statErr := os.Lstat(dst); !os.IsNotExist(statErr) {
 				if statErr == nil {
-					return counts, fmt.Errorf("move destination exists: %s/%s", op.Workspace, op.Path)
+					return counts, fmt.Errorf("move destination exists: %s/%s", op.Notespace, op.Path)
 				}
 				return counts, statErr
 			}
@@ -566,7 +566,7 @@ func ApplyReturnEscrow(escrowPath, generation string, opts ReturnApplyOptions) (
 		if p.op.Type == "delete" {
 			continue
 		}
-		root := opts.WorkspaceRoots[p.op.Workspace]
+		root := opts.NotespaceRoots[p.op.Notespace]
 		f, createErr := os.CreateTemp(root, ".record-return-stage-*")
 		if createErr != nil {
 			return counts, createErr
@@ -614,7 +614,7 @@ func ApplyReturnEscrow(escrowPath, generation string, opts ReturnApplyOptions) (
 				return counts, hookErr
 			}
 		}
-		root := opts.WorkspaceRoots[p.op.Workspace]
+		root := opts.NotespaceRoots[p.op.Notespace]
 		if _, secErr := secureReturnPath(root, p.op.Path, true); secErr != nil {
 			rollback(i - 1)
 			return counts, secErr
@@ -630,7 +630,7 @@ func ApplyReturnEscrow(escrowPath, generation string, opts ReturnApplyOptions) (
 		if p.noop {
 			if _, statErr := os.Lstat(p.dst); !os.IsNotExist(statErr) {
 				rollback(i - 1)
-				return counts, fmt.Errorf("delete no-op precondition changed before commit: %s/%s", p.op.Workspace, p.op.Path)
+				return counts, fmt.Errorf("delete no-op precondition changed before commit: %s/%s", p.op.Notespace, p.op.Path)
 			}
 			continue
 		}
@@ -640,20 +640,20 @@ func ApplyReturnEscrow(escrowPath, generation string, opts ReturnApplyOptions) (
 		case "create":
 			if _, statErr := os.Lstat(p.dst); !os.IsNotExist(statErr) {
 				rollback(i - 1)
-				return counts, fmt.Errorf("create destination changed before commit: %s/%s", p.op.Workspace, p.op.Path)
+				return counts, fmt.Errorf("create destination changed before commit: %s/%s", p.op.Notespace, p.op.Path)
 			}
 		case "update", "delete":
 			hash, _, hashErr := fileSHA256(p.dst)
 			if hashErr != nil || hash != p.op.BaseHash {
 				rollback(i - 1)
-				return counts, fmt.Errorf("local precondition changed before commit: %s/%s", p.op.Workspace, p.op.Path)
+				return counts, fmt.Errorf("local precondition changed before commit: %s/%s", p.op.Notespace, p.op.Path)
 			}
 		case "move":
 			hash, _, hashErr := fileSHA256(p.src)
 			_, dstErr := os.Lstat(p.dst)
 			if hashErr != nil || hash != p.op.BaseHash || !os.IsNotExist(dstErr) {
 				rollback(i - 1)
-				return counts, fmt.Errorf("move precondition changed before commit: %s/%s", p.op.Workspace, p.op.Path)
+				return counts, fmt.Errorf("move precondition changed before commit: %s/%s", p.op.Notespace, p.op.Path)
 			}
 		}
 		// A surviving delete's parent necessarily exists (its target does), and

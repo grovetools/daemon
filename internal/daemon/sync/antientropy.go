@@ -25,8 +25,8 @@ type AntiEntropyConfig struct {
 type AntiEntropyPass struct {
 	db            *DB
 	client        *Client
-	workspace     string
-	workspaceRoot string    // Absolute path to the workspace root
+	notespace     string
+	notespaceRoot string    // Absolute path to the notespace root
 	space         *DocSpace // exclusion + routing policy; drives walkLocalTree
 	log           *logging.UnifiedLogger
 	cfg           AntiEntropyConfig
@@ -36,21 +36,21 @@ type AntiEntropyPass struct {
 	// manual /api/sync/repush endpoint after it voids synced state.
 	kick chan struct{}
 
-	// OnEpochReset is called with this workspace's name when Run's handshake
+	// OnEpochReset is called with this notespace's name when Run's handshake
 	// detected a recreated server and voided the local synced state. The
 	// detection is per-pass but the reset is GLOBAL (ResetForRepushAll), so
-	// every other workspace has just had its synced state voided and its
+	// every other notespace has just had its synced state voided and its
 	// outbox cleared with no pass scheduled — the owner uses this to kick
 	// them, instead of leaving them un-pushed until their own hourly tick.
-	// Optional; nil means the other workspaces wait for their tick.
-	OnEpochReset func(workspace string)
+	// Optional; nil means the other notespaces wait for their tick.
+	OnEpochReset func(notespace string)
 }
 
 // NewAntiEntropyPass constructs an anti-entropy reconciler. space is the same
-// per-workspace DocSpace the watcher built (NewDocSpace(sub)), so the tree-walk
+// per-notespace DocSpace the watcher built (NewDocSpace(sub)), so the tree-walk
 // reconcile and the live watcher judge the doc space identically. A nil space
 // falls back to compiled defaults.
-func NewAntiEntropyPass(db *DB, client *Client, workspace, workspaceRoot string,
+func NewAntiEntropyPass(db *DB, client *Client, notespace, notespaceRoot string,
 	space *DocSpace, log *logging.UnifiedLogger, cfg AntiEntropyConfig,
 ) *AntiEntropyPass {
 	if cfg.Interval == 0 {
@@ -62,8 +62,8 @@ func NewAntiEntropyPass(db *DB, client *Client, workspace, workspaceRoot string,
 	return &AntiEntropyPass{
 		db:            db,
 		client:        client,
-		workspace:     workspace,
-		workspaceRoot: workspaceRoot,
+		notespace:     notespace,
+		notespaceRoot: notespaceRoot,
 		space:         space,
 		log:           log,
 		cfg:           cfg,
@@ -104,15 +104,15 @@ func (a *AntiEntropyPass) Run(ctx context.Context) error {
 		if err != nil {
 			a.log.Warn("anti-entropy: server epoch check failed").Err(err).Log(ctx)
 		}
-		// The reset was global; this pass only sweeps THIS workspace. Tell the
+		// The reset was global; this pass only sweeps THIS notespace. Tell the
 		// owner so the others get swept in this cycle too — they are now
 		// voided with an empty outbox, i.e. maximally un-replicated.
 		if reset && a.OnEpochReset != nil {
-			a.OnEpochReset(a.workspace)
+			a.OnEpochReset(a.notespace)
 		}
 	}
 
-	manifest, err := a.client.Snapshot(ctx, a.workspace)
+	manifest, err := a.client.Snapshot(ctx, a.notespace)
 	if err != nil {
 		return fmt.Errorf("failed to fetch snapshot for anti-entropy: %w", err)
 	}
@@ -172,7 +172,7 @@ func (a *AntiEntropyPass) Run(ctx context.Context) error {
 // reconcileDocument compares a manifest entry against the local filesystem:
 // if hashes match, adopt the server's UUID/version; if divergent, enqueue for push.
 func (a *AntiEntropyPass) reconcileDocument(ctx context.Context, docSnap *syncproto.DocumentSnapshot) error {
-	localPath := filepath.Join(a.workspaceRoot, syncproto.LocalizePath(docSnap.Path))
+	localPath := filepath.Join(a.notespaceRoot, syncproto.LocalizePath(docSnap.Path))
 
 	// Check if the local file exists
 	content, err := os.ReadFile(localPath)
@@ -191,7 +191,7 @@ func (a *AntiEntropyPass) reconcileDocument(ctx context.Context, docSnap *syncpr
 	hash := sha256.Sum256(content)
 	localHashHex := hex.EncodeToString(hash[:])
 
-	existing, err := a.db.GetDocumentByPath(a.workspace, docSnap.Path)
+	existing, err := a.db.GetDocumentByPath(a.notespace, docSnap.Path)
 	if err != nil {
 		return fmt.Errorf("failed to look up existing document for %s: %w", docSnap.Path, err)
 	}
@@ -221,7 +221,7 @@ func (a *AntiEntropyPass) reconcileDocument(ctx context.Context, docSnap *syncpr
 		if existing == nil {
 			return a.db.InsertDocument(&Document{
 				DocumentID:        docSnap.ID,
-				Workspace:         a.workspace,
+				Notespace:         a.notespace,
 				Path:              docSnap.Path,
 				ContentHash:       localHashHex,
 				LastSyncedHash:    localHashHex,
@@ -229,7 +229,7 @@ func (a *AntiEntropyPass) reconcileDocument(ctx context.Context, docSnap *syncpr
 				BaseContent:       content, // Local content is the base for 3-way merge
 			})
 		}
-		return a.db.AdoptDocument(a.workspace, docSnap.Path, docSnap.ID, docSnap.Version, localHashHex, content)
+		return a.db.AdoptDocument(a.notespace, docSnap.Path, docSnap.ID, docSnap.Version, localHashHex, content)
 	}
 
 	// Hash mismatch: check if already enqueued (avoid duplicate push)
@@ -250,7 +250,7 @@ func (a *AntiEntropyPass) reconcileDocument(ctx context.Context, docSnap *syncpr
 
 	_, err = a.db.EnqueueOutbox(&OutboxEntry{
 		DocumentID:  docSnap.ID,
-		Workspace:   a.workspace,
+		Notespace:   a.notespace,
 		EventType:   syncproto.EventDocumentUpdated,
 		Path:        docSnap.Path,
 		ContentHash: localHashHex,
@@ -270,12 +270,12 @@ func (a *AntiEntropyPass) reconcileDocument(ctx context.Context, docSnap *syncpr
 // parked conflicts at the head of the line are intentional (the pull
 // pipeline owns the merge).
 func (a *AntiEntropyPass) sweepLocalDocuments(ctx context.Context) error {
-	docs, err := a.db.ListDocuments(a.workspace)
+	docs, err := a.db.ListDocuments(a.notespace)
 	if err != nil {
 		return fmt.Errorf("failed to list documents for push sweep: %w", err)
 	}
 
-	pending, err := a.db.ListOutbox(a.workspace, 0)
+	pending, err := a.db.ListOutbox(a.notespace, 0)
 	if err != nil {
 		return fmt.Errorf("failed to list outbox for push sweep: %w", err)
 	}
@@ -304,7 +304,7 @@ func (a *AntiEntropyPass) sweepLocalDocuments(ctx context.Context) error {
 			continue
 		}
 
-		localPath := filepath.Join(a.workspaceRoot, syncproto.LocalizePath(doc.Path))
+		localPath := filepath.Join(a.notespaceRoot, syncproto.LocalizePath(doc.Path))
 		content, err := os.ReadFile(localPath) //nolint:gosec // G304: path from tracked notebook tree
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -328,7 +328,7 @@ func (a *AntiEntropyPass) sweepLocalDocuments(ctx context.Context) error {
 		// nothing reaches the outbox if it matches a secret heuristic.
 		if reason, found := ScanForSecrets(content); found {
 			a.log.Warn("push sweep: document matches secret heuristic, not queued").
-				Field("workspace", a.workspace).
+				Field("notespace", a.notespace).
 				Field("path", doc.Path).
 				Field("heuristic", reason).Log(ctx)
 			continue
@@ -345,7 +345,7 @@ func (a *AntiEntropyPass) sweepLocalDocuments(ctx context.Context) error {
 		if diskHash != doc.ContentHash {
 			if err := a.db.UpsertDocument(&Document{
 				DocumentID:  doc.DocumentID,
-				Workspace:   a.workspace,
+				Notespace:   a.notespace,
 				Path:        doc.Path,
 				ContentHash: diskHash,
 			}); err != nil {
@@ -362,7 +362,7 @@ func (a *AntiEntropyPass) sweepLocalDocuments(ctx context.Context) error {
 
 		if _, err := a.db.EnqueueOutbox(&OutboxEntry{
 			DocumentID:  doc.DocumentID,
-			Workspace:   a.workspace,
+			Notespace:   a.notespace,
 			EventType:   eventType,
 			Path:        doc.Path,
 			ContentHash: diskHash,
@@ -387,7 +387,7 @@ func (a *AntiEntropyPass) sweepMissingFile(ctx context.Context, doc *Document) {
 		Field("path", doc.Path).Log(ctx)
 	if _, err := a.db.EnqueueOutbox(&OutboxEntry{
 		DocumentID: doc.DocumentID,
-		Workspace:  a.workspace,
+		Notespace:  a.notespace,
 		EventType:  syncproto.EventDocumentDeleted,
 		Path:       doc.Path,
 	}); err != nil {
@@ -402,7 +402,7 @@ func (a *AntiEntropyPass) sweepMissingFile(ctx context.Context, doc *Document) {
 }
 
 // walkLocalTree is the disk→db reconcile pass (Phase 3, finding #1): it walks
-// the workspace tree through the shared DocSpace and seeds any included file
+// the notespace tree through the shared DocSpace and seeds any included file
 // that has no sync.db row via InsertAndEnqueue — the same path the watcher's
 // flush uses, so a create/quarantine judgement is identical on both. On an
 // empty sync.db this pass IS hydration (every file is new); on a populated one
@@ -419,12 +419,12 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 	start := time.Now()
 	var scanned, enqueued, quarantined int64
 	setHydrationProgress(HydrationProgress{
-		Workspace: a.workspace,
+		Notespace: a.notespace,
 		Running:   true,
 		StartedAt: start,
 	})
 
-	walkErr := a.space.WalkTree(a.workspaceRoot, nil, func(abs, rel string, de fs.DirEntry) error {
+	walkErr := a.space.WalkTree(a.notespaceRoot, nil, func(abs, rel string, de fs.DirEntry) error {
 		scanned++
 		// Long hydration must stay cancellable without stat-ing ctx every file.
 		if scanned%256 == 0 {
@@ -433,7 +433,7 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 			}
 		}
 
-		doc, err := a.db.GetDocumentByPath(a.workspace, rel)
+		doc, err := a.db.GetDocumentByPath(a.notespace, rel)
 		if err != nil {
 			a.log.Warn("hydration: failed to look up document").
 				Field("path", rel).Err(err).Log(ctx)
@@ -463,7 +463,7 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 			return nil
 		}
 
-		reason, err := InsertAndEnqueue(a.db, a.workspace, rel, content, info.ModTime())
+		reason, err := InsertAndEnqueue(a.db, a.notespace, rel, content, info.ModTime())
 		if err != nil {
 			a.log.Warn("hydration: failed to enqueue file").
 				Field("path", rel).Err(err).Log(ctx)
@@ -473,7 +473,7 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 			// Reconcile LOGS + COUNTS quarantine; no Store broadcast — that is
 			// the watcher's job (addendum #8). Nothing reaches the outbox.
 			a.log.Warn("hydration: secret quarantined, not queued").
-				Field("workspace", a.workspace).
+				Field("notespace", a.notespace).
 				Field("path", rel).
 				Field("heuristic", reason).Log(ctx)
 			quarantined++
@@ -485,13 +485,13 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 		if scanned%1000 == 0 {
 			rate := filesPerSec(scanned, time.Since(start))
 			a.log.Info("hydration progress").
-				Field("workspace", a.workspace).
+				Field("notespace", a.notespace).
 				Field("scanned", scanned).
 				Field("enqueued", enqueued).
 				Field("quarantined", quarantined).
 				Field("files_per_sec", rate).Log(ctx)
 			setHydrationProgress(HydrationProgress{
-				Workspace:   a.workspace,
+				Notespace:   a.notespace,
 				Running:     true,
 				Scanned:     scanned,
 				Enqueued:    enqueued,
@@ -505,7 +505,7 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 
 	finished := time.Now()
 	setHydrationProgress(HydrationProgress{
-		Workspace:   a.workspace,
+		Notespace:   a.notespace,
 		Running:     false,
 		Scanned:     scanned,
 		Enqueued:    enqueued,
@@ -520,7 +520,7 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 	}
 
 	a.log.Info("hydration pass complete").
-		Field("workspace", a.workspace).
+		Field("notespace", a.notespace).
 		Field("scanned", scanned).
 		Field("enqueued", enqueued).
 		Field("quarantined", quarantined).

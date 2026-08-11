@@ -1110,7 +1110,7 @@ func (s *Store) applyNoteEvent(event *models.NoteEvent) {
 
 	// Find workspace by name (state.Workspaces is keyed by path)
 	for _, ws := range s.state.Workspaces {
-		if ws.WorkspaceNode == nil || ws.Name != event.Workspace {
+		if ws.WorkspaceNode == nil || ws.Name != event.NotespaceName {
 			continue
 		}
 
@@ -1134,9 +1134,9 @@ func (s *Store) applyNoteEvent(event *models.NoteEvent) {
 	}
 
 	// For moved/archived events, also decrement the source workspace
-	if event.Event == models.NoteEventMoved && event.PrevWorkspace != "" {
+	if event.Event == models.NoteEventMoved && event.PrevNotespaceName != "" {
 		for _, ws := range s.state.Workspaces {
-			if ws.WorkspaceNode == nil || ws.Name != event.PrevWorkspace {
+			if ws.WorkspaceNode == nil || ws.Name != event.PrevNotespaceName {
 				continue
 			}
 			if ws.NoteCounts == nil {

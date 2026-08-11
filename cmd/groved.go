@@ -3,6 +3,7 @@ package cmd
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -140,7 +141,41 @@ func NewGrovedCmd() *cobra.Command {
 	cmd.AddCommand(newGrovedConfigCmd())
 	cmd.AddCommand(newGrovedMonitorCmd())
 	cmd.AddCommand(newGrovedHealthCmd())
+	cmd.AddCommand(newGrovedSyncDBCmd())
 
+	return cmd
+}
+
+func newGrovedSyncDBCmd() *cobra.Command {
+	var path string
+	var yes bool
+	cmd := &cobra.Command{
+		Use:   "sync-db-archive-rebuild",
+		Short: "Archive a legacy name-keyed sync.db and create a fresh id-keyed database",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !yes {
+				return fmt.Errorf("refusing sync.db transition without --yes")
+			}
+			running, pid, err := pidfile.IsRunning(paths.PidFilePath())
+			if err != nil {
+				return fmt.Errorf("check global daemon state: %w", err)
+			}
+			if running {
+				return fmt.Errorf("global daemon is running with PID %d; stop it before rebuilding sync.db", pid)
+			}
+			if path == "" {
+				path = syncdb.DefaultDBPath()
+			}
+			receipt, err := syncdb.ArchiveAndRebuild(path)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(cmd.OutOrStdout()).Encode(receipt)
+		},
+	}
+	cmd.Flags().StringVar(&path, "path", "", "sync.db path (defaults to the global daemon database)")
+	cmd.Flags().BoolVar(&yes, "yes", false, "confirm the destructive archive-and-rebuild transition")
 	return cmd
 }
 
@@ -1264,7 +1299,8 @@ func newGrovedStartCmd() *cobra.Command {
 						srv.SetSyncKick(syncHandler.KickAntiEntropy)
 						srv.SetSyncSubscriptions(syncHandler.SyncSubscriptions)
 						srv.SetSyncAuthFailure(syncHandler.AuthFailure)
-						srv.SetSyncWorkspaceRoots(syncHandler.WorkspaceRoots)
+						srv.SetSyncDBError(syncHandler.SyncDBError)
+						srv.SetSyncNotespaceRoots(syncHandler.NotespaceRoots)
 						srv.SetSyncMaintenance(syncHandler.BeginMaintenance, syncHandler.EndMaintenance)
 						workspaces := 0
 						if syncCfg != nil {

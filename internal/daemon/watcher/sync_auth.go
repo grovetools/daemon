@@ -273,16 +273,16 @@ func (h *SyncHandler) resetTransport(ctx context.Context) {
 }
 
 // kickAntiEntropyExcept requests an immediate anti-entropy pass on every
-// running workspace but the named one. It is the fan-out for an epoch reset
+// running notespace but the named one. It is the fan-out for an epoch reset
 // (contract §3 P2b, scope 2): CheckServerEpoch voids the synced state of ALL
-// workspaces and clears their outboxes, but only the workspace whose pass
+// notespaces and clears their outboxes, but only the notespace whose pass
 // detected the change sweeps in that cycle — the rest would sit voided, with
 // nothing queued and nothing scheduled, until their own hourly tick.
-func (h *SyncHandler) kickAntiEntropyExcept(workspace string) {
+func (h *SyncHandler) kickAntiEntropyExcept(notespace string) {
 	h.pipelinesMu.Lock()
 	defer h.pipelinesMu.Unlock()
 	for name, ae := range h.aePasses {
-		if name != workspace {
+		if name != notespace {
 			ae.Kick()
 		}
 	}

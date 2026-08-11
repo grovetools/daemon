@@ -37,12 +37,12 @@ import (
 //
 // limit caps the number of returned (drainable) entries; entries are scanned in
 // full id order regardless so earlier barriers are always observed.
-func (d *DB) ListOutboxDrainable(workspace string, limit int, now time.Time) ([]*OutboxEntry, error) {
+func (d *DB) ListOutboxDrainable(notespace string, limit int, now time.Time) ([]*OutboxEntry, error) {
 	query := `SELECT ` + outboxColumns + ` FROM sync_outbox`
 	var args []interface{}
-	if workspace != "" {
-		query += ` WHERE workspace = ?`
-		args = append(args, workspace)
+	if notespace != "" {
+		query += ` WHERE notespace = ?`
+		args = append(args, notespace)
 	}
 	query += ` ORDER BY id ASC`
 

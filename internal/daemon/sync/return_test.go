@@ -23,7 +23,7 @@ func returnTestClient(t *testing.T, epoch string, snaps map[string]syncproto.Sna
 		case "/sync/capabilities":
 			_ = json.NewEncoder(w).Encode(syncproto.CapabilitiesResponse{ProtocolVersion: syncproto.ProtocolVersionLegacy, Capabilities: syncproto.Capabilities{ProtocolVersions: []int{syncproto.ProtocolVersionLegacy}}, ServerEpoch: epoch})
 		case "/sync/snapshot":
-			_ = json.NewEncoder(w).Encode(snaps[r.URL.Query().Get("workspace")])
+			_ = json.NewEncoder(w).Encode(snaps[r.URL.Query().Get("notespace")])
 		case "/sync/history/blob":
 			b, ok := content[r.URL.Query().Get("document_id")]
 			if !ok {
@@ -48,7 +48,7 @@ func TestReturnManifestRepresentsCreateUpdateMoveDelete(t *testing.T) {
 	db := openTestDB(t)
 	old := []byte("old")
 	same := []byte("same")
-	for _, d := range []*Document{{DocumentID: "update", Workspace: "ws", Path: "u.md", ContentHash: hash(old)}, {DocumentID: "move", Workspace: "ws", Path: "before.md", ContentHash: hash(old)}, {DocumentID: "delete", Workspace: "ws", Path: "gone.md", ContentHash: hash(old), LastSyncedVersion: 1}, {DocumentID: "same", Workspace: "ws", Path: "same.md", ContentHash: hash(same)}} {
+	for _, d := range []*Document{{DocumentID: "update", Notespace: "ws", Path: "u.md", ContentHash: hash(old)}, {DocumentID: "move", Notespace: "ws", Path: "before.md", ContentHash: hash(old)}, {DocumentID: "delete", Notespace: "ws", Path: "gone.md", ContentHash: hash(old), LastSyncedVersion: 1}, {DocumentID: "same", Notespace: "ws", Path: "same.md", ContentHash: hash(same)}} {
 		if err := db.UpsertDocument(d); err != nil {
 			t.Fatal(err)
 		}
@@ -58,7 +58,7 @@ func TestReturnManifestRepresentsCreateUpdateMoveDelete(t *testing.T) {
 	for _, x := range []struct{ id, path string }{{"create", "new.md"}, {"update", "u.md"}, {"move", "after.md"}, {"same", "same.md"}} {
 		docs = append(docs, syncproto.DocumentSnapshot{ID: x.id, Path: x.path, Version: 2, Hash: hash(heads[x.id]), Size: int64(len(heads[x.id]))})
 	}
-	c := returnTestClient(t, "epoch-1", map[string]syncproto.SnapshotManifest{"ws": {Workspace: "ws", Cursor: 9, Documents: docs}}, heads)
+	c := returnTestClient(t, "epoch-1", map[string]syncproto.SnapshotManifest{"ws": {NotespaceID: "ws", Cursor: 9, Documents: docs}}, heads)
 	m, err := BuildReturnManifest(context.Background(), c, db, []string{"ws"})
 	if err != nil {
 		t.Fatal(err)
@@ -79,10 +79,10 @@ func TestReturnManifestRepresentsCreateUpdateMoveDelete(t *testing.T) {
 
 func TestReturnManifestIgnoresServerAbsenceForNeverSyncedLocalIdentity(t *testing.T) {
 	db := openTestDB(t)
-	if err := db.UpsertDocument(&Document{DocumentID: "stale", Workspace: "ws", Path: "plans/old/a.md", ContentHash: hash([]byte("body")), LastSyncedVersion: 0}); err != nil {
+	if err := db.UpsertDocument(&Document{DocumentID: "stale", Notespace: "ws", Path: "plans/old/a.md", ContentHash: hash([]byte("body")), LastSyncedVersion: 0}); err != nil {
 		t.Fatal(err)
 	}
-	c := returnTestClient(t, "epoch-1", map[string]syncproto.SnapshotManifest{"ws": {Workspace: "ws", Cursor: 1}}, nil)
+	c := returnTestClient(t, "epoch-1", map[string]syncproto.SnapshotManifest{"ws": {NotespaceID: "ws", Cursor: 1}}, nil)
 	m, err := BuildReturnManifest(context.Background(), c, db, []string{"ws"})
 	if err != nil {
 		t.Fatal(err)
@@ -95,13 +95,13 @@ func TestReturnManifestIgnoresServerAbsenceForNeverSyncedLocalIdentity(t *testin
 func TestReturnManifestLocalAndServerChangesInvalidateGeneration(t *testing.T) {
 	db := openTestDB(t)
 	body := []byte("head")
-	if err := db.UpsertDocument(&Document{DocumentID: "d", Workspace: "ws", Path: "a.md", ContentHash: hash([]byte("base"))}); err != nil {
+	if err := db.UpsertDocument(&Document{DocumentID: "d", Notespace: "ws", Path: "a.md", ContentHash: hash([]byte("base"))}); err != nil {
 		t.Fatal(err)
 	}
-	snap := syncproto.SnapshotManifest{Workspace: "ws", Cursor: 1, Documents: []syncproto.DocumentSnapshot{{ID: "d", Path: "a.md", Version: 1, Hash: hash(body)}}}
+	snap := syncproto.SnapshotManifest{NotespaceID: "ws", Cursor: 1, Documents: []syncproto.DocumentSnapshot{{ID: "d", Path: "a.md", Version: 1, Hash: hash(body)}}}
 	c := returnTestClient(t, "epoch-1", map[string]syncproto.SnapshotManifest{"ws": snap}, map[string][]byte{"d": body})
 	a, _ := BuildReturnManifest(context.Background(), c, db, []string{"ws"})
-	_ = db.UpsertDocument(&Document{DocumentID: "d", Workspace: "ws", Path: "a.md", ContentHash: hash([]byte("local edit"))})
+	_ = db.UpsertDocument(&Document{DocumentID: "d", Notespace: "ws", Path: "a.md", ContentHash: hash([]byte("local edit"))})
 	b, _ := BuildReturnManifest(context.Background(), c, db, []string{"ws"})
 	if a.Generation == b.Generation {
 		t.Fatal("local state change did not stale reviewed generation")
@@ -116,10 +116,10 @@ func TestReturnManifestLocalAndServerChangesInvalidateGeneration(t *testing.T) {
 func TestReviewedReturnManifestStaleRefusal(t *testing.T) {
 	db := openTestDB(t)
 	body := []byte("head")
-	snap := syncproto.SnapshotManifest{Workspace: "ws", Cursor: 1, Documents: []syncproto.DocumentSnapshot{{ID: "d", Path: "a.md", Version: 1, Hash: hash(body)}}}
+	snap := syncproto.SnapshotManifest{NotespaceID: "ws", Cursor: 1, Documents: []syncproto.DocumentSnapshot{{ID: "d", Path: "a.md", Version: 1, Hash: hash(body)}}}
 	c := returnTestClient(t, "epoch", map[string]syncproto.SnapshotManifest{"ws": snap}, map[string][]byte{"d": body})
 	reviewed, _ := BuildReturnManifest(context.Background(), c, db, []string{"ws"})
-	if err := db.UpsertDocument(&Document{DocumentID: "local", Workspace: "ws", Path: "local.md", ContentHash: hash([]byte("edit"))}); err != nil {
+	if err := db.UpsertDocument(&Document{DocumentID: "local", Notespace: "ws", Path: "local.md", ContentHash: hash([]byte("edit"))}); err != nil {
 		t.Fatal(err)
 	}
 	current, _ := BuildReturnManifest(context.Background(), c, db, []string{"ws"})
@@ -130,7 +130,7 @@ func TestReviewedReturnManifestStaleRefusal(t *testing.T) {
 
 func writeApplyEscrow(t *testing.T, ops []ReturnOperation, content map[string][]byte) (string, ReturnManifest) {
 	t.Helper()
-	m := ReturnManifest{Schema: ReturnManifestSchema, OperationID: "apply-test", ServerEpoch: "epoch", Generation: strings.Repeat("a", 64), Workspaces: []string{"one", "two"}, Operations: ops}
+	m := ReturnManifest{Schema: ReturnManifestSchema, OperationID: "apply-test", ServerEpoch: "epoch", Generation: strings.Repeat("a", 64), Notespaces: []string{"one", "two"}, Operations: ops}
 	m.ManifestSHA256 = manifestHash(m)
 	p := filepath.Join(t.TempDir(), "escrow.json")
 	b, err := json.Marshal(ReturnEscrow{Manifest: m, Content: content})
@@ -143,7 +143,7 @@ func writeApplyEscrow(t *testing.T, ops []ReturnOperation, content map[string][]
 	return p, m
 }
 
-func TestApplyReturnEscrowAllOperationsMultiWorkspace(t *testing.T) {
+func TestApplyReturnEscrowAllOperationsMultiNotespace(t *testing.T) {
 	one, two := t.TempDir(), t.TempDir()
 	oldUpdate, oldMove, oldDelete := []byte("old update"), []byte("old move"), []byte("old delete")
 	if err := os.WriteFile(filepath.Join(one, "update.md"), oldUpdate, 0o640); err != nil {
@@ -157,13 +157,13 @@ func TestApplyReturnEscrowAllOperationsMultiWorkspace(t *testing.T) {
 	}
 	content := map[string][]byte{"c": []byte("created"), "u": []byte("updated"), "m": []byte("moved head")}
 	ops := []ReturnOperation{
-		{Type: "create", Workspace: "one", DocumentID: "c", Path: "nested/create.md", HeadHash: hash(content["c"]), HeadVersion: 1},
-		{Type: "update", Workspace: "one", DocumentID: "u", Path: "update.md", BaseHash: hash(oldUpdate), HeadHash: hash(content["u"]), HeadVersion: 2},
-		{Type: "move", Workspace: "two", DocumentID: "m", PreviousPath: "before.md", Path: "nested/after.md", BaseHash: hash(oldMove), HeadHash: hash(content["m"]), HeadVersion: 3},
-		{Type: "delete", Workspace: "two", DocumentID: "d", Path: "delete.md", BaseHash: hash(oldDelete)},
+		{Type: "create", Notespace: "one", DocumentID: "c", Path: "nested/create.md", HeadHash: hash(content["c"]), HeadVersion: 1},
+		{Type: "update", Notespace: "one", DocumentID: "u", Path: "update.md", BaseHash: hash(oldUpdate), HeadHash: hash(content["u"]), HeadVersion: 2},
+		{Type: "move", Notespace: "two", DocumentID: "m", PreviousPath: "before.md", Path: "nested/after.md", BaseHash: hash(oldMove), HeadHash: hash(content["m"]), HeadVersion: 3},
+		{Type: "delete", Notespace: "two", DocumentID: "d", Path: "delete.md", BaseHash: hash(oldDelete)},
 	}
 	escrow, m := writeApplyEscrow(t, ops, content)
-	counts, err := ApplyReturnEscrow(escrow, m.Generation, ReturnApplyOptions{WorkspaceRoots: map[string]string{"one": one, "two": two}})
+	counts, err := ApplyReturnEscrow(escrow, m.Generation, ReturnApplyOptions{NotespaceRoots: map[string]string{"one": one, "two": two}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,11 +198,11 @@ func TestApplyReturnEscrowRollbackAndPathRefusal(t *testing.T) {
 	}
 	content := map[string][]byte{"a": []byte("new a"), "b": []byte("new b")}
 	ops := []ReturnOperation{
-		{Type: "update", Workspace: "one", DocumentID: "a", Path: "a.md", BaseHash: hash(old), HeadHash: hash(content["a"]), HeadVersion: 1},
-		{Type: "update", Workspace: "one", DocumentID: "b", Path: "b.md", BaseHash: hash(old), HeadHash: hash(content["b"]), HeadVersion: 1},
+		{Type: "update", Notespace: "one", DocumentID: "a", Path: "a.md", BaseHash: hash(old), HeadHash: hash(content["a"]), HeadVersion: 1},
+		{Type: "update", Notespace: "one", DocumentID: "b", Path: "b.md", BaseHash: hash(old), HeadHash: hash(content["b"]), HeadVersion: 1},
 	}
 	escrow, m := writeApplyEscrow(t, ops, content)
-	_, err := ApplyReturnEscrow(escrow, m.Generation, ReturnApplyOptions{WorkspaceRoots: map[string]string{"one": root, "two": t.TempDir()}, BeforeCommit: func(i int, _ ReturnOperation) error {
+	_, err := ApplyReturnEscrow(escrow, m.Generation, ReturnApplyOptions{NotespaceRoots: map[string]string{"one": root, "two": t.TempDir()}, BeforeCommit: func(i int, _ ReturnOperation) error {
 		if i == 1 {
 			return errors.New("injected")
 		}
@@ -221,17 +221,17 @@ func TestApplyReturnEscrowRollbackAndPathRefusal(t *testing.T) {
 		t.Fatalf("escrow not retained: %v", err)
 	}
 
-	bad := []ReturnOperation{{Type: "create", Workspace: "one", DocumentID: "x", Path: "../escape.md", HeadHash: hash([]byte("x")), HeadVersion: 1}}
+	bad := []ReturnOperation{{Type: "create", Notespace: "one", DocumentID: "x", Path: "../escape.md", HeadHash: hash([]byte("x")), HeadVersion: 1}}
 	badEscrow, badManifest := writeApplyEscrow(t, bad, map[string][]byte{"x": []byte("x")})
-	if _, err = ApplyReturnEscrow(badEscrow, badManifest.Generation, ReturnApplyOptions{WorkspaceRoots: map[string]string{"one": root, "two": t.TempDir()}}); err == nil {
+	if _, err = ApplyReturnEscrow(badEscrow, badManifest.Generation, ReturnApplyOptions{NotespaceRoots: map[string]string{"one": root, "two": t.TempDir()}}); err == nil {
 		t.Fatal("traversal accepted")
 	}
 }
 
-// applyRoots is the two-workspace root pair every writeApplyEscrow manifest
+// applyRoots is the two-notespace root pair every writeApplyEscrow manifest
 // expects.
 func applyRoots(one, two string) ReturnApplyOptions {
-	return ReturnApplyOptions{WorkspaceRoots: map[string]string{"one": one, "two": two}}
+	return ReturnApplyOptions{NotespaceRoots: map[string]string{"one": one, "two": two}}
 }
 
 // assertNoReturnResidue proves a failed or completed batch left no staging or
@@ -257,7 +257,7 @@ func TestApplyReturnEscrowRefusesLocalHashDrift(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(one, "a.md"), []byte("drifted locally"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	ops := []ReturnOperation{{Type: "update", Workspace: "one", DocumentID: "a", Path: "a.md", BaseHash: hash(base), HeadHash: hash(head), HeadVersion: 2}}
+	ops := []ReturnOperation{{Type: "update", Notespace: "one", DocumentID: "a", Path: "a.md", BaseHash: hash(base), HeadHash: hash(head), HeadVersion: 2}}
 	escrow, m := writeApplyEscrow(t, ops, map[string][]byte{"a": head})
 	_, err := ApplyReturnEscrow(escrow, m.Generation, applyRoots(one, two))
 	if err == nil || !strings.Contains(err.Error(), "local hash drift") {
@@ -286,7 +286,7 @@ func TestApplyReturnEscrowRefusesOccupiedDestinations(t *testing.T) {
 			},
 			ops: func() ([]ReturnOperation, map[string][]byte) {
 				body := []byte("incoming")
-				return []ReturnOperation{{Type: "create", Workspace: "one", DocumentID: "c", Path: "c.md", HeadHash: hash(body), HeadVersion: 1}}, map[string][]byte{"c": body}
+				return []ReturnOperation{{Type: "create", Notespace: "one", DocumentID: "c", Path: "c.md", HeadHash: hash(body), HeadVersion: 1}}, map[string][]byte{"c": body}
 			},
 		},
 		{
@@ -303,7 +303,7 @@ func TestApplyReturnEscrowRefusesOccupiedDestinations(t *testing.T) {
 			},
 			ops: func() ([]ReturnOperation, map[string][]byte) {
 				body := []byte("head")
-				return []ReturnOperation{{Type: "move", Workspace: "one", DocumentID: "m", PreviousPath: "before.md", Path: "after.md", BaseHash: hash([]byte("src")), HeadHash: hash(body), HeadVersion: 2}}, map[string][]byte{"m": body}
+				return []ReturnOperation{{Type: "move", Notespace: "one", DocumentID: "m", PreviousPath: "before.md", Path: "after.md", BaseHash: hash([]byte("src")), HeadHash: hash(body), HeadVersion: 2}}, map[string][]byte{"m": body}
 			},
 		},
 	} {
@@ -339,7 +339,7 @@ func TestApplyReturnEscrowRefusesSymlinkEscape(t *testing.T) {
 		{"symlinked leaf", "linkfile.md"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ops := []ReturnOperation{{Type: "update", Workspace: "one", DocumentID: "s", Path: tc.path, BaseHash: hash([]byte("base")), HeadHash: hash(head), HeadVersion: 2}}
+			ops := []ReturnOperation{{Type: "update", Notespace: "one", DocumentID: "s", Path: tc.path, BaseHash: hash([]byte("base")), HeadHash: hash(head), HeadVersion: 2}}
 			escrow, m := writeApplyEscrow(t, ops, map[string][]byte{"s": head})
 			_, err := ApplyReturnEscrow(escrow, m.Generation, applyRoots(one, two))
 			if err == nil || !strings.Contains(err.Error(), "symlink is not allowed") {
@@ -356,7 +356,7 @@ func TestApplyReturnEscrowRefusesSymlinkEscape(t *testing.T) {
 func TestApplyReturnEscrowRefusesStaleAndMalformedEscrow(t *testing.T) {
 	one, two := t.TempDir(), t.TempDir()
 	body := []byte("incoming")
-	ops := []ReturnOperation{{Type: "create", Workspace: "one", DocumentID: "c", Path: "c.md", HeadHash: hash(body), HeadVersion: 1}}
+	ops := []ReturnOperation{{Type: "create", Notespace: "one", DocumentID: "c", Path: "c.md", HeadHash: hash(body), HeadVersion: 1}}
 	escrow, m := writeApplyEscrow(t, ops, map[string][]byte{"c": body})
 
 	if _, err := ApplyReturnEscrow(escrow, strings.Repeat("b", 64), applyRoots(one, two)); err == nil || !strings.Contains(err.Error(), "stale") {
@@ -422,8 +422,8 @@ func TestApplyReturnEscrowAlreadyAbsentDeleteIsNoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	ops := []ReturnOperation{
-		{Type: "delete", Workspace: "one", DocumentID: "gone", Path: "nested/gone.md", BaseHash: hash([]byte("whatever"))},
-		{Type: "delete", Workspace: "two", DocumentID: "present", Path: "present.md", BaseHash: hash(present)},
+		{Type: "delete", Notespace: "one", DocumentID: "gone", Path: "nested/gone.md", BaseHash: hash([]byte("whatever"))},
+		{Type: "delete", Notespace: "two", DocumentID: "present", Path: "present.md", BaseHash: hash(present)},
 	}
 	escrow, m := writeApplyEscrow(t, ops, map[string][]byte{})
 	counts, err := ApplyReturnEscrow(escrow, m.Generation, applyRoots(one, two))
@@ -454,9 +454,9 @@ func TestApplyReturnEscrowRollbackRestoresMoveAndDelete(t *testing.T) {
 	}
 	head, created := []byte("moved head"), []byte("created")
 	ops := []ReturnOperation{
-		{Type: "move", Workspace: "two", DocumentID: "m", PreviousPath: "before.md", Path: "nested/after.md", BaseHash: hash(moved), HeadHash: hash(head), HeadVersion: 2},
-		{Type: "delete", Workspace: "two", DocumentID: "d", Path: "doomed.md", BaseHash: hash(deleted)},
-		{Type: "create", Workspace: "one", DocumentID: "c", Path: "c.md", HeadHash: hash(created), HeadVersion: 1},
+		{Type: "move", Notespace: "two", DocumentID: "m", PreviousPath: "before.md", Path: "nested/after.md", BaseHash: hash(moved), HeadHash: hash(head), HeadVersion: 2},
+		{Type: "delete", Notespace: "two", DocumentID: "d", Path: "doomed.md", BaseHash: hash(deleted)},
+		{Type: "create", Notespace: "one", DocumentID: "c", Path: "c.md", HeadHash: hash(created), HeadVersion: 1},
 	}
 	escrow, m := writeApplyEscrow(t, ops, map[string][]byte{"m": head, "c": created})
 	opts := applyRoots(one, two)
@@ -493,28 +493,28 @@ func TestReturnManifestValidateRejectsMalformedOperations(t *testing.T) {
 		ops  []ReturnOperation
 		ws   []string
 	}{
-		{name: "create carrying a base hash", ops: []ReturnOperation{{Type: "create", Workspace: "one", DocumentID: "a", Path: "a.md", BaseHash: good, HeadHash: good, HeadVersion: 1}}},
-		{name: "create without a head version", ops: []ReturnOperation{{Type: "create", Workspace: "one", DocumentID: "a", Path: "a.md", HeadHash: good}}},
-		{name: "update with a short hash", ops: []ReturnOperation{{Type: "update", Workspace: "one", DocumentID: "a", Path: "a.md", BaseHash: "abc", HeadHash: good, HeadVersion: 1}}},
-		{name: "delete carrying a head hash", ops: []ReturnOperation{{Type: "delete", Workspace: "one", DocumentID: "a", Path: "a.md", BaseHash: good, HeadHash: good}}},
-		{name: "move without a previous path", ops: []ReturnOperation{{Type: "move", Workspace: "one", DocumentID: "a", Path: "a.md", BaseHash: good, HeadHash: good, HeadVersion: 1}}},
-		{name: "absolute path", ops: []ReturnOperation{{Type: "create", Workspace: "one", DocumentID: "a", Path: "/etc/passwd", HeadHash: good, HeadVersion: 1}}},
-		{name: "traversal path", ops: []ReturnOperation{{Type: "create", Workspace: "one", DocumentID: "a", Path: "../a.md", HeadHash: good, HeadVersion: 1}}},
-		{name: "unclean path", ops: []ReturnOperation{{Type: "create", Workspace: "one", DocumentID: "a", Path: "./a.md", HeadHash: good, HeadVersion: 1}}},
-		{name: "workspace outside the reviewed set", ops: []ReturnOperation{{Type: "create", Workspace: "three", DocumentID: "a", Path: "a.md", HeadHash: good, HeadVersion: 1}}},
+		{name: "create carrying a base hash", ops: []ReturnOperation{{Type: "create", Notespace: "one", DocumentID: "a", Path: "a.md", BaseHash: good, HeadHash: good, HeadVersion: 1}}},
+		{name: "create without a head version", ops: []ReturnOperation{{Type: "create", Notespace: "one", DocumentID: "a", Path: "a.md", HeadHash: good}}},
+		{name: "update with a short hash", ops: []ReturnOperation{{Type: "update", Notespace: "one", DocumentID: "a", Path: "a.md", BaseHash: "abc", HeadHash: good, HeadVersion: 1}}},
+		{name: "delete carrying a head hash", ops: []ReturnOperation{{Type: "delete", Notespace: "one", DocumentID: "a", Path: "a.md", BaseHash: good, HeadHash: good}}},
+		{name: "move without a previous path", ops: []ReturnOperation{{Type: "move", Notespace: "one", DocumentID: "a", Path: "a.md", BaseHash: good, HeadHash: good, HeadVersion: 1}}},
+		{name: "absolute path", ops: []ReturnOperation{{Type: "create", Notespace: "one", DocumentID: "a", Path: "/etc/passwd", HeadHash: good, HeadVersion: 1}}},
+		{name: "traversal path", ops: []ReturnOperation{{Type: "create", Notespace: "one", DocumentID: "a", Path: "../a.md", HeadHash: good, HeadVersion: 1}}},
+		{name: "unclean path", ops: []ReturnOperation{{Type: "create", Notespace: "one", DocumentID: "a", Path: "./a.md", HeadHash: good, HeadVersion: 1}}},
+		{name: "notespace outside the reviewed set", ops: []ReturnOperation{{Type: "create", Notespace: "three", DocumentID: "a", Path: "a.md", HeadHash: good, HeadVersion: 1}}},
 		{name: "duplicate document id", ops: []ReturnOperation{
-			{Type: "create", Workspace: "one", DocumentID: "a", Path: "a.md", HeadHash: good, HeadVersion: 1},
-			{Type: "create", Workspace: "one", DocumentID: "a", Path: "b.md", HeadHash: good, HeadVersion: 1},
+			{Type: "create", Notespace: "one", DocumentID: "a", Path: "a.md", HeadHash: good, HeadVersion: 1},
+			{Type: "create", Notespace: "one", DocumentID: "a", Path: "b.md", HeadHash: good, HeadVersion: 1},
 		}},
-		{name: "unsorted workspace set", ws: []string{"two", "one"}},
-		{name: "duplicate workspace", ws: []string{"one", "one"}},
+		{name: "unsorted notespace set", ws: []string{"two", "one"}},
+		{name: "duplicate notespace", ws: []string{"one", "one"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ws := tc.ws
 			if ws == nil {
 				ws = []string{"one", "two"}
 			}
-			m := ReturnManifest{Schema: ReturnManifestSchema, OperationID: "v", ServerEpoch: "epoch", Generation: strings.Repeat("a", 64), Workspaces: ws, Operations: tc.ops}
+			m := ReturnManifest{Schema: ReturnManifestSchema, OperationID: "v", ServerEpoch: "epoch", Generation: strings.Repeat("a", 64), Notespaces: ws, Operations: tc.ops}
 			m.ManifestSHA256 = manifestHash(m)
 			if err := m.Validate(); err == nil {
 				t.Fatal("accepted malformed manifest")
@@ -524,9 +524,9 @@ func TestReturnManifestValidateRejectsMalformedOperations(t *testing.T) {
 }
 
 func TestPendingReturnPushRefusesUnpushedLocalChange(t *testing.T) {
-	m := ReturnManifest{Workspaces: []string{"ws"}, Operations: []ReturnOperation{
-		{Type: "update", Workspace: "ws", DocumentID: "d", Path: "a.md", BaseHash: hash([]byte("base")), HeadHash: hash([]byte("head")), HeadVersion: 2},
-		{Type: "move", Workspace: "ws", DocumentID: "m", PreviousPath: "before.md", Path: "after.md", BaseHash: hash([]byte("s")), HeadHash: hash([]byte("h")), HeadVersion: 2},
+	m := ReturnManifest{Notespaces: []string{"ws"}, Operations: []ReturnOperation{
+		{Type: "update", Notespace: "ws", DocumentID: "d", Path: "a.md", BaseHash: hash([]byte("base")), HeadHash: hash([]byte("head")), HeadVersion: 2},
+		{Type: "move", Notespace: "ws", DocumentID: "m", PreviousPath: "before.md", Path: "after.md", BaseHash: hash([]byte("s")), HeadHash: hash([]byte("h")), HeadVersion: 2},
 	}}
 	for _, tc := range []struct {
 		name  string
@@ -534,10 +534,10 @@ func TestPendingReturnPushRefusesUnpushedLocalChange(t *testing.T) {
 		want  string
 	}{
 		{name: "clean outbox", want: ""},
-		{name: "queued push on an updated path", entry: &OutboxEntry{DocumentID: "other", Workspace: "ws", EventType: "document.updated", Path: "a.md", ContentHash: hash([]byte("mine"))}, want: "ws/a.md"},
-		{name: "queued push on a move source", entry: &OutboxEntry{DocumentID: "other", Workspace: "ws", EventType: "document.updated", Path: "before.md", ContentHash: hash([]byte("mine"))}, want: "ws/after.md"},
-		{name: "queued push under the adopted identity", entry: &OutboxEntry{DocumentID: "d", Workspace: "ws", EventType: "document.updated", Path: "elsewhere.md", ContentHash: hash([]byte("mine"))}, want: "ws/a.md"},
-		{name: "queued push on an untouched path", entry: &OutboxEntry{DocumentID: "other", Workspace: "ws", EventType: "document.updated", Path: "unrelated.md", ContentHash: hash([]byte("mine"))}, want: ""},
+		{name: "queued push on an updated path", entry: &OutboxEntry{DocumentID: "other", Notespace: "ws", EventType: "document.updated", Path: "a.md", ContentHash: hash([]byte("mine"))}, want: "ws/a.md"},
+		{name: "queued push on a move source", entry: &OutboxEntry{DocumentID: "other", Notespace: "ws", EventType: "document.updated", Path: "before.md", ContentHash: hash([]byte("mine"))}, want: "ws/after.md"},
+		{name: "queued push under the adopted identity", entry: &OutboxEntry{DocumentID: "d", Notespace: "ws", EventType: "document.updated", Path: "elsewhere.md", ContentHash: hash([]byte("mine"))}, want: "ws/a.md"},
+		{name: "queued push on an untouched path", entry: &OutboxEntry{DocumentID: "other", Notespace: "ws", EventType: "document.updated", Path: "unrelated.md", ContentHash: hash([]byte("mine"))}, want: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := openTestDB(t)
@@ -560,10 +560,10 @@ func TestPendingReturnPushRefusesUnpushedLocalChange(t *testing.T) {
 func TestReconcileReturnEscrowConvergesAndClearsEcho(t *testing.T) {
 	db := openTestDB(t)
 	base, head := []byte("base"), []byte("head")
-	if err := db.UpsertDocument(&Document{DocumentID: "d", Workspace: "ws", Path: "a.md", ContentHash: hash(base), LastSyncedVersion: 1}); err != nil {
+	if err := db.UpsertDocument(&Document{DocumentID: "d", Notespace: "ws", Path: "a.md", ContentHash: hash(base), LastSyncedVersion: 1}); err != nil {
 		t.Fatal(err)
 	}
-	snap := syncproto.SnapshotManifest{Workspace: "ws", Cursor: 3, Documents: []syncproto.DocumentSnapshot{{ID: "d", Path: "a.md", Version: 2, Hash: hash(head)}}}
+	snap := syncproto.SnapshotManifest{NotespaceID: "ws", Cursor: 3, Documents: []syncproto.DocumentSnapshot{{ID: "d", Path: "a.md", Version: 2, Hash: hash(head)}}}
 	c := returnTestClient(t, "epoch", map[string]syncproto.SnapshotManifest{"ws": snap}, map[string][]byte{"d": head})
 	m, err := BuildReturnManifest(context.Background(), c, db, []string{"ws"})
 	if err != nil {
@@ -573,7 +573,7 @@ func TestReconcileReturnEscrowConvergesAndClearsEcho(t *testing.T) {
 		t.Fatalf("expected one update: %+v", m.Operations)
 	}
 	// An echo of the apply's own write, racing the filesystem commit.
-	if _, err = db.EnqueueOutbox(&OutboxEntry{DocumentID: "d", Workspace: "ws", EventType: "document.updated", Path: "a.md", ContentHash: hash(head)}); err != nil {
+	if _, err = db.EnqueueOutbox(&OutboxEntry{DocumentID: "d", Notespace: "ws", EventType: "document.updated", Path: "a.md", ContentHash: hash(head)}); err != nil {
 		t.Fatal(err)
 	}
 	if err = db.ReconcileReturnEscrow(ReturnEscrow{Manifest: m, Content: map[string][]byte{"d": head}}); err != nil {
@@ -595,7 +595,7 @@ func TestReconcileReturnEscrowConvergesAndClearsEcho(t *testing.T) {
 func TestReturnEscrowDurableHashVerification(t *testing.T) {
 	db := openTestDB(t)
 	body := []byte("guest only")
-	snap := syncproto.SnapshotManifest{Workspace: "ws", Cursor: 2, Documents: []syncproto.DocumentSnapshot{{ID: "d", Path: "new.md", Version: 1, Hash: hash(body)}}}
+	snap := syncproto.SnapshotManifest{NotespaceID: "ws", Cursor: 2, Documents: []syncproto.DocumentSnapshot{{ID: "d", Path: "new.md", Version: 1, Hash: hash(body)}}}
 	c := returnTestClient(t, "epoch", map[string]syncproto.SnapshotManifest{"ws": snap}, map[string][]byte{"d": body})
 	m, _ := BuildReturnManifest(context.Background(), c, db, []string{"ws"})
 	path, err := WriteReturnEscrow(context.Background(), c, m, t.TempDir())

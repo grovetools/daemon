@@ -285,13 +285,14 @@ type SyncConflictPayload struct {
 	// Kind is the event class. Not all of these are document conflicts — this
 	// is the sync system's general "something needs a human" feed:
 	// "secret_quarantine" | "conflict" | "oversize_skipped" | "diverged" |
-	// "registry_foreign_write" | "auth_failed". The last is transport-wide
-	// rather than per-document, so it carries no Workspace or Path.
-	Kind       string `json:"kind"`
-	Workspace  string `json:"workspace"`
-	Path       string `json:"path"` // slash-normalized workspace-relative path
-	DocumentID string `json:"document_id,omitempty"`
-	Detail     string `json:"detail,omitempty"`
+	// "registry_foreign_write" | "registration" | "auth_failed". The last is transport-wide
+	// rather than per-document, so it carries no notespace or path.
+	Kind          string `json:"kind"`
+	NotespaceID   string `json:"notespace_id,omitempty"`
+	NotespaceName string `json:"notespace_name,omitempty"`
+	Path          string `json:"path"` // slash-normalized notespace-relative path
+	DocumentID    string `json:"document_id,omitempty"`
+	Detail        string `json:"detail,omitempty"`
 }
 
 // SatelliteStatusPayload describes a satellite's connection health for SSE

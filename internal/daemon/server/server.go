@@ -216,7 +216,8 @@ type Server struct {
 	// machine's token" instead of reporting a plausible-looking idle sync.
 	// Nil when sync is not configured; then the status payload omits it.
 	syncAuthFailure      func() (string, time.Time, bool)
-	syncWorkspaceRoots   func([]string) (map[string]string, error)
+	syncDBError          func() string
+	syncNotespaceRoots   func([]string) (map[string]string, error)
 	syncBeginMaintenance func(context.Context) error
 	syncEndMaintenance   func()
 	maintenanceMu        sync.RWMutex
@@ -3198,7 +3199,8 @@ func (s *Server) handleNoteEvent(w http.ResponseWriter, r *http.Request) {
 
 	s.ulog.Debug("Note event received").
 		Field("event", event.Event).
-		Field("workspace", event.Workspace).
+		Field("notespace_id", event.NotespaceID).
+		Field("notespace_name", event.NotespaceName).
 		Field("path", event.Path).
 		Field("has_index", event.IndexEntry != nil).
 		Log(r.Context())
@@ -3220,7 +3222,7 @@ func (s *Server) tryAttachIndexEntry(event *models.NoteEvent) {
 	locator := workspace.NewNotebookLocator(cfg)
 
 	for _, ws := range state.Workspaces {
-		if ws.WorkspaceNode == nil || ws.Name != event.Workspace {
+		if ws.WorkspaceNode == nil || ws.Name != event.NotespaceName {
 			continue
 		}
 		contentDirPath, contentDirType := enrichment.ResolveContentDirForPath(event.Path, ws.WorkspaceNode, locator)

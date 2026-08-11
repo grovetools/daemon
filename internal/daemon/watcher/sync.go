@@ -1,12 +1,12 @@
 // SyncHandler implements DomainHandler for the notebook sync protocol's
-// Phase 0 client-side state: it watches subscribed notebook workspaces,
+// Phase 0 client-side state: it watches subscribed notebook notespaces,
 // hash-gates content changes, and records them in sync.db (identity map +
 // outbox) for the Phase 1 push loop.
 //
 // Standing rules baked in here:
 //
 //   - Dark by default: the handler is constructed unconditionally by the global
-//     daemon but stays DORMANT while no sync config with workspace
+//     daemon but stays DORMANT while no sync config with notespace
 //     subscriptions exists — no watches, no sync.db, no transport. sync.db is
 //     opened lazily by ensureDB the first time a subscription appears, which is
 //     what lets a first-ever `grove join` take effect on the next config reload
@@ -15,7 +15,7 @@
 //     writes to the USER's notes. All capture writes go to sync.db under
 //     ~/.local/share/grove. The single exception is the machine presence note
 //     (registry.go), which writes machines/<own-id>.md into the reserved
-//     registry workspace — this machine's own document, in a workspace that
+//     registry notespace — this machine's own document, in a notespace that
 //     exists for nothing else, single-writer by construction. It is not the
 //     user's note and the rule it looks like it breaks was never about it.
 //   - Global daemon only: sync.db is owned by the global daemon, like
@@ -24,6 +24,8 @@ package watcher
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"os"
@@ -39,6 +41,7 @@ import (
 	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/machine"
 	"github.com/grovetools/core/pkg/models"
+	notespacepkg "github.com/grovetools/core/pkg/notespace"
 	"github.com/grovetools/core/pkg/syncproto"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/daemon/internal/daemon/store"
@@ -59,11 +62,12 @@ const (
 	defaultEpochProbeInterval = 1 * time.Minute
 )
 
-// syncWatch maps a watched directory to its sync workspace subscription.
+// syncWatch maps a watched directory to its sync notespace subscription.
 type syncWatch struct {
-	workspace string           // sync workspace name
-	root      string           // workspace root dir; wire paths are relative to this
-	space     *syncdb.DocSpace // exclusion + routing policy for this subscription
+	displayName string           // mutable config/stamp name; discovery only, never a DB/wire key
+	notespace   string           // immutable stamp id; empty until registration succeeds
+	root        string           // notespace root dir; wire paths are relative to this
+	space       *syncdb.DocSpace // exclusion + routing policy for this subscription
 }
 
 // SyncHandler implements DomainHandler for sync change capture.
@@ -85,6 +89,7 @@ type SyncHandler struct {
 	dbReady      func(*syncdb.DB)
 	dbOpenMu     sync.Mutex
 	dbOpenFailed bool
+	dbOpenError  string
 
 	syncCfg   *config.SyncConfig
 	syncCfgMu sync.RWMutex
@@ -101,11 +106,11 @@ type SyncHandler struct {
 	firstSeen map[string]time.Time
 	timersMu  sync.Mutex
 
-	// Transport state: a shared server client plus per-workspace pipeline
-	// cancel funcs, spawned lazily once a workspace root is known (from the
+	// Transport state: a shared server client plus per-notespace pipeline
+	// cancel funcs, spawned lazily once a notespace root is known (from the
 	// discovery-driven watch set, or from config alone for pull = true
 	// subscriptions — see ensurePipelines). aePasses
-	// keeps each workspace's anti-entropy reconciler addressable so the
+	// keeps each notespace's anti-entropy reconciler addressable so the
 	// manual /api/sync/repush endpoint can kick an immediate pass (guarded by
 	// pipelinesMu, same lifecycle as pipelines).
 	client      *syncdb.Client
@@ -194,6 +199,13 @@ func (h *SyncHandler) SetDeferredDB(open func() (*syncdb.DB, error), ready func(
 // database returns the open sync database, or nil while dormant.
 func (h *SyncHandler) database() *syncdb.DB { return h.db.Load() }
 
+// SyncDBError is the status-only startup seam for a non-mutating legacy DB refusal.
+func (h *SyncHandler) SyncDBError() string {
+	h.dbOpenMu.Lock()
+	defer h.dbOpenMu.Unlock()
+	return h.dbOpenError
+}
+
 // hasSubscriptions reports whether the live config carries any subscription —
 // the condition that wakes a dormant handler.
 func (h *SyncHandler) hasSubscriptions() bool {
@@ -223,6 +235,7 @@ func (h *SyncHandler) ensureDB() *syncdb.DB {
 
 	db, err := h.dbOpener()
 	if err != nil {
+		h.dbOpenError = err.Error()
 		if !h.dbOpenFailed {
 			h.dbOpenFailed = true
 			h.ulog.Warn("Failed to open sync database, sync stays dormant").Err(err).Emit()
@@ -230,6 +243,7 @@ func (h *SyncHandler) ensureDB() *syncdb.DB {
 		return nil
 	}
 	h.dbOpenFailed = false
+	h.dbOpenError = ""
 	h.db.Store(db)
 	if h.dbReady != nil {
 		h.dbReady(db)
@@ -247,7 +261,7 @@ func (h *SyncHandler) Name() string {
 	return "sync"
 }
 
-// subscription returns the sync subscription for a workspace name, or nil.
+// subscription returns the sync subscription for a notespace name, or nil.
 func (h *SyncHandler) subscription(name string) *config.SyncWorkspace {
 	h.syncCfgMu.RLock()
 	defer h.syncCfgMu.RUnlock()
@@ -275,7 +289,7 @@ func (h *SyncHandler) subscriptionsSnapshot() []config.SyncWorkspace {
 
 // SyncSubscriptions returns the configured sync server URL alongside a copy of
 // the current subscription list — the same snapshot subscriptionsSnapshot
-// takes, read under one lock so the URL and the workspaces can never straddle
+// takes, read under one lock so the URL and the notespaces can never straddle
 // a hot reload. Wired into the HTTP server (SetSyncSubscriptions) so GET
 // /api/sync/status can answer "where is this syncing, and in which direction"
 // instead of only "how much is queued". Reads the live config rather than a
@@ -297,23 +311,23 @@ func (h *SyncHandler) SyncSubscriptions() (string, []config.SyncWorkspace) {
 func (h *SyncHandler) recordedNotebookRoot(name string) (string, string, error) {
 	cfg := h.cfg
 	if cfg == nil || name == "" {
-		return "", "", fmt.Errorf("workspace %q has no recorded code-root/notebook binding", name)
+		return "", "", fmt.Errorf("notespace %q has no recorded code-root/notebook binding", name)
 	}
 	if grove, ok := cfg.Groves[name]; ok {
 		if grove.Notebook != "" || grove.NotebookRoot != "" {
 			if grove.Notebook == "" || grove.NotebookRoot == "" {
-				return "", "", fmt.Errorf("workspace %q has an incomplete recorded code-root/notebook binding", name)
+				return "", "", fmt.Errorf("notespace %q has an incomplete recorded code-root/notebook binding", name)
 			}
 			return grove.Notebook, grove.NotebookRoot, nil
 		}
 	}
 	if cfg.Notebooks == nil || cfg.Notebooks.Rules == nil || cfg.Notebooks.Rules.Default == "" {
-		return "", "", fmt.Errorf("workspace %q has no recorded code-root/notebook binding or default notebook", name)
+		return "", "", fmt.Errorf("notespace %q has no recorded code-root/notebook binding or default notebook", name)
 	}
 	notebook := cfg.Notebooks.Rules.Default
 	definition := cfg.Notebooks.Definitions[notebook]
 	if definition == nil || definition.RootDir == "" {
-		return "", "", fmt.Errorf("workspace %q routes to default notebook %q without a recorded root", name, notebook)
+		return "", "", fmt.Errorf("notespace %q routes to default notebook %q without a recorded root", name, notebook)
 	}
 	return notebook, definition.RootDir, nil
 }
@@ -328,12 +342,12 @@ func (h *SyncHandler) syntheticNodeFor(name string) (*workspace.WorkspaceNode, e
 	return node, nil
 }
 
-// nodeWorkspaceRoot consumes a compiled root literally for discovered nodes as
+// nodeNotespaceRoot consumes a compiled root literally for discovered nodes as
 // well as synthetic subscriptions. It has no existence requirement: pull must
 // be able to materialize a replica into a tree that does not exist yet.
-func (h *SyncHandler) nodeWorkspaceRoot(node *workspace.WorkspaceNode) (string, error) {
+func (h *SyncHandler) nodeNotespaceRoot(node *workspace.WorkspaceNode) (string, error) {
 	if node == nil {
-		return "", fmt.Errorf("cannot route a nil workspace node")
+		return "", fmt.Errorf("cannot route a nil notespace node")
 	}
 	_, root, err := h.recordedNotebookRoot(node.Name)
 	if err != nil && node.Path != "" {
@@ -349,21 +363,21 @@ func (h *SyncHandler) nodeWorkspaceRoot(node *workspace.WorkspaceNode) (string, 
 		return "", err
 	}
 	if !filepath.IsAbs(root) {
-		return "", fmt.Errorf("workspace %q has non-absolute recorded notebook root %q", node.Name, root)
+		return "", fmt.Errorf("notespace %q has non-absolute recorded notebook root %q", node.Name, root)
 	}
-	return filepath.Join(root, "workspaces", node.Name), nil
+	return filepath.Join(root, "notespaces", node.Name), nil
 }
 
-// WorkspaceRoots resolves explicitly selected subscribed workspaces to their
+// NotespaceRoots resolves explicitly selected subscribed notespaces to their
 // configured laptop notebook roots. It is used by the user-authorized incoming
 // apply boundary; unlike configuredPullRoots it includes push-only laptop
 // subscriptions and never invents a wildcard/default selection.
-func (h *SyncHandler) WorkspaceRoots(names []string) (map[string]string, error) {
+func (h *SyncHandler) NotespaceRoots(names []string) (map[string]string, error) {
 	roots := make(map[string]string, len(names))
 	h.pathsMutex.RLock()
 	for _, w := range h.watchedPaths {
 		for _, name := range names {
-			if w.workspace == name {
+			if w.notespace == name {
 				roots[name] = w.root
 			}
 		}
@@ -371,14 +385,14 @@ func (h *SyncHandler) WorkspaceRoots(names []string) (map[string]string, error) 
 	h.pathsMutex.RUnlock()
 	for _, name := range names {
 		if h.subscription(name) == nil {
-			return nil, fmt.Errorf("workspace %q is not a sync subscription", name)
+			return nil, fmt.Errorf("notespace %q is not a sync subscription", name)
 		}
 		if roots[name] == "" {
 			node, err := h.syntheticNodeFor(name)
 			if err != nil {
 				return nil, err
 			}
-			roots[name], err = h.nodeWorkspaceRoot(node)
+			roots[name], err = h.nodeNotespaceRoot(node)
 			if err != nil {
 				return nil, err
 			}
@@ -387,9 +401,9 @@ func (h *SyncHandler) WorkspaceRoots(names []string) (map[string]string, error) 
 	return roots, nil
 }
 
-// configuredPullRoots derives workspace -> root for every pull = true
+// configuredPullRoots derives notespace -> root for every pull = true
 // subscription directly from sync.toml + notebook definitions, independent of
-// code-workspace discovery. Pull targets are notebook workspaces whose paths
+// code-notespace discovery. Pull targets are notebook notespaces whose paths
 // are fully config-determined; requiring a .git under a grove path to
 // materialize notes was accidental coupling (the empty-~/code satellite bug).
 func (h *SyncHandler) configuredPullRoots() (map[string]string, error) {
@@ -402,7 +416,7 @@ func (h *SyncHandler) configuredPullRoots() (map[string]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		root, err := h.nodeWorkspaceRoot(node)
+		root, err := h.nodeNotespaceRoot(node)
 		if err != nil {
 			return nil, err
 		}
@@ -412,7 +426,7 @@ func (h *SyncHandler) configuredPullRoots() (map[string]string, error) {
 }
 
 // recordedContentDirs derives standard content paths from the already-routed
-// workspace root, avoiding a notebook-name lookup through the locator.
+// notespace root, avoiding a notebook-name lookup through the locator.
 func recordedContentDirs(root string) []workspace.ContentDirectory {
 	return []workspace.ContentDirectory{
 		{Path: root, Type: "notes"},
@@ -421,36 +435,21 @@ func recordedContentDirs(root string) []workspace.ContentDirectory {
 	}
 }
 
-// workspaceRootForDir derives the workspace root a content dir belongs to.
-// Centralized notebook layouts follow <root>/workspaces/<name>/...; when the
-// marker is absent the content dir's parent is the best available root.
-func workspaceRootForDir(dir string) string {
-	marker := string(filepath.Separator) + "workspaces" + string(filepath.Separator)
-	if idx := strings.LastIndex(dir, marker); idx >= 0 {
-		rest := dir[idx+len(marker):]
-		if slash := strings.IndexByte(rest, filepath.Separator); slash > 0 {
-			return dir[:idx+len(marker)+slash]
-		}
-		return dir
-	}
-	return filepath.Dir(dir)
-}
-
-// computeWorkspaceWatches enumerates every Included directory of one subscribed
-// workspace as its own watch entry, recursively (Phase 2, the S1 fix). fsnotify
+// computeNotespaceWatches enumerates every Included directory of one subscribed
+// notespace as its own watch entry, recursively (Phase 2, the S1 fix). fsnotify
 // is non-recursive, so every directory in the doc space needs an individual
 // watch; DocSpace.WalkTree prunes excluded subtrees (.git/, .artifacts/, …)
-// during the walk at O(included dirs) cost. syncWatch.root stays the workspace
+// during the walk at O(included dirs) cost. syncWatch.root stays the notespace
 // root in every entry — lookupWatch/flush compute wire paths against it, and
 // that must not change with the walk root. Extracted from ComputeWatchPaths so
 // the S1 reproduction can test it without the locator machinery.
-func computeWorkspaceWatches(sub *config.SyncWorkspace, recordedRoot string, contentDirs []workspace.ContentDirectory) map[string]*syncWatch {
+func computeNotespaceWatches(sub *config.SyncWorkspace, recordedRoot string, contentDirs []workspace.ContentDirectory) map[string]*syncWatch {
 	watches := make(map[string]*syncWatch)
 	if sub == nil {
 		return watches
 	}
-	// Build the DocSpace once per subscription (per-workspace excludes + size
-	// cap), shared across all of the workspace's watched dirs.
+	// Build the DocSpace once per subscription (per-notespace excludes + size
+	// cap), shared across all of the notespace's watched dirs.
 	space := syncdb.NewDocSpace(sub)
 
 	// Root identity comes from the recorded route, never from whichever content
@@ -460,7 +459,7 @@ func computeWorkspaceWatches(sub *config.SyncWorkspace, recordedRoot string, con
 		return watches
 	}
 
-	// Walk roots by mode: Full covers everything from the workspace root in one
+	// Walk roots by mode: Full covers everything from the notespace root in one
 	// walk (the plans/chats content dirs become redundant and are ignored);
 	// PlansOnly walks only the plans/ content dirs, preserving today's filter.
 	var walkRoots []string
@@ -480,7 +479,7 @@ func computeWorkspaceWatches(sub *config.SyncWorkspace, recordedRoot string, con
 			continue
 		}
 		onDir := func(abs, _ string) error {
-			watches[abs] = &syncWatch{workspace: sub.Name, root: root, space: space}
+			watches[abs] = &syncWatch{displayName: sub.Name, root: root, space: space}
 			return nil
 		}
 		if err := space.WalkTree(walkRoot, onDir, nil); err != nil {
@@ -492,14 +491,14 @@ func computeWorkspaceWatches(sub *config.SyncWorkspace, recordedRoot string, con
 	return watches
 }
 
-// ComputeWatchPaths returns every Included directory of subscribed workspaces
+// ComputeWatchPaths returns every Included directory of subscribed notespaces
 // (recursively) so the non-recursive fsnotify backend covers the whole tree.
-func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) []string {
+func (h *SyncHandler) ComputeWatchPaths(notespaces []*models.EnrichedWorkspace) []string {
 	newWatches := make(map[string]*syncWatch)
 	covered := make(map[string]bool) // subscription names covered by discovery
 	var routingErrors []string
 
-	for _, ew := range workspaces {
+	for _, ew := range notespaces {
 		node := ew.WorkspaceNode
 		if node == nil {
 			continue
@@ -514,31 +513,31 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 			continue
 		}
 
-		root, err := h.nodeWorkspaceRoot(node)
+		root, err := h.nodeNotespaceRoot(node)
 		if err != nil {
 			routingErrors = append(routingErrors, err.Error())
 			continue
 		}
 		dirs := recordedContentDirs(root)
-		maps.Copy(newWatches, computeWorkspaceWatches(sub, root, dirs))
+		maps.Copy(newWatches, computeNotespaceWatches(sub, root, dirs))
 	}
 
 	// Subscriptions not covered by code discovery (pure notes satellite:
 	// nothing under any grove path) are still config-locatable: resolve their
-	// content dirs through a synthetic node so the workspace's own tree is
+	// content dirs through a synthetic node so the notespace's own tree is
 	// watched — local edits get captured and pushed just like on a machine
-	// where discovery works. computeWorkspaceWatches only registers stat-able
+	// where discovery works. computeNotespaceWatches only registers stat-able
 	// dirs, so this is a no-op until the tree exists (for a pull replica, until
 	// the pull pipeline materializes it; the periodic refresh picks it up
 	// afterwards).
 	//
 	// This loop deliberately does NOT filter on sub.Pull. Push-only
 	// subscriptions were the F8 residual: configuredPullRoots covers the
-	// pull side only, so a push-only notebook workspace that discovery never
+	// pull side only, so a push-only notebook notespace that discovery never
 	// yields (no .git under any grove path — a bare notebook) got no watches
 	// here and, because ensurePipelines derives its roots from this watch set,
 	// no push pipeline either. It went silently dark in both directions. The
-	// nodeWorkspaceRoot resolution below is the real gate: a subscription whose
+	// nodeNotespaceRoot resolution below is the real gate: a subscription whose
 	// root config cannot locate is still skipped. Pull remains strictly
 	// opt-in — ensurePipelines still starts a pull loop only for sub.Pull, so
 	// the legacy push-only invariant is untouched.
@@ -551,13 +550,13 @@ func (h *SyncHandler) ComputeWatchPaths(workspaces []*models.EnrichedWorkspace) 
 			routingErrors = append(routingErrors, err.Error())
 			continue
 		}
-		root, err := h.nodeWorkspaceRoot(node)
+		root, err := h.nodeNotespaceRoot(node)
 		if err != nil {
 			routingErrors = append(routingErrors, err.Error())
 			continue
 		}
 		dirs := recordedContentDirs(root)
-		maps.Copy(newWatches, computeWorkspaceWatches(&sub, root, dirs))
+		maps.Copy(newWatches, computeNotespaceWatches(&sub, root, dirs))
 	}
 
 	h.pathsMutex.Lock()
@@ -585,7 +584,7 @@ func (h *SyncHandler) RoutingErrors() []string {
 }
 
 // lookupWatch finds the subscription covering an absolute path (deepest
-// watched directory wins) and the wire path relative to the workspace root.
+// watched directory wins) and the wire path relative to the notespace root.
 func (h *SyncHandler) lookupWatch(absPath string) (*syncWatch, string) {
 	h.pathsMutex.RLock()
 	defer h.pathsMutex.RUnlock()
@@ -610,7 +609,7 @@ func (h *SyncHandler) lookupWatch(absPath string) (*syncWatch, string) {
 	return best, syncproto.NormalizePath(rel)
 }
 
-// MatchesEvent applies the default exclusion manifest (plus per-workspace
+// MatchesEvent applies the default exclusion manifest (plus per-notespace
 // extras) on top of subscription prefix matching.
 func (h *SyncHandler) MatchesEvent(event fsnotify.Event) bool {
 	if event.Op&fsnotify.Chmod == fsnotify.Chmod {
@@ -686,7 +685,10 @@ func (h *SyncHandler) scheduleFlush(absPath string) {
 // echo-suppression backstop).
 func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 	watch, rel := h.lookupWatch(absPath)
-	if watch == nil || !watch.space.Included(rel) {
+	if watch == nil || watch.notespace == "" || !watch.space.Included(rel) {
+		// A discovered watch is deliberately unroutable until its stamp has
+		// registered. This prevents display names (or empty placeholders) from
+		// ever becoming durable DB/wire keys and parks duplicate-id roots.
 		return
 	}
 	// A watch exists, so a subscription exists — open sync.db if this is the
@@ -699,7 +701,7 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 	fi, err := os.Stat(absPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			h.recordDelete(ctx, watch.workspace, rel)
+			h.recordDelete(ctx, watch.notespace, rel)
 		}
 		return
 	}
@@ -713,12 +715,12 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 		return
 	}
 
-	// Big-file policy: a per-workspace MaxFileSize skip is a quiet, user-
+	// Big-file policy: a per-notespace MaxFileSize skip is a quiet, user-
 	// configured policy (not an error). The server-ceiling skip is the
 	// surfaced one and happens at push time (DrainOutbox).
 	if watch.space.Route(rel, int64(len(content))) == syncdb.RouteSkip {
-		h.ulog.Debug("sync skip: file over workspace size cap").
-			Field("workspace", watch.workspace).
+		h.ulog.Debug("sync skip: file over notespace size cap").
+			Field("notespace", watch.notespace).
 			Field("path", rel).
 			Field("size", len(content)).
 			StructuredOnly().Log(ctx)
@@ -730,7 +732,7 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 	// EnqueueOutbox. The anti-entropy reconcile's walkLocalTree calls the same
 	// helper, so watch and reconcile can never disagree about the doc space or
 	// the quarantine judgement.
-	reason, err := syncdb.InsertAndEnqueue(db, watch.workspace, rel, content, fi.ModTime())
+	reason, err := syncdb.InsertAndEnqueue(db, watch.notespace, rel, content, fi.ModTime())
 	if err != nil {
 		h.ulog.Warn("Failed to record sync change").Err(err).Field("path", rel).Log(ctx)
 		return
@@ -740,15 +742,15 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 		// (addendum #8: the watcher keeps its Store broadcast; the reconcile
 		// only logs + counts).
 		h.ulog.Warn("Sync quarantine: document matches secret heuristic, not queued").
-			Field("workspace", watch.workspace).
+			Field("notespace", watch.notespace).
 			Field("path", rel).
 			Field("heuristic", reason).
 			Log(ctx)
 		h.broadcastConflict(&store.SyncConflictPayload{
-			Kind:      "secret_quarantine",
-			Workspace: watch.workspace,
-			Path:      rel,
-			Detail:    reason,
+			Kind:        "secret_quarantine",
+			NotespaceID: watch.notespace,
+			Path:        rel,
+			Detail:      reason,
 		})
 	}
 }
@@ -761,7 +763,7 @@ func (h *SyncHandler) flush(ctx context.Context, absPath string) {
 // check rejects any base_version != head, so a delete pushed with the default
 // 0 parks as a manufactured conflict forever. The row is still deleted
 // immediately — keeping it alive until push-ack would collide with the
-// sync_documents UNIQUE(workspace, path) constraint on delete-then-recreate.
+// sync_documents UNIQUE(notespace, path) constraint on delete-then-recreate.
 func (h *SyncHandler) recordDelete(ctx context.Context, ws, rel string) {
 	db := h.database()
 	if db == nil {
@@ -773,7 +775,7 @@ func (h *SyncHandler) recordDelete(ctx context.Context, ws, rel string) {
 	}
 	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{
 		DocumentID:  doc.DocumentID,
-		Workspace:   ws,
+		Notespace:   ws,
 		EventType:   syncproto.EventDocumentDeleted,
 		Path:        rel,
 		BaseVersion: doc.LastSyncedVersion,
@@ -846,11 +848,11 @@ func (h *SyncHandler) handleNoteEvent(ctx context.Context, event *models.NoteEve
 	}
 	if !newWatch.space.Included(newRel) {
 		// Moved out of sync scope — record as a delete of the old path.
-		h.recordDelete(ctx, prevWatch.workspace, prevRel)
+		h.recordDelete(ctx, prevWatch.notespace, prevRel)
 		return
 	}
 
-	doc, err := db.GetDocumentByPath(prevWatch.workspace, prevRel)
+	doc, err := db.GetDocumentByPath(prevWatch.notespace, prevRel)
 	if err != nil {
 		h.ulog.Warn("Failed to query sync document for move").Err(err).Field("path", prevRel).Log(ctx)
 		return
@@ -873,7 +875,7 @@ func (h *SyncHandler) handleNoteEvent(ctx context.Context, event *models.NoteEve
 	}
 	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{
 		DocumentID:  doc.DocumentID,
-		Workspace:   newWatch.workspace,
+		Notespace:   newWatch.notespace,
 		EventType:   syncproto.EventDocumentMoved,
 		Path:        newRel,
 		PrevPath:    prevRel,
@@ -896,7 +898,7 @@ func (h *SyncHandler) OnStart(ctx context.Context) {
 
 // transportLoop connects to the sync server (retrying quietly — sync stays
 // passive and the outbox accumulates until the server is reachable), then
-// keeps per-workspace pipelines in step with discovered workspaces.
+// keeps per-notespace pipelines in step with discovered notespaces.
 //
 // "Quietly" holds for a server that is merely down. It does NOT hold for a
 // server that rejects our token: that failure never fixes itself, so it is
@@ -1064,18 +1066,60 @@ func (h *SyncHandler) probeServerEpoch(ctx context.Context, db *syncdb.DB) {
 		return
 	}
 	if reset {
-		// Every workspace was just voided with an empty outbox. Sweep them all
+		// Every notespace was just voided with an empty outbox. Sweep them all
 		// now — that sweep IS the re-push.
 		h.KickAntiEntropy("")
 	}
 }
 
 // ensurePipelines spawns push/pull/anti-entropy loops for any subscribed
-// workspace that has no running transport yet. Workspace roots come from two
+// notespace that has no running transport yet. Notespace roots come from two
 // sources: the discovery-driven watch set (push-side real trees), and — for
 // pull = true subscriptions — direct config resolution, so a pull replica
-// spawns even when code-workspace discovery finds nothing.
+// spawns even when code-notespace discovery finds nothing.
 // Idempotent; called on each transport tick and after watch-path updates.
+func registrationIntent(stamp *notespacepkg.NotespaceStamp) (string, error) {
+	machineCfg, err := config.LoadMachineConfig()
+	if err != nil {
+		return "", err
+	}
+	if machineCfg != nil {
+		if primaryID := machineCfg.Primaries[stamp.Subject]; primaryID != "" && primaryID != stamp.ID {
+			return syncproto.RegistrationIntentCreateSibling, nil
+		}
+	}
+	return syncproto.RegistrationIntentProposePrimary, nil
+}
+
+func (h *SyncHandler) registerRoot(ctx context.Context, client *syncdb.Client, stamp *notespacepkg.NotespaceStamp, root string) error {
+	intent, err := registrationIntent(stamp)
+	if err != nil {
+		return fmt.Errorf("load primary registration intent: %w", err)
+	}
+	sum := sha256.Sum256([]byte(stamp.ID + "\x00" + stamp.Name + "\x00" + stamp.Subject + "\x00" + stamp.Kind + "\x00" + intent))
+	resp, err := client.Register(ctx, syncproto.RegisterRequest{
+		RequestIdentity: syncproto.RequestIdentity{IdempotencyKey: "daemon-" + hex.EncodeToString(sum[:])},
+		Intent:          intent, Subject: stamp.Subject,
+		NotespaceName: syncproto.NotespaceName(stamp.Name), Kind: stamp.Kind,
+		ProposedNotespaceID: syncproto.NotespaceID(stamp.ID),
+	})
+	if err != nil {
+		detail := fmt.Sprintf("registration failed for %s at %s: %v", stamp.ID, root, err)
+		_, _ = syncdb.WriteRegistrationConflict(stamp.ID, detail)
+		h.broadcastConflict(&store.SyncConflictPayload{Kind: syncdb.ConflictKindRegistration, NotespaceID: stamp.ID, NotespaceName: stamp.Name, Path: ".notespace.toml", Detail: detail})
+		return err
+	}
+	if resp.NotespaceID.String() != stamp.ID {
+		return fmt.Errorf("server registered %s as unexpected id %s", stamp.ID, resp.NotespaceID)
+	}
+	if db := h.database(); db != nil {
+		if err := db.UpsertNotespaceBinding(syncdb.NotespaceBinding{ID: stamp.ID, Name: stamp.Name, Root: root, Subject: stamp.Subject, Kind: stamp.Kind}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (h *SyncHandler) ensurePipelines() {
 	h.clientMu.RLock()
 	client := h.client
@@ -1088,11 +1132,19 @@ func (h *SyncHandler) ensurePipelines() {
 		return
 	}
 
-	// Unique workspace -> root from the current watch set.
+	// Display subscription -> root from the current watch set. Display names
+	// locate configuration only; registration replaces them with stamp ids
+	// before any DB or wire operation.
 	roots := make(map[string]string)
 	h.pathsMutex.RLock()
 	for _, w := range h.watchedPaths {
-		roots[w.workspace] = w.root
+		name := w.displayName
+		if name == "" { // direct test/legacy construction
+			name = w.notespace
+		}
+		if name != "" {
+			roots[name] = w.root
+		}
 	}
 	h.pathsMutex.RUnlock()
 
@@ -1113,7 +1165,46 @@ func (h *SyncHandler) ensurePipelines() {
 		}
 	}
 
-	for name, root := range roots {
+	names := slices.Collect(maps.Keys(roots))
+	slices.SortFunc(names, func(a, b string) int { return strings.Compare(roots[a], roots[b]) })
+	seenIDs := make(map[string]string)
+	for _, displayName := range names {
+		root := roots[displayName]
+		stamp, err := notespacepkg.LoadNotespace(root)
+		if err != nil || stamp == nil {
+			if err == nil {
+				err = fmt.Errorf("notespace %q at %s has no .notespace.toml; run grove migrate (step 2)", displayName, root)
+			} else {
+				err = fmt.Errorf("load notespace identity at %s: %w", root, err)
+			}
+			h.ulog.Error("notespace registration failed; pipeline parked").Err(err).Field("root", root).Log(h.baseCtx)
+			continue
+		}
+		name := stamp.ID
+		// Check copied ids before registration so the parked root cannot mutate
+		// server-side display metadata or create any data-plane state.
+		if first, duplicate := seenIDs[name]; duplicate && first != root {
+			detail := fmt.Sprintf("duplicate notespace id %s: first root %s keeps syncing; later root %s is parked", name, first, root)
+			_, _ = syncdb.WriteRegistrationConflict(name, detail)
+			h.broadcastConflict(&store.SyncConflictPayload{Kind: syncdb.ConflictKindRegistration, NotespaceID: name, NotespaceName: stamp.Name, Path: ".notespace.toml", Detail: detail})
+			continue
+		}
+		seenIDs[name] = root
+		if err := h.registerRoot(h.baseCtx, client, stamp, root); err != nil {
+			h.ulog.Error("notespace registration failed; pipeline parked").Err(err).Field("root", root).Log(h.baseCtx)
+			continue
+		}
+
+		// Capture switches to immutable identity as soon as registration succeeds,
+		// including after a watch-set refresh when the transport already exists.
+		h.pathsMutex.Lock()
+		for _, watch := range h.watchedPaths {
+			if watch.root == root {
+				watch.notespace = name
+			}
+		}
+		h.pathsMutex.Unlock()
+
 		h.pipelinesMu.Lock()
 		_, running := h.pipelines[name]
 		if running {
@@ -1124,18 +1215,18 @@ func (h *SyncHandler) ensurePipelines() {
 		h.pipelines[name] = cancel
 		h.pipelinesMu.Unlock()
 
-		sub := h.subscription(name)
+		sub := h.subscription(displayName)
 
 		push := syncdb.NewPushPipeline(db, client, name, h.ulog, syncdb.PushConfig{})
 		// Surface server-ceiling oversize skips as a sync_conflict SSE update
 		// (convertToAPIUpdate already forwards UpdateSyncConflict). The quiet
-		// per-workspace MaxFileSize skip stays in flush; this is the loud one.
+		// per-notespace MaxFileSize skip stays in flush; this is the loud one.
 		push.OnOversizeSkipped = func(ws, path string, size, limit int64) {
 			h.broadcastConflict(&store.SyncConflictPayload{
-				Kind:      "oversize_skipped",
-				Workspace: ws,
-				Path:      path,
-				Detail:    fmt.Sprintf("%d bytes exceeds server blob ceiling %d", size, limit),
+				Kind:        "oversize_skipped",
+				NotespaceID: ws,
+				Path:        path,
+				Detail:      fmt.Sprintf("%d bytes exceeds server blob ceiling %d", size, limit),
 			})
 		}
 		// Surface a push-side divergence (S5): the merged server head was pushed
@@ -1143,18 +1234,23 @@ func (h *SyncHandler) ensurePipelines() {
 		// `nb sync adopt`. Same SSE surfacing as an oversize skip.
 		push.OnDiverged = func(ws, path string) {
 			h.broadcastConflict(&store.SyncConflictPayload{
-				Kind:      "diverged",
-				Workspace: ws,
-				Path:      path,
-				Detail:    "local file lags the merged server head; run `nb sync adopt` to take it",
+				Kind:        "diverged",
+				NotespaceID: ws,
+				Path:        path,
+				Detail:      "local file lags the merged server head; run `nb sync adopt` to take it",
 			})
+		}
+		push.OnConflict = func(kind, ws, path, documentID, detail string) {
+			h.broadcastConflict(&store.SyncConflictPayload{Kind: kind, NotespaceID: ws, NotespaceName: stamp.Name, Path: path, DocumentID: documentID, Detail: detail})
 		}
 		go h.runWithRecovery(pctx, name, "push", func() error {
 			return push.RunPushLoop(pctx, root)
 		})
 
 		if sub != nil && sub.Pull {
-			pull := syncdb.NewPullPipeline(sub, client, db, h.ulog)
+			idSub := *sub
+			idSub.Name = name
+			pull := syncdb.NewPullPipeline(&idSub, client, db, h.ulog)
 			// Own-note guard (registry-role subscriptions only): an inbound
 			// event for machines/<our id>.md cannot be a legitimate
 			// replication of our own write, because the registry is
@@ -1164,23 +1260,26 @@ func (h *SyncHandler) ensurePipelines() {
 			pull.OwnMachineID = machine.ID()
 			pull.OnRegistryForeignWrite = func(ws, path, detail string) {
 				h.broadcastConflict(&store.SyncConflictPayload{
-					Kind:      syncdb.ConflictKindRegistryForeignWrite,
-					Workspace: ws,
-					Path:      path,
-					Detail:    detail,
+					Kind:        syncdb.ConflictKindRegistryForeignWrite,
+					NotespaceID: ws,
+					Path:        path,
+					Detail:      detail,
 				})
+			}
+			pull.OnConflict = func(kind, ws, path, documentID, detail string) {
+				h.broadcastConflict(&store.SyncConflictPayload{Kind: kind, NotespaceID: ws, NotespaceName: stamp.Name, Path: path, DocumentID: documentID, Detail: detail})
 			}
 			go h.runWithRecovery(pctx, name, "pull", func() error {
 				return pull.RunPullLoop(pctx, root)
 			})
 		}
 
-		// Build the reconcile with the same per-workspace DocSpace the watcher
+		// Build the reconcile with the same per-notespace DocSpace the watcher
 		// uses (sub is already resolved above), so walk coverage and reconcile
 		// coverage judge the doc space identically.
 		ae := syncdb.NewAntiEntropyPass(db, client, name, root, syncdb.NewDocSpace(sub), h.ulog, syncdb.AntiEntropyConfig{})
 		// A recreated server is detected by whichever pass handshakes first,
-		// but CheckServerEpoch voids EVERY workspace's synced state and
+		// but CheckServerEpoch voids EVERY notespace's synced state and
 		// clears their outboxes. Fan the sweep out so the others re-push in
 		// this cycle rather than sitting empty until their own hourly tick.
 		ae.OnEpochReset = h.kickAntiEntropyExcept
@@ -1198,12 +1297,13 @@ func (h *SyncHandler) ensurePipelines() {
 		// Materialize the sync_state row immediately so /api/sync/status
 		// reflects the subscription as soon as transport starts (readiness
 		// probes key on this; rows otherwise appear only on first activity).
-		if cur, err := db.GetWorkspaceCursor(name); err == nil {
-			_ = db.UpdateWorkspaceCursor(name, cur)
+		if cur, err := db.GetNotespaceCursor(name); err == nil {
+			_ = db.UpdateNotespaceCursor(name, cur)
 		}
 
 		h.ulog.Info("sync transport started").
-			Field("workspace", name).
+			Field("notespace_id", name).
+			Field("notespace_name", stamp.Name).
 			Field("pull", sub != nil && sub.Pull).
 			StructuredOnly().Log(pctx)
 	}
@@ -1243,16 +1343,22 @@ func (h *SyncHandler) BeginMaintenance(ctx context.Context) error {
 	roots := make(map[string]string)
 	h.pathsMutex.RLock()
 	for _, w := range h.watchedPaths {
-		roots[w.workspace] = w.root
+		if w.notespace != "" {
+			roots[w.notespace] = w.root
+		}
 	}
 	h.pathsMutex.RUnlock()
 	pullRoots, err := h.configuredPullRoots()
 	if err != nil {
 		return err
 	}
-	for name, root := range pullRoots {
-		if _, ok := roots[name]; !ok {
-			roots[name] = root
+	for _, root := range pullRoots {
+		stamp, loadErr := notespacepkg.LoadNotespace(root)
+		if loadErr != nil {
+			return loadErr
+		}
+		if stamp != nil {
+			roots[stamp.ID] = root
 		}
 	}
 
@@ -1285,16 +1391,16 @@ func (h *SyncHandler) BeginMaintenance(ctx context.Context) error {
 func (h *SyncHandler) EndMaintenance() { h.maintenance.Store(false) }
 
 // KickAntiEntropy triggers an immediate anti-entropy pass for the named
-// workspace, or for every running workspace when workspace is empty. Wired
+// notespace, or for every running notespace when notespace is empty. Wired
 // into the HTTP server (SetSyncKick) so POST /api/sync/repush can convert its
-// state reset into re-pushes without waiting for the hourly tick. A workspace
+// state reset into re-pushes without waiting for the hourly tick. A notespace
 // whose transport has not started yet is silently skipped — its initial pass
 // runs at pipeline start anyway.
-func (h *SyncHandler) KickAntiEntropy(workspace string) {
+func (h *SyncHandler) KickAntiEntropy(notespace string) {
 	h.pipelinesMu.Lock()
 	defer h.pipelinesMu.Unlock()
 	for name, ae := range h.aePasses {
-		if workspace == "" || name == workspace {
+		if notespace == "" || name == notespace {
 			ae.Kick()
 		}
 	}
@@ -1304,11 +1410,11 @@ func (h *SyncHandler) KickAntiEntropy(workspace string) {
 // If the goroutine panics, it logs the panic and exits gracefully rather than
 // crashing the daemon. This ensures server restarts or protocol edge cases
 // don't kill the entire sync handler.
-func (h *SyncHandler) runWithRecovery(ctx context.Context, workspace, pipelineType string, fn func() error) {
+func (h *SyncHandler) runWithRecovery(ctx context.Context, notespace, pipelineType string, fn func() error) {
 	defer func() {
 		if r := recover(); r != nil {
 			h.ulog.Error("sync pipeline panic (recovered)").
-				Field("workspace", workspace).
+				Field("notespace", notespace).
 				Field("pipeline", pipelineType).
 				Field("panic", fmt.Sprint(r)).
 				Log(ctx)
@@ -1317,7 +1423,7 @@ func (h *SyncHandler) runWithRecovery(ctx context.Context, workspace, pipelineTy
 	if err := fn(); err != nil {
 		// Normal error exit (context cancelled, etc)
 		h.ulog.Debug("sync pipeline stopped").
-			Field("workspace", workspace).
+			Field("notespace", notespace).
 			Field("pipeline", pipelineType).
 			Err(err).Log(ctx)
 	}

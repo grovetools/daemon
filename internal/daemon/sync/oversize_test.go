@@ -80,13 +80,13 @@ func TestDrainOutboxSkipsOversize(t *testing.T) {
 
 	// Enqueue big first so the oversize skip does not sit at the tail.
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-big", Workspace: "default",
+		DocumentID: "doc-big", Notespace: "default",
 		EventType: syncproto.EventDocumentCreated, Path: "inbox/big.md", ContentHash: sha(big),
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox big: %v", err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-small", Workspace: "default",
+		DocumentID: "doc-small", Notespace: "default",
 		EventType: syncproto.EventDocumentCreated, Path: "inbox/small.md", ContentHash: sha(small),
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox small: %v", err)
@@ -166,7 +166,7 @@ func TestDrainOutboxAllOversizeDrains(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-big", Workspace: "default",
+		DocumentID: "doc-big", Notespace: "default",
 		EventType: syncproto.EventDocumentCreated, Path: "inbox/big.md", ContentHash: sha(big),
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox: %v", err)

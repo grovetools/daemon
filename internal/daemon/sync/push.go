@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/grovetools/core/logging"
+	notespacepkg "github.com/grovetools/core/pkg/notespace"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/syncproto"
 )
@@ -60,26 +61,27 @@ type PushPipeline struct {
 	client    *Client
 	cfg       PushConfig
 	log       *logging.UnifiedLogger
-	workspace string
+	notespace string
 
 	// OnOversizeSkipped, when non-nil, is invoked for each outbox entry
 	// dropped because its content exceeds the server's advertised blob
 	// ceiling. It lets the watcher surface the skip (e.g. broadcast a
 	// SyncConflictPayload) without coupling the push pipeline to the store.
 	// Phase 4 will generalize this into a parked-entry surfacing hook.
-	OnOversizeSkipped func(workspace, path string, size, limit int64)
+	OnOversizeSkipped func(notespace, path string, size, limit int64)
 
 	// OnDiverged, when non-nil, is invoked when a push-side rebase produces a
 	// merged server head that the local file does not match (S5): the merged
-	// content is pushed but the workspace file is deliberately left untouched.
+	// content is pushed but the notespace file is deliberately left untouched.
 	// It lets the watcher surface the diverged disposition (broadcast a
 	// SyncConflictPayload{Kind:"diverged"}) so the user knows to `nb sync adopt`.
 	// Same decoupling pattern as OnOversizeSkipped.
-	OnDiverged func(workspace, path string)
+	OnDiverged func(notespace, path string)
+	OnConflict func(kind, notespace, path, documentID, detail string)
 }
 
-// NewPushPipeline constructs a push pipeline for a single workspace.
-func NewPushPipeline(db *DB, client *Client, workspace string, log *logging.UnifiedLogger, cfg PushConfig) *PushPipeline {
+// NewPushPipeline constructs a push pipeline for a single notespace.
+func NewPushPipeline(db *DB, client *Client, notespace string, log *logging.UnifiedLogger, cfg PushConfig) *PushPipeline {
 	if cfg.BatchSize == 0 {
 		cfg.BatchSize = 50
 	}
@@ -101,17 +103,17 @@ func NewPushPipeline(db *DB, client *Client, workspace string, log *logging.Unif
 		client:    client,
 		cfg:       cfg,
 		log:       log,
-		workspace: workspace,
+		notespace: notespace,
 	}
 }
 
-// DrainOutbox drains the outbox for the pipeline's workspace, pushing batches
+// DrainOutbox drains the outbox for the pipeline's notespace, pushing batches
 // to the server with retry logic and backoff. Returns the number of documents
 // successfully acknowledged.
 //
-// Note: The workspaceRoot parameter is required to read file content from disk.
-// It should be the absolute path to the workspace root directory.
-func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (int, error) {
+// Note: The notespaceRoot parameter is required to read file content from disk.
+// It should be the absolute path to the notespace root directory.
+func (p *PushPipeline) DrainOutbox(ctx context.Context, notespaceRoot string) (int, error) {
 	var successCount int
 
 	for {
@@ -127,7 +129,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 		// the doc/prefix barrier rules (F7), so a parked conflict isolates only
 		// itself instead of head-of-line-blocking the queue (S3).
 		now := time.Now()
-		entries, err := p.db.ListOutboxDrainable(p.workspace, p.cfg.BatchSize, now)
+		entries, err := p.db.ListOutboxDrainable(p.notespace, p.cfg.BatchSize, now)
 		if err != nil {
 			return successCount, fmt.Errorf("failed to list outbox: %w", err)
 		}
@@ -140,7 +142,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 		// Convert outbox entries to SyncEvents. The entry may carry its own
 		// bytes in Payload (the S5 push-only source: the rebase merges the
 		// server head and retargets the entry's Payload so push never re-reads
-		// — nor writes — the workspace file); otherwise content comes from disk.
+		// — nor writes — the notespace file); otherwise content comes from disk.
 		// A no-op update (push-content hash == the last-synced hash) is dropped
 		// client-side (S4) so an adoption-shaped edit dies here instead of
 		// round-tripping to the server's inline-size rejection.
@@ -159,7 +161,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 					event.Content = []byte(entry.Payload)
 					event.Size = int64(len(entry.Payload))
 				} else {
-					localPath := filepath.Join(workspaceRoot, syncproto.LocalizePath(entry.Path))
+					localPath := filepath.Join(notespaceRoot, syncproto.LocalizePath(entry.Path))
 					content, err := os.ReadFile(localPath)
 					if err != nil {
 						if os.IsNotExist(err) {
@@ -198,7 +200,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 			// manufactured conflict (base_version defaults to 0).
 			if event.Type == syncproto.EventDocumentUpdated ||
 				event.Type == syncproto.EventDocumentCreated {
-				if doc, derr := p.db.GetDocumentByPath(p.workspace, entry.Path); derr == nil && doc != nil {
+				if doc, derr := p.db.GetDocumentByPath(p.notespace, entry.Path); derr == nil && doc != nil {
 					if event.Type == syncproto.EventDocumentUpdated {
 						event.BaseVersion = doc.LastSyncedVersion
 						if event.DocumentID == "" {
@@ -233,7 +235,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 			if event.Type == syncproto.EventDocumentDeleted ||
 				event.Type == syncproto.EventDocumentMoved {
 				if event.BaseVersion == 0 {
-					if doc, derr := p.db.GetDocumentByPath(p.workspace, entry.Path); derr == nil && doc != nil {
+					if doc, derr := p.db.GetDocumentByPath(p.notespace, entry.Path); derr == nil && doc != nil {
 						event.BaseVersion = doc.LastSyncedVersion
 						if event.DocumentID == "" {
 							event.DocumentID = doc.DocumentID
@@ -290,7 +292,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 						Field("size", events[i].Size).
 						Field("limit", maxBlob).Log(ctx)
 					if p.OnOversizeSkipped != nil {
-						p.OnOversizeSkipped(p.workspace, events[i].Path, events[i].Size, maxBlob)
+						p.OnOversizeSkipped(p.notespace, events[i].Path, events[i].Size, maxBlob)
 					}
 					continue
 				default:
@@ -347,7 +349,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 			default:
 			}
 
-			pushResp, pushErr = p.client.Push(ctx, p.workspace, events)
+			pushResp, pushErr = p.client.Push(ctx, p.notespace, events)
 			if pushErr == nil {
 				break
 			}
@@ -421,7 +423,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				if result.DocumentID != "" && events[i].DocumentID == "" {
 					if err := p.db.UpsertDocument(&Document{
 						DocumentID:        result.DocumentID,
-						Workspace:         p.workspace,
+						Notespace:         p.notespace,
 						Path:              events[i].Path,
 						ContentHash:       events[i].ContentHash,
 						BaseContent:       events[i].Content,
@@ -446,7 +448,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 					// overwrite content_hash (which tracks the disk file, still
 					// lagging) or clear the diverged flag — the file stays
 					// diverged until `nb sync adopt`.
-					if doc, derr := p.db.GetDocumentByPath(p.workspace, events[i].Path); derr == nil && doc != nil && doc.Diverged {
+					if doc, derr := p.db.GetDocumentByPath(p.notespace, events[i].Path); derr == nil && doc != nil && doc.Diverged {
 						doc.LastSyncedVersion = result.Version
 						doc.LastSyncedHash = events[i].ContentHash
 						doc.BaseContent = events[i].Content
@@ -478,7 +480,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				// backoff; a failed one just backs off instead of spinning.
 				// The rebase retargets the entry's Payload at the merged server
 				// head and advances the doc's merge base; it NEVER writes the
-				// workspace file (S5). When the merge diverges from disk it
+				// notespace file (S5). When the merge diverges from disk it
 				// flags the doc diverged and the entry parks with reason
 				// "diverged" (free-form park_reason, no schema change) so the
 				// user knows to `nb sync adopt`.
@@ -492,10 +494,10 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 				reason := "conflict"
 				if events[i].Type == syncproto.EventDocumentUpdated ||
 					events[i].Type == syncproto.EventDocumentCreated {
-					if _, diverged := p.rebaseConflictedEntry(ctx, workspaceRoot, entries[i], &result); diverged {
+					if _, diverged := p.rebaseConflictedEntry(ctx, notespaceRoot, entries[i], &result); diverged {
 						reason = "diverged"
 						if p.OnDiverged != nil {
-							p.OnDiverged(p.workspace, events[i].Path)
+							p.OnDiverged(p.notespace, events[i].Path)
 						}
 					}
 				}
@@ -574,11 +576,11 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 			break
 		}
 
-		// Update workspace cursor after successful push
+		// Update notespace cursor after successful push
 		if pushResp.Cursor > 0 {
-			if err := p.db.SetCursor(p.workspace, pushResp.Cursor); err != nil {
+			if err := p.db.SetCursor(p.notespace, pushResp.Cursor); err != nil {
 				p.log.Warn("failed to update cursor after push").
-					Field("workspace", p.workspace).
+					Field("notespace", p.notespace).
 					Err(err).Log(ctx)
 			}
 		}
@@ -598,7 +600,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, workspaceRoot string) (i
 func (p *PushPipeline) selfHealUnknownDocument(entry *OutboxEntry) error {
 	docID := entry.DocumentID
 	if docID == "" {
-		doc, err := p.db.GetDocumentByPath(p.workspace, entry.Path)
+		doc, err := p.db.GetDocumentByPath(p.notespace, entry.Path)
 		if err != nil {
 			return err
 		}
@@ -631,7 +633,7 @@ func (p *PushPipeline) conflictBackoff(attempts int) time.Duration {
 // content over the stored merge base (frontmatter per-key LWW, body line-based
 // diff3), and on a clean merge RETARGET THE OUTBOX ENTRY at the merged bytes
 // (carried as Payload) and roll the doc's merge base forward — WITHOUT ever
-// writing the workspace file. The local file is left as the user last saved it;
+// writing the notespace file. The local file is left as the user last saved it;
 // when the merge differs from disk the doc enters the `diverged` state, resolved
 // only by an explicit `nb sync adopt`.
 //
@@ -656,7 +658,7 @@ func (p *PushPipeline) conflictBackoff(attempts int) time.Duration {
 // There is NO mid-rebase re-read guard: nothing is written, so there is nothing
 // to guard. A local edit that lands mid-rebase is simply the next local state of
 // a now-diverged doc, held (like every diverged edit) until adopt.
-func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot string, entry *OutboxEntry, result *syncproto.PushResult) (rebased, diverged bool) {
+func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, notespaceRoot string, entry *OutboxEntry, result *syncproto.PushResult) (rebased, diverged bool) {
 	docID := result.DocumentID
 	if docID == "" {
 		docID = entry.DocumentID
@@ -666,27 +668,36 @@ func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot 
 		return false, false
 	}
 
-	doc, err := p.db.GetDocumentByPath(p.workspace, entry.Path)
+	doc, err := p.db.GetDocumentByPath(p.notespace, entry.Path)
 	if err != nil || doc == nil {
 		return false, false
 	}
 
 	// Read the local disk content — reading is fine, writing is not (S5). It is
 	// the "local" leg of the 3-way merge; the file is never modified.
-	localPath := filepath.Join(workspaceRoot, syncproto.LocalizePath(entry.Path))
+	localPath := filepath.Join(notespaceRoot, syncproto.LocalizePath(entry.Path))
 	localContent, err := os.ReadFile(localPath)
 	if err != nil {
 		return false, false
 	}
 	localHash := hashContent(localContent)
 
-	serverContent, err := p.client.HistoryBlob(ctx, p.workspace, docID, result.Version)
+	serverContent, err := p.client.HistoryBlob(ctx, p.notespace, docID, result.Version)
 	if err != nil {
 		// Transient: stay parked, no artifact, retry next tick.
 		p.log.Debug("rebase: failed to fetch server head").
 			Field("path", entry.Path).
 			Field("server_version", result.Version).
 			Err(err).Log(ctx)
+		return false, false
+	}
+
+	if notespacepkg.IsIdentityStamp(entry.Path) && hashContent(serverContent) != localHash {
+		detail := "identity stamp differs from the registered local identity; automatic merge is forbidden"
+		_, _ = WriteRegistrationConflict(p.notespace, detail)
+		if p.OnConflict != nil {
+			p.OnConflict(ConflictKindRegistration, p.notespace, entry.Path, docID, detail)
+		}
 		return false, false
 	}
 
@@ -801,7 +812,7 @@ func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, workspaceRoot 
 // recordConflict — unless one already exists for this document (the entry is
 // retried every tick; the artifact is written once per divergence).
 func (p *PushPipeline) recordConflictArtifact(ctx context.Context, path, docID string, localContent []byte) {
-	conflictDir := filepath.Join(paths.StateDir(), "sync", "conflicts", p.workspace)
+	conflictDir := filepath.Join(paths.StateDir(), "sync", "conflicts", p.notespace)
 	conflictFile := filepath.Join(conflictDir, fmt.Sprintf("%s.%s.conflict.md", path, docID))
 	if _, err := os.Stat(conflictFile); err == nil {
 		return // already recorded for this divergence
@@ -812,7 +823,7 @@ func (p *PushPipeline) recordConflictArtifact(ctx context.Context, path, docID s
 		return
 	}
 	p.log.Info("conflict recorded").
-		Field("workspace", p.workspace).
+		Field("notespace", p.notespace).
 		Field("path", path).
 		Field("artifact", conflictFile).Log(ctx)
 }
@@ -848,9 +859,9 @@ func (p *PushPipeline) uploadFileBlobs(ctx context.Context, path string, content
 }
 
 // RunPushLoop starts a long-running goroutine that periodically drains the
-// outbox. It blocks until the context is cancelled. The workspaceRoot parameter
+// outbox. It blocks until the context is cancelled. The notespaceRoot parameter
 // is required to read file content from disk.
-func (p *PushPipeline) RunPushLoop(ctx context.Context, workspaceRoot string) error {
+func (p *PushPipeline) RunPushLoop(ctx context.Context, notespaceRoot string) error {
 	ticker := time.NewTicker(p.cfg.CheckInterval)
 	defer ticker.Stop()
 
@@ -858,13 +869,13 @@ func (p *PushPipeline) RunPushLoop(ctx context.Context, workspaceRoot string) er
 		select {
 		case <-ctx.Done():
 			// Final drain before shutdown
-			if _, err := p.DrainOutbox(ctx, workspaceRoot); err != nil && err != context.Canceled {
+			if _, err := p.DrainOutbox(ctx, notespaceRoot); err != nil && err != context.Canceled {
 				p.log.Error("final push drain failed").Err(err).Log(ctx)
 			}
 			return ctx.Err()
 
 		case <-ticker.C:
-			count, err := p.DrainOutbox(ctx, workspaceRoot)
+			count, err := p.DrainOutbox(ctx, notespaceRoot)
 			if err != nil {
 				if err == context.Canceled {
 					return err
@@ -874,7 +885,7 @@ func (p *PushPipeline) RunPushLoop(ctx context.Context, workspaceRoot string) er
 			} else if count > 0 {
 				p.log.Debug("drained outbox entries").
 					Field("count", count).
-					Field("workspace", p.workspace).Log(ctx)
+					Field("notespace", p.notespace).Log(ctx)
 			}
 		}
 	}

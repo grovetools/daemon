@@ -49,14 +49,15 @@ type Event struct {
 // ~20 payload structs and gains more with every subsystem, and every one of
 // them already spells these concepts with the same JSON keys.
 type payloadProbe struct {
-	ID        string `json:"id"`
-	JobID     string `json:"job_id"`
-	Workspace string `json:"workspace"`
-	PlanName  string `json:"plan_name"`
-	Plan      string `json:"plan"`
-	Status    string `json:"status"`
-	State     string `json:"state"`
-	Origin    string `json:"origin"`
+	ID            string `json:"id"`
+	JobID         string `json:"job_id"`
+	Workspace     string `json:"workspace"`
+	NotespaceName string `json:"notespace_name"`
+	PlanName      string `json:"plan_name"`
+	Plan          string `json:"plan"`
+	Status        string `json:"status"`
+	State         string `json:"state"`
+	Origin        string `json:"origin"`
 	// Event is NoteEvent's discriminator ("created", "deleted", …), which is
 	// the closest thing that payload has to a status.
 	Event string `json:"event"`
@@ -92,7 +93,7 @@ func NewEvent(u store.Update, now time.Time) Event {
 		return ev
 	}
 	ev.JobID = firstNonEmpty(probe.JobID, probe.ID)
-	ev.Workspace = firstNonEmpty(probe.Workspace, probe.Path)
+	ev.Workspace = firstNonEmpty(probe.Workspace, probe.NotespaceName, probe.Path)
 	ev.Plan = firstNonEmpty(probe.PlanName, probe.Plan)
 	ev.Status = firstNonEmpty(probe.Status, probe.State, probe.Event)
 	if probe.Origin != "" {

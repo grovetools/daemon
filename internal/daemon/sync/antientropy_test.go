@@ -62,7 +62,7 @@ func TestAntiEntropyAdoptRollsMergeBase(t *testing.T) {
 	// last-synced fields and merge base are stuck at an older version.
 	if err := db.InsertDocument(&Document{
 		DocumentID:        "doc-1",
-		Workspace:         "default",
+		Notespace:         "default",
 		Path:              "inbox/note.md",
 		ContentHash:       sha(content),
 		LastSyncedHash:    sha(stale),
@@ -73,8 +73,8 @@ func TestAntiEntropyAdoptRollsMergeBase(t *testing.T) {
 	}
 
 	srv := serveSnapshotStub(t, &syncproto.SnapshotManifest{
-		Workspace: "default",
-		Cursor:    42,
+		NotespaceID: "default",
+		Cursor:      42,
 		Documents: []syncproto.DocumentSnapshot{
 			{ID: "doc-1", Path: "inbox/note.md", Version: 12, Hash: sha(content), Size: int64(len(content))},
 		},
@@ -139,7 +139,7 @@ func TestSweepEnqueuesCreateForOfflineBornDoc(t *testing.T) {
 	}
 	if err := db.InsertDocument(&Document{
 		DocumentID:  "doc-1",
-		Workspace:   "default",
+		Notespace:   "default",
 		Path:        "inbox/offline.md",
 		ContentHash: sha(content),
 		// never synced: version 0, last_synced_hash ""
@@ -234,7 +234,7 @@ func TestSweepSkipsDocsWithPendingOutbox(t *testing.T) {
 	// Parked conflict: the entry stays queued until the pull pipeline merges.
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
 		DocumentID:  "doc-1",
-		Workspace:   "default",
+		Notespace:   "default",
 		EventType:   syncproto.EventDocumentUpdated,
 		Path:        "inbox/note.md",
 		ContentHash: sha(edited),
@@ -272,7 +272,7 @@ func TestSweepSkipsQuarantinedContent(t *testing.T) {
 	}
 	if err := db.InsertDocument(&Document{
 		DocumentID:  "doc-1",
-		Workspace:   "default",
+		Notespace:   "default",
 		Path:        "inbox/secret.md",
 		ContentHash: sha(secret),
 	}); err != nil {
@@ -303,7 +303,7 @@ func TestSweepHandlesMissingFiles(t *testing.T) {
 	// Synced doc, file deleted offline.
 	if err := db.InsertDocument(&Document{
 		DocumentID:        "doc-1",
-		Workspace:         "default",
+		Notespace:         "default",
 		Path:              "inbox/deleted.md",
 		ContentHash:       "aaaa",
 		LastSyncedHash:    "aaaa",
@@ -315,7 +315,7 @@ func TestSweepHandlesMissingFiles(t *testing.T) {
 	// Never-synced doc, file gone: nothing to replicate.
 	if err := db.InsertDocument(&Document{
 		DocumentID:  "doc-2",
-		Workspace:   "default",
+		Notespace:   "default",
 		Path:        "inbox/ghost.md",
 		ContentHash: "bbbb",
 	}); err != nil {
@@ -411,7 +411,7 @@ func TestWalkLocalTreeSkipsTracked(t *testing.T) {
 	// Pre-seed a row for tracked.md, mimicking a partial sync.db.
 	if err := db.UpsertDocument(&Document{
 		DocumentID:  "doc-tracked",
-		Workspace:   "default",
+		Notespace:   "default",
 		Path:        "inbox/tracked.md",
 		ContentHash: hashContent([]byte("already synced\n")),
 	}); err != nil {
@@ -528,7 +528,7 @@ func TestSweepSkipsDivergedDoc(t *testing.T) {
 	// merged server head — disk != last_synced, exactly the shape the sweep
 	// would normally re-enqueue.
 	if err := db.InsertDocument(&Document{
-		DocumentID: "doc-1", Workspace: "default", Path: "inbox/note.md",
+		DocumentID: "doc-1", Notespace: "default", Path: "inbox/note.md",
 		ContentHash: sha(local), LastSyncedHash: sha([]byte("merged head")), LastSyncedVersion: 7,
 		BaseContent: []byte("merged head"), Diverged: true,
 	}); err != nil {

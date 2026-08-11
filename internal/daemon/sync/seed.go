@@ -33,10 +33,10 @@ import (
 // mtime is fine (stat failed / unknown): it rides the wire as "unknown".
 //
 // Exported because the watcher package imports this sync package.
-func InsertAndEnqueue(db *DB, workspace, rel string, content []byte, mtime time.Time) (quarantineReason string, err error) {
+func InsertAndEnqueue(db *DB, notespace, rel string, content []byte, mtime time.Time) (quarantineReason string, err error) {
 	hash := hashContent(content)
 
-	doc, err := db.GetDocumentByPath(workspace, rel)
+	doc, err := db.GetDocumentByPath(notespace, rel)
 	if err != nil {
 		return "", err
 	}
@@ -62,7 +62,7 @@ func InsertAndEnqueue(db *DB, workspace, rel string, content []byte, mtime time.
 	// agree: an allow-listed file syncs from either path, and a non-overridden
 	// secret is dropped from both. (Before this helper existed, flush never
 	// read the override table, so the allow-list was written-but-dead.)
-	overridden, err := db.IsQuarantineOverridden(workspace, rel)
+	overridden, err := db.IsQuarantineOverridden(notespace, rel)
 	if err != nil {
 		return "", err
 	}
@@ -81,7 +81,7 @@ func InsertAndEnqueue(db *DB, workspace, rel string, content []byte, mtime time.
 
 	if err := db.UpsertDocument(&Document{
 		DocumentID:  documentID,
-		Workspace:   workspace,
+		Notespace:   notespace,
 		Path:        rel,
 		ContentHash: hash,
 	}); err != nil {
@@ -90,7 +90,7 @@ func InsertAndEnqueue(db *DB, workspace, rel string, content []byte, mtime time.
 
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
 		DocumentID:  documentID,
-		Workspace:   workspace,
+		Notespace:   notespace,
 		EventType:   eventType,
 		Path:        rel,
 		ContentHash: hash,

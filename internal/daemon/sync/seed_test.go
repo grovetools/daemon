@@ -164,7 +164,7 @@ func TestInsertAndEnqueueQuarantineOverride(t *testing.T) {
 func TestInsertAndEnqueueSkipsDivergedDoc(t *testing.T) {
 	db := openTestDB(t)
 	if err := db.InsertDocument(&Document{
-		DocumentID: "doc-1", Workspace: "default", Path: "inbox/n.md",
+		DocumentID: "doc-1", Notespace: "default", Path: "inbox/n.md",
 		ContentHash: hashContent([]byte("old local")), LastSyncedHash: hashContent([]byte("merged head")),
 		LastSyncedVersion: 7, Diverged: true,
 	}); err != nil {

@@ -34,7 +34,7 @@ const registryScanInterval = time.Hour
 
 // startRegistryWriter launches the presence-note goroutine. Owned by the
 // SyncHandler because the note's location is derived from a sync subscription
-// (syntheticNodeFor/nodeWorkspaceRoot) and its origin_id comes from sync.db —
+// (syntheticNodeFor/nodeNotespaceRoot) and its origin_id comes from sync.db —
 // both of which the handler already owns and neither of which anything else
 // in the daemon can resolve.
 func (h *SyncHandler) startRegistryWriter(ctx context.Context) {
@@ -114,7 +114,7 @@ func (h *SyncHandler) registryClock() time.Time {
 // This is the one place the sync handler writes into the notebook tree. The
 // notebook-read-only rule protects the user's notes from the sync machinery;
 // the presence note is not the user's note, it is this machine's own document
-// in a workspace reserved for exactly that, and it is single-writer by
+// in a notespace reserved for exactly that, and it is single-writer by
 // construction.
 func (h *SyncHandler) writeRegistryNote(ctx context.Context) {
 	sub := registry.Subscription(h.syncConfigSnapshot())
@@ -128,12 +128,12 @@ func (h *SyncHandler) writeRegistryNote(ctx context.Context) {
 	}
 	node, err := h.syntheticNodeFor(sub.Name)
 	if err != nil {
-		h.warnRegistryOnce(ctx, fmt.Sprintf("registry note skipped: cannot resolve a local root for workspace %q", sub.Name), err)
+		h.warnRegistryOnce(ctx, fmt.Sprintf("registry note skipped: cannot resolve a local root for notespace %q", sub.Name), err)
 		return
 	}
-	root, err := h.nodeWorkspaceRoot(node)
+	root, err := h.nodeNotespaceRoot(node)
 	if err != nil {
-		h.warnRegistryOnce(ctx, fmt.Sprintf("registry note skipped: cannot resolve a local root for workspace %q", sub.Name), err)
+		h.warnRegistryOnce(ctx, fmt.Sprintf("registry note skipped: cannot resolve a local root for notespace %q", sub.Name), err)
 		return
 	}
 
@@ -186,7 +186,7 @@ func (h *SyncHandler) writeRegistryNote(ctx context.Context) {
 	}
 	h.registryWarned = false
 	h.ulog.Info("registry presence note written").
-		Field("workspace", sub.Name).
+		Field("notespace", sub.Name).
 		Field("path", registry.NotePath(id)).
 		Field("rev", note.Rev).
 		StructuredOnly().Log(ctx)

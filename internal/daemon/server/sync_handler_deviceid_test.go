@@ -73,7 +73,7 @@ func writeSandboxSyncConfig(t *testing.T, serverURL string) {
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatalf("mkdir config dir: %v", err)
 	}
-	body := fmt.Sprintf("server = %q\ntoken = \"t\"\n\n[[workspaces]]\nname = \"ws\"\n", serverURL)
+	body := fmt.Sprintf("server = %q\ntoken = \"t\"\n\n[[notespaces]]\nname = \"ws\"\n", serverURL)
 	if err := os.WriteFile(filepath.Join(configDir, "sync.toml"), []byte(body), 0o644); err != nil {
 		t.Fatalf("write sync.toml: %v", err)
 	}

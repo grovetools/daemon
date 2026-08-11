@@ -47,7 +47,7 @@ func TestAuthErrorClassification(t *testing.T) {
 
 	t.Run("other failures are not auth errors", func(t *testing.T) {
 		// 403 above all: it is the server's authorization answer for a token it
-		// RECOGNIZES, on a workspace the user has no grant for. Reading it as a
+		// RECOGNIZES, on a notespace the user has no grant for. Reading it as a
 		// dead token tells operators of valid share-scoped clients to mint a
 		// replacement and puts their transport in a reconnect cycle.
 		for _, code := range []int{http.StatusForbidden, http.StatusInternalServerError} {

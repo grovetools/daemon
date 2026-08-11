@@ -38,7 +38,7 @@ func seedSyncedDoc(t *testing.T, db *DB, root, relPath string, content []byte) {
 	}
 	if err := db.UpsertDocument(&Document{
 		DocumentID:        "doc-1",
-		Workspace:         "default",
+		Notespace:         "default",
 		Path:              relPath,
 		ContentHash:       sha(content),
 		LastSyncedHash:    sha(content),
@@ -92,7 +92,7 @@ func TestApplyUpdatePreservesUnpushedLocalEdit(t *testing.T) {
 	remote := []byte("---\ntitle: note\n---\nshared base body\nremote line\n")
 	p := newTestPullPipeline(t, db)
 	ev := &syncproto.SyncEvent{
-		Type: syncproto.EventDocumentUpdated, Workspace: "default",
+		Type: syncproto.EventDocumentUpdated, NotespaceID: "default",
 		DocumentID: "doc-1", Path: "inbox/note.md",
 		Content: remote, ContentHash: sha(remote), Version: 2,
 	}
@@ -139,7 +139,7 @@ func TestApplyUpdateMergesDisjointRemoteEdits(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-1", Workspace: "default",
+		DocumentID: "doc-1", Notespace: "default",
 		EventType: syncproto.EventDocumentUpdated,
 		Path:      "inbox/note.md", ContentHash: sha(local),
 	}); err != nil {
@@ -150,7 +150,7 @@ func TestApplyUpdateMergesDisjointRemoteEdits(t *testing.T) {
 	remote := []byte("---\ntitle: note\n---\nline one\nline two\nREMOTE three\n")
 	p := newTestPullPipeline(t, db)
 	ev := &syncproto.SyncEvent{
-		Type: syncproto.EventDocumentUpdated, Workspace: "default",
+		Type: syncproto.EventDocumentUpdated, NotespaceID: "default",
 		DocumentID: "doc-1", Path: "inbox/note.md",
 		Content: remote, ContentHash: sha(remote), Version: 2,
 	}
@@ -218,7 +218,7 @@ func TestApplyUpdateOverlappingRemoteEditConflicts(t *testing.T) {
 	remote := []byte("---\ntitle: note\n---\nREMOTE one\nline two\n")
 	p := newTestPullPipeline(t, db)
 	ev := &syncproto.SyncEvent{
-		Type: syncproto.EventDocumentUpdated, Workspace: "default",
+		Type: syncproto.EventDocumentUpdated, NotespaceID: "default",
 		DocumentID: "doc-1", Path: "inbox/note.md",
 		Content: remote, ContentHash: sha(remote), Version: 2,
 	}
@@ -262,7 +262,7 @@ func TestApplyUpdateFastForwardsCleanLocal(t *testing.T) {
 	remote := []byte("---\ntitle: note\n---\nv2 body\n")
 	p := newTestPullPipeline(t, db)
 	ev := &syncproto.SyncEvent{
-		Type: syncproto.EventDocumentUpdated, Workspace: "default",
+		Type: syncproto.EventDocumentUpdated, NotespaceID: "default",
 		DocumentID: "doc-1", Path: "inbox/note.md",
 		Content: remote, ContentHash: sha(remote), Version: 2,
 	}
@@ -298,7 +298,7 @@ func TestApplyCreateRestoresMtime(t *testing.T) {
 	mtime := time.Date(2026, 7, 11, 8, 15, 30, 0, time.Local)
 	content := []byte("---\ntitle: note\n---\nbody\n")
 	ev := &syncproto.SyncEvent{
-		Type: syncproto.EventDocumentCreated, Workspace: "default",
+		Type: syncproto.EventDocumentCreated, NotespaceID: "default",
 		DocumentID: "doc-1", Path: "inbox/new.md",
 		Content: content, ContentHash: sha(content), Version: 1,
 		Mtime: mtime,
@@ -327,7 +327,7 @@ func TestApplyCreateEmptyDocumentSkipsBlobFetch(t *testing.T) {
 	p := newTestPullPipeline(t, db)
 
 	ev := &syncproto.SyncEvent{
-		Type: syncproto.EventDocumentCreated, Workspace: "default",
+		Type: syncproto.EventDocumentCreated, NotespaceID: "default",
 		DocumentID: "doc-1", Path: "rules/placeholder.md.rules",
 		ContentHash: emptyContentHash, Version: 1,
 	}
@@ -364,7 +364,7 @@ func TestApplyUpdateFastForwardRestoresMtime(t *testing.T) {
 	mtime := time.Date(2026, 7, 11, 12, 0, 5, 0, time.Local)
 	remote := []byte("---\ntitle: note\n---\nv2 body\n")
 	ev := &syncproto.SyncEvent{
-		Type: syncproto.EventDocumentUpdated, Workspace: "default",
+		Type: syncproto.EventDocumentUpdated, NotespaceID: "default",
 		DocumentID: "doc-1", Path: "inbox/note.md",
 		Content: remote, ContentHash: sha(remote), Version: 2,
 		Mtime: mtime,
@@ -393,7 +393,7 @@ func TestApplyCreateZeroMtimeKeepsWriteTime(t *testing.T) {
 	before := time.Now().Add(-time.Minute)
 	content := []byte("---\ntitle: legacy\n---\nbody\n")
 	ev := &syncproto.SyncEvent{
-		Type: syncproto.EventDocumentCreated, Workspace: "default",
+		Type: syncproto.EventDocumentCreated, NotespaceID: "default",
 		DocumentID: "doc-legacy", Path: "inbox/legacy.md",
 		Content: content, ContentHash: sha(content), Version: 1,
 	}
@@ -457,7 +457,7 @@ func serveGCStoreStub(t *testing.T, s *gcStoreStub) *httptest.Server {
 			_ = json.NewEncoder(w).Encode(syncproto.PullResponse{
 				SnapshotRequired: true,
 				Cursor:           cursor,
-				Error:            "cursor predates the event retention window; resync from snapshot",
+				Error:            &syncproto.ProtocolError{Code: "cursor_expired", Message: "cursor predates the event retention window; resync from snapshot"},
 			})
 			return
 		}
@@ -529,8 +529,8 @@ func TestRunPullLoopSnapshotResyncOn410(t *testing.T) {
 	stub := &gcStoreStub{
 		watermark: 5,
 		manifest: syncproto.SnapshotManifest{
-			Workspace: "default",
-			Cursor:    5,
+			NotespaceID: "default",
+			Cursor:      5,
 			Documents: []syncproto.DocumentSnapshot{{
 				ID: "doc-gc", Path: "inbox/gc-note.md", Version: 3,
 				Hash: sha(content), Size: int64(len(content)), Mtime: mtime,
@@ -555,7 +555,7 @@ func TestRunPullLoopSnapshotResyncOn410(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		fi, ferr := os.Stat(filePath)
-		cur, _ := db.GetWorkspaceCursor("default")
+		cur, _ := db.GetNotespaceCursor("default")
 		pulls := stub.recordedPulls()
 		if ferr == nil && fi.ModTime().Equal(mtime) && cur == 5 &&
 			len(pulls) >= 2 && pulls[len(pulls)-1] == 5 {
@@ -584,8 +584,8 @@ func TestRunPullLoopSnapshotResyncOn410(t *testing.T) {
 	if !fi.ModTime().Equal(mtime) {
 		t.Fatalf("materialized mtime = %v, want the manifest fidelity mtime %v", fi.ModTime(), mtime)
 	}
-	if cur, _ := db.GetWorkspaceCursor("default"); cur != 5 {
-		t.Fatalf("workspace cursor = %d, want the manifest cursor 5", cur)
+	if cur, _ := db.GetNotespaceCursor("default"); cur != 5 {
+		t.Fatalf("notespace cursor = %d, want the manifest cursor 5", cur)
 	}
 	doc, err := db.GetDocumentByPath("default", "inbox/gc-note.md")
 	if err != nil || doc == nil {
@@ -631,7 +631,7 @@ func TestApplyMoveRestoresMtime(t *testing.T) {
 
 	mtime := time.Date(2026, 7, 11, 17, 45, 0, 0, time.Local)
 	ev := &syncproto.SyncEvent{
-		Type: syncproto.EventDocumentMoved, Workspace: "default",
+		Type: syncproto.EventDocumentMoved, NotespaceID: "default",
 		DocumentID: "doc-1", PrevPath: "inbox/old.md", Path: "inbox/new.md",
 		Version: 2, Mtime: mtime,
 	}

@@ -118,7 +118,7 @@ func (s *Server) handleMemoryAnalysisWorkspaces(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	aggs, err := s.memStore.GetWorkspaceAggregations(r.Context())
+	aggs, err := s.memStore.GetNotespaceAggregations(r.Context())
 	if err != nil {
 		http.Error(w, fmt.Sprintf("workspace aggregation failed: %v", err), http.StatusInternalServerError)
 		return
@@ -133,11 +133,11 @@ func (s *Server) handleMemoryAnalysisWorkspaces(w http.ResponseWriter, r *http.R
 			}
 			fi, err := os.Stat(p.Path)
 			if err == nil && fi.ModTime().After(p.UpdatedAt) {
-				stalePerWs[p.Workspace]++
+				stalePerWs[p.NotespaceID]++
 			}
 		}
 		for _, a := range aggs {
-			a.StaleCount = stalePerWs[a.Workspace]
+			a.StaleCount = stalePerWs[a.NotespaceID]
 		}
 	}
 
@@ -170,8 +170,8 @@ func (s *Server) handleMemoryAnalysisEcosystems(w http.ResponseWriter, r *http.R
 	}
 	indexed := map[string]int{}
 	for _, p := range infos {
-		if p.Workspace != "" {
-			indexed[p.Workspace]++
+		if p.NotespaceName != "" {
+			indexed[p.NotespaceName]++
 		}
 	}
 
@@ -406,7 +406,7 @@ func (s *Server) handleMemoryAnalysisContext(w http.ResponseWriter, r *http.Requ
 
 	out := &models.ContextAnalysis{TotalPresets: len(docs)}
 	for _, d := range docs {
-		stat := models.ContextPresetStat{Workspace: d.Workspace, Path: d.Path}
+		stat := models.ContextPresetStat{NotespaceID: d.NotespaceID, NotespaceName: d.NotespaceName, Path: d.Path}
 		for _, ref := range parsePresetReferences(d.Content) {
 			stat.FileCount++
 			if _, err := os.Stat(ref); os.IsNotExist(err) {

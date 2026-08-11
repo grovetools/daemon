@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/grovetools/core/pkg/models"
+	notespacepkg "github.com/grovetools/core/pkg/notespace"
 	"github.com/grovetools/daemon/internal/daemon/store"
 )
 
@@ -19,6 +20,22 @@ type: oneshot
 body
 `
 
+func TestValidateBundleRootRejectsDisplayNameCollision(t *testing.T) {
+	root := t.TempDir()
+	const actual = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	if _, err := notespacepkg.InstallNotespace(root, notespacepkg.NotespaceStamp{
+		ID: actual, Name: "same-display", Subject: "local:01ARZ3NDEKTSV4RRFFQ69G5FAW", Kind: "notes",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBundleRoot(root, actual); err != nil {
+		t.Fatalf("matching id: %v", err)
+	}
+	if err := validateBundleRoot(root, "01ARZ3NDEKTSV4RRFFQ69G5FAX"); err == nil {
+		t.Fatal("display-selected root with a different id was accepted")
+	}
+}
+
 // TestWriteBundleFilesRoundTripAndIdempotence covers materialize (C12): first
 // write lands the files; a second identical write is a no-op skip.
 func TestWriteBundleFilesRoundTripAndIdempotence(t *testing.T) {
@@ -26,8 +43,9 @@ func TestWriteBundleFilesRoundTripAndIdempotence(t *testing.T) {
 	planDir := filepath.Join(t.TempDir(), "myplan")
 
 	bundle := &models.PlanBundle{
-		Workspace: "ws",
-		PlanName:  "myplan",
+		NotespaceID:   "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+		NotespaceName: "ws",
+		PlanName:      "myplan",
 		Files: map[string][]byte{
 			"01-job.md":       []byte(minimalJob),
 			".grove-plan.yml": []byte("status: active\n"),
@@ -64,7 +82,7 @@ func TestWriteBundleFilesRejectsTraversal(t *testing.T) {
 	jr := newTestRunner(store.New())
 	planDir := filepath.Join(t.TempDir(), "myplan")
 	bundle := &models.PlanBundle{
-		Workspace: "ws", PlanName: "myplan",
+		NotespaceID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", NotespaceName: "ws", PlanName: "myplan",
 		Files: map[string][]byte{"../escape.md": []byte("nope")},
 	}
 	if err := jr.writeBundleFiles(planDir, bundle); err == nil {
@@ -82,7 +100,7 @@ func TestWriteBundleFilesRefusesRunningJobDiff(t *testing.T) {
 	jr := newTestRunner(st)
 	planDir := filepath.Join(t.TempDir(), "myplan")
 
-	v1 := &models.PlanBundle{Workspace: "ws", PlanName: "myplan", Files: map[string][]byte{"01-job.md": []byte("v1")}}
+	v1 := &models.PlanBundle{NotespaceID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", NotespaceName: "ws", PlanName: "myplan", Files: map[string][]byte{"01-job.md": []byte("v1")}}
 	if err := jr.writeBundleFiles(planDir, v1); err != nil {
 		t.Fatalf("initial write: %v", err)
 	}
@@ -96,7 +114,7 @@ func TestWriteBundleFilesRefusesRunningJobDiff(t *testing.T) {
 		},
 	})
 
-	v2 := &models.PlanBundle{Workspace: "ws", PlanName: "myplan", Files: map[string][]byte{"01-job.md": []byte("v2-different")}}
+	v2 := &models.PlanBundle{NotespaceID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", NotespaceName: "ws", PlanName: "myplan", Files: map[string][]byte{"01-job.md": []byte("v2-different")}}
 	if err := jr.writeBundleFiles(planDir, v2); err == nil {
 		t.Fatal("expected refusal when a running job's file differs")
 	}

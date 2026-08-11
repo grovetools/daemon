@@ -10,20 +10,20 @@ import (
 	"github.com/grovetools/core/pkg/syncproto"
 )
 
-// TestEpochResetFansOutToOtherWorkspaces is the second half of the
+// TestEpochResetFansOutToOtherNotespaces is the second half of the
 // recreated-server recovery (contract §3 P2b, scope 2).
 //
 // The detection is per-pass but the reset is GLOBAL: CheckServerEpoch calls
-// ResetForRepushAll, which voids the synced state of every workspace and
+// ResetForRepushAll, which voids the synced state of every notespace and
 // deletes their non-diverged outbox entries. The pass that detected it sweeps
-// itself back into the outbox immediately — but every OTHER workspace was left
+// itself back into the outbox immediately — but every OTHER notespace was left
 // voided, with an empty outbox and no pass scheduled, so nothing of theirs
-// re-pushed until their own hourly tick. On a laptop with a notes workspace
-// and a registry workspace that is up to an hour of a recreated server holding
+// re-pushed until their own hourly tick. On a laptop with a notes notespace
+// and a registry notespace that is up to an hour of a recreated server holding
 // none of one of them.
 //
 // The pass now reports the reset so the transport owner can kick the others.
-func TestEpochResetFansOutToOtherWorkspaces(t *testing.T) {
+func TestEpochResetFansOutToOtherNotespaces(t *testing.T) {
 	db := openTestDB(t)
 	root := t.TempDir()
 
@@ -34,11 +34,11 @@ func TestEpochResetFansOutToOtherWorkspaces(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "inbox", "a.md"), content, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// "default" is the workspace whose pass runs; "registry" is the bystander
+	// "default" is the notespace whose pass runs; "registry" is the bystander
 	// the reset also voids.
 	for _, ws := range []string{"default", "registry"} {
 		if err := db.InsertDocument(&Document{
-			DocumentID: "doc-" + ws, Workspace: ws, Path: "inbox/a.md",
+			DocumentID: "doc-" + ws, Notespace: ws, Path: "inbox/a.md",
 			ContentHash: sha(content), LastSyncedHash: sha(content), LastSyncedVersion: 7,
 			BaseContent: content,
 		}); err != nil {
@@ -61,24 +61,24 @@ func TestEpochResetFansOutToOtherWorkspaces(t *testing.T) {
 
 	var fanout []string
 	ae := newTestAntiEntropy(db, client, root)
-	ae.OnEpochReset = func(workspace string) { fanout = append(fanout, workspace) }
+	ae.OnEpochReset = func(notespace string) { fanout = append(fanout, notespace) }
 
 	if err := ae.Run(ctx); err != nil {
 		t.Fatalf("anti-entropy Run: %v", err)
 	}
 
 	if len(fanout) != 1 || fanout[0] != "default" {
-		t.Fatalf("expected exactly one fan-out naming the detecting workspace, got %v", fanout)
+		t.Fatalf("expected exactly one fan-out naming the detecting notespace, got %v", fanout)
 	}
 
-	// The detecting workspace swept itself; the bystander is voided and idle —
+	// The detecting notespace swept itself; the bystander is voided and idle —
 	// which is exactly why the callback has to exist.
 	entries, err := db.ListOutbox("default", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(entries) != 1 || entries[0].EventType != syncproto.EventDocumentCreated {
-		t.Fatalf("detecting workspace must re-enqueue a create, got %+v", entries)
+		t.Fatalf("detecting notespace must re-enqueue a create, got %+v", entries)
 	}
 	bystander, err := db.GetDocumentByPath("registry", "inbox/a.md")
 	if err != nil || bystander == nil {
@@ -92,7 +92,7 @@ func TestEpochResetFansOutToOtherWorkspaces(t *testing.T) {
 	}
 
 	// A stable epoch never fans out — the kick is not free (a full pass per
-	// workspace) and must not fire on every hourly tick.
+	// notespace) and must not fire on every hourly tick.
 	fanout = nil
 	if err := ae.Run(ctx); err != nil {
 		t.Fatalf("second anti-entropy Run: %v", err)

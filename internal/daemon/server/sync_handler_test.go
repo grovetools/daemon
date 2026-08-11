@@ -33,6 +33,25 @@ func newSyncTestServer(t *testing.T, dbPath string) *Server {
 	return s
 }
 
+func TestHandleSyncStatusReportsLegacyDBMigrationWithoutEnablingPipelines(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir())
+	s := New(false)
+	s.SetSyncDBError(func() string { return syncdb.ErrLegacySchema.Error() })
+	req := httptest.NewRequest(http.MethodGet, "/api/sync/status", nil)
+	w := httptest.NewRecorder()
+	s.handleSyncStatus(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var out syncStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Enabled || !out.Degraded || !strings.Contains(out.MigrationRequired, "grove migrate (step 2)") {
+		t.Fatalf("legacy status=%+v", out)
+	}
+}
+
 func TestHandleSyncDocuments(t *testing.T) {
 	db, _ := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
 	t.Cleanup(func() { _ = db.Close() })
@@ -40,10 +59,10 @@ func TestHandleSyncDocuments(t *testing.T) {
 	s.SetSyncDB(db)
 
 	// One clean (content == last_synced), one dirty (content != last_synced).
-	if err := db.UpsertDocument(&syncdb.Document{DocumentID: "d1", Workspace: "ws", Path: "a.md", ContentHash: "h", LastSyncedHash: "h", LastSyncedVersion: 3}); err != nil {
+	if err := db.UpsertDocument(&syncdb.Document{DocumentID: "d1", Notespace: "ws", Path: "a.md", ContentHash: "h", LastSyncedHash: "h", LastSyncedVersion: 3}); err != nil {
 		t.Fatalf("upsert clean: %v", err)
 	}
-	if err := db.UpsertDocument(&syncdb.Document{DocumentID: "d2", Workspace: "ws", Path: "b.md", ContentHash: "local", LastSyncedHash: "server"}); err != nil {
+	if err := db.UpsertDocument(&syncdb.Document{DocumentID: "d2", Notespace: "ws", Path: "b.md", ContentHash: "local", LastSyncedHash: "server"}); err != nil {
 		t.Fatalf("upsert dirty: %v", err)
 	}
 
@@ -72,8 +91,8 @@ func TestHandleSyncDocuments(t *testing.T) {
 		t.Errorf("d2 should be dirty, got %+v", d)
 	}
 
-	// Workspace filter excludes everything when it doesn't match.
-	req = httptest.NewRequest(http.MethodGet, "/api/sync/documents?workspace=none", nil)
+	// Notespace filter excludes everything when it doesn't match.
+	req = httptest.NewRequest(http.MethodGet, "/api/sync/documents?notespace_id=none", nil)
 	w = httptest.NewRecorder()
 	s.handleSyncDocuments(w, req)
 	var filtered []syncDocumentResponse
@@ -81,7 +100,7 @@ func TestHandleSyncDocuments(t *testing.T) {
 		t.Fatalf("decode filtered: %v", err)
 	}
 	if len(filtered) != 0 {
-		t.Fatalf("expected 0 docs for unknown workspace, got %d", len(filtered))
+		t.Fatalf("expected 0 docs for unknown notespace, got %d", len(filtered))
 	}
 }
 
@@ -101,10 +120,10 @@ func TestHandleSyncOutbox(t *testing.T) {
 	s := New(false)
 	s.SetSyncDB(db)
 
-	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{DocumentID: "d1", Workspace: "ws", EventType: "document.updated", Path: "a.md", ContentHash: "h1", Payload: "secret-body"}); err != nil {
+	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{DocumentID: "d1", Notespace: "ws", EventType: "document.updated", Path: "a.md", ContentHash: "h1", Payload: "secret-body"}); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{DocumentID: "d2", Workspace: "other", EventType: "document.created", Path: "b.md", ContentHash: "h2"}); err != nil {
+	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{DocumentID: "d2", Notespace: "other", EventType: "document.created", Path: "b.md", ContentHash: "h2"}); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
 
@@ -129,8 +148,8 @@ func TestHandleSyncOutbox(t *testing.T) {
 		t.Errorf("unexpected first entry: %+v", entries[0])
 	}
 
-	// Workspace filter.
-	req = httptest.NewRequest(http.MethodGet, "/api/sync/outbox?workspace=other", nil)
+	// Notespace filter.
+	req = httptest.NewRequest(http.MethodGet, "/api/sync/outbox?notespace_id=other", nil)
 	w = httptest.NewRecorder()
 	s.handleSyncOutbox(w, req)
 	var filtered []syncOutboxResponse
@@ -138,14 +157,14 @@ func TestHandleSyncOutbox(t *testing.T) {
 		t.Fatalf("decode filtered: %v", err)
 	}
 	if len(filtered) != 1 || filtered[0].DocumentID != "d2" {
-		t.Fatalf("expected only the 'other' workspace entry, got %+v", filtered)
+		t.Fatalf("expected only the 'other' notespace entry, got %+v", filtered)
 	}
 }
 
 // TestHandleSyncStatusReportsServerAndDirection proves /api/sync/status
 // answers "where is this syncing": the configured server URL plus each
-// workspace's subscription direction (pull) and mode, overlaid onto the
-// sync.db-driven rows by name. A workspace with state but no subscription
+// notespace's subscription direction (pull) and mode, overlaid onto the
+// sync.db-driven rows by name. A notespace with state but no subscription
 // keeps zero values rather than borrowing another entry's.
 func TestHandleSyncStatusReportsServerAndDirection(t *testing.T) {
 	db, _ := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
@@ -178,9 +197,9 @@ func TestHandleSyncStatusReportsServerAndDirection(t *testing.T) {
 	if out.Server != "https://sync.example.com" {
 		t.Errorf("server: got %q want https://sync.example.com", out.Server)
 	}
-	byName := map[string]syncWorkspaceStatus{}
-	for _, ws := range out.Workspaces {
-		byName[ws.Name] = ws
+	byName := map[string]syncNotespaceStatus{}
+	for _, ws := range out.Notespaces {
+		byName[ws.NotespaceID] = ws
 	}
 	if ws := byName["notes"]; !ws.Pull || ws.Mode != "full" || ws.Role != config.SyncRolePeer {
 		t.Errorf("notes: got pull=%v mode=%q role=%q want true/full/peer", ws.Pull, ws.Mode, ws.Role)
@@ -197,7 +216,7 @@ func TestHandleSyncStatusReportsServerAndDirection(t *testing.T) {
 
 // TestHandleSyncStatusWithoutSubscriptions proves the pre-existing payload is
 // unchanged when the subscription view is not wired (nil-safe): no server, no
-// direction, and the workspace rows still come from sync.db.
+// direction, and the notespace rows still come from sync.db.
 func TestHandleSyncStatusWithoutSubscriptions(t *testing.T) {
 	db, _ := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
 	t.Cleanup(func() { _ = db.Close() })
@@ -220,8 +239,8 @@ func TestHandleSyncStatusWithoutSubscriptions(t *testing.T) {
 	if out.Server != "" {
 		t.Errorf("server should be empty without a subscription view, got %q", out.Server)
 	}
-	if len(out.Workspaces) != 1 || out.Workspaces[0].Name != "notes" || out.Workspaces[0].Cursor != 4 {
-		t.Fatalf("workspace rows changed: %+v", out.Workspaces)
+	if len(out.Notespaces) != 1 || out.Notespaces[0].NotespaceID != "notes" || out.Notespaces[0].Cursor != 4 {
+		t.Fatalf("notespace rows changed: %+v", out.Notespaces)
 	}
 }
 
@@ -241,7 +260,7 @@ func TestHandleSyncConflicts(t *testing.T) {
 	const docID = "11111111-2222-3333-4444-555555555555"
 	if err := db.UpsertDocument(&syncdb.Document{
 		DocumentID:  docID,
-		Workspace:   "ws",
+		Notespace:   "ws",
 		Path:        "notes/foo.md",
 		ContentHash: "local",
 		BaseContent: []byte("base body"),
@@ -272,8 +291,8 @@ func TestHandleSyncConflicts(t *testing.T) {
 		t.Fatalf("expected 1 conflict, got %d (%+v)", len(conflicts), conflicts)
 	}
 	c := conflicts[0]
-	if c.Workspace != "ws" {
-		t.Errorf("workspace: got %q want ws", c.Workspace)
+	if c.NotespaceID != "ws" {
+		t.Errorf("notespace: got %q want ws", c.NotespaceID)
 	}
 	if c.Path != "notes/foo.md" {
 		t.Errorf("path: got %q want notes/foo.md", c.Path)
@@ -373,7 +392,7 @@ func TestHandleSyncConflictsEmptyWhenNoStore(t *testing.T) {
 // serveAdoptSyncStub mimics grove-syncd for the adopt endpoint test: the
 // capabilities handshake, a snapshot manifest holding the target doc at head,
 // and the head blob.
-func serveAdoptSyncStub(t *testing.T, workspace, docID, docPath string, version int64, head []byte) *httptest.Server {
+func serveAdoptSyncStub(t *testing.T, notespace, docID, docPath string, version int64, head []byte) *httptest.Server {
 	t.Helper()
 	hash := sha256.Sum256(head)
 	hashHex := hex.EncodeToString(hash[:])
@@ -399,8 +418,8 @@ func serveAdoptSyncStub(t *testing.T, workspace, docID, docPath string, version 
 		case "/sync/snapshot":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(syncproto.SnapshotManifest{
-				Workspace: workspace,
-				Cursor:    version,
+				NotespaceID: syncproto.NotespaceID(notespace),
+				Cursor:      version,
 				Documents: []syncproto.DocumentSnapshot{
 					{ID: docID, Path: docPath, Version: version, Hash: hashHex, Size: int64(len(head))},
 				},
@@ -450,14 +469,14 @@ func TestHandleSyncAdopt(t *testing.T) {
 	// the (untouched) disk file, last_synced already rolled to the head.
 	localHash := "abc123localdiskhash"
 	if err := db.InsertDocument(&syncdb.Document{
-		DocumentID: "doc-1", Workspace: "ws", Path: "inbox/note.md",
+		DocumentID: "doc-1", Notespace: "ws", Path: "inbox/note.md",
 		ContentHash: localHash, LastSyncedHash: headHash, LastSyncedVersion: 8,
 		BaseContent: head, Diverged: true,
 	}); err != nil {
 		t.Fatalf("InsertDocument: %v", err)
 	}
 
-	body, _ := json.Marshal(map[string]string{"workspace": "ws", "path": "inbox/note.md"})
+	body, _ := json.Marshal(map[string]string{"notespace_id": "ws", "path": "inbox/note.md"})
 	req := httptest.NewRequest(http.MethodPost, "/api/sync/adopt", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	s.handleSyncAdopt(w, req)
@@ -489,7 +508,7 @@ func TestHandleSyncAdoptNotTracked(t *testing.T) {
 	t.Setenv("GROVE_HOME", t.TempDir())
 	s := newSyncTestServer(t, filepath.Join(t.TempDir(), "sync.db"))
 
-	body, _ := json.Marshal(map[string]string{"workspace": "ws", "path": "inbox/missing.md"})
+	body, _ := json.Marshal(map[string]string{"notespace_id": "ws", "path": "inbox/missing.md"})
 	req := httptest.NewRequest(http.MethodPost, "/api/sync/adopt", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	s.handleSyncAdopt(w, req)
@@ -509,7 +528,7 @@ func TestHandleSyncAdoptConflictsWithPendingPush(t *testing.T) {
 	s.SetSyncDB(db)
 
 	if err := db.InsertDocument(&syncdb.Document{
-		DocumentID: "doc-1", Workspace: "ws", Path: "inbox/note.md",
+		DocumentID: "doc-1", Notespace: "ws", Path: "inbox/note.md",
 		ContentHash: "local", LastSyncedHash: "head", LastSyncedVersion: 8, Diverged: true,
 	}); err != nil {
 		t.Fatalf("InsertDocument: %v", err)
@@ -517,13 +536,13 @@ func TestHandleSyncAdoptConflictsWithPendingPush(t *testing.T) {
 	// An unpushed (merged) entry still queued for this path: adopting past it
 	// would drop the user's merged-in lines from the hub, so adopt must 409.
 	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{
-		DocumentID: "doc-1", Workspace: "ws", EventType: "document.updated",
+		DocumentID: "doc-1", Notespace: "ws", EventType: "document.updated",
 		Path: "inbox/note.md", ContentHash: "merged", Payload: "merged body",
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox: %v", err)
 	}
 
-	body, _ := json.Marshal(map[string]string{"workspace": "ws", "path": "inbox/note.md"})
+	body, _ := json.Marshal(map[string]string{"notespace_id": "ws", "path": "inbox/note.md"})
 	req := httptest.NewRequest(http.MethodPost, "/api/sync/adopt", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	s.handleSyncAdopt(w, req)

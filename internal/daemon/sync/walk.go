@@ -13,13 +13,13 @@ import (
 // O(included dirs): .git/, .artifacts/, .grove/rules/ etc. are never descended
 // and never stat'd (fs.DirEntry carries the type from readdir — no os.Stat).
 //
-// Paths handed to the callbacks are slash-normalized workspace-relative
+// Paths handed to the callbacks are slash-normalized notespace-relative
 // (syncproto.NormalizePath), matching what DocSpace.Included, the watcher's
 // lookupWatch, and the wire protocol expect. The root itself is passed with
 // rel == "" (always Included; callers key on abs).
 //
 // This is the shared prune-aware walk reused by the watcher's recursive watch
-// enumeration (Phase 2, computeWorkspaceWatches) and the anti-entropy reconcile
+// enumeration (Phase 2, computeNotespaceWatches) and the anti-entropy reconcile
 // pass (Phase 3, walkLocalTree). It lives on DocSpace in the sync package so
 // antientropy.go can call it with the same DocSpace the watcher built — no
 // import cycle — guaranteeing watch coverage and reconcile coverage can never
@@ -28,8 +28,8 @@ import (
 // onFile may be nil (Phase 2 registers directories only). Symlinked directories
 // are not followed (filepath.WalkDir semantics — acceptable for the notebook
 // tree). Transient per-entry errors (permission denied, race-deleted entries)
-// are skipped; a failure on the root itself (a vanished workspace) is returned
-// to the caller, who skips the workspace this tick like a failed os.Stat.
+// are skipped; a failure on the root itself (a vanished notespace) is returned
+// to the caller, who skips the notespace this tick like a failed os.Stat.
 func (d *DocSpace) WalkTree(root string,
 	onDir func(abs, rel string) error,
 	onFile func(abs, rel string, de fs.DirEntry) error,

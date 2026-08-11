@@ -8,7 +8,7 @@ import (
 )
 
 // epochMu serializes CheckServerEpoch across the callers that can race it
-// (the transport connect and each workspace's anti-entropy pass), so an epoch
+// (the transport connect and each notespace's anti-entropy pass), so an epoch
 // change triggers exactly one full reset instead of one per goroutine.
 var epochMu gosync.Mutex
 
@@ -27,7 +27,7 @@ var epochMu gosync.Mutex
 //   - stored == ""          → first contact (or first post-upgrade handshake):
 //     record the epoch, no re-push.
 //   - stored != received    → the server was recreated: void every
-//     workspace's synced state (ResetForRepush) so the next anti-entropy
+//     notespace's synced state (ResetForRepush) so the next anti-entropy
 //     sweep re-pushes the full document set as creates with stable ids,
 //     then record the new epoch.
 //
@@ -56,14 +56,14 @@ func CheckServerEpoch(ctx context.Context, db *DB, received string, log *logging
 			Field("stored_epoch", stored).
 			Field("server_epoch", received).Log(ctx)
 	}
-	docs, workspaces, err := db.ResetForRepushAll()
+	docs, notespaces, err := db.ResetForRepushAll()
 	if err != nil {
 		return false, err
 	}
 	if log != nil {
 		log.Warn("reset local sync state for full re-push").
 			Field("documents_reset", docs).
-			Field("workspaces", len(workspaces)).Log(ctx)
+			Field("notespaces", len(notespaces)).Log(ctx)
 	}
 	return true, db.SetServerEpoch(received)
 }

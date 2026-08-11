@@ -37,23 +37,36 @@ func (s *Server) SetSyncDB(db *syncdb.DB) {
 	s.syncDB.Store(db)
 }
 
+// SetSyncDBError exposes non-mutating legacy-schema refusal through status.
+func (s *Server) SetSyncDBError(status func() string) { s.syncDBError = status }
+
 // syncDatabase returns the wired sync database, or nil while sync is dormant.
 func (s *Server) syncDatabase() *syncdb.DB {
 	return s.syncDB.Load()
 }
 
+func (s *Server) syncNotespaceName(id string) string {
+	if s.syncDatabase() == nil {
+		return ""
+	}
+	if binding, _ := s.syncDatabase().GetNotespaceBinding(id); binding != nil {
+		return binding.Name
+	}
+	return ""
+}
+
 // SetSyncKick wires the watcher SyncHandler's anti-entropy kick into the
 // server so POST /api/sync/repush can trigger an immediate reconcile pass
-// (workspace-scoped, or all workspaces for ""). Nil-safe: without it the
+// (notespace-scoped, or all notespaces for ""). Nil-safe: without it the
 // reset still lands and the hourly anti-entropy tick performs the re-push.
-func (s *Server) SetSyncKick(kick func(workspace string)) {
+func (s *Server) SetSyncKick(kick func(notespace string)) {
 	s.syncKick = kick
 }
 
-// SetSyncWorkspaceRoots wires configured notebook-root resolution into the
+// SetSyncNotespaceRoots wires configured notebook-root resolution into the
 // explicit batch-apply endpoint.
-func (s *Server) SetSyncWorkspaceRoots(resolve func([]string) (map[string]string, error)) {
-	s.syncWorkspaceRoots = resolve
+func (s *Server) SetSyncNotespaceRoots(resolve func([]string) (map[string]string, error)) {
+	s.syncNotespaceRoots = resolve
 }
 
 // SetSyncMaintenance wires the watcher-owned synchronous drain. The server
@@ -65,8 +78,8 @@ func (s *Server) SetSyncMaintenance(begin func(context.Context) error, end func(
 }
 
 // SetSyncSubscriptions wires the watcher SyncHandler's live subscription view
-// (server URL + per-workspace pull/mode) into the server so GET
-// /api/sync/status can report where each workspace syncs and in which
+// (server URL + per-notespace pull/mode) into the server so GET
+// /api/sync/status can report where each notespace syncs and in which
 // direction. A function, not a captured config, so a hot reload is reflected
 // without a daemon restart. Nil-safe: without it the status payload simply
 // omits the server and direction fields, exactly as it did before.
@@ -114,22 +127,24 @@ type syncStatusResponse struct {
 	DocumentsDiverged int                   `json:"documents_diverged"`
 	OutboxPending     int                   `json:"outbox_pending"`
 	OutboxParked      int                   `json:"outbox_parked"`
-	Workspaces        []syncWorkspaceStatus `json:"workspaces,omitempty"`
+	Notespaces        []syncNotespaceStatus `json:"notespaces,omitempty"`
+	MigrationRequired string                `json:"migration_required,omitempty"`
 }
 
-type syncWorkspaceStatus struct {
-	Name         string                    `json:"name"`
-	Cursor       int64                     `json:"cursor"`
-	LastSyncedAt time.Time                 `json:"last_synced_at,omitzero"`
-	Hydration    *syncdb.HydrationProgress `json:"hydration,omitempty"`
-	// Pull and Mode mirror the subscription this workspace syncs under
+type syncNotespaceStatus struct {
+	NotespaceID   string                    `json:"notespace_id"`
+	NotespaceName string                    `json:"notespace_name,omitempty"`
+	Cursor        int64                     `json:"cursor"`
+	LastSyncedAt  time.Time                 `json:"last_synced_at,omitzero"`
+	Hydration     *syncdb.HydrationProgress `json:"hydration,omitempty"`
+	// Pull and Mode mirror the subscription this notespace syncs under
 	// (config.SyncWorkspace): Pull=false is push-only, Mode filters what is
-	// subscribed. Zero values when the workspace has sync.db state but no
+	// subscribed. Zero values when the notespace has sync.db state but no
 	// matching subscription (e.g. a subscription removed from sync.toml).
 	Pull bool   `json:"pull,omitempty"`
 	Mode string `json:"mode,omitempty"`
 	// Role is the subscription's relationship: satellite, peer, or registry.
-	// Empty is a legacy role-less entry (push-only) — or a workspace with no
+	// Empty is a legacy role-less entry (push-only) — or a notespace with no
 	// matching subscription at all.
 	Role string `json:"role,omitempty"`
 }
@@ -162,6 +177,12 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		if detail, since, failing := s.syncAuthFailure(); failing {
 			out.AuthError = detail
 			out.AuthErrorSince = since
+		}
+	}
+	if s.syncDBError != nil {
+		out.MigrationRequired = s.syncDBError()
+		if out.MigrationRequired != "" {
+			out.Degraded = true
 		}
 	}
 	if s.syncDatabase() != nil {
@@ -197,18 +218,25 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		if states, err := s.syncDatabase().ListStates(); err == nil {
 			for _, st := range states {
-				ws := syncWorkspaceStatus{
-					Name:         st.Workspace,
+				ws := syncNotespaceStatus{
+					NotespaceID:  st.Notespace,
 					Cursor:       st.Cursor,
 					LastSyncedAt: st.LastSyncedAt,
-					Hydration:    syncdb.HydrationStatus(st.Workspace),
+					Hydration:    syncdb.HydrationStatus(st.Notespace),
 				}
-				if sub, ok := subsByName[st.Workspace]; ok {
+				if binding, _ := s.syncDatabase().GetNotespaceBinding(st.Notespace); binding != nil {
+					ws.NotespaceName = binding.Name
+				} else {
+					// Fresh v2 databases always have a binding before state. The
+					// fallback keeps status diagnostic for synthetic/test rows only.
+					ws.NotespaceName = st.Notespace
+				}
+				if sub, ok := subsByName[ws.NotespaceName]; ok {
 					ws.Pull = sub.Pull
 					ws.Mode = sub.Mode
 					ws.Role = sub.Role
 				}
-				out.Workspaces = append(out.Workspaces, ws)
+				out.Notespaces = append(out.Notespaces, ws)
 			}
 		}
 	}
@@ -223,7 +251,8 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 // should read dirty was the visible symptom of the fast-forward clobber bug).
 type syncDocumentResponse struct {
 	DocumentID     string `json:"document_id"`
-	Workspace      string `json:"workspace"`
+	NotespaceID    string `json:"notespace_id"`
+	NotespaceName  string `json:"notespace_name,omitempty"`
 	Path           string `json:"path"`
 	Version        int64  `json:"version"`
 	ContentHash    string `json:"content_hash"`
@@ -232,7 +261,7 @@ type syncDocumentResponse struct {
 	Diverged       bool   `json:"diverged"`
 }
 
-// handleSyncDocuments handles GET /api/sync/documents[?workspace=W], returning
+// handleSyncDocuments handles GET /api/sync/documents[?notespace=W], returning
 // per-document sync state with a computed is_dirty flag. Read-only.
 func (s *Server) handleSyncDocuments(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -249,7 +278,7 @@ func (s *Server) handleSyncDocuments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	docs, err := s.syncDatabase().ListDocuments(r.URL.Query().Get("workspace"))
+	docs, err := s.syncDatabase().ListDocuments(r.URL.Query().Get("notespace_id"))
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to list documents: %v", err), http.StatusInternalServerError)
 		return
@@ -259,7 +288,8 @@ func (s *Server) handleSyncDocuments(w http.ResponseWriter, r *http.Request) {
 	for _, doc := range docs {
 		out = append(out, syncDocumentResponse{
 			DocumentID:     doc.DocumentID,
-			Workspace:      doc.Workspace,
+			NotespaceID:    doc.Notespace,
+			NotespaceName:  s.syncNotespaceName(doc.Notespace),
 			Path:           doc.Path,
 			Version:        doc.LastSyncedVersion,
 			ContentHash:    doc.ContentHash,
@@ -278,21 +308,22 @@ func (s *Server) handleSyncDocuments(w http.ResponseWriter, r *http.Request) {
 // full document body) — this view drives the "parked" matrix indicator, not a
 // content diff.
 type syncOutboxResponse struct {
-	ID          int64     `json:"id"`
-	DocumentID  string    `json:"document_id"`
-	Workspace   string    `json:"workspace"`
-	EventType   string    `json:"event_type"`
-	Path        string    `json:"path"`
-	PrevPath    string    `json:"prev_path,omitempty"`
-	ContentHash string    `json:"content_hash"`
-	CreatedAt   time.Time `json:"created_at"`
-	Parked      bool      `json:"parked,omitempty"`
-	Attempts    int       `json:"attempts,omitempty"`
-	NextRetryAt time.Time `json:"next_retry_at,omitzero"`
-	ParkReason  string    `json:"park_reason,omitempty"`
+	ID            int64     `json:"id"`
+	DocumentID    string    `json:"document_id"`
+	NotespaceID   string    `json:"notespace_id"`
+	NotespaceName string    `json:"notespace_name,omitempty"`
+	EventType     string    `json:"event_type"`
+	Path          string    `json:"path"`
+	PrevPath      string    `json:"prev_path,omitempty"`
+	ContentHash   string    `json:"content_hash"`
+	CreatedAt     time.Time `json:"created_at"`
+	Parked        bool      `json:"parked,omitempty"`
+	Attempts      int       `json:"attempts,omitempty"`
+	NextRetryAt   time.Time `json:"next_retry_at,omitzero"`
+	ParkReason    string    `json:"park_reason,omitempty"`
 }
 
-// handleSyncOutbox handles GET /api/sync/outbox[?workspace=W], returning the
+// handleSyncOutbox handles GET /api/sync/outbox[?notespace=W], returning the
 // pending push queue in insertion order. Read-only.
 func (s *Server) handleSyncOutbox(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -308,7 +339,7 @@ func (s *Server) handleSyncOutbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := s.syncDatabase().ListOutbox(r.URL.Query().Get("workspace"), 0)
+	entries, err := s.syncDatabase().ListOutbox(r.URL.Query().Get("notespace_id"), 0)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to list outbox: %v", err), http.StatusInternalServerError)
 		return
@@ -317,18 +348,19 @@ func (s *Server) handleSyncOutbox(w http.ResponseWriter, r *http.Request) {
 	out := make([]syncOutboxResponse, 0, len(entries))
 	for _, e := range entries {
 		out = append(out, syncOutboxResponse{
-			ID:          e.ID,
-			DocumentID:  e.DocumentID,
-			Workspace:   e.Workspace,
-			EventType:   e.EventType,
-			Path:        e.Path,
-			PrevPath:    e.PrevPath,
-			ContentHash: e.ContentHash,
-			CreatedAt:   e.CreatedAt,
-			Parked:      e.Parked,
-			Attempts:    e.Attempts,
-			NextRetryAt: e.NextRetryAt,
-			ParkReason:  e.ParkReason,
+			ID:            e.ID,
+			DocumentID:    e.DocumentID,
+			NotespaceID:   e.Notespace,
+			NotespaceName: s.syncNotespaceName(e.Notespace),
+			EventType:     e.EventType,
+			Path:          e.Path,
+			PrevPath:      e.PrevPath,
+			ContentHash:   e.ContentHash,
+			CreatedAt:     e.CreatedAt,
+			Parked:        e.Parked,
+			Attempts:      e.Attempts,
+			NextRetryAt:   e.NextRetryAt,
+			ParkReason:    e.ParkReason,
 		})
 	}
 
@@ -341,21 +373,22 @@ func (s *Server) handleSyncOutbox(w http.ResponseWriter, r *http.Request) {
 // BaseContent is the "base" leg of the conflict inspector's diff; the "local"
 // leg is ArtifactContent and the "server head" leg is fetched separately.
 type syncConflictResponse struct {
-	Workspace  string `json:"workspace"`
-	Path       string `json:"path"`        // original wire path of the conflicted document
-	DocumentID string `json:"document_id"` // parsed from the artifact filename
+	NotespaceID   string `json:"notespace_id"`
+	NotespaceName string `json:"notespace_name,omitempty"`
+	Path          string `json:"path"`        // original wire path of the conflicted document
+	DocumentID    string `json:"document_id"` // parsed from the artifact filename
 	// Kind is what went wrong: "merge" (the historical case) or one of the
 	// named kinds, e.g. "registry_foreign_write". It is parsed back out of the
 	// artifact filename, because this endpoint is artifact-backed and the
 	// filename is the only thing that outlives the SSE broadcast.
 	Kind            string `json:"kind,omitempty"`
-	Artifact        string `json:"artifact"` // artifact filename, workspace-relative (slash form)
+	Artifact        string `json:"artifact"` // artifact filename, notespace-relative (slash form)
 	ArtifactContent string `json:"artifact_content"`
 	BaseContent     string `json:"base_content,omitempty"` // 3-way base from sync_documents, when resolvable
 }
 
-// handleSyncConflicts handles GET /api/sync/conflicts[?workspace=W]. It scans
-// the on-disk conflict store (StateDir/sync/conflicts/<workspace>/) written by
+// handleSyncConflicts handles GET /api/sync/conflicts[?notespace=W]. It scans
+// the on-disk conflict store (StateDir/sync/conflicts/<notespace>/) written by
 // the pull pipeline (pull.go recordConflict: <path>.<document_id>.conflict.md)
 // and, for each artifact, recovers the base content from the matching
 // sync_documents row. Read-only.
@@ -373,7 +406,7 @@ func (s *Server) handleSyncConflicts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filter := r.URL.Query().Get("workspace")
+	filter := r.URL.Query().Get("notespace_id")
 	root := filepath.Join(paths.StateDir(), "sync", "conflicts")
 	out := make([]syncConflictResponse, 0)
 
@@ -393,11 +426,11 @@ func (s *Server) handleSyncConflicts(w http.ResponseWriter, r *http.Request) {
 		if !wsEntry.IsDir() {
 			continue
 		}
-		workspace := wsEntry.Name()
-		if filter != "" && workspace != filter {
+		notespace := wsEntry.Name()
+		if filter != "" && notespace != filter {
 			continue
 		}
-		wsDir := filepath.Join(root, workspace)
+		wsDir := filepath.Join(root, notespace)
 		walkErr := filepath.WalkDir(wsDir, func(p string, de fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -425,7 +458,8 @@ func (s *Server) handleSyncConflicts(w http.ResponseWriter, r *http.Request) {
 			}
 
 			resp := syncConflictResponse{
-				Workspace:       workspace,
+				NotespaceID:     notespace,
+				NotespaceName:   s.syncNotespaceName(notespace),
 				Path:            origPath,
 				DocumentID:      docID,
 				Kind:            kind,
@@ -448,9 +482,9 @@ func (s *Server) handleSyncConflicts(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// handleSyncAllow handles POST /api/sync/allow, which adds a workspace/path
+// handleSyncAllow handles POST /api/sync/allow, which adds a notespace/path
 // to the quarantine override list, allowing it to sync despite secret pattern
-// matches. Request body: {"workspace": "...", "path": "..."}.
+// matches. Request body: {"notespace": "...", "path": "..."}.
 func (s *Server) handleSyncAllow(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -469,20 +503,20 @@ func (s *Server) handleSyncAllow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Workspace string `json:"workspace"`
-		Path      string `json:"path"`
+		NotespaceID string `json:"notespace_id"`
+		Path        string `json:"path"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	if req.Workspace == "" || req.Path == "" {
-		http.Error(w, "workspace and path are required", http.StatusBadRequest)
+	if req.NotespaceID == "" || req.Path == "" {
+		http.Error(w, "notespace and path are required", http.StatusBadRequest)
 		return
 	}
 
-	if err := s.syncDatabase().SetQuarantineOverride(req.Workspace, req.Path); err != nil {
+	if err := s.syncDatabase().SetQuarantineOverride(req.NotespaceID, req.Path); err != nil {
 		http.Error(w, fmt.Sprintf("failed to set quarantine override: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -493,7 +527,7 @@ func (s *Server) handleSyncAllow(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSyncDisallowQuarantine handles DELETE /api/sync/allow, which removes
-// a workspace/path from the quarantine override list.
+// a notespace/path from the quarantine override list.
 func (s *Server) handleSyncDisallowQuarantine(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -512,20 +546,20 @@ func (s *Server) handleSyncDisallowQuarantine(w http.ResponseWriter, r *http.Req
 	}
 
 	var req struct {
-		Workspace string `json:"workspace"`
-		Path      string `json:"path"`
+		NotespaceID string `json:"notespace_id"`
+		Path        string `json:"path"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	if req.Workspace == "" || req.Path == "" {
-		http.Error(w, "workspace and path are required", http.StatusBadRequest)
+	if req.NotespaceID == "" || req.Path == "" {
+		http.Error(w, "notespace and path are required", http.StatusBadRequest)
 		return
 	}
 
-	if err := s.syncDatabase().RemoveQuarantineOverride(req.Workspace, req.Path); err != nil {
+	if err := s.syncDatabase().RemoveQuarantineOverride(req.NotespaceID, req.Path); err != nil {
 		http.Error(w, fmt.Sprintf("failed to remove quarantine override: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -588,7 +622,7 @@ func (s *Server) historyClient(ctx context.Context) (*syncdb.Client, error) {
 	return syncdb.NewClientFromConfig(ctx, cfg, machine.ID(), s.syncDatabase().OriginID(), "", nil)
 }
 
-// handleSyncHistory handles GET /api/sync/history?workspace=W&path=P by
+// handleSyncHistory handles GET /api/sync/history?notespace=W&path=P by
 // proxying to grove-syncd's /sync/history with the daemon-held token.
 func (s *Server) handleSyncHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -605,9 +639,9 @@ func (s *Server) handleSyncHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	workspace, path := q.Get("workspace"), q.Get("path")
-	if workspace == "" || path == "" {
-		http.Error(w, "workspace and path are required", http.StatusBadRequest)
+	notespace, path := q.Get("notespace_id"), q.Get("path")
+	if notespace == "" || path == "" {
+		http.Error(w, "notespace and path are required", http.StatusBadRequest)
 		return
 	}
 
@@ -616,7 +650,7 @@ func (s *Server) handleSyncHistory(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	entries, err := client.History(r.Context(), workspace, path)
+	entries, err := client.History(r.Context(), notespace, path)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("history fetch failed: %v", err), http.StatusBadGateway)
 		return
@@ -626,7 +660,7 @@ func (s *Server) handleSyncHistory(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(entries)
 }
 
-// handleSyncRestore handles GET /api/sync/restore?workspace=W&path=P&version=V.
+// handleSyncRestore handles GET /api/sync/restore?notespace=W&path=P&version=V.
 // The daemon resolves the document id from sync.db and returns the raw
 // historical content; the caller (nb) writes the file as a user-initiated
 // edit, which re-enters sync as a normal new head version.
@@ -645,9 +679,9 @@ func (s *Server) handleSyncRestore(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	workspace, path, versionStr := q.Get("workspace"), q.Get("path"), q.Get("version")
-	if workspace == "" || path == "" || versionStr == "" {
-		http.Error(w, "workspace, path and version are required", http.StatusBadRequest)
+	notespace, path, versionStr := q.Get("notespace_id"), q.Get("path"), q.Get("version")
+	if notespace == "" || path == "" || versionStr == "" {
+		http.Error(w, "notespace, path and version are required", http.StatusBadRequest)
 		return
 	}
 	version, err := strconv.ParseInt(versionStr, 10, 64)
@@ -656,7 +690,7 @@ func (s *Server) handleSyncRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc, err := s.syncDatabase().GetDocumentByPath(workspace, path)
+	doc, err := s.syncDatabase().GetDocumentByPath(notespace, path)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("document lookup failed: %v", err), http.StatusInternalServerError)
 		return
@@ -671,7 +705,7 @@ func (s *Server) handleSyncRestore(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	content, err := client.HistoryBlob(r.Context(), workspace, doc.DocumentID, version)
+	content, err := client.HistoryBlob(r.Context(), notespace, doc.DocumentID, version)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("restore fetch failed: %v", err), http.StatusBadGateway)
 		return
@@ -681,10 +715,10 @@ func (s *Server) handleSyncRestore(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(content)
 }
 
-// handleSyncAdopt handles POST /api/sync/adopt with body {"workspace","path"}.
+// handleSyncAdopt handles POST /api/sync/adopt with body {"notespace","path"}.
 // It is the ONLY sanctioned path by which a diverged document's local file is
 // brought to the server head — and even here the daemon does NOT write the
-// workspace tree: it fetches the head content, rolls the sync.db merge base +
+// notespace tree: it fetches the head content, rolls the sync.db merge base +
 // clears the diverged flag, and returns the raw head bytes; the CLI (nb sync
 // adopt) performs the local os.WriteFile as a user-initiated edit. Modeled on
 // handleSyncAllow (unix-only, global-scope forwarded). Distinct from
@@ -706,21 +740,21 @@ func (s *Server) handleSyncAdopt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Workspace string `json:"workspace"`
-		Path      string `json:"path"`
+		NotespaceID string `json:"notespace_id"`
+		Path        string `json:"path"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 		return
 	}
-	if req.Workspace == "" || req.Path == "" {
-		http.Error(w, "workspace and path are required", http.StatusBadRequest)
+	if req.NotespaceID == "" || req.Path == "" {
+		http.Error(w, "notespace and path are required", http.StatusBadRequest)
 		return
 	}
 
 	// Must be a tracked document (mirrors handleSyncRestore). AdoptDocument does
 	// not error on zero rows affected, so this existence check is load-bearing.
-	doc, err := s.syncDatabase().GetDocumentByPath(req.Workspace, req.Path)
+	doc, err := s.syncDatabase().GetDocumentByPath(req.NotespaceID, req.Path)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("document lookup failed: %v", err), http.StatusInternalServerError)
 		return
@@ -734,7 +768,7 @@ func (s *Server) handleSyncAdopt(w http.ResponseWriter, r *http.Request) {
 	// for this path (e.g. the merged payload has not yet drained), adopting to
 	// the server head would drop the user's merged-in lines from the hub. In the
 	// normal flow the parked entry drains before the user reaches for adopt.
-	if n, err := s.syncDatabase().CountOutboxForPath(req.Workspace, req.Path); err != nil {
+	if n, err := s.syncDatabase().CountOutboxForPath(req.NotespaceID, req.Path); err != nil {
 		http.Error(w, fmt.Sprintf("outbox lookup failed: %v", err), http.StatusInternalServerError)
 		return
 	} else if n > 0 {
@@ -751,7 +785,7 @@ func (s *Server) handleSyncAdopt(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	manifest, err := client.Snapshot(r.Context(), req.Workspace)
+	manifest, err := client.Snapshot(r.Context(), req.NotespaceID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("snapshot fetch failed: %v", err), http.StatusBadGateway)
 		return
@@ -768,7 +802,7 @@ func (s *Server) handleSyncAdopt(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "document is not present in the server snapshot", http.StatusNotFound)
 		return
 	}
-	content, err := client.HistoryBlob(r.Context(), req.Workspace, snap.ID, snap.Version)
+	content, err := client.HistoryBlob(r.Context(), req.NotespaceID, snap.ID, snap.Version)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("head fetch failed: %v", err), http.StatusBadGateway)
 		return
@@ -778,7 +812,7 @@ func (s *Server) handleSyncAdopt(w http.ResponseWriter, r *http.Request) {
 	// says "clean" before the CLI writes the file; if the CLI write then fails,
 	// the next reconcile sweep sees diskHash != last_synced_hash and re-enqueues
 	// — self-healing, acceptable.
-	if err := s.syncDatabase().AdoptDocument(req.Workspace, req.Path, snap.ID, snap.Version, snap.Hash, content); err != nil {
+	if err := s.syncDatabase().AdoptDocument(req.NotespaceID, req.Path, snap.ID, snap.Version, snap.Hash, content); err != nil {
 		http.Error(w, fmt.Sprintf("adopt failed: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -803,8 +837,8 @@ type syncIncomingResponse struct {
 	EscrowVerified bool                  `json:"escrow_verified"`
 }
 
-func requestedReturnWorkspaces(r *http.Request) ([]string, error) {
-	raw := r.URL.Query().Get("workspaces")
+func requestedReturnNotespaces(r *http.Request) ([]string, error) {
+	raw := r.URL.Query().Get("notespace_ids")
 	var out []string
 	for _, name := range strings.Split(raw, ",") {
 		if name = strings.TrimSpace(name); name != "" {
@@ -812,17 +846,17 @@ func requestedReturnWorkspaces(r *http.Request) ([]string, error) {
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("an explicit non-empty workspaces list is required")
+		return nil, fmt.Errorf("an explicit non-empty notespaces list is required")
 	}
 	return out, nil
 }
 
-func (s *Server) currentReturnManifest(ctx context.Context, workspaces []string) (syncdb.ReturnManifest, error) {
+func (s *Server) currentReturnManifest(ctx context.Context, notespaces []string) (syncdb.ReturnManifest, error) {
 	client, err := s.historyClient(ctx)
 	if err != nil {
 		return syncdb.ReturnManifest{}, err
 	}
-	return syncdb.BuildReturnManifest(ctx, client, s.syncDatabase(), workspaces)
+	return syncdb.BuildReturnManifest(ctx, client, s.syncDatabase(), notespaces)
 }
 
 func returnEscrowDir(satellite string) (string, error) {
@@ -864,12 +898,12 @@ func (s *Server) handleSyncIncoming(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	workspaces, err := requestedReturnWorkspaces(r)
+	notespaces, err := requestedReturnNotespaces(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	m, err := s.currentReturnManifest(r.Context(), workspaces)
+	m, err := s.currentReturnManifest(r.Context(), notespaces)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("incoming manifest failed: %v", err), http.StatusBadGateway)
 		return
@@ -911,7 +945,7 @@ func (s *Server) handleSyncEscrow(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	current, err := s.currentReturnManifest(r.Context(), req.Manifest.Workspaces)
+	current, err := s.currentReturnManifest(r.Context(), req.Manifest.Notespaces)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -959,7 +993,7 @@ func (s *Server) handleSyncApply(w http.ResponseWriter, r *http.Request) {
 		s.forwardSyncToGlobal(w, r)
 		return
 	}
-	if s.syncDatabase() == nil || s.syncWorkspaceRoots == nil {
+	if s.syncDatabase() == nil || s.syncNotespaceRoots == nil {
 		http.Error(w, "sync apply is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -981,7 +1015,7 @@ func (s *Server) handleSyncApply(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	current, err := s.currentReturnManifest(r.Context(), req.Manifest.Workspaces)
+	current, err := s.currentReturnManifest(r.Context(), req.Manifest.Notespaces)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("cannot recheck incoming generation: %v", err), http.StatusBadGateway)
 		return
@@ -1008,7 +1042,7 @@ func (s *Server) handleSyncApply(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("a pending push exists for %s; wait for it to drain before applying", pending), http.StatusConflict)
 		return
 	}
-	roots, err := s.syncWorkspaceRoots(current.Workspaces)
+	roots, err := s.syncNotespaceRoots(current.Notespaces)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1027,7 +1061,7 @@ func (s *Server) handleSyncApply(w http.ResponseWriter, r *http.Request) {
 	// Escrow creation may fetch several blobs. Recheck once more after it so a
 	// server generation change or disconnect during that window fails before
 	// the first notebook mutation. The verified escrow remains recoverable.
-	final, err := s.currentReturnManifest(r.Context(), current.Workspaces)
+	final, err := s.currentReturnManifest(r.Context(), current.Notespaces)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("cannot recheck incoming generation (verified escrow retained at %s): %v", escrowPath, err), http.StatusBadGateway)
 		return
@@ -1037,14 +1071,14 @@ func (s *Server) handleSyncApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	counts, err := syncdb.ApplyReturnEscrow(escrowPath, current.Generation, syncdb.ReturnApplyOptions{
-		WorkspaceRoots: roots,
+		NotespaceRoots: roots,
 		Reconcile:      s.syncDatabase().ReconcileReturnEscrow,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("apply failed (verified escrow retained at %s): %v", escrowPath, err), http.StatusConflict)
 		return
 	}
-	for _, ws := range current.Workspaces {
+	for _, ws := range current.Notespaces {
 		if s.syncKick != nil {
 			s.syncKick(ws)
 		}
@@ -1136,7 +1170,7 @@ func (s *Server) handleSyncMaintenance(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSyncRepush handles POST /api/sync/repush with optional body
-// {"workspace": "<name>"} (absent/empty = all workspaces). It is the manual
+// {"notespace": "<name>"} (absent/empty = all notespaces). It is the manual
 // edition of the automatic server-epoch recovery: it voids the
 // server-confirmed sync state of every non-diverged document
 // (ResetForRepush — last_synced_* zeroed, document ids kept, obsolete outbox
@@ -1160,9 +1194,9 @@ func (s *Server) handleSyncRepush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The body is optional: absent/empty selects all workspaces.
+	// The body is optional: absent/empty selects all notespaces.
 	var req struct {
-		Workspace string `json:"workspace"`
+		NotespaceID string `json:"notespace_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
@@ -1170,32 +1204,32 @@ func (s *Server) handleSyncRepush(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		workspaces []string
+		notespaces []string
 		reset      int
 		err        error
 	)
-	if req.Workspace == "" {
-		reset, workspaces, err = s.syncDatabase().ResetForRepushAll()
+	if req.NotespaceID == "" {
+		reset, notespaces, err = s.syncDatabase().ResetForRepushAll()
 	} else {
-		reset, err = s.syncDatabase().ResetForRepush(req.Workspace)
-		workspaces = []string{req.Workspace}
+		reset, err = s.syncDatabase().ResetForRepush(req.NotespaceID)
+		notespaces = []string{req.NotespaceID}
 	}
 	if err != nil {
 		http.Error(w, fmt.Sprintf("repush reset failed: %v", err), http.StatusInternalServerError)
 		return
 	}
-	if workspaces == nil {
-		workspaces = []string{}
+	if notespaces == nil {
+		notespaces = []string{}
 	}
 
 	// Convert the reset into pushes now rather than at the next hourly tick.
 	if s.syncKick != nil {
-		s.syncKick(req.Workspace)
+		s.syncKick(req.NotespaceID)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"workspaces":      workspaces,
+		"notespaces":      notespaces,
 		"documents_reset": reset,
 	})
 }

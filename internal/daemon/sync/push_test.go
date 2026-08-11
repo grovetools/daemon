@@ -56,17 +56,17 @@ func handshake(t *testing.T, client *Client) {
 func TestDrainOutboxConflictTerminates(t *testing.T) {
 	db := openTestDB(t)
 
-	workspaceRoot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(workspaceRoot, "inbox"), 0o755); err != nil {
+	notespaceRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(notespaceRoot, "inbox"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(workspaceRoot, "inbox", "note.md"), []byte("local edit"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(notespaceRoot, "inbox", "note.md"), []byte("local edit"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
 		DocumentID:  "doc-1",
-		Workspace:   "default",
+		Notespace:   "default",
 		EventType:   syncproto.EventDocumentUpdated,
 		Path:        "inbox/note.md",
 		ContentHash: "deadbeef",
@@ -100,7 +100,7 @@ func TestDrainOutboxConflictTerminates(t *testing.T) {
 		defer close(done)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		n, drainErr = pipeline.DrainOutbox(ctx, workspaceRoot)
+		n, drainErr = pipeline.DrainOutbox(ctx, notespaceRoot)
 	}()
 
 	select {
@@ -145,7 +145,7 @@ func TestDrainOutboxParksConflictInIsolation(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := db.EnqueueOutbox(&OutboxEntry{
-			DocumentID: "doc-" + name, Workspace: "default",
+			DocumentID: "doc-" + name, Notespace: "default",
 			EventType: syncproto.EventDocumentCreated, Path: "inbox/" + name + ".md", ContentHash: "h" + name,
 		}); err != nil {
 			t.Fatalf("EnqueueOutbox %s: %v", name, err)
@@ -226,17 +226,17 @@ func TestDrainOutboxParksConflictInIsolation(t *testing.T) {
 func TestDrainOutboxPopulatesBaseVersion(t *testing.T) {
 	db := openTestDB(t)
 
-	workspaceRoot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(workspaceRoot, "inbox"), 0o755); err != nil {
+	notespaceRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(notespaceRoot, "inbox"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(workspaceRoot, "inbox", "note.md"), []byte("v2 content"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(notespaceRoot, "inbox", "note.md"), []byte("v2 content"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := db.UpsertDocument(&Document{
 		DocumentID:        "doc-1",
-		Workspace:         "default",
+		Notespace:         "default",
 		Path:              "inbox/note.md",
 		ContentHash:       "deadbeef",
 		LastSyncedVersion: 6,
@@ -245,7 +245,7 @@ func TestDrainOutboxPopulatesBaseVersion(t *testing.T) {
 		t.Fatalf("UpsertDocument: %v", err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		Workspace:   "default",
+		Notespace:   "default",
 		EventType:   syncproto.EventDocumentUpdated,
 		Path:        "inbox/note.md",
 		ContentHash: "deadbeef",
@@ -274,7 +274,7 @@ func TestDrainOutboxPopulatesBaseVersion(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	n, err := pipeline.DrainOutbox(ctx, workspaceRoot)
+	n, err := pipeline.DrainOutbox(ctx, notespaceRoot)
 	if err != nil {
 		t.Fatalf("DrainOutbox: %v", err)
 	}
@@ -326,13 +326,13 @@ func TestDrainOutboxPrefersPayloadOverDisk(t *testing.T) {
 	payload := "PAYLOAD BYTES the entry carries"
 
 	if err := db.UpsertDocument(&Document{
-		DocumentID: "doc-1", Workspace: "default", Path: "inbox/note.md",
+		DocumentID: "doc-1", Notespace: "default", Path: "inbox/note.md",
 		ContentHash: sha(disk), LastSyncedHash: sha([]byte("server-base")), LastSyncedVersion: 1,
 	}); err != nil {
 		t.Fatalf("UpsertDocument: %v", err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-1", Workspace: "default", EventType: syncproto.EventDocumentUpdated,
+		DocumentID: "doc-1", Notespace: "default", EventType: syncproto.EventDocumentUpdated,
 		Path: "inbox/note.md", ContentHash: sha([]byte(payload)), Payload: payload,
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox: %v", err)
@@ -390,13 +390,13 @@ func TestDrainOutboxDropsHashEqualNoOp(t *testing.T) {
 	}
 	// The doc's last-synced hash already equals the disk hash → pushing is a no-op.
 	if err := db.UpsertDocument(&Document{
-		DocumentID: "doc-1", Workspace: "default", Path: "inbox/note.md",
+		DocumentID: "doc-1", Notespace: "default", Path: "inbox/note.md",
 		ContentHash: sha(content), LastSyncedHash: sha(content), LastSyncedVersion: 3,
 	}); err != nil {
 		t.Fatalf("UpsertDocument: %v", err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-1", Workspace: "default", EventType: syncproto.EventDocumentUpdated,
+		DocumentID: "doc-1", Notespace: "default", EventType: syncproto.EventDocumentUpdated,
 		Path: "inbox/note.md", ContentHash: sha(content),
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox: %v", err)
@@ -474,7 +474,7 @@ func serveRebaseStub(t *testing.T, push func(req *syncproto.PushRequest) *syncpr
 
 // seedRebaseScenario sets up the standard rebase fixture: a synced doc at
 // version 1 with the given base content, a local on-disk edit, and a parked
-// outbox update for it. Returns the workspace root.
+// outbox update for it. Returns the notespace root.
 func seedRebaseScenario(t *testing.T, db *DB, base, local []byte) string {
 	t.Helper()
 	root := t.TempDir()
@@ -490,7 +490,7 @@ func seedRebaseScenario(t *testing.T, db *DB, base, local []byte) string {
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
 		DocumentID:  "doc-1",
-		Workspace:   "default",
+		Notespace:   "default",
 		EventType:   syncproto.EventDocumentUpdated,
 		Path:        "inbox/note.md",
 		ContentHash: sha(local),
@@ -502,7 +502,7 @@ func seedRebaseScenario(t *testing.T, db *DB, base, local []byte) string {
 
 // TestDrainOutboxRebasesCleanConflict is the S5 unit regression: a Conflict
 // whose server head touched a different body region than the local edit is
-// rebased WITHOUT writing the workspace file. The merged content travels as the
+// rebased WITHOUT writing the notespace file. The merged content travels as the
 // entry's Payload and converges on the server; the doc enters the `diverged`
 // state; and — the security invariant — the local file is BYTE-IDENTICAL to the
 // user's last save at every point in the sequence (sync never writes the tree).
@@ -527,7 +527,7 @@ func TestDrainOutboxRebasesCleanConflict(t *testing.T) {
 			t.Fatal(err)
 		}
 		if string(got) != string(local) {
-			t.Fatalf("%s: sync wrote the workspace file (S5 violation): disk=%q want %q", when, got, local)
+			t.Fatalf("%s: sync wrote the notespace file (S5 violation): disk=%q want %q", when, got, local)
 		}
 	}
 
@@ -732,7 +732,7 @@ func TestDrainOutboxRebaseOverlapParksWithArtifact(t *testing.T) {
 }
 
 // TestDrainOutboxRebaseNeverWritesLocalFile: even when the local file changes
-// mid-rebase, sync writes NOTHING to the workspace tree (S5). The pre-S5 code
+// mid-rebase, sync writes NOTHING to the notespace tree (S5). The pre-S5 code
 // had a mid-rebase re-read guard whose only purpose was to protect a disk write
 // that no longer happens; deleting the write deletes the need for the guard. The
 // disk holds exactly the bytes the user (here, the test) wrote — sync never
@@ -788,7 +788,7 @@ func TestDrainOutboxRebaseNeverWritesLocalFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(got) != string(midEdit) {
-		t.Fatalf("sync wrote the workspace file (S5 violation): disk = %q, want the test's mid-rebase bytes", got)
+		t.Fatalf("sync wrote the notespace file (S5 violation): disk = %q, want the test's mid-rebase bytes", got)
 	}
 
 	// The rebase still ran against the snapshot: doc rolled to the server head
@@ -992,7 +992,7 @@ func TestDrainOutboxDeleteCarriesBaseVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		Workspace: "default", EventType: syncproto.EventDocumentCreated,
+		Notespace: "default", EventType: syncproto.EventDocumentCreated,
 		Path: "inbox/note.md", ContentHash: sha(content),
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox (created): %v", err)
@@ -1027,7 +1027,7 @@ func TestDrainOutboxDeleteCarriesBaseVersion(t *testing.T) {
 	// Leg 2: the delete, enqueued exactly as the watcher's recordDelete does —
 	// base captured onto the entry, then the doc row destroyed, file removed.
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: doc.DocumentID, Workspace: "default",
+		DocumentID: doc.DocumentID, Notespace: "default",
 		EventType: syncproto.EventDocumentDeleted, Path: "inbox/note.md",
 		BaseVersion: doc.LastSyncedVersion,
 	}); err != nil {
@@ -1065,7 +1065,7 @@ func TestDrainOutboxDeleteGenuineConflictParks(t *testing.T) {
 
 	// Client last saw version 2; the server head is at 5.
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-1", Workspace: "default",
+		DocumentID: "doc-1", Notespace: "default",
 		EventType: syncproto.EventDocumentDeleted, Path: "inbox/note.md",
 		BaseVersion: 2,
 	}); err != nil {
@@ -1121,14 +1121,14 @@ func TestDrainOutboxMoveCarriesBaseVersion(t *testing.T) {
 	// The doc row as handleNoteEvent leaves it: already at the NEW path
 	// (MoveDocument ran at enqueue time), synced at version 3.
 	if err := db.UpsertDocument(&Document{
-		DocumentID: "doc-1", Workspace: "default", Path: "notes/current/task.md",
+		DocumentID: "doc-1", Notespace: "default", Path: "notes/current/task.md",
 		ContentHash: sha(content), LastSyncedHash: sha(content),
 		LastSyncedVersion: 3, BaseContent: content,
 	}); err != nil {
 		t.Fatalf("UpsertDocument: %v", err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-1", Workspace: "default",
+		DocumentID: "doc-1", Notespace: "default",
 		EventType: syncproto.EventDocumentMoved,
 		Path:      "notes/current/task.md", PrevPath: "notes/inbox/task.md",
 		ContentHash: sha(content),
@@ -1186,7 +1186,7 @@ func TestDrainOutboxMoveCarriesBaseVersion(t *testing.T) {
 // seedOrphanRecreate builds the B8 fixture, observed live: the server holds a
 // live doc at the path (serverDocs seeded by the caller) while the client has
 // LOST its record of it — the watcher then recreated the file and minted a
-// fresh local document id. Returns the workspace root.
+// fresh local document id. Returns the notespace root.
 func seedOrphanRecreate(t *testing.T, db *DB, localID, eventType string, local []byte) string {
 	t.Helper()
 	root := t.TempDir()
@@ -1199,13 +1199,13 @@ func seedOrphanRecreate(t *testing.T, db *DB, localID, eventType string, local [
 	// The watcher's InsertAndEnqueue outcome: a fresh row with a minted id,
 	// never synced (version 0, no base), plus the queued event.
 	if err := db.UpsertDocument(&Document{
-		DocumentID: localID, Workspace: "default", Path: "inbox/note.md",
+		DocumentID: localID, Notespace: "default", Path: "inbox/note.md",
 		ContentHash: sha(local),
 	}); err != nil {
 		t.Fatalf("UpsertDocument: %v", err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: localID, Workspace: "default", EventType: eventType,
+		DocumentID: localID, Notespace: "default", EventType: eventType,
 		Path: "inbox/note.md", ContentHash: sha(local),
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox: %v", err)
@@ -1343,13 +1343,13 @@ func TestDrainOutboxCreateAtOrphanedPathMergeableConverges(t *testing.T) {
 		t.Fatalf("client must record the advanced head: v%d hash=%q want v2 %q",
 			doc.LastSyncedVersion, doc.LastSyncedHash, d.hash)
 	}
-	// S5: the workspace file was never written.
+	// S5: the notespace file was never written.
 	got, err := os.ReadFile(filepath.Join(root, "inbox", "note.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != string(local) {
-		t.Fatalf("sync wrote the workspace file (S5 violation): %q", got)
+		t.Fatalf("sync wrote the notespace file (S5 violation): %q", got)
 	}
 }
 
@@ -1383,7 +1383,7 @@ func TestDrainOutboxOrphanedPathDivergentParksDiverged(t *testing.T) {
 			handshake(t, client)
 			pipeline := NewPushPipeline(db, client, "default", logging.NewUnifiedLogger("test.push"), PushConfig{RetryBackoff: 50 * time.Millisecond})
 			var divergedPath atomic.Value
-			pipeline.OnDiverged = func(workspace, path string) { divergedPath.Store(workspace + "/" + path) }
+			pipeline.OnDiverged = func(notespace, path string) { divergedPath.Store(notespace + "/" + path) }
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
@@ -1429,7 +1429,7 @@ func TestDrainOutboxOrphanedPathDivergentParksDiverged(t *testing.T) {
 				t.Fatal(err)
 			}
 			if string(got) != string(local) {
-				t.Fatalf("sync wrote the workspace file (S5 violation): %q", got)
+				t.Fatalf("sync wrote the notespace file (S5 violation): %q", got)
 			}
 			artifact := filepath.Join(stateHome, "grove", "sync", "conflicts", "default", "inbox/note.md.doc-server-1.conflict.md")
 			artifactContent, err := os.ReadFile(artifact)
@@ -1462,7 +1462,7 @@ func TestDrainOutboxOrphanedPathDivergentParksDiverged(t *testing.T) {
 				t.Fatalf("AdoptDocument: %v", err)
 			}
 			if _, err := db.EnqueueOutbox(&OutboxEntry{
-				DocumentID: "doc-server-1", Workspace: "default",
+				DocumentID: "doc-server-1", Notespace: "default",
 				EventType: syncproto.EventDocumentUpdated,
 				Path:      "inbox/note.md", ContentHash: sha(local),
 			}); err != nil {
@@ -1494,7 +1494,7 @@ func TestDrainOutboxRejectedParksNotDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-1", Workspace: "default",
+		DocumentID: "doc-1", Notespace: "default",
 		EventType: syncproto.EventDocumentUpdated,
 		Path:      "inbox/note.md", ContentHash: sha(content),
 	}); err != nil {
@@ -1571,7 +1571,7 @@ func TestDrainOutboxCarriesMtime(t *testing.T) {
 	}
 
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		Workspace: "default", EventType: syncproto.EventDocumentCreated,
+		Notespace: "default", EventType: syncproto.EventDocumentCreated,
 		Path: "inbox/note.md", ContentHash: sha(content), Mtime: mtime,
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox: %v", err)
@@ -1645,7 +1645,7 @@ func TestDrainOutboxRecomputesHashOnDiskReRead(t *testing.T) {
 
 	// Enqueue with the hash/size/mtime captured at enqueue time.
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		Workspace: "default", EventType: syncproto.EventDocumentCreated,
+		Notespace: "default", EventType: syncproto.EventDocumentCreated,
 		Path: "inbox/note.md", ContentHash: sha(oldContent), Mtime: statMtime(localPath),
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox: %v", err)
@@ -1723,13 +1723,13 @@ func TestDrainOutboxDropsHashEqualNoOpCreate(t *testing.T) {
 
 	// The doc row says the server already holds exactly these bytes.
 	if err := db.UpsertDocument(&Document{
-		DocumentID: "doc-1", Workspace: "default", Path: "inbox/note.md",
+		DocumentID: "doc-1", Notespace: "default", Path: "inbox/note.md",
 		ContentHash: sha(content), LastSyncedHash: sha(content), LastSyncedVersion: 3,
 	}); err != nil {
 		t.Fatalf("UpsertDocument: %v", err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		Workspace: "default", EventType: syncproto.EventDocumentCreated,
+		Notespace: "default", EventType: syncproto.EventDocumentCreated,
 		Path: "inbox/note.md", ContentHash: sha(content),
 	}); err != nil {
 		t.Fatalf("EnqueueOutbox: %v", err)
@@ -1784,14 +1784,14 @@ func TestDrainOutboxUnknownDocumentSelfHeals(t *testing.T) {
 	// A doc the client believes is synced (against the dead server) with a
 	// queued edit.
 	if err := db.InsertDocument(&Document{
-		DocumentID: "doc-stable", Workspace: "default", Path: "inbox/note.md",
+		DocumentID: "doc-stable", Notespace: "default", Path: "inbox/note.md",
 		ContentHash: sha(content), LastSyncedHash: "old-hash", LastSyncedVersion: 9,
 		BaseContent: []byte("old base"),
 	}); err != nil {
 		t.Fatalf("InsertDocument: %v", err)
 	}
 	if _, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-stable", Workspace: "default",
+		DocumentID: "doc-stable", Notespace: "default",
 		EventType: syncproto.EventDocumentUpdated,
 		Path:      "inbox/note.md", ContentHash: sha(content),
 	}); err != nil {
@@ -1864,13 +1864,13 @@ func TestDrainOutboxUnknownDocumentParksAtAttemptCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := db.InsertDocument(&Document{
-		DocumentID: "doc-capped", Workspace: "default", Path: "inbox/note.md",
+		DocumentID: "doc-capped", Notespace: "default", Path: "inbox/note.md",
 		ContentHash: sha(content), LastSyncedHash: "old-hash", LastSyncedVersion: 4,
 	}); err != nil {
 		t.Fatalf("InsertDocument: %v", err)
 	}
 	id, err := db.EnqueueOutbox(&OutboxEntry{
-		DocumentID: "doc-capped", Workspace: "default",
+		DocumentID: "doc-capped", Notespace: "default",
 		EventType: syncproto.EventDocumentUpdated,
 		Path:      "inbox/note.md", ContentHash: sha(content),
 	})

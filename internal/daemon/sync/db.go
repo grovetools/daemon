@@ -7,7 +7,7 @@
 //     (hash-gating / echo suppression), the last server-confirmed
 //     hash/version, and the 3-way merge base content,
 //   - sync_outbox — the durable queue of local changes awaiting push,
-//   - sync_state — per-workspace replication cursor + origin id,
+//   - sync_state — per-notespace replication cursor + origin id,
 //   - sync_meta — install-wide keys, most importantly the persistent
 //     origin id used for echo suppression.
 //
@@ -41,9 +41,17 @@ CREATE TABLE IF NOT EXISTS sync_meta (
 	value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sync_notespaces (
+	notespace_id   TEXT PRIMARY KEY,
+	notespace_name TEXT NOT NULL,
+	root           TEXT NOT NULL UNIQUE,
+	subject        TEXT NOT NULL,
+	kind           TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sync_documents (
 	document_id         TEXT PRIMARY KEY,
-	workspace           TEXT NOT NULL,
+	notespace           TEXT NOT NULL,
 	path                TEXT NOT NULL,
 	content_hash        TEXT NOT NULL DEFAULT '',
 	last_synced_hash    TEXT NOT NULL DEFAULT '',
@@ -51,13 +59,13 @@ CREATE TABLE IF NOT EXISTS sync_documents (
 	base_content        BLOB,
 	diverged            INTEGER NOT NULL DEFAULT 0,
 	updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	UNIQUE(workspace, path)
+	UNIQUE(notespace, path)
 );
 
 CREATE TABLE IF NOT EXISTS sync_outbox (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
 	document_id   TEXT NOT NULL DEFAULT '',
-	workspace     TEXT NOT NULL,
+	notespace     TEXT NOT NULL,
 	event_type    TEXT NOT NULL,
 	path          TEXT NOT NULL,
 	prev_path     TEXT NOT NULL DEFAULT '',
@@ -73,16 +81,16 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
-	workspace      TEXT PRIMARY KEY,
+	notespace      TEXT PRIMARY KEY,
 	cursor         INTEGER NOT NULL DEFAULT 0,
 	origin_id      TEXT NOT NULL DEFAULT '',
 	last_synced_at DATETIME
 );
 
 CREATE TABLE IF NOT EXISTS sync_quarantine_override (
-	workspace TEXT NOT NULL,
+	notespace TEXT NOT NULL,
 	path      TEXT NOT NULL,
-	PRIMARY KEY (workspace, path)
+	PRIMARY KEY (notespace, path)
 );
 `
 
@@ -95,10 +103,10 @@ type DB struct {
 
 // Document is one row of sync_documents: the identity map entry and sync
 // state for a single notebook document. Path is the slash-normalized
-// workspace-relative wire path (syncproto.NormalizePath form).
+// notespace-relative wire path (syncproto.NormalizePath form).
 type Document struct {
 	DocumentID        string
-	Workspace         string
+	Notespace         string
 	Path              string
 	ContentHash       string // current local content hash (sha256 hex)
 	LastSyncedHash    string // hash last confirmed by the server
@@ -108,20 +116,20 @@ type Document struct {
 	// but whose local file was deliberately NOT rewritten — the local file
 	// lags the server head. A diverged doc is frozen from the push sweep and
 	// the watcher flush until the user runs `nb sync adopt`; strict push-only
-	// means sync never writes the workspace tree to resolve the lag.
+	// means sync never writes the notespace tree to resolve the lag.
 	Diverged  bool
 	UpdatedAt time.Time
 }
 
 // documentColumns is the shared SELECT column list for document scanners; the
 // order must match scanDocumentRow.
-const documentColumns = `document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged, updated_at`
+const documentColumns = `document_id, notespace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged, updated_at`
 
 // OutboxEntry is one pending local change awaiting push.
 type OutboxEntry struct {
 	ID          int64
 	DocumentID  string
-	Workspace   string
+	Notespace   string
 	EventType   string // syncproto.Event* constant
 	Path        string
 	PrevPath    string // for moved events
@@ -132,7 +140,7 @@ type OutboxEntry struct {
 	// last_synced_version captured at enqueue time). It matters for deleted
 	// events (B7): recordDelete destroys the sync_documents row immediately —
 	// keeping the row alive would break delete-then-recreate on the
-	// UNIQUE(workspace, path) constraint — so the entry itself must carry the
+	// UNIQUE(notespace, path) constraint — so the entry itself must carry the
 	// OCC base or every delete of a server-known doc pushes base_version 0 and
 	// parks as a manufactured conflict forever. Updated/moved events resolve
 	// their base from the still-live doc row at drain time instead.
@@ -158,7 +166,7 @@ type OutboxEntry struct {
 
 // outboxColumns is the shared SELECT column list for outbox scanners; the
 // order must match scanOutboxEntry.
-const outboxColumns = `id, document_id, workspace, event_type, path, prev_path, content_hash, payload, base_version, mtime, created_at, parked, attempts, next_retry_at, park_reason`
+const outboxColumns = `id, document_id, notespace, event_type, path, prev_path, content_hash, payload, base_version, mtime, created_at, parked, attempts, next_retry_at, park_reason`
 
 // scanOutboxEntry scans one outbox row selected via outboxColumns. next_retry_at
 // is nullable (an entry only has a retry time once parked); parked is stored as
@@ -168,7 +176,7 @@ func scanOutboxEntry(rows *sql.Rows) (*OutboxEntry, error) {
 	var parked int64
 	var mtimeNanos int64
 	var nextRetry sql.NullTime
-	if err := rows.Scan(&e.ID, &e.DocumentID, &e.Workspace, &e.EventType, &e.Path,
+	if err := rows.Scan(&e.ID, &e.DocumentID, &e.Notespace, &e.EventType, &e.Path,
 		&e.PrevPath, &e.ContentHash, &e.Payload, &e.BaseVersion, &mtimeNanos, &e.CreatedAt,
 		&parked, &e.Attempts, &nextRetry, &e.ParkReason); err != nil {
 		return nil, err
@@ -199,9 +207,9 @@ func nanosToMtime(n int64) time.Time {
 	return time.Unix(0, n)
 }
 
-// WorkspaceState is the per-workspace replication state.
-type WorkspaceState struct {
-	Workspace    string
+// NotespaceState is the per-notespace replication state.
+type NotespaceState struct {
+	Notespace    string
 	Cursor       int64
 	OriginID     string
 	LastSyncedAt time.Time
@@ -217,6 +225,13 @@ func DefaultDBPath() string {
 // Open opens (creating if necessary) the sync database at path, applies the
 // schema, and ensures the persistent per-install origin id exists.
 func Open(path string) (*DB, error) {
+	state, err := InspectSchema(path)
+	if err != nil {
+		return nil, err
+	}
+	if state.Legacy {
+		return nil, ErrLegacySchema
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create sync db directory: %w", err)
 	}
@@ -364,7 +379,7 @@ func (d *DB) SetServerEpoch(epoch string) error {
 	return nil
 }
 
-// ResetForRepush voids a workspace's server-confirmed sync state so the next
+// ResetForRepush voids a notespace's server-confirmed sync state so the next
 // anti-entropy sweep re-pushes every document as a document_created — the
 // recovery primitive for a recreated (fresh, empty) server, where local
 // "already synced" state points at documents that no longer exist. It
@@ -374,12 +389,12 @@ func (d *DB) SetServerEpoch(epoch string) error {
 // (sweepLocalDocuments then chooses document_created, and the drain-time
 // no-op guard no longer drops it) while document_id is KEPT — the server's
 // create branch inserts the pushed id fresh, so identities stay stable across
-// the recreate. The workspace's non-diverged outbox entries are deleted
+// the recreate. The notespace's non-diverged outbox entries are deleted
 // (queued/parked UPDATEs against the dead server are obsolete; the sweep
 // re-enqueues from disk) and the pull cursor resets to 0. Diverged documents
 // — and their outbox entries, whose Payload may carry an unpushed merge — are
 // left untouched: they resolve only via explicit `nb sync adopt`.
-func (d *DB) ResetForRepush(workspace string) (int, error) {
+func (d *DB) ResetForRepush(notespace string) (int, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin repush reset: %w", err)
@@ -388,66 +403,66 @@ func (d *DB) ResetForRepush(workspace string) (int, error) {
 
 	res, err := tx.Exec(
 		`UPDATE sync_documents SET last_synced_hash = '', last_synced_version = 0, updated_at = CURRENT_TIMESTAMP
-		 WHERE workspace = ? AND diverged = 0`, workspace)
+		 WHERE notespace = ? AND diverged = 0`, notespace)
 	if err != nil {
-		return 0, fmt.Errorf("failed to reset documents for repush in %s: %w", workspace, err)
+		return 0, fmt.Errorf("failed to reset documents for repush in %s: %w", notespace, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return 0, fmt.Errorf("failed to count repush reset in %s: %w", workspace, err)
+		return 0, fmt.Errorf("failed to count repush reset in %s: %w", notespace, err)
 	}
 
 	if _, err := tx.Exec(
-		`DELETE FROM sync_outbox WHERE workspace = ?
-		 AND document_id NOT IN (SELECT document_id FROM sync_documents WHERE workspace = ? AND diverged = 1)`,
-		workspace, workspace); err != nil {
-		return 0, fmt.Errorf("failed to clear outbox for repush in %s: %w", workspace, err)
+		`DELETE FROM sync_outbox WHERE notespace = ?
+		 AND document_id NOT IN (SELECT document_id FROM sync_documents WHERE notespace = ? AND diverged = 1)`,
+		notespace, notespace); err != nil {
+		return 0, fmt.Errorf("failed to clear outbox for repush in %s: %w", notespace, err)
 	}
 
 	if _, err := tx.Exec(
-		`UPDATE sync_state SET cursor = 0 WHERE workspace = ?`, workspace); err != nil {
-		return 0, fmt.Errorf("failed to reset cursor for repush in %s: %w", workspace, err)
+		`UPDATE sync_state SET cursor = 0 WHERE notespace = ?`, notespace); err != nil {
+		return 0, fmt.Errorf("failed to reset cursor for repush in %s: %w", notespace, err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit repush reset for %s: %w", workspace, err)
+		return 0, fmt.Errorf("failed to commit repush reset for %s: %w", notespace, err)
 	}
 	return int(n), nil
 }
 
-// ResetForRepushAll runs ResetForRepush over every workspace known to
+// ResetForRepushAll runs ResetForRepush over every notespace known to
 // sync_documents or sync_state, returning the total documents reset and the
-// workspaces touched.
+// notespaces touched.
 func (d *DB) ResetForRepushAll() (int, []string, error) {
 	rows, err := d.db.Query(
-		`SELECT workspace FROM sync_documents
-		 UNION SELECT workspace FROM sync_state ORDER BY workspace`)
+		`SELECT notespace FROM sync_documents
+		 UNION SELECT notespace FROM sync_state ORDER BY notespace`)
 	if err != nil {
-		return 0, nil, fmt.Errorf("failed to list workspaces for repush: %w", err)
+		return 0, nil, fmt.Errorf("failed to list notespaces for repush: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	var workspaces []string
+	var notespaces []string
 	for rows.Next() {
 		var ws string
 		if err := rows.Scan(&ws); err != nil {
-			return 0, nil, fmt.Errorf("failed to scan workspace for repush: %w", err)
+			return 0, nil, fmt.Errorf("failed to scan notespace for repush: %w", err)
 		}
-		workspaces = append(workspaces, ws)
+		notespaces = append(notespaces, ws)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, nil, err
 	}
 
 	total := 0
-	for _, ws := range workspaces {
+	for _, ws := range notespaces {
 		n, err := d.ResetForRepush(ws)
 		if err != nil {
-			return total, workspaces, err
+			return total, notespaces, err
 		}
 		total += n
 	}
-	return total, workspaces, nil
+	return total, notespaces, nil
 }
 
 // ClearDocumentSyncedState zeroes one document's server-confirmed state
@@ -463,12 +478,12 @@ func (d *DB) ClearDocumentSyncedState(documentID string) error {
 	return nil
 }
 
-// GetDocumentByPath returns the document for (workspace, path), or nil when
+// GetDocumentByPath returns the document for (notespace, path), or nil when
 // the path is untracked.
-func (d *DB) GetDocumentByPath(workspace, path string) (*Document, error) {
+func (d *DB) GetDocumentByPath(notespace, path string) (*Document, error) {
 	return scanDocumentRow(d.db.QueryRow(
-		`SELECT `+documentColumns+` FROM sync_documents WHERE workspace = ? AND path = ?`,
-		workspace, path).Scan)
+		`SELECT `+documentColumns+` FROM sync_documents WHERE notespace = ? AND path = ?`,
+		notespace, path).Scan)
 }
 
 // GetDocument returns the document by its stable UUID, or nil when unknown.
@@ -485,7 +500,7 @@ func (d *DB) GetDocument(documentID string) (*Document, error) {
 func scanDocumentRow(scan func(dest ...any) error) (*Document, error) {
 	var doc Document
 	var diverged int64
-	err := scan(&doc.DocumentID, &doc.Workspace, &doc.Path, &doc.ContentHash,
+	err := scan(&doc.DocumentID, &doc.Notespace, &doc.Path, &doc.ContentHash,
 		&doc.LastSyncedHash, &doc.LastSyncedVersion, &doc.BaseContent, &diverged, &doc.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -498,7 +513,7 @@ func scanDocumentRow(scan func(dest ...any) error) (*Document, error) {
 }
 
 // UpsertDocument inserts a new document or, when the document_id already
-// exists, updates its workspace/path/content_hash while preserving the
+// exists, updates its notespace/path/content_hash while preserving the
 // last-synced fields and base content (those advance only on server
 // confirmation, via SetSynced in Phase 1).
 func (d *DB) UpsertDocument(doc *Document) error {
@@ -506,14 +521,14 @@ func (d *DB) UpsertDocument(doc *Document) error {
 	// untouched: those advance only on server confirmation / explicit adopt,
 	// never from watcher-side content tracking.
 	_, err := d.db.Exec(
-		`INSERT INTO sync_documents (document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged, updated_at)
+		`INSERT INTO sync_documents (document_id, notespace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		 ON CONFLICT(document_id) DO UPDATE SET
-			workspace = excluded.workspace,
+			notespace = excluded.notespace,
 			path = excluded.path,
 			content_hash = excluded.content_hash,
 			updated_at = CURRENT_TIMESTAMP`,
-		doc.DocumentID, doc.Workspace, doc.Path, doc.ContentHash,
+		doc.DocumentID, doc.Notespace, doc.Path, doc.ContentHash,
 		doc.LastSyncedHash, doc.LastSyncedVersion, doc.BaseContent, boolToInt(doc.Diverged))
 	if err != nil {
 		return fmt.Errorf("failed to upsert sync document %s: %w", doc.DocumentID, err)
@@ -544,17 +559,17 @@ func (d *DB) DeleteDocument(documentID string) error {
 	return nil
 }
 
-// ListDocuments returns tracked documents ordered by workspace then path. An
-// empty workspace lists every workspace; a non-empty one filters to it. Used
+// ListDocuments returns tracked documents ordered by notespace then path. An
+// empty notespace lists every notespace; a non-empty one filters to it. Used
 // by the read-only /api/sync/documents introspection endpoint (dev UI).
-func (d *DB) ListDocuments(workspace string) ([]*Document, error) {
+func (d *DB) ListDocuments(notespace string) ([]*Document, error) {
 	query := `SELECT ` + documentColumns + ` FROM sync_documents`
 	var args []interface{}
-	if workspace != "" {
-		query += ` WHERE workspace = ?`
-		args = append(args, workspace)
+	if notespace != "" {
+		query += ` WHERE notespace = ?`
+		args = append(args, notespace)
 	}
-	query += ` ORDER BY workspace ASC, path ASC`
+	query += ` ORDER BY notespace ASC, path ASC`
 
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
@@ -585,9 +600,9 @@ func (d *DB) CountDocuments() (int, error) {
 // EnqueueOutbox appends a pending change to the outbox and returns its id.
 func (d *DB) EnqueueOutbox(e *OutboxEntry) (int64, error) {
 	res, err := d.db.Exec(
-		`INSERT INTO sync_outbox (document_id, workspace, event_type, path, prev_path, content_hash, payload, base_version, mtime)
+		`INSERT INTO sync_outbox (document_id, notespace, event_type, path, prev_path, content_hash, payload, base_version, mtime)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.DocumentID, e.Workspace, e.EventType, e.Path, e.PrevPath, e.ContentHash, e.Payload, e.BaseVersion, mtimeToNanos(e.Mtime))
+		e.DocumentID, e.Notespace, e.EventType, e.Path, e.PrevPath, e.ContentHash, e.Payload, e.BaseVersion, mtimeToNanos(e.Mtime))
 	if err != nil {
 		return 0, fmt.Errorf("failed to enqueue sync outbox entry: %w", err)
 	}
@@ -599,13 +614,13 @@ func (d *DB) EnqueueOutbox(e *OutboxEntry) (int64, error) {
 }
 
 // ListOutbox returns pending outbox entries in insertion order. An empty
-// workspace lists all workspaces; limit <= 0 means no limit.
-func (d *DB) ListOutbox(workspace string, limit int) ([]*OutboxEntry, error) {
+// notespace lists all notespaces; limit <= 0 means no limit.
+func (d *DB) ListOutbox(notespace string, limit int) ([]*OutboxEntry, error) {
 	query := `SELECT ` + outboxColumns + ` FROM sync_outbox`
 	var args []interface{}
-	if workspace != "" {
-		query += ` WHERE workspace = ?`
-		args = append(args, workspace)
+	if notespace != "" {
+		query += ` WHERE notespace = ?`
+		args = append(args, notespace)
 	}
 	query += ` ORDER BY id ASC`
 	if limit > 0 {
@@ -654,12 +669,12 @@ func (d *DB) DeleteOutbox(ids []int64) error {
 // file): the push pipeline reads content from disk at push time, so a parked
 // entry carrying the pre-merge hash would fail the server's hash-integrity
 // check and be dropped — silently losing the merged edit.
-func (d *DB) UpdateOutboxContentHashForPath(workspace, path, hash string) error {
+func (d *DB) UpdateOutboxContentHashForPath(notespace, path, hash string) error {
 	_, err := d.db.Exec(
-		`UPDATE sync_outbox SET content_hash = ? WHERE workspace = ? AND path = ? AND event_type = ?`,
-		hash, workspace, path, syncproto.EventDocumentUpdated)
+		`UPDATE sync_outbox SET content_hash = ? WHERE notespace = ? AND path = ? AND event_type = ?`,
+		hash, notespace, path, syncproto.EventDocumentUpdated)
 	if err != nil {
-		return fmt.Errorf("failed to update outbox content hash for %s/%s: %w", workspace, path, err)
+		return fmt.Errorf("failed to update outbox content hash for %s/%s: %w", notespace, path, err)
 	}
 	return nil
 }
@@ -718,33 +733,33 @@ func (d *DB) CountOutboxParked() (int, error) {
 }
 
 // CountOutboxForPath returns the number of pending outbox entries for a
-// workspace/path (parked included). The adopt endpoint (item 5) uses it to
+// notespace/path (parked included). The adopt endpoint (item 5) uses it to
 // refuse adopting past an unpushed merge — adopting to the server head while a
 // merged payload is still queued would drop the user's merged-in lines from the
 // hub.
-func (d *DB) CountOutboxForPath(workspace, path string) (int, error) {
+func (d *DB) CountOutboxForPath(notespace, path string) (int, error) {
 	var n int
 	if err := d.db.QueryRow(
-		`SELECT COUNT(*) FROM sync_outbox WHERE workspace = ? AND path = ?`,
-		workspace, path).Scan(&n); err != nil {
-		return 0, fmt.Errorf("failed to count outbox for %s/%s: %w", workspace, path, err)
+		`SELECT COUNT(*) FROM sync_outbox WHERE notespace = ? AND path = ?`,
+		notespace, path).Scan(&n); err != nil {
+		return 0, fmt.Errorf("failed to count outbox for %s/%s: %w", notespace, path, err)
 	}
 	return n, nil
 }
 
-// GetState returns the replication state for a workspace, or nil when the
-// workspace has never synced.
-func (d *DB) GetState(workspace string) (*WorkspaceState, error) {
-	var st WorkspaceState
+// GetState returns the replication state for a notespace, or nil when the
+// notespace has never synced.
+func (d *DB) GetState(notespace string) (*NotespaceState, error) {
+	var st NotespaceState
 	var lastSynced sql.NullTime
 	err := d.db.QueryRow(
-		`SELECT workspace, cursor, origin_id, last_synced_at FROM sync_state WHERE workspace = ?`,
-		workspace).Scan(&st.Workspace, &st.Cursor, &st.OriginID, &lastSynced)
+		`SELECT notespace, cursor, origin_id, last_synced_at FROM sync_state WHERE notespace = ?`,
+		notespace).Scan(&st.Notespace, &st.Cursor, &st.OriginID, &lastSynced)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to read sync state for %s: %w", workspace, err)
+		return nil, fmt.Errorf("failed to read sync state for %s: %w", notespace, err)
 	}
 	if lastSynced.Valid {
 		st.LastSyncedAt = lastSynced.Time
@@ -752,19 +767,19 @@ func (d *DB) GetState(workspace string) (*WorkspaceState, error) {
 	return &st, nil
 }
 
-// ListStates returns the replication state of every workspace that has one.
-func (d *DB) ListStates() ([]*WorkspaceState, error) {
-	rows, err := d.db.Query(`SELECT workspace, cursor, origin_id, last_synced_at FROM sync_state ORDER BY workspace`)
+// ListStates returns the replication state of every notespace that has one.
+func (d *DB) ListStates() ([]*NotespaceState, error) {
+	rows, err := d.db.Query(`SELECT notespace, cursor, origin_id, last_synced_at FROM sync_state ORDER BY notespace`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list sync states: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	var states []*WorkspaceState
+	var states []*NotespaceState
 	for rows.Next() {
-		var st WorkspaceState
+		var st NotespaceState
 		var lastSynced sql.NullTime
-		if err := rows.Scan(&st.Workspace, &st.Cursor, &st.OriginID, &lastSynced); err != nil {
+		if err := rows.Scan(&st.Notespace, &st.Cursor, &st.OriginID, &lastSynced); err != nil {
 			return nil, fmt.Errorf("failed to scan sync state: %w", err)
 		}
 		if lastSynced.Valid {
@@ -775,19 +790,19 @@ func (d *DB) ListStates() ([]*WorkspaceState, error) {
 	return states, rows.Err()
 }
 
-// SetCursor advances a workspace's replication cursor, stamping the install
+// SetCursor advances a notespace's replication cursor, stamping the install
 // origin id and last-synced time.
-func (d *DB) SetCursor(workspace string, cursor int64) error {
+func (d *DB) SetCursor(notespace string, cursor int64) error {
 	_, err := d.db.Exec(
-		`INSERT INTO sync_state (workspace, cursor, origin_id, last_synced_at)
+		`INSERT INTO sync_state (notespace, cursor, origin_id, last_synced_at)
 		 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-		 ON CONFLICT(workspace) DO UPDATE SET
+		 ON CONFLICT(notespace) DO UPDATE SET
 			cursor = excluded.cursor,
 			origin_id = excluded.origin_id,
 			last_synced_at = CURRENT_TIMESTAMP`,
-		workspace, cursor, d.originID)
+		notespace, cursor, d.originID)
 	if err != nil {
-		return fmt.Errorf("failed to set sync cursor for %s: %w", workspace, err)
+		return fmt.Errorf("failed to set sync cursor for %s: %w", notespace, err)
 	}
 	return nil
 }
@@ -832,7 +847,7 @@ func (d *DB) MarkDocumentSynced(documentID string, version int64, hash string, c
 func (e *OutboxEntry) ToSyncEvent() syncproto.SyncEvent {
 	return syncproto.SyncEvent{
 		Type:        e.EventType,
-		Workspace:   e.Workspace,
+		NotespaceID: syncproto.NotespaceID(e.Notespace),
 		DocumentID:  e.DocumentID,
 		Path:        e.Path,
 		PrevPath:    e.PrevPath,
@@ -848,45 +863,45 @@ func (e *OutboxEntry) ToSyncEvent() syncproto.SyncEvent {
 	}
 }
 
-// IsQuarantineOverridden reports whether a workspace/path pair has been
+// IsQuarantineOverridden reports whether a notespace/path pair has been
 // explicitly overridden to allow syncing despite secret quarantine matches.
-func (d *DB) IsQuarantineOverridden(workspace, path string) (bool, error) {
+func (d *DB) IsQuarantineOverridden(notespace, path string) (bool, error) {
 	var count int
 	err := d.db.QueryRow(
-		`SELECT COUNT(*) FROM sync_quarantine_override WHERE workspace = ? AND path = ?`,
-		workspace, path).Scan(&count)
+		`SELECT COUNT(*) FROM sync_quarantine_override WHERE notespace = ? AND path = ?`,
+		notespace, path).Scan(&count)
 	if err != nil {
-		return false, fmt.Errorf("failed to check quarantine override for %s/%s: %w", workspace, path, err)
+		return false, fmt.Errorf("failed to check quarantine override for %s/%s: %w", notespace, path, err)
 	}
 	return count > 0, nil
 }
 
-// SetQuarantineOverride adds a workspace/path to the quarantine override list,
+// SetQuarantineOverride adds a notespace/path to the quarantine override list,
 // allowing it to sync despite secret pattern matches.
-func (d *DB) SetQuarantineOverride(workspace, path string) error {
+func (d *DB) SetQuarantineOverride(notespace, path string) error {
 	_, err := d.db.Exec(
-		`INSERT OR REPLACE INTO sync_quarantine_override (workspace, path) VALUES (?, ?)`,
-		workspace, path)
+		`INSERT OR REPLACE INTO sync_quarantine_override (notespace, path) VALUES (?, ?)`,
+		notespace, path)
 	if err != nil {
-		return fmt.Errorf("failed to set quarantine override for %s/%s: %w", workspace, path, err)
+		return fmt.Errorf("failed to set quarantine override for %s/%s: %w", notespace, path, err)
 	}
 	return nil
 }
 
-// RemoveQuarantineOverride removes a workspace/path from the override list.
-func (d *DB) RemoveQuarantineOverride(workspace, path string) error {
+// RemoveQuarantineOverride removes a notespace/path from the override list.
+func (d *DB) RemoveQuarantineOverride(notespace, path string) error {
 	_, err := d.db.Exec(
-		`DELETE FROM sync_quarantine_override WHERE workspace = ? AND path = ?`,
-		workspace, path)
+		`DELETE FROM sync_quarantine_override WHERE notespace = ? AND path = ?`,
+		notespace, path)
 	if err != nil {
-		return fmt.Errorf("failed to remove quarantine override for %s/%s: %w", workspace, path, err)
+		return fmt.Errorf("failed to remove quarantine override for %s/%s: %w", notespace, path, err)
 	}
 	return nil
 }
 
-// GetWorkspaceCursor retrieves the current pull cursor for a workspace.
-func (d *DB) GetWorkspaceCursor(workspace string) (int64, error) {
-	state, err := d.GetState(workspace)
+// GetNotespaceCursor retrieves the current pull cursor for a notespace.
+func (d *DB) GetNotespaceCursor(notespace string) (int64, error) {
+	state, err := d.GetState(notespace)
 	if err != nil {
 		return 0, err
 	}
@@ -896,17 +911,17 @@ func (d *DB) GetWorkspaceCursor(workspace string) (int64, error) {
 	return state.Cursor, nil
 }
 
-// UpdateWorkspaceCursor updates the pull cursor for a workspace.
-func (d *DB) UpdateWorkspaceCursor(workspace string, cursor int64) error {
-	return d.SetCursor(workspace, cursor)
+// UpdateNotespaceCursor updates the pull cursor for a notespace.
+func (d *DB) UpdateNotespaceCursor(notespace string, cursor int64) error {
+	return d.SetCursor(notespace, cursor)
 }
 
 // InsertDocument inserts a new document into sync_documents.
 func (d *DB) InsertDocument(doc *Document) error {
 	_, err := d.db.Exec(
-		`INSERT INTO sync_documents (document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged)
+		`INSERT INTO sync_documents (document_id, notespace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		doc.DocumentID, doc.Workspace, doc.Path, doc.ContentHash, doc.LastSyncedHash, doc.LastSyncedVersion, doc.BaseContent, boolToInt(doc.Diverged))
+		doc.DocumentID, doc.Notespace, doc.Path, doc.ContentHash, doc.LastSyncedHash, doc.LastSyncedVersion, doc.BaseContent, boolToInt(doc.Diverged))
 	if err != nil {
 		return fmt.Errorf("failed to insert sync document %s: %w", doc.DocumentID, err)
 	}
@@ -931,15 +946,15 @@ func (d *DB) UpdateDocument(doc *Document) error {
 // base: version, last_synced_hash, and base_content roll together (mirroring
 // MarkDocumentSynced) — rolling the version alone leaves a stale merge base,
 // the phantom-conflict trap.
-func (d *DB) AdoptDocument(workspace, path, documentID string, version int64, hash string, content []byte) error {
+func (d *DB) AdoptDocument(notespace, path, documentID string, version int64, hash string, content []byte) error {
 	// diverged = 0: adopting the server head IS the resolution of divergence.
 	// The reconcile self-heal path (antientropy.go reconcileDocument's hash-equal
 	// branch) and `nb sync adopt` both land here, so a disk drift back to
 	// hash-equal-with-server clears the diverged flag for free.
 	_, err := d.db.Exec(
 		`UPDATE sync_documents SET document_id = ?, last_synced_version = ?, last_synced_hash = ?, content_hash = ?, base_content = ?, diverged = 0, updated_at = CURRENT_TIMESTAMP
-		 WHERE workspace = ? AND path = ?`,
-		documentID, version, hash, hash, content, workspace, path)
+		 WHERE notespace = ? AND path = ?`,
+		documentID, version, hash, hash, content, notespace, path)
 	if err != nil {
 		return fmt.Errorf("failed to adopt document %s: %w", documentID, err)
 	}
@@ -958,12 +973,12 @@ func (d *DB) PendingReturnPush(m ReturnManifest) (string, error) {
 		var n int
 		if err := d.db.QueryRow(
 			`SELECT COUNT(*) FROM sync_outbox
-			 WHERE document_id = ? OR (workspace = ? AND (path = ? OR (? != '' AND path = ?)))`,
-			op.DocumentID, op.Workspace, op.Path, op.PreviousPath, op.PreviousPath).Scan(&n); err != nil {
-			return "", fmt.Errorf("failed to count outbox for %s/%s: %w", op.Workspace, op.Path, err)
+			 WHERE document_id = ? OR (notespace = ? AND (path = ? OR (? != '' AND path = ?)))`,
+			op.DocumentID, op.Notespace, op.Path, op.PreviousPath, op.PreviousPath).Scan(&n); err != nil {
+			return "", fmt.Errorf("failed to count outbox for %s/%s: %w", op.Notespace, op.Path, err)
 		}
 		if n > 0 {
-			return op.Workspace + "/" + op.Path, nil
+			return op.Notespace + "/" + op.Path, nil
 		}
 	}
 	return "", nil
@@ -985,8 +1000,8 @@ func (d *DB) ReconcileReturnEscrow(e ReturnEscrow) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	for _, op := range e.Manifest.Operations {
-		if _, err = tx.Exec(`DELETE FROM sync_outbox WHERE document_id = ? OR (workspace = ? AND (path = ? OR path = ?))`,
-			op.DocumentID, op.Workspace, op.Path, op.PreviousPath); err != nil {
+		if _, err = tx.Exec(`DELETE FROM sync_outbox WHERE document_id = ? OR (notespace = ? AND (path = ? OR path = ?))`,
+			op.DocumentID, op.Notespace, op.Path, op.PreviousPath); err != nil {
 			return fmt.Errorf("clear adopted outbox for %s: %w", op.DocumentID, err)
 		}
 		if op.Type == "delete" {
@@ -1001,16 +1016,16 @@ func (d *DB) ReconcileReturnEscrow(e ReturnEscrow) error {
 		}
 		// A watcher event racing the filesystem commit may have minted a fresh
 		// local identity for the adopted destination. The server identity wins.
-		if _, err = tx.Exec(`DELETE FROM sync_documents WHERE workspace = ? AND path = ? AND document_id != ?`, op.Workspace, op.Path, op.DocumentID); err != nil {
-			return fmt.Errorf("clear raced local identity at %s/%s: %w", op.Workspace, op.Path, err)
+		if _, err = tx.Exec(`DELETE FROM sync_documents WHERE notespace = ? AND path = ? AND document_id != ?`, op.Notespace, op.Path, op.DocumentID); err != nil {
+			return fmt.Errorf("clear raced local identity at %s/%s: %w", op.Notespace, op.Path, err)
 		}
 		_, err = tx.Exec(`INSERT INTO sync_documents
-			(document_id, workspace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged, updated_at)
+			(document_id, notespace, path, content_hash, last_synced_hash, last_synced_version, base_content, diverged, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
-			ON CONFLICT(document_id) DO UPDATE SET workspace=excluded.workspace, path=excluded.path,
+			ON CONFLICT(document_id) DO UPDATE SET notespace=excluded.notespace, path=excluded.path,
 			content_hash=excluded.content_hash, last_synced_hash=excluded.last_synced_hash,
 			last_synced_version=excluded.last_synced_version, base_content=excluded.base_content,
-			diverged=0, updated_at=CURRENT_TIMESTAMP`, op.DocumentID, op.Workspace, op.Path,
+			diverged=0, updated_at=CURRENT_TIMESTAMP`, op.DocumentID, op.Notespace, op.Path,
 			op.HeadHash, op.HeadHash, op.HeadVersion, content)
 		if err != nil {
 			return fmt.Errorf("adopt identity %s: %w", op.DocumentID, err)
@@ -1025,7 +1040,7 @@ func (d *DB) ReconcileReturnEscrow(e ReturnEscrow) error {
 // answers with the EXISTING document id, and the local row — plus every queued
 // outbox entry still carrying the stale id — must adopt it or every subsequent
 // push dangles off an id the server never learned. Same-row UPDATE, so the
-// UNIQUE(workspace, path) constraint is untouched; the PRIMARY KEY constraint
+// UNIQUE(notespace, path) constraint is untouched; the PRIMARY KEY constraint
 // still fails if newID is already tracked at another path, which the caller
 // surfaces rather than papering over.
 func (d *DB) RemapDocument(oldID, newID string) error {
@@ -1118,7 +1133,7 @@ func (d *DB) InsertOutboxEntry(e *OutboxEntry) error {
 
 // MovePrefix updates all documents under a prefix, renaming the directory.
 // For example, moving "plans/" to "archived/plans/" updates all docs under the prefix.
-func (d *DB) MovePrefix(workspace, oldPrefix, newPrefix string) error {
+func (d *DB) MovePrefix(notespace, oldPrefix, newPrefix string) error {
 	// Normalize prefixes to end with /
 	if len(oldPrefix) > 0 && oldPrefix[len(oldPrefix)-1] != '/' {
 		oldPrefix += "/"
@@ -1128,8 +1143,8 @@ func (d *DB) MovePrefix(workspace, oldPrefix, newPrefix string) error {
 	}
 
 	_, err := d.db.Exec(
-		`UPDATE sync_documents SET path = ? || SUBSTR(path, ?) WHERE workspace = ? AND path LIKE ?`,
-		newPrefix, len(oldPrefix)+1, workspace, oldPrefix+"%")
+		`UPDATE sync_documents SET path = ? || SUBSTR(path, ?) WHERE notespace = ? AND path LIKE ?`,
+		newPrefix, len(oldPrefix)+1, notespace, oldPrefix+"%")
 	if err != nil {
 		return fmt.Errorf("failed to move prefix %s to %s: %w", oldPrefix, newPrefix, err)
 	}
@@ -1137,15 +1152,15 @@ func (d *DB) MovePrefix(workspace, oldPrefix, newPrefix string) error {
 }
 
 // DeletePrefix removes all documents under a path prefix.
-func (d *DB) DeletePrefix(workspace, prefix string) error {
+func (d *DB) DeletePrefix(notespace, prefix string) error {
 	// Normalize prefix to end with /
 	if len(prefix) > 0 && prefix[len(prefix)-1] != '/' {
 		prefix += "/"
 	}
 
 	_, err := d.db.Exec(
-		`DELETE FROM sync_documents WHERE workspace = ? AND (path = ? OR path LIKE ?)`,
-		workspace, prefix[:len(prefix)-1], prefix+"%")
+		`DELETE FROM sync_documents WHERE notespace = ? AND (path = ? OR path LIKE ?)`,
+		notespace, prefix[:len(prefix)-1], prefix+"%")
 	if err != nil {
 		return fmt.Errorf("failed to delete prefix %s: %w", prefix, err)
 	}

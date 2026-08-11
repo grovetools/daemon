@@ -15,9 +15,9 @@ import (
 // registryFixture builds a hermetic machine: a sandboxed GROVE_HOME (which
 // redirects config, state AND data, so the identity mint below can never reach
 // the developer's real ~/.local/state/grove), a notebook definition, a
-// registry-role subscription, and a materialized workspace root.
+// registry-role subscription, and a materialized notespace root.
 //
-// Returns the handler, the registry workspace root, and this machine's id.
+// Returns the handler, the registry notespace root, and this machine's id.
 func registryFixture(t *testing.T, machineTOML string) (*SyncHandler, string, string) {
 	t.Helper()
 
@@ -28,10 +28,10 @@ func registryFixture(t *testing.T, machineTOML string) (*SyncHandler, string, st
 
 	configDir := filepath.Join(home, "config", "grove")
 	notebookRoot := filepath.Join(home, "notebooks", "nb")
-	// syntheticNodeFor prefers a notebook definition whose resolved workspace
+	// syntheticNodeFor prefers a notebook definition whose resolved notespace
 	// root already exists on disk, so precreate it — this is what a `grove
 	// join` does when it seeds the registry dirs.
-	if err := os.MkdirAll(filepath.Join(notebookRoot, "workspaces", "registry", "notes"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(notebookRoot, "notespaces", "registry", "notes"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	writeTestFile(t, filepath.Join(configDir, "notebooks.toml"), `default = "nb"
@@ -65,9 +65,9 @@ root = "`+notebookRoot+`"
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := h.nodeWorkspaceRoot(node)
+	root, err := h.nodeNotespaceRoot(node)
 	if err != nil {
-		t.Fatalf("fixture could not resolve the registry workspace root: %v", err)
+		t.Fatalf("fixture could not resolve the registry notespace root: %v", err)
 	}
 
 	id := machine.ID()
@@ -236,8 +236,8 @@ func TestRegistryWriterRecordsSubscriptionsWithoutSecrets(t *testing.T) {
 func TestRegistryWriterIsDarkWithoutARegistrySubscription(t *testing.T) {
 	h, root, id := registryFixture(t, "[machine]\nname = \"fixture-a\"\n")
 	h.syncCfgMu.Lock()
-	// A push-only legacy entry: same workspace name, no role. The ROLE is what
-	// makes a workspace the registry, never the name.
+	// A push-only legacy entry: same notespace name, no role. The ROLE is what
+	// makes a notespace the registry, never the name.
 	h.syncCfg.Workspaces = []config.SyncWorkspace{{Name: "registry"}}
 	h.syncCfgMu.Unlock()
 
