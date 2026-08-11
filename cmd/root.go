@@ -45,6 +45,7 @@ func init() {
 	rootCmd.AddCommand(newGrovedConfigCmd())
 	rootCmd.AddCommand(newGrovedMonitorCmd())
 	rootCmd.AddCommand(newGrovedHealthCmd())
+	rootCmd.AddCommand(newGrovedSyncDBCmd())
 }
 
 func Execute() error {

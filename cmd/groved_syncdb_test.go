@@ -11,6 +11,16 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+func TestRootRegistersSyncDBArchiveRebuildCommand(t *testing.T) {
+	cmd, _, err := rootCmd.Find([]string{"sync-db-archive-rebuild"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd == rootCmd || cmd.Name() != "sync-db-archive-rebuild" {
+		t.Fatalf("sync-db-archive-rebuild command is not registered on the shipped root")
+	}
+}
+
 func TestSyncDBArchiveRebuildCommandEmitsReceipt(t *testing.T) {
 	t.Setenv("GROVE_HOME", t.TempDir())
 	path := filepath.Join(t.TempDir(), "sync.db")
