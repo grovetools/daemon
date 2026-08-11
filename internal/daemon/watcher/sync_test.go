@@ -3,6 +3,7 @@ package watcher
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -543,6 +544,37 @@ func TestSyncFlushHashGating(t *testing.T) {
 	}
 	if entries[1].DocumentID != doc.DocumentID {
 		t.Fatalf("document id changed on update: %q != %q", entries[1].DocumentID, doc.DocumentID)
+	}
+}
+
+func TestSyncCreatedDirectoryCapturesPreWatchBurst(t *testing.T) {
+	h, wsRoot := newTestSyncHandler(t, 10, 100)
+	ctx := context.Background()
+
+	// fsnotify reports the directory creation through the already-watched
+	// parent, but it is non-recursive: these children can all exist before the
+	// unified watcher gets a chance to install a watch on burst/.
+	burstDir := filepath.Join(wsRoot, "quick")
+	for i := 0; i < 100; i++ {
+		writeFile(t, filepath.Join(burstDir, fmt.Sprintf("flood-%03d.md", i)), "fresh\n")
+	}
+	if err := h.HandleEvents(ctx, []fsnotify.Event{{Name: burstDir, Op: fsnotify.Create}}); err != nil {
+		t.Fatalf("HandleEvents: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		entries, err := h.database().ListOutbox("testws", 0)
+		if err != nil {
+			t.Fatalf("ListOutbox: %v", err)
+		}
+		if len(entries) == 100 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("directory registration gap lost files: captured %d/100", len(entries))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

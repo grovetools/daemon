@@ -27,6 +27,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -649,12 +650,53 @@ func (h *SyncHandler) MatchesEvent(event fsnotify.Event) bool {
 	return watch.space.Included(rel)
 }
 
-// HandleEvents debounces matched filesystem events per path.
+// HandleEvents debounces matched filesystem events per path. A newly-created
+// directory is reconciled immediately: fsnotify is non-recursive, so files
+// created inside it before the unified watcher installs the directory watch
+// produce no individual events. Walking the completed subtree closes that
+// registration gap; later writes are covered by the newly-installed watch.
 func (h *SyncHandler) HandleEvents(ctx context.Context, events []fsnotify.Event) error {
 	for _, event := range events {
+		if event.Op&fsnotify.Create != 0 {
+			if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+				h.scheduleCreatedDirectory(event.Name)
+				continue
+			}
+		}
 		h.scheduleFlush(event.Name)
 	}
 	return nil
+}
+
+// scheduleCreatedDirectory captures files already present below a directory at
+// the instant its non-recursive fsnotify watch is being installed. Paths are
+// judged relative to the notespace root (not the new subtree) so per-notespace
+// exclusion globs retain their normal semantics.
+func (h *SyncHandler) scheduleCreatedDirectory(dir string) {
+	watch, _ := h.lookupWatch(dir)
+	if watch == nil {
+		return
+	}
+	_ = filepath.WalkDir(dir, func(abs string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // transient create/delete races are covered by reconciliation
+		}
+		rel, relErr := filepath.Rel(watch.root, abs)
+		if relErr != nil || strings.HasPrefix(rel, "..") {
+			return nil
+		}
+		rel = syncproto.NormalizePath(rel)
+		if entry.IsDir() {
+			if abs != dir && !watch.space.Included(rel) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if watch.space.Included(rel) {
+			h.scheduleFlush(abs)
+		}
+		return nil
+	})
 }
 
 // scheduleFlush arms (or re-arms) the per-path debounce timer: quietMs of
