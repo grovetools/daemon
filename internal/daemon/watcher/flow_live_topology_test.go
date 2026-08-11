@@ -45,8 +45,8 @@ func TestFlowHoldDeliveryFromDiscoveredLiveTopology(t *testing.T) {
 	repo := filepath.Join(codeRoot, "fixture-repo")
 	twinRepo := filepath.Join(codeRoot, "twin-repo")
 	notebookRoot := filepath.Join(home, "notebooks", "verifybook")
-	plansRoot := filepath.Join(notebookRoot, "workspaces", "fixture-repo", "plans")
-	twinPlansRoot := filepath.Join(notebookRoot, "workspaces", "twin-repo", "plans")
+	plansRoot := filepath.Join(notebookRoot, "notespaces", "fixture-repo", "plans")
+	twinPlansRoot := filepath.Join(notebookRoot, "notespaces", "twin-repo", "plans")
 
 	configDir := filepath.Join(groveHome, "config", "grove")
 	if err := os.MkdirAll(configDir, 0o755); err != nil {

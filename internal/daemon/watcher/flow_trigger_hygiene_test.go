@@ -24,7 +24,7 @@ import (
 // .md files, and neither descends further — so everything an agent writes
 // while it runs must classify as unreadable.
 func TestClassifyPlanEventAllowlistsOnlyWhatTheReadersOpen(t *testing.T) {
-	plansDir := filepath.Join("/nb", "workspaces", "grovetools", "plans")
+	plansDir := filepath.Join("/nb", "notespaces", "grovetools", "plans")
 	plan := filepath.Join(plansDir, "perf-audit")
 
 	cases := []struct {
@@ -79,7 +79,7 @@ func TestClassifyPlanEventAllowlistsOnlyWhatTheReadersOpen(t *testing.T) {
 func hygieneHandler(t *testing.T) (*FlowHandler, string) {
 	t.Helper()
 	notebookRoot := t.TempDir()
-	plansDir := filepath.Join(notebookRoot, "workspaces", "fixture-repo", "plans")
+	plansDir := filepath.Join(notebookRoot, "notespaces", "fixture-repo", "plans")
 	planDir := filepath.Join(plansDir, "live-plan")
 	writeIndexedPlan(t, planDir)
 	if err := os.MkdirAll(filepath.Join(planDir, ".artifacts", "job-abc"), 0o755); err != nil {
@@ -88,7 +88,7 @@ func hygieneHandler(t *testing.T) (*FlowHandler, string) {
 
 	cfg := &config.Config{Notebooks: &config.NotebooksConfig{
 		Definitions: map[string]*config.Notebook{"test": {
-			RootDir: notebookRoot, PlansPathTemplate: "workspaces/{{ .Workspace.Name }}/plans",
+			RootDir: notebookRoot, PlansPathTemplate: "notespaces/{{ .Workspace.Name }}/plans",
 		}},
 		Rules: &config.NotebookRules{Default: "test"},
 	}}

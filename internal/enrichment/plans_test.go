@@ -185,7 +185,7 @@ func TestAssociatedPlanDirUsesCanonicalRegistryResolver(t *testing.T) {
 	coreconfig.ResetLoadCache()
 	t.Cleanup(coreconfig.ResetLoadCache)
 
-	planDir := filepath.Join(notebookRoot, "workspaces", "alpha-repo", "plans", "alpha-view")
+	planDir := filepath.Join(notebookRoot, "notespaces", "alpha-repo", "plans", "alpha-view")
 	if err := os.MkdirAll(planDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

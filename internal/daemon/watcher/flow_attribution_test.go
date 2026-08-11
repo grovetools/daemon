@@ -14,7 +14,7 @@ import (
 )
 
 // attributionWorld is the production shape that produced the bad record:
-// ONE centralized notebook plans directory (`workspaces/grovetools/plans`)
+// ONE centralized notebook plans directory (`notespaces/grovetools/plans`)
 // shared by the grovetools ecosystem root, its `perf-audit` worktree, and
 // member checkouts sitting inside OTHER, unrelated worktree containers.
 // Every one of these nodes resolves to the same plans dir, so every one of
@@ -36,7 +36,7 @@ func newAttributionWorld(t *testing.T) *attributionWorld {
 	worktrees := filepath.Join(root, "worktrees", "grovetools-0bd46c64")
 
 	w := &attributionWorld{
-		plansDir: filepath.Join(notebookRoot, "workspaces", "grovetools", "plans"),
+		plansDir: filepath.Join(notebookRoot, "notespaces", "grovetools", "plans"),
 		cfg: &config.Config{Notebooks: &config.NotebooksConfig{
 			Definitions: map[string]*config.Notebook{"test": {RootDir: notebookRoot}},
 			Rules:       &config.NotebookRules{Default: "test"},
@@ -218,7 +218,7 @@ func TestJobAttributionKeepsOwnerWhenWorktreeNameIsForeign(t *testing.T) {
 // several entries. The enclosing plan directory is the answer; a shorter
 // prefix must never win just because map iteration reached it first.
 func TestOwnerForPathPrefersTheMostSpecificWatchedPath(t *testing.T) {
-	plansDir := filepath.FromSlash("/nb/workspaces/grovetools/plans")
+	plansDir := filepath.FromSlash("/nb/notespaces/grovetools/plans")
 	outer := &workspace.WorkspaceNode{Name: "outer", Path: "/eco"}
 	inner := &workspace.WorkspaceNode{Name: "inner", Path: "/eco/inner"}
 
@@ -236,7 +236,7 @@ func TestOwnerForPathPrefersTheMostSpecificWatchedPath(t *testing.T) {
 	if got := h.ownerForPath(filepath.Join(plansDir, "other-plan", "01-job.md")); got != outer {
 		t.Fatalf("owner = %+v, want the plans-directory node %+v", got, outer)
 	}
-	if got := h.ownerForPath(filepath.FromSlash("/nb/workspaces/grovetools/notes/x.md")); got != nil {
+	if got := h.ownerForPath(filepath.FromSlash("/nb/notespaces/grovetools/notes/x.md")); got != nil {
 		t.Fatalf("owner = %+v, want nil for an unwatched path", got)
 	}
 }

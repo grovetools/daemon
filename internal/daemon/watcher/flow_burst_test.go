@@ -32,7 +32,7 @@ func TestFlowBurstInsertsAllReachSubscribers(t *testing.T) {
 	workspaces := make(map[string]*models.EnrichedWorkspace)
 	ws := coldStartWorkspace(t, root, "beta-repo")
 	workspaces[ws.Path] = ws
-	plansDir := filepath.Join(notebookRoot, "workspaces", "beta-repo", "plans")
+	plansDir := filepath.Join(notebookRoot, "notespaces", "beta-repo", "plans")
 	for i := 0; i < 24; i++ {
 		writeIndexedPlan(t, filepath.Join(plansDir, fmt.Sprintf("beta-live-%02d", i)))
 	}

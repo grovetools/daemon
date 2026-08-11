@@ -17,7 +17,7 @@ import (
 func coldStartConfig(notebookRoot string) *config.Config {
 	return &config.Config{Notebooks: &config.NotebooksConfig{
 		Definitions: map[string]*config.Notebook{"test": {
-			RootDir: notebookRoot, PlansPathTemplate: "workspaces/{{ .Workspace.Name }}/plans",
+			RootDir: notebookRoot, PlansPathTemplate: "notespaces/{{ .Workspace.Name }}/plans",
 		}},
 		Rules: &config.NotebookRules{Default: "test"},
 	}}
@@ -58,7 +58,7 @@ func TestFlowColdStartPublishesAfterLateWorkspaceDiscovery(t *testing.T) {
 		ws := coldStartWorkspace(t, root, name)
 		workspaces[ws.Path] = ws
 		for i := 0; i < 24; i++ {
-			writeIndexedPlan(t, filepath.Join(notebookRoot, "workspaces", name, "plans", name+"-live-"+string(rune('a'+i))))
+			writeIndexedPlan(t, filepath.Join(notebookRoot, "notespaces", name, "plans", name+"-live-"+string(rune('a'+i))))
 			total++
 		}
 	}
@@ -128,8 +128,8 @@ func TestFlowScopedRefreshServesUnaffectedDirsFromCache(t *testing.T) {
 
 	wsA := coldStartWorkspace(t, root, "repo-a")
 	wsB := coldStartWorkspace(t, root, "repo-b")
-	plansA := filepath.Join(notebookRoot, "workspaces", "repo-a", "plans")
-	plansB := filepath.Join(notebookRoot, "workspaces", "repo-b", "plans")
+	plansA := filepath.Join(notebookRoot, "notespaces", "repo-a", "plans")
+	plansB := filepath.Join(notebookRoot, "notespaces", "repo-b", "plans")
 	writeIndexedPlan(t, filepath.Join(plansA, "a-one"))
 	writeIndexedPlan(t, filepath.Join(plansA, "a-two"))
 	writeIndexedPlan(t, filepath.Join(plansB, "b-one"))

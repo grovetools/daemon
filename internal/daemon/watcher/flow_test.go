@@ -57,18 +57,18 @@ func TestPlanWorkspaceRootUsesOwnerForStandaloneWorktree(t *testing.T) {
 
 func TestFlowHandlerResolvesNotebookAliasForRuntimeEvents(t *testing.T) {
 	notebookRoot := t.TempDir()
-	realWorkspace := filepath.Join(notebookRoot, "workspaces", "fixture-repo")
+	realWorkspace := filepath.Join(notebookRoot, "notespaces", "fixture-repo")
 	plansDir := filepath.Join(realWorkspace, "plans")
 	planDir := filepath.Join(plansDir, "hold-plan")
 	writeIndexedPlan(t, planDir)
 
-	aliasWorkspace := filepath.Join(notebookRoot, "workspaces", "hold-plan")
+	aliasWorkspace := filepath.Join(notebookRoot, "notespaces", "hold-plan")
 	if err := os.Symlink(realWorkspace, aliasWorkspace); err != nil {
 		t.Fatal(err)
 	}
 	cfg := &config.Config{Notebooks: &config.NotebooksConfig{
 		Definitions: map[string]*config.Notebook{"test": {
-			RootDir: notebookRoot, PlansPathTemplate: "workspaces/{{ .Workspace.Name }}/plans",
+			RootDir: notebookRoot, PlansPathTemplate: "notespaces/{{ .Workspace.Name }}/plans",
 		}},
 		Rules: &config.NotebookRules{Default: "test"},
 	}}
@@ -148,7 +148,7 @@ func TestFlowHoldLifecycleIsNotLostToDebounce(t *testing.T) {
 		container := filepath.Join(owner, ".grove-worktrees", "hold-plan")
 		member := filepath.Join(container, name)
 		runGit(t, owner, "worktree", "add", "-q", member, "hold-plan")
-		planDir := filepath.Join(notebookRoot, "workspaces", name, "plans", "hold-plan")
+		planDir := filepath.Join(notebookRoot, "notespaces", name, "plans", "hold-plan")
 		writeIndexedPlan(t, planDir)
 		if err := os.WriteFile(filepath.Join(planDir, ".grove-plan.yml"), []byte("worktree: hold-plan\nrepos:\n  - "+name+"\n"), 0o600); err != nil {
 			t.Fatal(err)
