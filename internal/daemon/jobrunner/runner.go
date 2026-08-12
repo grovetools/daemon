@@ -12,8 +12,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/grovetools/core/config"
 	grovelogging "github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/daemon/internal/daemon/jobattr"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/flow/pkg/orchestration"
 	tuimux "github.com/grovetools/tuimux/api/client"
@@ -211,7 +214,7 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 	// lookups. Fall back to a synthesized key only when the job file can't be
 	// read, and carry the type either way so no record is shaped like the
 	// duplicates were.
-	jobID, jobType, jobTitle := jr.flowJobIdentity(req.PlanDir, req.JobFile)
+	jobID, jobType, jobTitle, jobWorktree := jr.flowJobIdentity(req.PlanDir, req.JobFile)
 	if jobID == "" {
 		baseName := strings.TrimSuffix(req.JobFile, ".md")
 		jobID = fmt.Sprintf("%s-%s", baseName, uuid.New().String()[:6])
@@ -252,6 +255,11 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 		info.Repo = existing.Repo
 		info.Branch = existing.Branch
 		info.Channels = existing.Channels
+	} else {
+		// Nothing to carry over: this submission IS the row. Compute the trio
+		// through the same helper the other producers use, so it cannot
+		// disagree with the sweep that follows.
+		info.WorkDir, info.Repo, info.Branch = jr.resolveWorkspace(req.PlanDir, jobWorktree)
 	}
 
 	// Same reasoning for routing, one step further out: a resubmission of a job
@@ -344,18 +352,75 @@ func (jr *JobRunner) lastKnownAgentTarget(jobID string) string {
 	return ""
 }
 
-// flowJobIdentity reads the Flow job's own identity — ID, type and title — from
-// the plan. All three are empty when the plan or job file can't be read.
-func (jr *JobRunner) flowJobIdentity(planDir, jobFile string) (id string, jobType models.JobType, title string) {
+// flowJobIdentity reads the Flow job's own identity — ID, type, title and the
+// `worktree:` name its workspace attribution resolves through — from the plan.
+// All four are empty when the plan or job file can't be read.
+func (jr *JobRunner) flowJobIdentity(planDir, jobFile string) (id string, jobType models.JobType, title, worktree string) {
 	plan, err := orchestration.LoadPlan(planDir)
 	if err != nil {
-		return "", "", ""
+		return "", "", "", ""
 	}
 	job, found := plan.GetJobByFilename(jobFile)
 	if !found || job == nil {
+		return "", "", "", ""
+	}
+	return job.ID, models.JobType(job.Type), job.Title, job.Worktree
+}
+
+// resolveWorkspace computes the WorkDir/Repo/Branch trio for a job the store
+// has never seen, so a FIRST submission is attributed at submit time rather
+// than waiting for a filesystem producer. Without it jobrunner is a third
+// producer of the shared job row (see the jobattr package doc) that publishes
+// those three fields empty — and not just briefly: UpdateJobsDiscovered SKIPS
+// a row whose daemon status is "queued", so a blank-attributed queued job is
+// passed over by every later sweep and persisted blank across restarts.
+//
+// The workspace set comes from the store's cache, not a fresh DiscoverAll:
+// discovery is the multi-minute sweep this bug's window is made of. A cold
+// store yields no answer, leaving the pre-existing scan-heals-it behavior.
+func (jr *JobRunner) resolveWorkspace(planDir, worktreeName string) (workDir, repo, branch string) {
+	if planDir == "" {
 		return "", "", ""
 	}
-	return job.ID, models.JobType(job.Type), job.Title
+	enriched := jr.store.GetWorkspaces()
+	if len(enriched) == 0 {
+		return "", "", ""
+	}
+	nodes := make([]*workspace.WorkspaceNode, 0, len(enriched))
+	for _, ws := range enriched {
+		if ws != nil && ws.WorkspaceNode != nil {
+			nodes = append(nodes, ws.WorkspaceNode)
+		}
+	}
+
+	coreCfg, err := config.LoadDefault()
+	if err != nil {
+		return "", "", ""
+	}
+	locator := workspace.NewNotebookLocator(coreCfg)
+
+	// planDir is "<plans root>/<plan name>"; GetPlansDir answers the root.
+	plansRoot := filepath.Dir(planDir)
+	var owner *workspace.WorkspaceNode
+	for _, node := range nodes {
+		dir, err := locator.GetPlansDir(node)
+		if err != nil || dir != plansRoot {
+			continue
+		}
+		// Every worktree in a group shares its plans dir; ScanForAllPlans
+		// attributes the group to its main project, so prefer that here too
+		// rather than whichever worktree happens to be enumerated first.
+		if owner == nil || (owner.IsWorktree() && !node.IsWorktree()) {
+			owner = node
+		}
+	}
+	if owner == nil {
+		return "", "", ""
+	}
+
+	workDir, repo, branch, _ = jobattr.JobWorkspace(
+		jobattr.NewIndex(nodes), owner, worktreeName, owner.Path, owner.Name)
+	return workDir, repo, branch
 }
 
 // areDependenciesMet loads the plan for the given job and checks whether all
