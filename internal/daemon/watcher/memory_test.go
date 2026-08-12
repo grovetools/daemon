@@ -99,11 +99,11 @@ func TestAssistantMemoryDirIsWatched(t *testing.T) {
 	root := t.TempDir()
 	eco := t.TempDir()
 
-	memoryDir := filepath.Join(root, "workspaces", "grovetools", "steward", "memory")
+	memoryDir := filepath.Join(root, "notespaces", "grovetools", "steward", "memory")
 	if err := os.MkdirAll(memoryDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(root, "workspaces", "grovetools", "plans"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(root, "notespaces", "grovetools", "plans"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -132,8 +132,8 @@ func TestAssistantMemoryDirFollowsGroveTomlPlanName(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(eco, "grove.toml"), []byte("[assistant]\nenabled = true\nplan = \"front-desk\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	renamed := filepath.Join(root, "workspaces", "grovetools", "front-desk", "memory")
-	steward := filepath.Join(root, "workspaces", "grovetools", "steward", "memory")
+	renamed := filepath.Join(root, "notespaces", "grovetools", "front-desk", "memory")
+	steward := filepath.Join(root, "notespaces", "grovetools", "steward", "memory")
 	for _, dir := range []string{renamed, steward} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -172,7 +172,7 @@ func TestAssistantMemoryDirSkipsNonEcosystemAndMissingDirs(t *testing.T) {
 	// An ecosystem that has never written a memory file is resolved but never
 	// watched: addDir stats the directory first.
 	eco := &workspace.WorkspaceNode{Name: "grovetools", Path: t.TempDir(), Kind: workspace.KindEcosystemRoot, NotebookName: "nb"}
-	want := filepath.Join(root, "workspaces", "grovetools", "steward", "memory")
+	want := filepath.Join(root, "notespaces", "grovetools", "steward", "memory")
 	if dir := h.assistantMemoryDir(eco); dir != want {
 		t.Errorf("assistantMemoryDir = %q, want %q", dir, want)
 	}
