@@ -40,11 +40,13 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/grovetools/core/config"
 	"github.com/grovetools/core/logging"
+	"github.com/grovetools/core/pkg/coderoot"
 	"github.com/grovetools/core/pkg/machine"
 	"github.com/grovetools/core/pkg/models"
 	notespacepkg "github.com/grovetools/core/pkg/notespace"
 	"github.com/grovetools/core/pkg/syncproto"
 	"github.com/grovetools/core/pkg/workspace"
+	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
 )
@@ -306,7 +308,8 @@ func (h *SyncHandler) SyncSubscriptions() (string, []config.SyncWorkspace) {
 }
 
 // recordedNotebookRoot returns the authoritative name+root pair. An exact
-// compiled code-root binding is literal rung 0; the recorded default is the
+// compiled code-root binding is literal rung 0; a stamped notespace whose id is
+// the recorded primary for its subject is rung 1; the recorded default is the
 // only fallback. The compiled NotebookRoot is returned directly, never
 // re-resolved through Definitions by notebook name.
 func (h *SyncHandler) recordedNotebookRoot(name string) (string, string, error) {
@@ -322,6 +325,18 @@ func (h *SyncHandler) recordedNotebookRoot(name string) (string, string, error) 
 			return grove.Notebook, grove.NotebookRoot, nil
 		}
 	}
+	// Identity rung, ahead of the default: a notes-plane subscription with no
+	// compiled code-root binding is still locatable BY IDENTITY — its stamp id
+	// has to be the recorded primary for its subject in machine.toml. Dropping
+	// straight to notebooks.rules.default here is what sent a notespace bound
+	// to a non-default notebook to <default>/notespaces/<name>, the wrong-root
+	// class P2 exists to eliminate. Nothing is inferred: an unstamped tree (a
+	// pull replica that does not exist yet) or a name that does not identify
+	// exactly one recorded primary falls through to the default rung below,
+	// byte for byte as before.
+	if notebook, root, ok := h.stampedNotebookRoot(name); ok {
+		return notebook, root, nil
+	}
 	if cfg.Notebooks == nil || cfg.Notebooks.Rules == nil || cfg.Notebooks.Rules.Default == "" {
 		return "", "", fmt.Errorf("notespace %q has no recorded code-root/notebook binding or default notebook", name)
 	}
@@ -330,7 +345,95 @@ func (h *SyncHandler) recordedNotebookRoot(name string) (string, string, error) 
 	if definition == nil || definition.RootDir == "" {
 		return "", "", fmt.Errorf("notespace %q routes to default notebook %q without a recorded root", name, notebook)
 	}
-	return notebook, definition.RootDir, nil
+	return notebook, notebookRootDir(definition), nil
+}
+
+// notebookRootDir resolves a recorded notebook definition's root to a path the
+// daemon can watch, join and stat.
+//
+// core resolves these at config compile time, so on a machine with a recorded
+// notebooks.toml this is already a no-op. It is here anyway because the
+// daemon must not silently depend on that: a config shape that leaves the
+// legacy `root_dir = '~/notebooks/<name>'` spelling in place (no notebooks.toml
+// yet, a seeded satellite) would otherwise send every watch and every pull
+// root to "<cwd>/~/notebooks/…" with nothing raising an error. Expansion is
+// idempotent, so applying it twice costs nothing.
+func notebookRootDir(definition *config.Notebook) string {
+	if definition == nil {
+		return ""
+	}
+	return coderoot.ExpandPath(definition.RootDir)
+}
+
+// stampedNotebookRoot answers which recorded notebook holds the stamped
+// notespace a display name identifies, using core's recorded-primary resolver
+// (stamp id + machine.toml [primaries]) rather than any name-to-directory
+// guess — the same chain nb, grove.nvim and skills already route through.
+//
+// ok is false whenever that chain cannot answer EXACTLY: no readable
+// machine.toml, no stamp, a name that is not a recorded primary, a name
+// ambiguous across roots, a resolved root that is not
+// <recorded notebook root>/notespaces/<name>, or a notebook root that
+// notebooks.toml does not record. Every one of those leaves the decision to the
+// caller's remaining rungs instead of inventing a root.
+func (h *SyncHandler) stampedNotebookRoot(name string) (string, string, bool) {
+	cfg := h.cfg
+	if cfg == nil || cfg.Notebooks == nil || len(cfg.Notebooks.Definitions) == 0 {
+		return "", "", false
+	}
+	machineCfg, err := config.LoadMachineConfig()
+	if err != nil || machineCfg == nil {
+		return "", "", false
+	}
+	resolution, err := workspace.ResolveNotespaceName(name, cfg, machineCfg)
+	if err != nil || resolution.Root == "" {
+		return "", "", false
+	}
+	// recordedNotebookRoot's contract is a NOTEBOOK root that nodeNotespaceRoot
+	// re-joins with "notespaces/<name>", so only a resolution that round-trips
+	// through that join can be reported here.
+	if filepath.Base(resolution.Root) != name {
+		return "", "", false
+	}
+	notespacesDir := filepath.Dir(resolution.Root)
+	if filepath.Base(notespacesDir) != workspace.NotespaceDirectory {
+		return "", "", false
+	}
+	notebookRoot := filepath.Dir(notespacesDir)
+	// Both sides are normalized before comparison. resolution.Root is an
+	// absolute path built by walking the notespace index; a definition's
+	// RootDir is a RECORDED value, and comparing a recorded value to a
+	// resolved one by raw string equality is exactly the mistake this rung
+	// exists to correct one layer down. A declared "~/notebooks/canary-nb"
+	// never equals "/Users/…/notebooks/canary-nb", so the rung would report
+	// "no recorded notebook" and hand the decision back to the default — the
+	// same wrong root, arrived at more expensively.
+	for _, notebook := range slices.Sorted(maps.Keys(cfg.Notebooks.Definitions)) {
+		if samePhysicalPath(notebookRootDir(cfg.Notebooks.Definitions[notebook]), notebookRoot) {
+			return notebook, notebookRoot, true
+		}
+	}
+	return "", "", false
+}
+
+// samePhysicalPath reports whether two paths name the same directory.
+//
+// Lexical comparison first, so an answer does not depend on the filesystem;
+// symlink resolution only as a fallback, for the macOS /var -> /private/var
+// aliasing that also defeats containment checks elsewhere in the daemon. A
+// path that cannot be resolved (it does not exist yet — an unmaterialized pull
+// replica) simply does not match, which is the conservative answer: the
+// caller's remaining rungs decide rather than this one guessing.
+func samePhysicalPath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	canonicalA, errA := pathutil.CanonicalPath(a)
+	canonicalB, errB := pathutil.CanonicalPath(b)
+	return errA == nil && errB == nil && canonicalA == canonicalB
 }
 
 func (h *SyncHandler) syntheticNodeFor(name string) (*workspace.WorkspaceNode, error) {
