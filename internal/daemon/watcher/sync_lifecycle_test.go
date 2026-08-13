@@ -324,6 +324,15 @@ func (lh *lifecycleHarness) placeOnServer(id, name, notebookID string, version i
 	lh.serverNotespaces[id] = &fixtureNotespace{name: name, notebookID: notebookID, membershipVersion: version}
 }
 
+// forgetServerNotespace drops a notespace from the fixture server, as a server
+// rebuilt or reset under a running daemon forgets one: the identity is gone
+// until something registers it again.
+func (lh *lifecycleHarness) forgetServerNotespace(id string) {
+	lh.mu.Lock()
+	defer lh.mu.Unlock()
+	delete(lh.serverNotespaces, id)
+}
+
 func (lh *lifecycleHarness) attachRequests() []syncproto.NotespaceReparentRequest {
 	lh.mu.Lock()
 	defer lh.mu.Unlock()

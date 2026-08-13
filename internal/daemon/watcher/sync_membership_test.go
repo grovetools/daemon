@@ -32,6 +32,25 @@ func sharedNotebookHarness(t *testing.T) *lifecycleHarness {
 	return lh
 }
 
+// fakeMembershipClock is the hermetic clock the expiry cases step by hand.
+// Only the reconcile pass reads it, and only from the calling goroutine, so an
+// advance between passes is as ordered as the passes are.
+type fakeMembershipClock struct{ now time.Time }
+
+func (c *fakeMembershipClock) time() time.Time         { return c.now }
+func (c *fakeMembershipClock) advance(d time.Duration) { c.now = c.now.Add(d) }
+
+// membershipClock installs that clock and both membership floors, so every
+// expiry below is a deliberate step rather than a wait. The base instant is
+// fixed: nothing in these tests reads the wall clock.
+func (lh *lifecycleHarness) membershipClock(retry, confirm time.Duration) *fakeMembershipClock {
+	clock := &fakeMembershipClock{now: time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)}
+	lh.h.membershipNow = clock.time
+	lh.h.membershipRetryInterval = retry
+	lh.h.membershipConfirmInterval = confirm
+	return clock
+}
+
 // The headline: a notespace created inside a shared notebook is not only
 // registered but ATTACHED, so the notebook's membership roll names it and the
 // other machine's pull can find it.
@@ -262,5 +281,131 @@ func TestAStaleAttachIsRetriedAgainstTheVersionTheServerReports(t *testing.T) {
 	}
 	if book, version := lh.serverMembership(idBeta); book != notebookID || version != 8 {
 		t.Fatalf("membership = %s@%d, want %s@8", book, version, notebookID)
+	}
+}
+
+// A confirmed membership is believed, but not forever. The passes in between
+// ask nothing — including the ones past the FAILURE floor, which is a different
+// and much shorter question — and then the confirmation expires, is revalidated
+// against the server's own inventory, and goes quiet again on its new stamp.
+func TestAConfirmedMembershipIsRevalidatedWhenItExpires(t *testing.T) {
+	lh := sharedNotebookHarness(t)
+	lh.notespace(t, "widget-personal", idBeta)
+	lh.subscribe()
+	clock := lh.membershipClock(time.Minute, 10*time.Minute)
+
+	lh.h.ComputeWatchPaths(nil)
+	lh.h.ensurePipelines()
+	if got := lh.inventoryCount(); got != 1 {
+		t.Fatalf("inventory requests = %d on the pass that settled it, want 1", got)
+	}
+
+	// Well past the failure floor and well inside the confirmation's: a
+	// confirmed answer is not re-asked on the cadence of an unsettled one.
+	clock.advance(2 * time.Minute)
+	lh.h.ensurePipelines()
+	lh.h.ensurePipelines()
+	if got := lh.inventoryCount(); got != 1 {
+		t.Fatalf("inventory requests = %d inside the confirmation window, want the settling pass's 1", got)
+	}
+
+	clock.advance(9 * time.Minute)
+	lh.h.ensurePipelines()
+	if got := lh.inventoryCount(); got != 2 {
+		t.Fatalf("inventory requests = %d after the confirmation expired, want it revalidated exactly once more", got)
+	}
+	// Revalidation is a question, not a write: the server still holds the
+	// membership, so nothing is sent.
+	if attaches := lh.attachRequests(); len(attaches) != 1 {
+		t.Fatalf("attach requests = %d, want only the one that settled it: %+v", len(attaches), attaches)
+	}
+	if book, version := lh.serverMembership(idBeta); book != notebookID || version != 1 {
+		t.Fatalf("membership = %s@%d, want it untouched at %s@1", book, version, notebookID)
+	}
+
+	// And the fresh confirmation restarts the floor rather than leaving the
+	// notespace asking once per pass from here on.
+	lh.h.ensurePipelines()
+	if got := lh.inventoryCount(); got != 2 {
+		t.Fatalf("inventory requests = %d after revalidation, want the confirmation to have re-stamped at 2", got)
+	}
+}
+
+// The reason the confirmation expires at all: a server rebuilt, restored, or
+// history-reset under a running daemon holds the notespace unparented again,
+// and until this the memo answered for it forever — so the notespace reached no
+// other machine until the daemon was restarted. Now the expiry finds it and the
+// attach leg repairs it, with no restart and no operator verb.
+func TestAMembershipTheServerLostIsReattachedAfterTheConfirmationExpires(t *testing.T) {
+	lh := sharedNotebookHarness(t)
+	lh.notespace(t, "widget-personal", idBeta)
+	lh.subscribe()
+	clock := lh.membershipClock(time.Minute, 10*time.Minute)
+
+	lh.h.ComputeWatchPaths(nil)
+	lh.h.ensurePipelines()
+	if book, _ := lh.serverMembership(idBeta); book != notebookID {
+		t.Fatalf("membership = %q before the rebuild, want %q", book, notebookID)
+	}
+
+	// The server comes back with this notespace's identity and none of its
+	// membership — registered, unparented, version 0, exactly as the register
+	// leg leaves one.
+	lh.placeOnServer(idBeta, "widget-personal", "", 0)
+
+	lh.h.ensurePipelines()
+	if attaches := lh.attachRequests(); len(attaches) != 1 {
+		t.Fatalf("attach requests = %d inside the confirmation window, want the memo to still suppress repeats: %+v", len(attaches), attaches)
+	}
+
+	clock.advance(11 * time.Minute)
+	lh.h.ensurePipelines()
+
+	attaches := lh.attachRequests()
+	if len(attaches) != 2 {
+		t.Fatalf("attach requests = %d after the confirmation expired, want the settling one and the repair: %+v", len(attaches), attaches)
+	}
+	if attaches[1].FromNotebookID != "" || attaches[1].ToNotebookID.String() != notebookID {
+		t.Fatalf("the repair = %+v, want the attach leg into %s", attaches[1], notebookID)
+	}
+	if book, version := lh.serverMembership(idBeta); book != notebookID || version != 1 {
+		t.Fatalf("membership = %s@%d after the repair, want %s@1", book, version, notebookID)
+	}
+}
+
+// The harder shape of the same rebuild: the server has not even re-registered
+// the notespace yet when the confirmation expires. There is nothing to attach,
+// so the expired confirmation becomes an UNSETTLED verdict — and an unsettled
+// verdict waits the short failure floor, not another confirmation window, so the
+// attach follows the registration that repairs it rather than trailing it by
+// half an hour.
+func TestAnExpiredConfirmationFallsBackToTheFailureFloor(t *testing.T) {
+	lh := sharedNotebookHarness(t)
+	lh.notespace(t, "widget-personal", idBeta)
+	lh.subscribe()
+	clock := lh.membershipClock(time.Minute, 10*time.Minute)
+
+	lh.h.ComputeWatchPaths(nil)
+	lh.h.ensurePipelines()
+
+	// A server with no memory of this notespace at all.
+	lh.forgetServerNotespace(idBeta)
+	clock.advance(11 * time.Minute)
+	lh.h.ensurePipelines()
+	if attaches := lh.attachRequests(); len(attaches) != 1 {
+		t.Fatalf("attach requests = %d against a server that does not hold the notespace, want only the settling one: %+v", len(attaches), attaches)
+	}
+
+	// Registration lands again, and one failure floor — not one confirmation
+	// window — later the membership follows it.
+	lh.placeOnServer(idBeta, "widget-personal", "", 0)
+	lh.h.ensurePipelines()
+	if book, _ := lh.serverMembership(idBeta); book != "" {
+		t.Fatalf("membership = %q inside the retry backoff, want it still unparented", book)
+	}
+	clock.advance(2 * time.Minute)
+	lh.h.ensurePipelines()
+	if book, version := lh.serverMembership(idBeta); book != notebookID || version != 1 {
+		t.Fatalf("membership = %s@%d once the retry floor was up, want %s@1", book, version, notebookID)
 	}
 }

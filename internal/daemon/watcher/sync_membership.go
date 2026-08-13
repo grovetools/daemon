@@ -46,14 +46,27 @@ package watcher
 // # Cost
 //
 // One inventory round trip per reconcile pass that has something to check, and
-// nothing at all once every contained notespace's membership is confirmed: the
-// verdicts are memoized per (notespace, containing notebook), so the steady
-// state is free and a notespace that moves to another notebook is re-checked
-// because the pair changed. A verdict that could not be settled — the server
-// has not heard of the notebook yet, the notespace belongs elsewhere, the
-// attach was refused — is retried, but no more often than
-// membershipRetryInterval, so a condition only an operator can clear does not
-// turn into a request per pass.
+// nothing at all between checks: the verdicts are memoized per (notespace,
+// containing notebook), so the passes in between make no request, and a
+// notespace that moves to another notebook is re-checked because the pair
+// changed. Both kinds of verdict expire, on their own floor, because both can
+// stop being true:
+//
+//   - A verdict that could not be settled — the server has not heard of the
+//     notebook yet, the notespace belongs elsewhere, the attach was refused —
+//     waits membershipRetryInterval. What clears those is operator-shaped and
+//     human-paced, so the retry is a backstop for the moment it is cleared.
+//   - A CONFIRMED membership waits membershipConfirmInterval. It is believed
+//     for much longer because only the server losing it can falsify it — a
+//     rebuild, a restore, a history reset — but it is not believed forever:
+//     a memo with no expiry meant a server recreated under a running daemon
+//     was re-registered by the epoch guard and then left unparented until the
+//     daemon restarted, because the one thing that would have noticed had
+//     already answered the question once. Nothing else re-asks it: the epoch
+//     guard voids DOCUMENT state, and says nothing about membership.
+//
+// So the steady-state cost is one inventory round trip per confirm interval per
+// batch that expires together, and zero requests between them.
 
 import (
 	"crypto/sha256"
@@ -73,6 +86,19 @@ import (
 // (share the notebook on this server, move the notespace back), so the retry is
 // a backstop for the moment they are cleared, not a poll.
 const defaultMembershipRetryInterval = 5 * time.Minute
+
+// defaultMembershipConfirmInterval bounds how long a CONFIRMED membership is
+// believed without asking the server again.
+//
+// It is deliberately much longer than the failure floor, because the two answer
+// different questions. An unsettled verdict is waiting on something an operator
+// is in the middle of doing. A confirmed one can only be falsified by the server
+// losing what it already held — recreated, restored, or reset — which is rare,
+// is not something the operator is waiting on this daemon to notice, and is
+// noticed here at all only because nothing else re-asks. Six failure floors
+// keeps that repair inside a coffee break while leaving a settled machine's
+// standing cost at two small round trips an hour.
+const defaultMembershipConfirmInterval = 30 * time.Minute
 
 // membershipVerdict is the last answer for one notespace's membership of one
 // notebook. notebookID is part of the key, not just the value: a notespace that
@@ -159,7 +185,11 @@ func (h *SyncHandler) pendingMemberships(resolved map[string]resolvedNotespace) 
 }
 
 // membershipSettled reports whether this exact question — is notespace id a
-// member of notebook notebookID — has an answer worth reusing.
+// member of notebook notebookID — has an answer worth reusing, which every
+// answer is until its floor is up. A confirmed membership is reused for a long
+// time and an unsettled one for a short time, but neither is reused forever:
+// the server can lose a membership it confirmed, and the only way this daemon
+// hears about that is by asking again.
 func (h *SyncHandler) membershipSettled(id, notebookID string) bool {
 	h.membershipMu.Lock()
 	defer h.membershipMu.Unlock()
@@ -167,10 +197,7 @@ func (h *SyncHandler) membershipSettled(id, notebookID string) bool {
 	if !ok || verdict.notebookID != notebookID {
 		return false
 	}
-	if verdict.attached {
-		return true
-	}
-	return h.membershipNowFunc()().Sub(verdict.at) < h.membershipRetry()
+	return h.membershipNowFunc()().Sub(verdict.at) < h.membershipFloor(verdict.attached)
 }
 
 func (h *SyncHandler) recordMembership(id, notebookID string, attached bool) {
@@ -182,7 +209,15 @@ func (h *SyncHandler) recordMembership(id, notebookID string, attached bool) {
 	h.membership[id] = membershipVerdict{notebookID: notebookID, attached: attached, at: h.membershipNowFunc()()}
 }
 
-func (h *SyncHandler) membershipRetry() time.Duration {
+// membershipFloor is how long a verdict of this kind is reused before the
+// question is asked again.
+func (h *SyncHandler) membershipFloor(attached bool) time.Duration {
+	if attached {
+		if h.membershipConfirmInterval > 0 {
+			return h.membershipConfirmInterval
+		}
+		return defaultMembershipConfirmInterval
+	}
 	if h.membershipRetryInterval > 0 {
 		return h.membershipRetryInterval
 	}

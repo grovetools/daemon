@@ -183,13 +183,17 @@ type SyncHandler struct {
 
 	// Notebook membership (sync_membership.go): the per-notespace verdict on
 	// whether the server counts it in the notebook that contains it, so a
-	// settled machine makes no inventory request at all.
-	// membershipRetryInterval and membershipNow are test seams; zero values
-	// select the production backoff and the wall clock.
-	membershipMu            sync.Mutex
-	membership              map[string]membershipVerdict
-	membershipRetryInterval time.Duration
-	membershipNow           func() time.Time
+	// settled machine makes no inventory request between checks. Every verdict
+	// expires — unsettled ones on membershipRetryInterval, confirmed ones on
+	// the much longer membershipConfirmInterval — so a server that loses a
+	// membership it once confirmed is repaired without a daemon restart.
+	// The two intervals and membershipNow are test seams; zero values select
+	// the production floors and the wall clock.
+	membershipMu              sync.Mutex
+	membership                map[string]membershipVerdict
+	membershipRetryInterval   time.Duration
+	membershipConfirmInterval time.Duration
+	membershipNow             func() time.Time
 
 	// Registry presence writer (registry.go). registryKick coalesces
 	// structural-change triggers; registryInterval and registryNow are test
