@@ -48,7 +48,7 @@ GO_CROSS_ENV += CGO_LDFLAGS="$(GROVE_TARGET_CGO_LDFLAGS)"
 endif
 endif
 
-.PHONY: all build test clean fmt fmt-check vet lint run check dev build-all help
+.PHONY: all build test clean fmt fmt-check vet lint run check dev build-one build-all help
 
 all: build
 
@@ -104,6 +104,14 @@ dev:
 	@mkdir -p $(BIN_DIR)
 	@echo "Building $(BINARY_NAME) version $(VERSION) with race detector..."
 	@go build -race $(LDFLAGS) -o $(BIN_DIR)/$(BINARY_NAME) .
+
+# Build a single binary with a custom output path (used by CI matrix builds)
+# Usage: make build-one OUTPUT=dist/groved-linux-amd64 VERSION=v1.2.3
+OUTPUT ?= $(BIN_DIR)/$(BINARY_NAME)
+build-one:
+	@mkdir -p $(dir $(OUTPUT))
+	@echo "Building $(OUTPUT) version $(VERSION)..."
+	@go build $(GO_TAGS) $(LDFLAGS) -o $(OUTPUT) .
 
 # Cross-compilation targets
 PLATFORMS ?= darwin/amd64 darwin/arm64 linux/amd64 linux/arm64

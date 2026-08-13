@@ -1,61 +1,100 @@
 name: Release
-
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
 
-env:
-  GO_VERSION: "1.24"
-
+# groved links SQLite (mattn/go-sqlite3 + sqlite-vec) through cgo, so the
+# binaries are built on native runners rather than cross-compiled on one box.
 jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: arm64
+          - runner: macos-latest
+            goos: darwin
+            goarch: amd64
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.4'
+
+      - name: Install cross-compiler
+        if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+          CC: ${{ matrix.goos == 'linux' && matrix.goarch == 'arm64' && 'aarch64-linux-gnu-gcc' || '' }}
+        run: make build-one OUTPUT=dist/groved-${{ matrix.goos }}-${{ matrix.goarch }} VERSION=${{ github.ref_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: groved-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
   release:
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    - name: Configure Git LFS
-      run: |
-        # Disable Git LFS to avoid permission issues with dependencies
-        git config --global filter.lfs.process ""
-        git config --global filter.lfs.required false
-        git config --global filter.lfs.clean ""
-        git config --global filter.lfs.smudge ""
-    
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: ${{ env.GO_VERSION }}
-    - name: Configure git for private modules
-      run: |
-        git config --global url."https://${{ secrets.GROVE_PAT }}@github.com/".insteadOf "https://github.com/"
-        go env -w GOPRIVATE=github.com/grovetools/*
-        go env -w GOPROXY=direct
-    
-    - name: Update dependencies
-      run: |
-        rm -f go.sum
-        go mod download
-        go mod tidy
-    
-    - name: Run tests
-      run: make test
-    
-    - name: Build binaries
-      run: |
-        VERSION=$${GITHUB_REF_NAME#v}
-        make build-all VERSION=$VERSION
-    
-    - name: Create release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          dist/daemon-darwin-amd64
-          dist/daemon-darwin-arm64
-          dist/daemon-linux-amd64
-          dist/daemon-linux-arm64
-        generate_release_notes: true
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Extract Release Notes from Changelog
+        run: |
+          awk '/^## ${{ github.ref_name }}/{flag=1; next} /^## v/{flag=0} flag' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No changelog entry found for ${{ github.ref_name }}, using auto-generated notes"
+            echo "Release ${{ github.ref_name }}" > release-notes.md
+          fi
+
+      - name: Create GitHub Release
+        run: |
+          IS_PRERELEASE=false
+          if [[ "${{ github.ref_name }}" == *-* ]]; then
+            IS_PRERELEASE=true
+          fi
+          gh release create ${{ github.ref_name }} \
+            --notes-file release-notes.md \
+            --draft=false \
+            --prerelease=$IS_PRERELEASE \
+            dist/*
+        env:
+          GH_TOKEN: ${{ github.token }}
