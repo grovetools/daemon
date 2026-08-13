@@ -130,6 +130,16 @@ func (lh *lifecycleHarness) subscribe(subs ...config.SyncWorkspace) {
 	lh.h.bumpConfigGeneration()
 }
 
+// share records `[notebooks.<name>.sync] share` for the harness notebook, the
+// way notebooks.toml does and compileCodeRootTable projects it, and reloads
+// the config exactly as a config reload does.
+func (lh *lifecycleHarness) share(shared bool) {
+	cfg := notebookConfig(lh.notebookRoot)
+	cfg.Notebooks.Definitions["default"].Shared = shared
+	lh.h.setConfig(cfg)
+	lh.h.bumpConfigGeneration()
+}
+
 // watch installs the watch entries a ComputeWatchPaths refresh would produce.
 func (lh *lifecycleHarness) watch(entries map[string]string) {
 	watches := make(map[string]*syncWatch, len(entries))

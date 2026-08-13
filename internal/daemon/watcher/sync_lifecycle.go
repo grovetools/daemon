@@ -401,12 +401,23 @@ func (h *SyncHandler) firstSeenRoot(id string, group []resolvedNotespace, siblin
 // The last sweep's result is therefore cached and replayed until the next one
 // supersedes it. A copy that has since been re-minted stays parked for up to
 // one scan interval, which is the conservative direction.
+//
+// A replay is re-checked against the disk first (liveSiblings), which is NOT
+// the same conservatism read the other way. A cached sibling that has VANISHED
+// is not a duplicate of anything: the P3 gate found a notebook root move being
+// read as a duplicate stamp against the path it had just left, because the
+// cache still named the old root, the durable binding still named it too, and
+// a path that no longer exists therefore out-voted the live one — parking the
+// relocated notespace and leaving a duplicate_stamp artifact naming a
+// directory the operator cannot go look at. Re-checking only the cached roots
+// costs a stamp read each, not the sweep the rate limit exists to bound.
 func (h *SyncHandler) duplicateSiblings(candidates map[string][]resolvedNotespace) map[string][]string {
 	interval := h.duplicateScanInterval
 	if interval <= 0 {
 		interval = defaultDuplicateScanInterval
 	}
 	if !h.duplicateScannedAt.IsZero() && time.Since(h.duplicateScannedAt) < interval {
+		h.duplicateSiblingsCache = liveSiblings(h.duplicateSiblingsCache)
 		return claimedSiblings(h.duplicateSiblingsCache, candidates)
 	}
 	h.duplicateScannedAt = time.Now()
@@ -461,6 +472,37 @@ func claimedSiblings(found map[string][]string, candidates map[string][]resolved
 			continue
 		}
 		out[id] = roots
+	}
+	return out
+}
+
+// liveSiblings drops cached sibling roots that no longer carry the id the
+// sweep recorded there.
+//
+// The check is the stamp, not the directory: a root that was moved away is
+// gone, and a root whose stamp was re-minted (the `grove doctor --fix --remint`
+// repair) no longer claims the id either. Both mean the same thing to the
+// duplicate rule — there is nothing at that path contesting this identity — and
+// asserting it against the stamp rather than against os.Stat is what keeps a
+// re-minted copy from being replayed as a duplicate for the rest of the scan
+// interval.
+func liveSiblings(found map[string][]string) map[string][]string {
+	if len(found) == 0 {
+		return found
+	}
+	out := make(map[string][]string, len(found))
+	for id, roots := range found {
+		live := make([]string, 0, len(roots))
+		for _, root := range roots {
+			stamp, err := notespacepkg.LoadNotespace(root)
+			if err != nil || stamp == nil || stamp.ID != id {
+				continue
+			}
+			live = append(live, root)
+		}
+		if len(live) > 0 {
+			out[id] = live
+		}
 	}
 	return out
 }

@@ -9,30 +9,60 @@ import (
 	"github.com/grovetools/core/pkg/workspace"
 )
 
-const idBeta = "01ARZ3NDEKTSV4RRFFQ69G5FA2"
+const (
+	idBeta  = "01ARZ3NDEKTSV4RRFFQ69G5FA2"
+	idGamma = "01ARZ3NDEKTSV4RRFFQ69G5FA3"
+)
 
-// Containment ships dark: on a P2 machine a stamped sibling in a notebook that
-// has a subscribed notespace inherits nothing, because the recorded input the
-// rule needs (`[notebooks.<name>.sync] share = true`) does not exist yet.
-func TestContainmentIsDarkByDefault(t *testing.T) {
+// Consent is the recorded bit and nothing else. A notebook that has never been
+// shared inherits nothing to its notespaces even when one of them is
+// explicitly subscribed — the stand-in that read "some subscription resolves
+// into this notebook" as consent would have turned one subscribed notespace
+// into a decision about every sibling beside it.
+func TestContainmentNeedsARecordedShare(t *testing.T) {
 	lh := newLifecycleHarness(t)
 	lh.notespace(t, "alpha", idA)
 	beta := lh.notespace(t, "beta", idBeta)
 	lh.subscribe(config.SyncWorkspace{Name: "alpha", Mode: config.SyncModeFull})
 
 	if sub := lh.h.effectiveSubscription("beta", beta); sub != nil {
-		t.Fatalf("containment inherited %+v while dark", sub)
+		t.Fatalf("an unshared notebook inherited %+v", sub)
 	}
 	if found := lh.h.containedNotespaces(map[string]bool{"alpha": true}); found != nil {
-		t.Fatalf("containment enumerated %+v while dark", found)
+		t.Fatalf("an unshared notebook enumerated %+v", found)
+	}
+	if lh.h.anySharedNotebook() {
+		t.Fatal("anySharedNotebook is true with nothing recorded as shared")
 	}
 }
 
+// `share = true` alone — no [[workspaces]] entry naming anything — is what
+// puts a contained notespace in scope, on bidirectional peer terms.
+func TestRecordedShareAloneInheritsBidirectionalTerms(t *testing.T) {
+	lh := newLifecycleHarness(t)
+	beta := lh.notespace(t, "beta", idBeta)
+	lh.share(true)
+
+	sub := lh.h.effectiveSubscription("beta", beta)
+	if sub == nil {
+		t.Fatal("a stamped notespace inside a shared notebook inherited nothing")
+	}
+	if sub.Name != "beta" {
+		t.Fatalf("inherited name = %q, want the contained notespace's own name", sub.Name)
+	}
+	if !sub.Pull || sub.Role != config.SyncRolePeer || sub.Mode != config.SyncModeFull {
+		t.Fatalf("inherited terms = %+v, want bidirectional peer terms", sub)
+	}
+}
+
+// When the notebook DOES have an explicit subscription, its recorded terms are
+// what the siblings inherit: containment is a statement about the notebook, so
+// an operator who wrote down mode/excludes/size for it governs the whole thing.
 func TestContainmentInheritsTheContainingNotebooksSubscription(t *testing.T) {
 	lh := newLifecycleHarness(t)
 	lh.notespace(t, "alpha", idA)
 	beta := lh.notespace(t, "beta", idBeta)
-	lh.h.ContainmentAutoRegister = true
+	lh.share(true)
 	lh.subscribe(config.SyncWorkspace{
 		Name: "alpha", Role: config.SyncRolePeer, Mode: config.SyncModeFull,
 		Pull: true, Excludes: []string{"scratch/**"}, MaxFileSize: 4096,
@@ -41,9 +71,6 @@ func TestContainmentInheritsTheContainingNotebooksSubscription(t *testing.T) {
 	sub := lh.h.effectiveSubscription("beta", beta)
 	if sub == nil {
 		t.Fatal("a stamped notespace inside a shared notebook inherited nothing")
-	}
-	if sub.Name != "beta" {
-		t.Fatalf("inherited name = %q, want the contained notespace's own name", sub.Name)
 	}
 	if !sub.Pull || sub.Mode != config.SyncModeFull || sub.MaxFileSize != 4096 ||
 		len(sub.Excludes) != 1 || sub.Excludes[0] != "scratch/**" {
@@ -55,7 +82,8 @@ func TestContainmentInheritsTheContainingNotebooksSubscription(t *testing.T) {
 		t.Fatal("the inherited subscription aliased the template's excludes")
 	}
 
-	// An explicit subscription always wins over inheritance.
+	// An explicit subscription always wins over inheritance — the union of the
+	// two mechanisms, resolved in favor of the recorded one.
 	lh.subscribe(
 		config.SyncWorkspace{Name: "alpha", Pull: true},
 		config.SyncWorkspace{Name: "beta", Mode: config.SyncModeSearchOnly},
@@ -65,10 +93,10 @@ func TestContainmentInheritsTheContainingNotebooksSubscription(t *testing.T) {
 	}
 }
 
-func TestContainmentRequiresAStampAndANonRegistryTemplate(t *testing.T) {
+func TestContainmentRequiresAStampInsideTheSharedNotebook(t *testing.T) {
 	lh := newLifecycleHarness(t)
 	lh.notespace(t, "alpha", idA)
-	lh.h.ContainmentAutoRegister = true
+	lh.share(true)
 
 	// An unstamped directory under notespaces/ is not a notespace.
 	bare := filepath.Join(lh.notebookRoot, workspace.NotespaceDirectory, "bare")
@@ -92,10 +120,26 @@ func TestContainmentRequiresAStampAndANonRegistryTemplate(t *testing.T) {
 	if sub := lh.h.containmentSubscription(elsewhere); sub != nil {
 		t.Fatalf("a notespace outside any notebook inherited %+v", sub)
 	}
+}
 
-	// The registry notespace is never a template for its notebook.
-	lh.subscribe(config.SyncWorkspace{Name: "alpha", Role: config.SyncRoleRegistry, Pull: true})
-	if sub := lh.h.containmentSubscription(filepath.Join(lh.notebookRoot, workspace.NotespaceDirectory, "gamma")); sub != nil {
+// The registry entry `grove join` writes is never a share template: it would
+// hand an ordinary notespace the registry's own-note guard and pull posture.
+// Since it is usually the ONLY subscription a machine has, this is also what
+// makes the default terms the ordinary answer rather than a rare one.
+func TestTheRegistrySubscriptionIsNeverAShareTemplate(t *testing.T) {
+	lh := newLifecycleHarness(t)
+	lh.notespace(t, "registry", idA)
+	gamma := lh.notespace(t, "gamma", idGamma)
+	lh.share(true)
+	lh.subscribe(config.SyncWorkspace{
+		Name: "registry", Role: config.SyncRoleRegistry, Pull: true, Excludes: []string{"registry-only/**"},
+	})
+
+	sub := lh.h.containmentSubscription(gamma)
+	if sub == nil {
+		t.Fatal("a shared notebook whose only subscription is the registry inherited nothing")
+	}
+	if sub.Role == config.SyncRoleRegistry || len(sub.Excludes) != 0 {
 		t.Fatalf("the registry subscription was used as a share template: %+v", sub)
 	}
 }
@@ -106,7 +150,7 @@ func TestContainedNotespaceIsWatchedAndRegistered(t *testing.T) {
 	lh := newLifecycleHarness(t)
 	alpha := lh.notespace(t, "alpha", idA)
 	beta := lh.notespace(t, "beta", idBeta)
-	lh.h.ContainmentAutoRegister = true
+	lh.share(true)
 	lh.subscribe(config.SyncWorkspace{Name: "alpha", Mode: config.SyncModeFull})
 
 	paths := lh.h.ComputeWatchPaths(nil)
@@ -126,4 +170,57 @@ func TestContainedNotespaceIsWatchedAndRegistered(t *testing.T) {
 	if state := lh.pipeline(idBeta); state == nil || state.root != beta {
 		t.Fatalf("contained pipeline = %+v, want root %q", state, beta)
 	}
+}
+
+// The headline promise of W3.2, as the daemon has to keep it: a notespace
+// created INSIDE an already-shared notebook, after the daemon is running and
+// with nothing recorded about it anywhere, is registered and transported by
+// the next reconcile. Nothing is edited between the two passes but the disk.
+func TestANotespaceCreatedInsideASharedNotebookAutoRegisters(t *testing.T) {
+	lh := newLifecycleHarness(t)
+	lh.share(true)
+	lh.subscribe()
+
+	if paths := lh.h.ComputeWatchPaths(nil); len(paths) != 0 {
+		t.Fatalf("watch paths = %v before anything exists, want none", paths)
+	}
+	lh.h.ensurePipelines()
+	if state := lh.pipeline(idGamma); state != nil {
+		t.Fatalf("a pipeline ran for a notespace that does not exist yet: %+v", state)
+	}
+
+	// The operator makes a notespace. No verb, no config edit.
+	gamma := lh.notespace(t, "gamma", idGamma)
+
+	if paths := lh.h.ComputeWatchPaths(nil); !contains(paths, gamma) {
+		t.Fatalf("watch paths = %v after the notespace was created, want %q among them", paths, gamma)
+	}
+	lh.h.ensurePipelines()
+	if lh.registrationCount(idGamma) != 1 {
+		t.Fatalf("the new notespace registered %d times, want 1", lh.registrationCount(idGamma))
+	}
+	state := lh.pipeline(idGamma)
+	if state == nil || state.root != gamma {
+		t.Fatalf("auto-registered pipeline = %+v, want root %q", state, gamma)
+	}
+	if !state.pull {
+		t.Fatal("the auto-registered pipeline runs push-only; `share = true` is recorded by pull as well as by share")
+	}
+
+	// And unsharing it takes the transport away again, without a restart.
+	lh.share(false)
+	lh.h.ComputeWatchPaths(nil)
+	lh.h.ensurePipelines()
+	waitForLifecycle(t, "the unshared notespace's pipeline to stop", func() bool {
+		return lh.pipeline(idGamma) == nil
+	})
+}
+
+func contains(haystack []string, needle string) bool {
+	for _, item := range haystack {
+		if item == needle {
+			return true
+		}
+	}
+	return false
 }

@@ -164,12 +164,6 @@ type SyncHandler struct {
 	duplicateScanInterval  time.Duration
 	duplicateSiblingsCache map[string][]string
 
-	// ContainmentAutoRegister enables W3.2's "containment is consent"
-	// inheritance (sync_containment.go). Dark by default and set by nothing in
-	// the daemon: its recorded input, `[notebooks.<name>.sync] share = true`,
-	// is the core half of Phase 3 and does not parse yet.
-	ContainmentAutoRegister bool
-
 	// Token-rejection state (sync_auth.go): the stale-token trap's detection,
 	// reporting, and reconnect-backoff machinery. transportInterval and the
 	// two authRetry bounds are test seams — zero values select the production
@@ -784,9 +778,11 @@ func (h *SyncHandler) ComputeWatchPaths(notespaces []*models.EnrichedWorkspace) 
 		maps.Copy(newWatches, computeNotespaceWatches(&sub, root, dirs))
 	}
 
-	// Containment is consent (W3.2): stamped notespaces inside a shared
-	// notebook that neither an explicit subscription nor discovery covers.
-	// Dark unless ContainmentAutoRegister — see sync_containment.go.
+	// Containment is consent (W3.2): stamped notespaces inside a notebook
+	// recorded `share = true` that neither an explicit subscription nor
+	// discovery covers — see sync_containment.go. This is also how a notespace
+	// CREATED inside an already-shared notebook starts syncing: it is simply
+	// present on the next reconcile.
 	for _, contained := range h.containedNotespaces(covered) {
 		maps.Copy(newWatches, computeNotespaceWatches(&contained.sub, contained.root, recordedContentDirs(contained.root)))
 	}
