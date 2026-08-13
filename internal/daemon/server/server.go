@@ -300,6 +300,22 @@ func New(autoShutdown bool) *Server {
 	}
 }
 
+// HasClients reports whether anything is currently attached to this daemon:
+// a terminal WebSocket (the signal auto-shutdown's idle timer watches) or a
+// live /api/stream subscriber (which holds a hub client lease for its
+// lifetime, and is how a headless CLI or TUI keeps a daemon in use).
+//
+// It is the "is anyone home?" question the scoped self-yield asks before
+// standing down in favor of a host daemon. It deliberately answers about
+// ATTACHMENT, not about work: sessions and jobs are checked separately by the
+// caller, because a daemon can own live agents with no client watching them.
+func (s *Server) HasClients() bool {
+	if s.terminalHub != nil && s.terminalHub.HasConnections() {
+		return true
+	}
+	return s.sseSubscribers.Load() > 0
+}
+
 func (s *Server) TerminalHubShutdownReq() <-chan struct{} {
 	if s.terminalHub == nil {
 		return nil

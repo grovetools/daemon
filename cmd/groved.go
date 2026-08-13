@@ -468,6 +468,38 @@ func newGrovedStartCmd() *cobra.Command {
 				}
 			}
 
+			// 1.5 Publish the daemon-host record NOW, marked "starting".
+			//
+			// The record is what stops clients in worktrees from auto-starting
+			// scoped daemons when no UI host is up. Written at bind, it arrived
+			// several seconds into boot — and those seconds are the entire
+			// fleet-restart window, when every client on the machine is asking at
+			// once and the registry is empty. Written here, one statement after
+			// the pidfile lock that makes this process THE global daemon, it
+			// arrives in milliseconds, and its Starting flag tells those clients
+			// to wait for us rather than race us (see core's connectHostDaemon).
+			//
+			// Only the winner of pidfile.Acquire gets here, so a losing duplicate
+			// can never publish a record for a socket it will not serve. MarkReady
+			// follows at bind; both the degraded path and the normal one own that.
+			//
+			// Scoped daemons still never register: their socket would become the
+			// most specific host for their own subtree and could steal session
+			// traffic from a global treemux streaming a different daemon. A live
+			// UI host outranks this record either way, so treemux's routing is
+			// unchanged while it is up.
+			var hostReg *daemon.HostRegistration
+			if scope == "" {
+				reg, herr := daemon.RegisterDaemonHostStarting(scope, "groved")
+				if herr != nil {
+					ulog.Warn("Failed to register daemon host; scoped clients may spawn their own daemons").
+						Err(herr).Log(context.Background())
+				} else {
+					hostReg = reg
+				}
+			}
+			defer hostReg.Unregister()
+
 			// 2. Load config for daemon settings. A malformed canonical config is
 			// not a defaults case: defaults would let topology-dependent work run
 			// against an invented topology. Bind a status-only daemon instead and
@@ -476,7 +508,7 @@ func newGrovedStartCmd() *cobra.Command {
 			if err != nil {
 				ulog.Error("Failed to load config; serving status only until restart").Err(err).Log(context.Background())
 				httpPort, _ := cmd.Flags().GetInt("http-port")
-				return serveConfigDegraded(cmd.Context(), autoShutdown, scope, sockPath, httpPort, readyFd, pairPID, err, ulog)
+				return serveConfigDegraded(cmd.Context(), autoShutdown, scope, sockPath, httpPort, readyFd, pairPID, hostReg, err, ulog)
 			}
 
 			// Parse intervals from config with defaults
@@ -723,20 +755,11 @@ func newGrovedStartCmd() *cobra.Command {
 			//  1. If the parent passed --ready-fd, close that inherited fd. The
 			//     parent reads EOF and stops polling — a deterministic
 			//     handshake. No-op when readyFd is 0 (ad-hoc / manual startups).
-			//  2. The GLOBAL daemon registers itself as the routing endpoint of
-			//     last resort (daemon.RegisterDaemonHost). Without it, "no live
-			//     registered UI host" and "no host at all" are the same answer,
-			//     which is exactly wrong during a fleet restart: treemux is
-			//     still coming back, the hosts registry is empty, and every
-			//     scope-resolving client in a worktree concludes "no host" and
-			//     spawns a scoped groved nothing will use. A live UI host always
-			//     outranks this record, so treemux's routing is unchanged while
-			//     it is up. Registered at BIND, not after boot, because the
-			//     window this closes is measured in seconds. Scoped daemons
-			//     never register: their socket would become the most specific
-			//     host for their own subtree and could steal session traffic
-			//     from a global treemux streaming a different daemon.
-			var unregisterDaemonHost func()
+			//  2. The GLOBAL daemon's host record (published at step 1.5) flips
+			//     from "starting" to ready. Until it does, clients wait for us;
+			//     from here on they route to us. The record exists from
+			//     pidfile-acquire so that the whole boot is covered — this is
+			//     only the moment the socket behind it starts answering.
 			srv.OnReady = func() {
 				if readyFd > 0 {
 					if err := syscall.Close(readyFd); err != nil {
@@ -744,16 +767,10 @@ func newGrovedStartCmd() *cobra.Command {
 							Field("fd", readyFd).Err(err).Log(ctx)
 					}
 				}
-				if scope != "" {
-					return
+				if err := hostReg.MarkReady(); err != nil {
+					ulog.Warn("Failed to mark daemon host ready; scoped clients may wait out the boot grace").
+						Err(err).Log(ctx)
 				}
-				unregister, herr := daemon.RegisterDaemonHost(scope, "groved")
-				if herr != nil {
-					ulog.Warn("Failed to register daemon host; scoped clients may spawn their own daemons").
-						Err(herr).Log(ctx)
-					return
-				}
-				unregisterDaemonHost = unregister
 			}
 
 			// Boot phases published under early bind. Each boundary updates the
@@ -1149,6 +1166,27 @@ func newGrovedStartCmd() *cobra.Command {
 				// (auto-shutdown mode). Nil if auto-shutdown is disabled.
 				shutdownReq := srv.TerminalHubShutdownReq()
 
+				// 5.15 Self-yield. An auto-started scoped daemon that finds a
+				// live host daemon covering its scope hands the scope back and
+				// exits, instead of idling out the auto-shutdown timer. This is
+				// the cleanup half of the boot-window fix: the spawn-side grace
+				// and the early host record close the window from the front, and
+				// whatever still slips through — a client that asked before
+				// groved was even exec'd — is reaped in seconds rather than
+				// minutes. See yieldToHostDaemon for the safety conditions.
+				yieldReq := make(chan struct{})
+				if scope != "" && autoShutdown && pairPID <= 0 && hostYieldEnabled() {
+					go yieldToHostDaemon(ctx, hostYieldParams{
+						scope:      scope,
+						socketPath: sockPath,
+						idle: func() bool {
+							return !srv.HasClients() && len(st.GetSessions()) == 0 && !jr.Busy()
+						},
+						yield: yieldReq,
+						ulog:  ulog,
+					})
+				}
+
 				// sshServer is set later (step 7.7) and closed by the signal handler.
 				var sshServer *daemonssh.Server
 
@@ -1159,6 +1197,9 @@ func newGrovedStartCmd() *cobra.Command {
 						ulog.Info("Received stop signal").Field("event", "daemon.stopped").Log(bgCtx)
 					case <-shutdownReq:
 						ulog.Info("Auto-shutdown fired (idle TerminalHub)").Field("event", "daemon.stopped").Log(bgCtx)
+					case <-yieldReq:
+						ulog.Info("Yielding scope to host daemon").
+							Field("event", "daemon.stopped").Field("scope", scope).Log(bgCtx)
 					}
 					// Reap the agent PTYs this daemon owns. With PTYs out-of-process,
 					// a plain stop (this SIGTERM/auto-shutdown path — NOT the SIGUSR1
@@ -1221,9 +1262,7 @@ func newGrovedStartCmd() *cobra.Command {
 					// leftover record is harmless — lookups skip dead pids and
 					// the next registration prunes it — but leaving one behind
 					// means every lookup pays a dial to a dead socket first.
-					if unregisterDaemonHost != nil {
-						unregisterDaemonHost()
-					}
+					hostReg.Unregister()
 					_ = pidfile.Release(pidPath)
 					os.Exit(0)
 				}()
@@ -1620,6 +1659,7 @@ func serveConfigDegraded(
 	autoShutdown bool,
 	scope, socketPath string,
 	httpPort, readyFd, pairPID int,
+	hostReg *daemon.HostRegistration,
 	configErr error,
 	ulog *grovelogging.UnifiedLogger,
 ) error {
@@ -1629,20 +1669,18 @@ func serveConfigDegraded(
 	srv.SetConfigDegradation(configErr.Error())
 	srv.SetBootStatus(&daemon.BootStatus{Done: true, Err: configErr.Error()})
 
-	var unregisterDaemonHost func()
+	// A status-only daemon is still the machine's global daemon: it holds the
+	// pidfile and answers on the global socket, so clients must route to it
+	// rather than spawn scoped daemons that would be just as degraded. The
+	// record was published before config load (step 1.5); mark it ready here.
 	srv.OnReady = func() {
 		if readyFd > 0 {
 			if err := syscall.Close(readyFd); err != nil {
 				ulog.Warn("failed to close ready-fd").Field("fd", readyFd).Err(err).Log(ctx)
 			}
 		}
-		if scope == "" {
-			unregister, err := daemon.RegisterDaemonHost(scope, "groved")
-			if err != nil {
-				ulog.Warn("Failed to register degraded daemon host").Err(err).Log(ctx)
-			} else {
-				unregisterDaemonHost = unregister
-			}
+		if err := hostReg.MarkReady(); err != nil {
+			ulog.Warn("Failed to mark degraded daemon host ready").Err(err).Log(ctx)
 		}
 	}
 
@@ -1670,9 +1708,7 @@ func serveConfigDegraded(
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if unregisterDaemonHost != nil {
-			unregisterDaemonHost()
-		}
+		hostReg.Unregister()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			ulog.Error("Degraded server shutdown error").Err(err).Log(shutdownCtx)
 		}

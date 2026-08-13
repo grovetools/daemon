@@ -66,6 +66,26 @@ type JobRunner struct {
 	onJobDetached func(jobID string)
 }
 
+// Busy reports whether this runner has work in flight — a job executing, or one
+// queued or blocked waiting to. A nil runner (jobs disabled) is never busy.
+//
+// Used by the scoped self-yield: a daemon may hand its scope to a host daemon
+// only when nothing it owns would die with it.
+func (jr *JobRunner) Busy() bool {
+	if jr == nil {
+		return false
+	}
+	jr.mu.RLock()
+	running := len(jr.running)
+	jr.mu.RUnlock()
+	if running > 0 || len(jr.queue) > 0 {
+		return true
+	}
+	jr.blockedMu.Lock()
+	defer jr.blockedMu.Unlock()
+	return len(jr.blocked) > 0
+}
+
 // SetOnJobDetached registers a callback invoked when a job completes its
 // executor with status="running" (interactive_agent / headless_agent launched
 // detached). Wired by the daemon to the LogStreamer.NotifyJobDetached method.
