@@ -192,6 +192,15 @@ func (h *SyncHandler) ensurePipelines() {
 		h.startPipeline(client, db, resolved[id], generation)
 	}
 
+	// Registration gave every notespace above an identity on the server; this
+	// gives the contained ones the notebook they belong to. It runs after the
+	// loop, not inside startPipeline, for two reasons: an attach is refused
+	// before the registration it depends on has landed, and a notespace whose
+	// pipeline was already running from an earlier pass — a notebook shared
+	// after the fact, a machine that predates this rule — would otherwise never
+	// be asked about at all.
+	h.attachContainedNotespaces(client, resolved)
+
 	// Capture switches to immutable identity only for roots that have a
 	// REGISTERED, running transport — including after a watch-set refresh that
 	// rebuilt the watch entries with an empty notespace field. Binding earlier

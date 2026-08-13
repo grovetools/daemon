@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -21,9 +22,10 @@ import (
 	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
 )
 
-// lifecycleHarness is a SyncHandler wired to temp dirs and a register-only
-// fixture server. Nothing here reads ambient config: GROVE_HOME and the XDG
-// homes are redirected, and every root is a t.TempDir.
+// lifecycleHarness is a SyncHandler wired to temp dirs and a fixture server
+// that speaks the three verbs the reconcile pass uses: register, inventory and
+// re-parent. Nothing here reads ambient config: GROVE_HOME and the XDG homes
+// are redirected, and every root is a t.TempDir.
 type lifecycleHarness struct {
 	h            *SyncHandler
 	notebookRoot string
@@ -32,6 +34,28 @@ type lifecycleHarness struct {
 
 	mu            sync.Mutex
 	registrations map[string]int
+	// The fixture server's own records, so a test can ask what the server
+	// believes rather than only what the daemon sent. serverNotespaces is
+	// written by /sync/register (unparented, as the real server registers) and
+	// moved by /sync/notespaces/reparent.
+	serverNotespaces map[string]*fixtureNotespace
+	serverNotebooks  map[string]fixtureNotebook
+	reparents        []syncproto.NotespaceReparentRequest
+	inventories      int
+}
+
+// fixtureNotespace is one notespace as the fixture server holds it: an id, the
+// notebook it belongs to (empty = unparented) and the membership version that
+// every membership write is CAS'd against.
+type fixtureNotespace struct {
+	name              string
+	notebookID        string
+	membershipVersion int64
+}
+
+type fixtureNotebook struct {
+	name       string
+	shareState string
 }
 
 func newLifecycleHarness(t *testing.T) *lifecycleHarness {
@@ -47,21 +71,119 @@ func newLifecycleHarness(t *testing.T) *lifecycleHarness {
 		t.Fatal(err)
 	}
 
-	harness := &lifecycleHarness{registrations: map[string]int{}}
+	harness := &lifecycleHarness{
+		registrations:    map[string]int{},
+		serverNotespaces: map[string]*fixtureNotespace{},
+		serverNotebooks:  map[string]fixtureNotebook{},
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/sync/register" {
+		switch r.URL.Path {
+		case "/sync/register":
+			var req syncproto.RegisterRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			harness.mu.Lock()
+			id := req.ProposedNotespaceID.String()
+			harness.registrations[id]++
+			// A registration establishes identity and nothing else — the
+			// notespace belongs to no notebook until something says so. That
+			// is the exact shape of the gap probe 10 found, so the fixture
+			// keeps it rather than helpfully parenting the row.
+			if _, exists := harness.serverNotespaces[id]; !exists {
+				harness.serverNotespaces[id] = &fixtureNotespace{name: req.NotespaceName.String()}
+			}
+			harness.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(syncproto.RegisterResponse{NotespaceID: req.ProposedNotespaceID})
+
+		case "/sync/inventory":
+			harness.mu.Lock()
+			harness.inventories++
+			out := syncproto.InventoryResponse{}
+			for id, ns := range harness.serverNotespaces {
+				out.Notespaces = append(out.Notespaces, syncproto.InventoryNotespace{
+					ID:         syncproto.NotespaceID(id),
+					Name:       syncproto.NotespaceName(ns.name),
+					NotebookID: syncproto.NotebookID(ns.notebookID),
+				})
+			}
+			for id, book := range harness.serverNotebooks {
+				out.Notebooks = append(out.Notebooks, syncproto.InventoryNotebook{
+					ID: syncproto.NotebookID(id), Name: book.name, ShareState: book.shareState,
+				})
+			}
+			harness.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(out)
+
+		case "/sync/notespaces/reparent":
+			var req syncproto.NotespaceReparentRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			harness.mu.Lock()
+			defer harness.mu.Unlock()
+			harness.reparents = append(harness.reparents, req)
+			refuse := func(status int, wire *syncproto.ProtocolError) {
+				w.WriteHeader(status)
+				_ = json.NewEncoder(w).Encode(syncproto.NotespaceReparentResponse{
+					NotespaceID: req.NotespaceID, ToNotebookID: req.ToNotebookID, Error: wire,
+				})
+			}
+			ns, held := harness.serverNotespaces[req.NotespaceID.String()]
+			if !held {
+				refuse(http.StatusNotFound, &syncproto.ProtocolError{
+					Code: syncproto.ErrorUnregisteredNotespace, Message: "not registered",
+				})
+				return
+			}
+			book, known := harness.serverNotebooks[req.ToNotebookID.String()]
+			if !known {
+				refuse(http.StatusNotFound, &syncproto.ProtocolError{
+					Code: syncproto.ErrorUnregisteredNotebook, Message: "destination notebook is not registered",
+				})
+				return
+			}
+			if book.shareState == syncproto.NotebookShareStateUnshared {
+				refuse(http.StatusConflict, &syncproto.ProtocolError{
+					Code: syncproto.ErrorNotebookUnshared, Message: "destination notebook is unshared",
+				})
+				return
+			}
+			// The two preconditions the real store applies, in its order: the
+			// membership being moved out of, then the version it was decided
+			// against. Both refusals report the version the server holds,
+			// which is the only place a client can learn it.
+			if ns.notebookID != req.FromNotebookID.String() {
+				refuse(http.StatusPreconditionFailed, &syncproto.ProtocolError{
+					Code:           syncproto.ErrorStaleResolution,
+					Message:        "notespace belongs to another notebook",
+					CurrentVersion: ns.membershipVersion,
+				})
+				return
+			}
+			if ns.membershipVersion != req.ExpectedVersion {
+				refuse(http.StatusPreconditionFailed, &syncproto.ProtocolError{
+					Code:           syncproto.ErrorStaleResolution,
+					Message:        "membership has moved on",
+					CurrentVersion: ns.membershipVersion,
+				})
+				return
+			}
+			ns.notebookID = req.ToNotebookID.String()
+			ns.membershipVersion++
+			_ = json.NewEncoder(w).Encode(syncproto.NotespaceReparentResponse{
+				NotespaceID:      req.NotespaceID,
+				FromNotebookID:   req.FromNotebookID,
+				ToNotebookID:     req.ToNotebookID,
+				Version:          ns.membershipVersion,
+				HistoryPreserved: true,
+			})
+
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		var req syncproto.RegisterRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		harness.mu.Lock()
-		harness.registrations[req.ProposedNotespaceID.String()]++
-		harness.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(syncproto.RegisterResponse{NotespaceID: req.ProposedNotespaceID})
 	}))
 	t.Cleanup(server.Close)
 
@@ -161,6 +283,57 @@ func (lh *lifecycleHarness) registrationCount(id string) int {
 	lh.mu.Lock()
 	defer lh.mu.Unlock()
 	return lh.registrations[id]
+}
+
+// stampNotebook mints the harness notebook's .notebook.toml — the identity a
+// notespace can be a member OF, written by `grove notebook share` in the real
+// world and by nothing in the daemon.
+func (lh *lifecycleHarness) stampNotebook(t *testing.T, id, name string) {
+	t.Helper()
+	if _, err := notespacepkg.InstallNotebook(lh.notebookRoot, notespacepkg.NotebookStamp{ID: id, Name: name}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// serverNotebook records a notebook on the fixture server, as `grove notebook
+// share` registers one.
+func (lh *lifecycleHarness) serverNotebook(id, name, shareState string) {
+	lh.mu.Lock()
+	defer lh.mu.Unlock()
+	lh.serverNotebooks[id] = fixtureNotebook{name: name, shareState: shareState}
+}
+
+// serverMembership is the notebook the fixture server counts a notespace in,
+// and the membership version it holds. A missing notespace reports "-" so a
+// failure message tells "unparented" apart from "never registered".
+func (lh *lifecycleHarness) serverMembership(id string) (string, int64) {
+	lh.mu.Lock()
+	defer lh.mu.Unlock()
+	ns, ok := lh.serverNotespaces[id]
+	if !ok {
+		return "-", 0
+	}
+	return ns.notebookID, ns.membershipVersion
+}
+
+// placeOnServer puts a notespace on the fixture server directly, for the states
+// a registration cannot produce: already a member, or moved before.
+func (lh *lifecycleHarness) placeOnServer(id, name, notebookID string, version int64) {
+	lh.mu.Lock()
+	defer lh.mu.Unlock()
+	lh.serverNotespaces[id] = &fixtureNotespace{name: name, notebookID: notebookID, membershipVersion: version}
+}
+
+func (lh *lifecycleHarness) attachRequests() []syncproto.NotespaceReparentRequest {
+	lh.mu.Lock()
+	defer lh.mu.Unlock()
+	return slices.Clone(lh.reparents)
+}
+
+func (lh *lifecycleHarness) inventoryCount() int {
+	lh.mu.Lock()
+	defer lh.mu.Unlock()
+	return lh.inventories
 }
 
 func waitForLifecycle(t *testing.T, what string, cond func() bool) {

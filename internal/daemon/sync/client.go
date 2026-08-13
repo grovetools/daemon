@@ -425,6 +425,55 @@ func (c *Client) Inventory(ctx context.Context) (*syncproto.InventoryResponse, e
 	return &out, nil
 }
 
+// ReparentNotespace moves one notespace's notebook membership.
+//
+// The daemon calls exactly one of the verb's three legs: the ATTACH
+// (`unparented -> notebook`), for a notespace it has just registered inside a
+// notebook the operator recorded as shared. The other two — moving between
+// notebooks and detaching — stay operator verbs (`grove notespace move`),
+// because they take membership away from somewhere, and this daemon only ever
+// completes a registration that left the notespace belonging nowhere.
+//
+// A refusal is returned rather than swallowed: the interesting answer here is
+// ErrorStaleResolution, which carries the membership version the server
+// actually holds, and it is the only way a client can learn it — the inventory
+// does not carry it. So the response is decoded on every status and returned
+// alongside the error, exactly as Register does.
+func (c *Client) ReparentNotespace(ctx context.Context, req syncproto.NotespaceReparentRequest) (*syncproto.NotespaceReparentResponse, error) {
+	if req.ProtocolVersion == 0 {
+		req.ProtocolVersion = syncproto.ProtocolVersionNotespaceID
+	}
+	if req.DeviceID == "" {
+		req.DeviceID = c.deviceID
+	}
+	if wire := req.Validate(); wire != nil {
+		return nil, fmt.Errorf("invalid re-parent request: %s", wire.Message)
+	}
+	httpReq, err := c.newRequest(ctx, http.MethodPost, "/sync/notespaces/reparent", &req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.doAuthenticated(ctx, c.httpClient, "re-parent request", replayableRequest(httpReq))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if err := c.rejectIfUnauthorized("re-parent request", resp); err != nil {
+		return nil, err
+	}
+	var out syncproto.NotespaceReparentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode re-parent response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK || out.Error != nil {
+		if out.Error != nil {
+			return &out, fmt.Errorf("re-parent %s: %s", out.Error.Code, out.Error.Message)
+		}
+		return &out, fmt.Errorf("re-parent failed with status %d", resp.StatusCode)
+	}
+	return &out, nil
+}
+
 // Push uploads a batch of outbox entries to the server. Returns the
 // per-event results in the same order as the input events.
 func (c *Client) Push(ctx context.Context, notespace string, events []syncproto.SyncEvent) (*syncproto.PushResponse, error) {
