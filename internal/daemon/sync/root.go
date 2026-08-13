@@ -20,11 +20,18 @@ package sync
 // notespace-wide deletion to the server and from there to every other
 // machine. AntiEntropyPass.Run refuses the pass instead.
 //
-// Nothing here canonicalizes symlinks: a notebook root reached through a
-// symlink is a legitimate, common layout (the macOS /var -> /private/var
-// aliasing the rest of the daemon already tolerates). os.Stat follows the
-// link, so the check answers "is there a directory at the recorded route",
-// which is exactly the question.
+// The ROOT check does not canonicalize symlinks: a notebook root reached
+// through a symlink is a legitimate, common layout (the macOS /var ->
+// /private/var aliasing the rest of the daemon already tolerates). os.Stat
+// follows the link, so the check answers "is there a directory at the recorded
+// route", which is exactly the question.
+//
+// Server-supplied CHILD paths are a different question and get the opposite
+// answer — see requireUnderRoot. "Is this path inside the tree" cannot be
+// settled lexically once a symlink inside the tree can point out of it, so
+// both sides are canonicalized there before they are compared. The two rules
+// coexist because the root is a RECORDED route this machine chose, while a
+// child path is an input from the other end of the wire.
 
 import (
 	"errors"
@@ -88,7 +95,32 @@ func RequireNotespaceRoot(root string) error {
 // root. Wire paths are server-supplied, and filepath.Join happily resolves
 // "../.." out of the tree; containment is checked here so no writer has to
 // remember to.
+//
+// The check is lexical AND physical. Lexical alone is not enough: filepath.Rel
+// cleans "notes/link/../../../etc/x" to a contained-looking relative path
+// without ever asking what `link` points at, so a symlink INSIDE the tree is a
+// legitimate route out of it and the write follows the link. The header's
+// argument for not canonicalizing applies to the ROOT — a notebook reached
+// through a symlink is a real layout — and does not transfer to server-supplied
+// CHILD paths. Both sides are canonicalized before comparison, so the macOS
+// /var -> /private/var aliasing the rest of the daemon tolerates still passes.
 func requireUnderRoot(root, dst string) error {
+	if err := lexicallyUnderRoot(root, dst); err != nil {
+		return err
+	}
+	resolvedRoot, err := resolveExisting(root)
+	if err != nil {
+		return fmt.Errorf("resolve notespace root %s: %w", root, err)
+	}
+	resolvedDst, err := resolveExisting(dst)
+	if err != nil {
+		return fmt.Errorf("resolve %s against notespace root %s: %w", dst, root, err)
+	}
+	return lexicallyUnderRoot(resolvedRoot, resolvedDst)
+}
+
+// lexicallyUnderRoot is the pure path-arithmetic half of the containment check.
+func lexicallyUnderRoot(root, dst string) error {
 	rel, err := filepath.Rel(root, dst)
 	if err != nil {
 		return fmt.Errorf("resolve %s against notespace root %s: %w", dst, root, err)
@@ -97,6 +129,40 @@ func requireUnderRoot(root, dst string) error {
 		return fmt.Errorf("path escapes notespace root %s: %s", root, dst)
 	}
 	return nil
+}
+
+// resolveExisting canonicalizes the deepest existing ancestor of path and
+// re-joins the components that do not exist yet.
+//
+// filepath.EvalSymlinks fails outright on a path whose tail is missing, which
+// is the ordinary case for an incoming write: plans/2026/note.md arrives before
+// plans/2026 does. Resolving the part that DOES exist is what matters for
+// containment — a symlink can only be traversed where it exists — and the
+// missing tail cannot introduce one.
+func resolveExisting(path string) (string, error) {
+	current := filepath.Clean(path)
+	rest := ""
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			if rest == "" {
+				return resolved, nil
+			}
+			return filepath.Join(resolved, rest), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Walked to the filesystem root without finding anything that
+			// exists: there is no symlink to resolve, so the lexical answer
+			// already is the physical one.
+			return filepath.Clean(path), nil
+		}
+		rest = filepath.Join(filepath.Base(current), rest)
+		current = parent
+	}
 }
 
 // writeFileUnderRoot is writeFile with the root precondition and containment
@@ -125,4 +191,56 @@ func moveFileUnderRoot(root, src, dst string) error {
 		return err
 	}
 	return moveFile(src, dst)
+}
+
+// deleteFileUnderRoot is deleteFile with the same two guards.
+//
+// Deletes need containment MORE than writes, not less: a write at least has to
+// name a document the server can produce content for, while a delete needs no
+// precondition at all — no DB row for a prefix delete, no hash, no prior state.
+// One event from a compromised, confused, or simply buggy server would
+// otherwise remove anything the daemon can reach.
+func deleteFileUnderRoot(root, dst string) error {
+	if err := RequireNotespaceRoot(root); err != nil {
+		return err
+	}
+	if err := requireUnderRoot(root, dst); err != nil {
+		return err
+	}
+	return deleteFile(dst)
+}
+
+// deleteDirUnderRoot is deleteDir (a recursive RemoveAll) with the same two
+// guards. This is the most destructive call in the package.
+func deleteDirUnderRoot(root, dst string) error {
+	if err := RequireNotespaceRoot(root); err != nil {
+		return err
+	}
+	if err := requireUnderRoot(root, dst); err != nil {
+		return err
+	}
+	// Refusing the root itself is not containment, it is the same rule
+	// RequireNotespaceRoot exists for: sync never creates a notespace root, so
+	// it must not remove one either. A prefix delete addressing "" or "." would
+	// otherwise take the whole tree.
+	if same, err := samePath(root, dst); err != nil {
+		return err
+	} else if same {
+		return fmt.Errorf("refusing to delete the notespace root itself: %s", root)
+	}
+	return deleteDir(dst)
+}
+
+// samePath reports whether two paths name the same directory after symlink
+// resolution.
+func samePath(a, b string) (bool, error) {
+	resolvedA, err := resolveExisting(a)
+	if err != nil {
+		return false, err
+	}
+	resolvedB, err := resolveExisting(b)
+	if err != nil {
+		return false, err
+	}
+	return resolvedA == resolvedB, nil
 }

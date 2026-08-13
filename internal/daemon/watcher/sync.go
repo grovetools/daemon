@@ -75,7 +75,16 @@ type syncWatch struct {
 
 // SyncHandler implements DomainHandler for sync change capture.
 type SyncHandler struct {
-	store   *store.Store
+	store *store.Store
+	// cfg/locator are swapped wholesale by a config reload running on the
+	// store dispatch goroutine, and read by the reconcile pass (routing,
+	// containment) running on its own. They carry the same RWMutex treatment
+	// syncCfg already has rather than being bare fields: since the reload
+	// handler itself now kicks `go h.ensurePipelines()`, reload N's reconcile
+	// is routinely still in flight — it registers over the network under
+	// reconcileMu — when reload N+1 swaps the pointers. Read them through
+	// configSnapshot/notebookLocator, never directly.
+	cfgMu   sync.RWMutex
 	cfg     *config.Config
 	locator *workspace.NotebookLocator
 	ulog    *logging.UnifiedLogger
@@ -148,8 +157,12 @@ type SyncHandler struct {
 
 	// duplicateScannedAt rate-limits the containing-notebook duplicate-stamp
 	// sweep; zero duplicateScanInterval selects the production cadence.
-	duplicateScannedAt    time.Time
-	duplicateScanInterval time.Duration
+	// duplicateSiblingsCache holds the last sweep's result so a rate-limited
+	// pass replays the verdict instead of reporting "no duplicates" — see
+	// duplicateSiblings. All three are touched only under reconcileMu.
+	duplicateScannedAt     time.Time
+	duplicateScanInterval  time.Duration
+	duplicateSiblingsCache map[string][]string
 
 	// ContainmentAutoRegister enables W3.2's "containment is consent"
 	// inheritance (sync_containment.go). Dark by default and set by nothing in
@@ -342,13 +355,41 @@ func (h *SyncHandler) SyncSubscriptions() (string, []config.SyncWorkspace) {
 	return h.syncCfg.Server, slices.Clone(h.syncCfg.Workspaces)
 }
 
+// configSnapshot returns the recorded config a pass should route against. The
+// pointer is immutable once published — a reload installs a NEW *config.Config
+// rather than mutating the live one — so a pass that reads it once is
+// internally consistent even if a reload lands mid-pass. The generation check
+// in ensurePipelines, not this lock, is what stops a pass from ACTING on a
+// snapshot that has since been superseded.
+func (h *SyncHandler) configSnapshot() *config.Config {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	return h.cfg
+}
+
+// notebookLocator returns the locator built from the current config snapshot.
+func (h *SyncHandler) notebookLocator() *workspace.NotebookLocator {
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	return h.locator
+}
+
+// setConfig installs a reloaded config and the locator derived from it as one
+// atomic swap, so no reader can observe a locator built from the other config.
+func (h *SyncHandler) setConfig(cfg *config.Config) {
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
+	h.cfg = cfg
+	h.locator = workspace.NewNotebookLocator(cfg)
+}
+
 // recordedNotebookRoot returns the authoritative name+root pair. An exact
 // compiled code-root binding is literal rung 0; a stamped notespace whose id is
 // the recorded primary for its subject is rung 1; the recorded default is the
 // only fallback. The compiled NotebookRoot is returned directly, never
 // re-resolved through Definitions by notebook name.
 func (h *SyncHandler) recordedNotebookRoot(name string) (string, string, error) {
-	cfg := h.cfg
+	cfg := h.configSnapshot()
 	if cfg == nil || name == "" {
 		return "", "", fmt.Errorf("notespace %q has no recorded code-root/notebook binding", name)
 	}
@@ -412,7 +453,7 @@ func notebookRootDir(definition *config.Notebook) string {
 // notebooks.toml does not record. Every one of those leaves the decision to the
 // caller's remaining rungs instead of inventing a root.
 func (h *SyncHandler) stampedNotebookRoot(name string) (string, string, bool) {
-	cfg := h.cfg
+	cfg := h.configSnapshot()
 	if cfg == nil || cfg.Notebooks == nil || len(cfg.Notebooks.Definitions) == 0 {
 		return "", "", false
 	}
@@ -493,7 +534,7 @@ func (h *SyncHandler) nodeNotespaceRoot(node *workspace.WorkspaceNode) (string, 
 		binding := config.ResolveNotebook(config.NotebookQuery{
 			Path:       node.Path,
 			OwnerPaths: []string{node.ParentProjectPath, node.ParentEcosystemPath, node.RootEcosystemPath},
-		}, h.cfg)
+		}, h.configSnapshot())
 		if binding.Notebook != "" && binding.NotebookRoot != "" {
 			root, err = binding.NotebookRoot, nil
 		}
@@ -1032,8 +1073,7 @@ func (h *SyncHandler) HandleStoreUpdate(update store.Update) {
 		// of installing pipelines against config that is already superseded.
 		generation := h.bumpConfigGeneration()
 		if newCfg, err := config.LoadDefault(); err == nil {
-			h.cfg = newCfg
-			h.locator = workspace.NewNotebookLocator(newCfg)
+			h.setConfig(newCfg)
 		}
 		if syncCfg, err := config.LoadSyncConfig(); err == nil {
 			h.syncCfgMu.Lock()
@@ -1048,9 +1088,16 @@ func (h *SyncHandler) HandleStoreUpdate(update store.Update) {
 			// (a `grove join` on a machine that has never synced) rather than
 			// waiting for the transport tick. Dormant on nil/empty config.
 			h.ensureDB()
+			// Count through the snapshot accessor, never off syncCfg
+			// directly: LoadSyncConfig returns (nil, nil) when sync.toml is
+			// absent — the documented "sync is disabled" state, and the
+			// default on every machine that has never run `grove join` — so
+			// this branch is entered with a nil config on the ordinary path.
+			// A deref here panics the store dispatch goroutine, and nothing on
+			// UnifiedWatcher's dispatch path recovers, so it takes groved down.
 			h.ulog.Info("sync config reloaded").
 				Field("generation", generation).
-				Field("subscriptions", len(syncCfg.Workspaces)).
+				Field("subscriptions", len(h.subscriptionsSnapshot())).
 				StructuredOnly().Emit()
 			// Reconcile now rather than at the next transport tick, so a
 			// removed subscription stops its pipelines promptly (W3.3) and a

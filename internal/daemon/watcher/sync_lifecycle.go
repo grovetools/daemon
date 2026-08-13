@@ -70,6 +70,13 @@ import (
 // to repeat it on every ten-second transport tick.
 const defaultDuplicateScanInterval = time.Minute
 
+// drainWaitWarnPasses is how many consecutive reconcile passes may find the same
+// pipeline still draining before the wait stops being routine. A pull sits in
+// a 30s long-poll and the transport ticks every 10s, so a healthy re-root is
+// expected to block a handful of passes; past that the goroutine is wedged and
+// the notespace has no transport.
+const drainWaitWarnPasses = 6
+
 // pipelineState is one running per-notespace transport.
 type pipelineState struct {
 	cancel context.CancelFunc
@@ -83,6 +90,9 @@ type pipelineState struct {
 	pull bool
 	// generation is the config generation that installed this pipeline.
 	generation uint64
+	// drainWaits counts reconcile passes that found this cancelled pipeline
+	// still draining. Touched only under pipelinesMu.
+	drainWaits int
 }
 
 // stopped reports whether every goroutine of a cancelled pipeline has returned.
@@ -160,6 +170,7 @@ func (h *SyncHandler) ensurePipelines() {
 
 	resolved := h.resolveIdentities(desired)
 
+	h.reclaimDrained()
 	h.stopUndesired(resolved, desired, generation)
 
 	ids := slices.Sorted(maps.Keys(resolved))
@@ -255,11 +266,34 @@ func (h *SyncHandler) resolveIdentities(desired map[string]string) map[string]re
 	resolved := make(map[string]resolvedNotespace, len(candidates))
 	parked := make(map[string]ParkedNotespace)
 	for id, group := range candidates {
-		keeper := h.firstSeenRoot(id, group)
+		keeper := h.firstSeenRoot(id, group, siblings[id])
+		// The keeper can be a swept sibling rather than one of the desired
+		// candidates — the durable binding names the root this machine has
+		// been syncing, and nothing says that root is still subscribed. The
+		// sweep DETECTS but never promotes, so the honest outcome is that this
+		// id resolves to nobody: every desired copy parks, no pipeline runs,
+		// and the operator re-mints. Letting an unbound copy inherit the
+		// identity instead is precisely the D8 inversion this answers.
+		keeperDesired := false
+		for _, cand := range group {
+			if samePhysicalPath(cand.root, keeper) {
+				keeperDesired = true
+				break
+			}
+		}
 		for _, cand := range group {
 			if samePhysicalPath(cand.root, keeper) {
 				resolved[id] = cand
 				continue
+			}
+			detail := fmt.Sprintf("duplicate notespace id %s: first-seen root %s keeps syncing; %s is parked "+
+				"(no push, no pull) until one of the two is re-minted — `grove doctor --fix` re-mints the copy you designate",
+				id, keeper, cand.root)
+			if !keeperDesired {
+				detail = fmt.Sprintf("duplicate notespace id %s: this machine's recorded sync history belongs to %s, "+
+					"which is not subscribed, so %s is parked (no push, no pull) rather than taking over the id — "+
+					"re-mint one of the two (`grove doctor --fix`) or subscribe the recorded root",
+					id, keeper, cand.root)
 			}
 			parked[parkKey(id, cand.root)] = ParkedNotespace{
 				NotespaceID: id,
@@ -267,9 +301,7 @@ func (h *SyncHandler) resolveIdentities(desired map[string]string) map[string]re
 				Root:        cand.root,
 				Keeper:      keeper,
 				Reason:      syncdb.ConflictKindDuplicateStamp,
-				Detail: fmt.Sprintf("duplicate notespace id %s: first-seen root %s keeps syncing; %s is parked "+
-					"(no push, no pull) until one of the two is re-minted — `grove doctor --fix` re-mints the copy you designate",
-					id, keeper, cand.root),
+				Detail:      detail,
 			}
 		}
 		for _, sibling := range siblings[id] {
@@ -306,14 +338,29 @@ func (h *SyncHandler) resolveIdentities(desired map[string]string) map[string]re
 //  2. the root a pipeline is currently running against;
 //  3. the lexicographically smallest root, so a first-ever observation of two
 //     copies is at least deterministic.
-func (h *SyncHandler) firstSeenRoot(id string, group []resolvedNotespace) string {
-	roots := make([]string, 0, len(group))
+//
+// Two things the earlier shape got wrong, both of which INVERTED rung 1 in
+// exactly the case it exists for:
+//
+//   - the candidate set was built only from `group`, the DESIRED subscriptions,
+//     so a root the sweep found could never win — even when sync.db says it is
+//     the root this machine has been syncing all along. Siblings are folded in
+//     here (detection only: winning the vote does not put a sibling into the
+//     desired set — see resolveIdentities, where a sibling keeper means NOBODY
+//     syncs this id until the operator re-mints);
+//   - a `len(roots) == 1` short-circuit ran BEFORE the binding lookup, so a
+//     lone newly-subscribed copy took over an id the DB had bound to a sibling
+//     without the durable answer ever being consulted.
+func (h *SyncHandler) firstSeenRoot(id string, group []resolvedNotespace, siblings []string) string {
+	roots := make([]string, 0, len(group)+len(siblings))
 	for _, cand := range group {
 		roots = append(roots, cand.root)
 	}
+	roots = append(roots, siblings...)
 	sort.Strings(roots)
-	if len(roots) == 1 {
-		return roots[0]
+	roots = slices.Compact(roots)
+	if len(roots) == 0 {
+		return ""
 	}
 
 	if db := h.database(); db != nil {
@@ -343,13 +390,24 @@ func (h *SyncHandler) firstSeenRoot(id string, group []resolvedNotespace) string
 // hosts a desired notespace and reports any OTHER stamped directory carrying
 // an id the desired set already claims. Read-only and rate-limited; it exists
 // so the `cp -R` case is detected rather than silently ignored.
+//
+// The rate limit is on the SWEEP, never on the verdict. Returning nil on a
+// rate-limited pass made every sibling-derived parking decision vanish for the
+// ~5 of every 6 transport ticks that skip the scan (10s tick, 60s sweep), with
+// two consequences: recordParked saw the verdict as absent from `previous` on
+// the next sweep and re-emitted duplicate_stamp evidence as a new episode once
+// a minute forever, and isParkedRoot — the exclusion that keeps a parked copy
+// out of the escrow apply and the maintenance drain — went false in between.
+// The last sweep's result is therefore cached and replayed until the next one
+// supersedes it. A copy that has since been re-minted stays parked for up to
+// one scan interval, which is the conservative direction.
 func (h *SyncHandler) duplicateSiblings(candidates map[string][]resolvedNotespace) map[string][]string {
 	interval := h.duplicateScanInterval
 	if interval <= 0 {
 		interval = defaultDuplicateScanInterval
 	}
 	if !h.duplicateScannedAt.IsZero() && time.Since(h.duplicateScannedAt) < interval {
-		return nil
+		return claimedSiblings(h.duplicateSiblingsCache, candidates)
 	}
 	h.duplicateScannedAt = time.Now()
 
@@ -386,7 +444,25 @@ func (h *SyncHandler) duplicateSiblings(candidates map[string][]resolvedNotespac
 	for id := range found {
 		sort.Strings(found[id])
 	}
-	return found
+	h.duplicateSiblingsCache = found
+	return claimedSiblings(found, candidates)
+}
+
+// claimedSiblings narrows a sweep result to the ids this pass actually claims.
+// The cache outlives the candidate set that produced it, and a replayed verdict
+// must not park a root for a notespace nothing is subscribed to any more.
+func claimedSiblings(found map[string][]string, candidates map[string][]resolvedNotespace) map[string][]string {
+	if len(found) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(found))
+	for id, roots := range found {
+		if len(candidates[id]) == 0 {
+			continue
+		}
+		out[id] = roots
+	}
+	return out
 }
 
 func parkKey(id, root string) string { return id + "\x00" + root }
@@ -497,6 +573,21 @@ func (h *SyncHandler) isContested(id string) (string, bool) {
 	return reason, ok
 }
 
+// pullDesired is the pull-side desired state for a resolved notespace: the
+// recorded subscription's pull flag, minus the W3.5 contested veto.
+//
+// It exists so the code that SPAWNS a pull loop (startPipeline) and the code
+// that decides a running pipeline is healthy (stopUndesired) read one
+// definition. While only the spawn side had one, `contested` and `pull` were
+// enforced exclusively at pipeline birth: consulted once, never compared again.
+func (h *SyncHandler) pullDesired(r resolvedNotespace) bool {
+	if r.sub == nil || !r.sub.Pull {
+		return false
+	}
+	_, contested := h.isContested(r.id)
+	return !contested
+}
+
 // bindWatchIdentities stamps the immutable id onto every watch entry whose
 // directory belongs to a running, registered pipeline. Until a watch carries an
 // id, flush refuses to capture through it — which is what keeps a parked
@@ -529,6 +620,14 @@ func (h *SyncHandler) stopUndesired(resolved map[string]resolvedNotespace, desir
 		desiredRoots[root] = true
 	}
 
+	// Desired pull state per id, computed before pipelinesMu is taken so the
+	// health test below needs no lock of its own (parkMu under pipelinesMu is
+	// the established order, but not needing it at all is better).
+	wantPull := make(map[string]bool, len(resolved))
+	for id, r := range resolved {
+		wantPull[id] = h.pullDesired(r)
+	}
+
 	type stopping struct {
 		id     string
 		state  *pipelineState
@@ -540,8 +639,18 @@ func (h *SyncHandler) stopUndesired(resolved map[string]resolvedNotespace, desir
 	h.pipelinesMu.Lock()
 	for id, state := range h.pipelines {
 		if want, ok := resolved[id]; ok {
-			if samePhysicalPath(want.root, state.root) {
+			// Health is the root AND the pull state. Comparing only the root
+			// made a running pipeline healthy forever regardless of what
+			// config or the contested set now said, which falsified W3.5's
+			// contract in both directions (MarkContested took effect only if
+			// it beat the first reconcile) and let a subscription downgraded
+			// to pull = false keep writing into the tree until a restart.
+			if samePhysicalPath(want.root, state.root) && state.pull == wantPull[id] {
 				continue // healthy
+			}
+			if samePhysicalPath(want.root, state.root) {
+				stops = append(stops, stopping{id: id, state: state, reason: "pull state changed"})
+				continue
 			}
 			stops = append(stops, stopping{id: id, state: state, reason: "re-root", toRoot: want.root})
 			continue
@@ -576,6 +685,26 @@ func (h *SyncHandler) stopUndesired(resolved map[string]resolvedNotespace, desir
 	}
 }
 
+// reclaimDrained drops pipelines whose goroutines have all returned from the
+// draining map.
+//
+// startPipeline only ever reclaimed an entry when the SAME id became desired
+// again, so a subscription removed for good leaked its pipelineState and its
+// cancel closure permanently — and resetTransport moves every pipeline into
+// draining at once, so an auth-reset cycle on a shrinking config accumulated
+// them. Sweeping at the top of each pass also makes the map mean what its name
+// says: what is left in it is still draining, which is the state worth
+// escalating about.
+func (h *SyncHandler) reclaimDrained() {
+	h.pipelinesMu.Lock()
+	defer h.pipelinesMu.Unlock()
+	for id, state := range h.draining {
+		if state.stopped() {
+			delete(h.draining, id)
+		}
+	}
+}
+
 // isParkedRoot reports whether a root lost its identity to a duplicate this
 // pass — a running pipeline on a parked root must stop.
 func (h *SyncHandler) isParkedRoot(root string) bool {
@@ -600,9 +729,22 @@ func (h *SyncHandler) startPipeline(client *syncdb.Client, db *syncdb.DB, r reso
 	}
 	if old := h.draining[r.id]; old != nil {
 		if !old.stopped() {
+			old.drainWaits++
+			waits := old.drainWaits
 			h.pipelinesMu.Unlock()
-			h.ulog.Debug("sync transport waiting for the previous pipeline to drain").
-				Field("notespace_id", r.id).
+			// A drain that never completes leaves the notespace with no
+			// transport at all, and the wait is unbounded by design (a pull
+			// sits in a 30s long-poll, so the first few passes waiting is
+			// normal). What was missing is any way to tell "draining" from
+			// "wedged": at Debug level the only evidence was invisible at
+			// default verbosity. Escalate once the wait outlasts anything a
+			// long-poll explains.
+			entry := h.ulog.Debug("sync transport waiting for the previous pipeline to drain")
+			if waits >= drainWaitWarnPasses {
+				entry = h.ulog.Warn("sync transport blocked: the previous pipeline has not drained").
+					Field("passes_waited", waits)
+			}
+			entry.Field("notespace_id", r.id).
 				Field("old_root", old.root).
 				Field("new_root", r.root).
 				StructuredOnly().Log(h.baseCtx)
@@ -614,6 +756,21 @@ func (h *SyncHandler) startPipeline(client *syncdb.Client, db *syncdb.DB, r reso
 
 	if err := h.registerRoot(h.baseCtx, client, r.stamp, r.root); err != nil {
 		h.ulog.Error("notespace registration failed; pipeline parked").Err(err).Field("root", r.root).Log(h.baseCtx)
+		return
+	}
+
+	// registerRoot is a network round trip, and the caller's generation check
+	// is per-iteration — taken BEFORE it. A reload landing inside this window
+	// would otherwise install a pipeline stamped with a generation that is
+	// already stale, routed from superseded config. The queued reconcile the
+	// reload triggers heals it, but not before the wrong root has been pushed
+	// from; re-checking here costs one atomic load.
+	if h.configGeneration.Load() != generation {
+		h.ulog.Debug("sync transport not installed: config generation advanced during registration").
+			Field("notespace_id", r.id).
+			Field("root", r.root).
+			Field("generation", generation).
+			StructuredOnly().Log(h.baseCtx)
 		return
 	}
 
@@ -660,7 +817,7 @@ func (h *SyncHandler) startPipeline(client *syncdb.Client, db *syncdb.DB, r reso
 	run("push", func() error { return push.RunPushLoop(pctx, root) })
 
 	contestedReason, contested := h.isContested(name)
-	pull := sub != nil && sub.Pull && !contested
+	pull := h.pullDesired(r)
 	if contested {
 		h.ulog.Warn("sync pull withheld: notespace is contested and not adopted yet").
 			Field("notespace_id", name).
@@ -702,9 +859,27 @@ func (h *SyncHandler) startPipeline(client *syncdb.Client, db *syncdb.DB, r reso
 	// this cycle rather than sitting empty until their own hourly tick.
 	ae.OnEpochReset = h.kickAntiEntropyExcept
 	run("anti-entropy", func() error {
-		// One immediate pass (initial reconciliation), then the loop.
+		// One immediate pass (initial reconciliation), then the loop. A failed
+		// initial pass is logged and fallen THROUGH, matching the policy
+		// RunAntiEntropyLoop already applies to every later pass ("continue
+		// polling on error"). Returning here instead exited the goroutine
+		// before the loop was ever entered, so a single transient refusal —
+		// and W3.2 gave Run a brand-new one in RequireNotespaceRoot, for a
+		// condition that is transient by construction (an unmounted volume, a
+		// replica not yet materialized, a notebook about to be pulled) — left
+		// the notespace running push and pull with NO reconciliation for the
+		// life of the process. Nothing would have noticed: the reconcile pass
+		// sees a live pipeline at the right root, and `done` never closes
+		// because push and pull are still running, so the drain gate cannot
+		// recycle it either.
 		if err := ae.Run(pctx); err != nil {
-			return err
+			if pctx.Err() != nil {
+				return err // cancelled, not failed: do not enter the loop
+			}
+			h.ulog.Warn("initial anti-entropy pass failed; continuing into the periodic loop").
+				Field("notespace_id", name).
+				Field("root", root).
+				Err(err).Log(pctx)
 		}
 		return ae.RunAntiEntropyLoop(pctx)
 	})

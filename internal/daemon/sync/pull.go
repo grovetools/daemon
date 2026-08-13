@@ -170,6 +170,18 @@ func (p *PullPipeline) snaphotResync(ctx context.Context, notespaceRoot string) 
 
 	// Reconcile: for each document in the manifest, check if we have a hash match
 	for _, doc := range manifest.Documents {
+		// A manifest path is server-supplied and this loop is where it first
+		// becomes a TRACKED ROW. AdoptDocument accepts whatever path it is
+		// handed, and a row whose path escapes the root is what later turns an
+		// ordinary document_deleted into a delete outside the tree. Reject it
+		// at the insert rather than relying on the delete guard alone.
+		if err := requireUnderRoot(notespaceRoot, p.joinPath(notespaceRoot, doc.Path)); err != nil {
+			p.log.Error("snapshot document path escapes the notespace root; skipped").
+				Field("notespace", p.ws.Name).
+				Field("path", doc.Path).
+				Err(err).Log(ctx)
+			continue
+		}
 		localDoc, _ := p.db.GetDocumentByPath(p.ws.Name, doc.Path)
 
 		adopted := false
@@ -279,6 +291,14 @@ func (p *PullPipeline) applyEvent(ctx context.Context, notespaceRoot string, ev 
 	if err := RequireNotespaceRoot(notespaceRoot); err != nil {
 		return err
 	}
+	// Containment for every event shape in one place. The per-call-site
+	// *UnderRoot helpers below are the enforcement, but they were only ever
+	// wired into the writes and moves; a single gate here means a new event
+	// type cannot be added without one. Both fields are checked because a move
+	// names two paths and either may escape.
+	if err := p.requireEventUnderRoot(notespaceRoot, ev); err != nil {
+		return err
+	}
 	if p.guardOwnRegistryNote(ctx, ev) {
 		return nil
 	}
@@ -298,6 +318,20 @@ func (p *PullPipeline) applyEvent(ctx context.Context, notespaceRoot string, ev 
 	default:
 		return fmt.Errorf("unknown event type: %s", ev.Type)
 	}
+}
+
+// requireEventUnderRoot rejects an event whose Path or PrevPath resolves
+// outside the notespace root, before any handler acts on it.
+func (p *PullPipeline) requireEventUnderRoot(notespaceRoot string, ev *syncproto.SyncEvent) error {
+	for _, path := range []string{ev.Path, ev.PrevPath} {
+		if path == "" {
+			continue
+		}
+		if err := requireUnderRoot(notespaceRoot, p.joinPath(notespaceRoot, path)); err != nil {
+			return fmt.Errorf("refusing %s event: %w", ev.Type, err)
+		}
+	}
+	return nil
 }
 
 // applyCreate writes a new document to the local filesystem.
@@ -521,7 +555,7 @@ func (p *PullPipeline) applyDelete(ctx context.Context, notespaceRoot string, ev
 
 	// No local edits: safe to delete
 	filePath = p.joinPath(notespaceRoot, ev.Path)
-	if err := deleteFile(filePath); err != nil {
+	if err := deleteFileUnderRoot(notespaceRoot, filePath); err != nil {
 		return fmt.Errorf("failed to delete file: %w", err)
 	}
 
@@ -545,7 +579,7 @@ func (p *PullPipeline) applyPrefixMove(ctx context.Context, notespaceRoot string
 // applyPrefixDelete deletes a directory.
 func (p *PullPipeline) applyPrefixDelete(ctx context.Context, notespaceRoot string, ev *syncproto.SyncEvent) error {
 	path := p.joinPath(notespaceRoot, ev.Path)
-	if err := deleteDir(path); err != nil {
+	if err := deleteDirUnderRoot(notespaceRoot, path); err != nil {
 		return fmt.Errorf("failed to delete prefix: %w", err)
 	}
 

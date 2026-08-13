@@ -229,7 +229,7 @@ func TestReconcileRerootsPipelineAfterTheOldOneDrains(t *testing.T) {
 	if err := os.RemoveAll(oldRoot); err != nil {
 		t.Fatal(err)
 	}
-	lh.h.cfg = notebookConfig(newNotebook)
+	lh.h.setConfig(notebookConfig(newNotebook))
 	lh.subscribe(config.SyncWorkspace{Name: "alpha"})
 	lh.watch(map[string]string{"alpha": newRoot})
 

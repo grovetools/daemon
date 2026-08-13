@@ -111,12 +111,13 @@ type containedNotespace struct {
 // Without this the containment rule would hold only for notespaces that happen
 // to have a checkout under a scan root.
 func (h *SyncHandler) containedNotespaces(covered map[string]bool) []containedNotespace {
-	if !h.ContainmentAutoRegister || h.cfg == nil || h.cfg.Notebooks == nil {
+	cfg := h.configSnapshot()
+	if !h.ContainmentAutoRegister || cfg == nil || cfg.Notebooks == nil {
 		return nil
 	}
 	var found []containedNotespace
-	for _, notebook := range slices.Sorted(maps.Keys(h.cfg.Notebooks.Definitions)) {
-		notebookRoot := notebookRootDir(h.cfg.Notebooks.Definitions[notebook])
+	for _, notebook := range slices.Sorted(maps.Keys(cfg.Notebooks.Definitions)) {
+		notebookRoot := notebookRootDir(cfg.Notebooks.Definitions[notebook])
 		if notebookRoot == "" {
 			continue
 		}
