@@ -12,6 +12,7 @@ import (
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/util/pathutil"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 	"github.com/grovetools/flow/pkg/orchestration"
 )
 
@@ -27,6 +28,15 @@ type Store struct {
 	workflowPersister *workflowPersister
 	pendingRestore    persistedState // Loaded from disk, applied when workspaces arrive
 	ulog              *grovelogging.UnifiedLogger
+
+	// noteIndexDigest fingerprints the note index currently in state, so a
+	// rebuilt-but-identical index can be dropped instead of published. Both
+	// note producers rebuild the WHOLE index every scan, so without this the
+	// replay ring accumulates references to full multi-megabyte maps that
+	// differ in nothing. noteIndexSeen distinguishes "digest 0" from "no index
+	// applied yet". Guarded by mu.
+	noteIndexDigest uint64
+	noteIndexSeen   bool
 
 	// satSeenSnapshot marks origins whose first UpdateSatelliteSnapshot of this
 	// process has been applied. The first snapshot per origin is a baseline
@@ -279,6 +289,17 @@ func (s *Store) GetPlanIndexSnapshot() *models.PlanIndexSnapshot {
 
 // ApplyUpdate modifies the state and notifies subscribers.
 func (s *Store) ApplyUpdate(u Update) {
+	// Fingerprint a note index BEFORE taking the lock. The digest walks every
+	// entry, and s.mu serializes every state mutation in the daemon — the one
+	// place a tens-of-thousands-of-entries hash must not run is under it. The
+	// comparison itself happens in the UpdateNoteIndex branch below.
+	var noteDigest uint64
+	if u.Type == UpdateNoteIndex {
+		if index, ok := u.Payload.(map[string]*models.NoteIndexEntry); ok {
+			noteDigest = noteIndexDigestOf(index)
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -370,7 +391,20 @@ func (s *Store) ApplyUpdate(u Update) {
 	// Record plane, not this Store), so no origin-scoping is needed here (C7).
 	case UpdateNoteIndex:
 		if noteIndex, ok := u.Payload.(map[string]*models.NoteIndexEntry); ok {
+			// The fence (see note_index_digest.go). An index that fingerprints
+			// the same as the one already in state carries no news, so it is
+			// neither stored nor published: storing it would swap one live
+			// multi-megabyte map for an identical one, and publishing it would
+			// hand the replay ring a second copy to pin. Returning here skips
+			// publishLocked, so the sequence does not advance either — a no-op
+			// scan is invisible to subscribers, which is the point.
+			if s.noteIndexSeen && noteDigest == s.noteIndexDigest {
+				telemetry.RecordNoteIndexPublish(len(noteIndex), false)
+				return
+			}
+			s.noteIndexDigest, s.noteIndexSeen = noteDigest, true
 			s.state.NoteIndex = noteIndex
+			telemetry.RecordNoteIndexPublish(len(noteIndex), true)
 		}
 
 	// Delta updates for workspace enrichment fields

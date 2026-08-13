@@ -162,6 +162,38 @@ var (
 	// therefore the counter that shows whether filtering is actually paying.
 	SSEInitialSent    = Default().Counter("sse.initial.sent")
 	SSEInitialSkipped = Default().Counter("sse.initial.skipped")
+	// Marshal-once frame cache. One publish reaches every subscriber's request
+	// goroutine, and each used to convert and marshal the SAME update
+	// independently — N copies of byte-identical JSON per event, which at a
+	// mature host's frame sizes was the largest single allocator on the stream
+	// path. The cache keys that work by store sequence, so hits ≈
+	// (subscribers − 1) × events for the unfiltered majority.
+	//
+	// misses is the number of marshals actually performed, so
+	// hits/(hits+misses) is the fan-out saving directly. shared_bytes is the
+	// JSON that was NOT produced a second time — the allocation this removes.
+	SSEMarshalCacheHits   = Default().Counter("sse.marshal.cache_hits")
+	SSEMarshalCacheMisses = Default().Counter("sse.marshal.cache_misses")
+	SSEMarshalSharedBytes = Default().Counter("sse.marshal.shared_bytes")
+	// The subscribe-time snapshot gets its own cache (keyed by sequence AND
+	// filter, TTL'd) because it is the one frame big enough that a reconnect
+	// storm marshalling it once per client is visible in a heap profile.
+	SSEInitialCacheHits   = Default().Counter("sse.initial.cache_hits")
+	SSEInitialCacheMisses = Default().Counter("sse.initial.cache_misses")
+	// SSEFrameCacheEvicted counts frames dropped from the ring by the byte
+	// budget rather than by sequence recycling. A nonzero, growing value means
+	// frames are large enough that the budget — not the slot count — is what
+	// bounds the cache, which is the signal to re-read the frame sizes.
+	SSEFrameCacheEvicted = Default().Counter("sse.marshal.cache_evicted")
+
+	// Note-index publish fence. Both the note collector and the note watcher
+	// rebuild the WHOLE index (tens of thousands of entries at ecosystem
+	// scale) and used to publish it unconditionally, so every scan handed the
+	// 1024-slot replay ring another full map to retain even when not one entry
+	// had changed. published/suppressed is how often that map actually moved.
+	NoteIndexPublished  = Default().Counter("note.index.published")
+	NoteIndexSuppressed = Default().Counter("note.index.suppressed")
+	noteIndexEntries    = Default().Gauge("note.index.entries")
 
 	// Aggregated plan-stats enrichment: one pass recounts every workspace's
 	// plan/job totals. It is kicked by plan-file events on a short debounce and
@@ -355,6 +387,19 @@ func RecordBlobHash(o BlobHashObservation) {
 		Default().Warnings().Raise(o.Repo, CondLargeBlobHash,
 			fmt.Sprintf("%s (%s) — consider .gitignore", o.LargestPath, humanBytes(o.LargestBytes)))
 	}
+}
+
+// RecordNoteIndexPublish records the outcome of one note-index publish
+// attempt. entries is the size of the index the producer built, recorded on
+// both outcomes: a suppressed publish still proves the index was rebuilt, and
+// the gauge is how an operator sizes what the fence is holding back.
+func RecordNoteIndexPublish(entries int, published bool) {
+	if published {
+		NoteIndexPublished.Inc()
+	} else {
+		NoteIndexSuppressed.Inc()
+	}
+	noteIndexEntries.Set(float64(entries))
 }
 
 // RecordPlanStatsPass records one aggregated PlanStats pass over n workspaces.

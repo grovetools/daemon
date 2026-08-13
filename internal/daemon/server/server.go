@@ -164,6 +164,11 @@ type Server struct {
 	sseSubscribers         atomic.Int64
 	sseSubscribersFiltered atomic.Int64
 
+	// frames is the marshal-once cache shared by every /api/stream subscriber:
+	// one conversion and one json.Marshal per store sequence instead of one per
+	// subscriber. See stream_frames.go.
+	frames *frameCache
+
 	// scope is the daemon's configured ecosystem scope — empty for the
 	// global/unscoped daemon, non-empty for scoped daemons. Proxy
 	// registration handlers gate on this: only the global daemon accepts
@@ -290,6 +295,7 @@ func New(autoShutdown bool) *Server {
 		terminalHub:        hub.NewHub(hubCfg),
 		satelliteLeases:    make(map[string]string),
 		maintenanceTargets: make(map[string]bool),
+		frames:             newFrameCache(),
 	}
 }
 
@@ -2266,15 +2272,45 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, ": connected\n\n")
 	flusher.Flush()
 
+	// writeFrame emits one already-serialized frame in SSE form. The bytes go
+	// straight to the connection rather than through fmt: a snapshot frame is
+	// by far the largest thing this endpoint writes, and %s would copy all of
+	// it into a formatting buffer on the way out.
+	writeFrame := func(data []byte) {
+		_, _ = io.WriteString(w, "data: ")
+		_, _ = w.Write(data)
+		_, _ = io.WriteString(w, "\n\n")
+		flusher.Flush()
+	}
+
+	// send serializes a frame this subscriber owns — a control frame, or the
+	// copy the path filter pruned for it alone — and writes it.
 	send := func(update *apiStateUpdate) {
 		data, err := json.Marshal(update)
 		if err != nil {
 			s.ulog.Error("Failed to marshal update").Err(err).Log(r.Context())
 			return
 		}
-		// SSE format: "data: {json}\n\n"
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
+		writeFrame(data)
+	}
+
+	// deliver writes one converted live/replayed frame. When the path filter
+	// pruned nothing it returns its input pointer unchanged, and that pointer
+	// identity is the exact test for "these are the bytes every other
+	// subscriber of this sequence gets" — so those go through the frame cache
+	// and are marshalled once for all of them. A genuinely pruned copy is this
+	// subscriber's alone and is serialized here.
+	deliver := func(seq uint64, shared, sent *apiStateUpdate) {
+		if sent != shared {
+			send(sent)
+			return
+		}
+		data, err := s.frames.marshal(seq, sent)
+		if err != nil {
+			s.ulog.Error("Failed to marshal update").Err(err).Log(r.Context())
+			return
+		}
+		writeFrame(data)
 	}
 
 	var lastSent uint64
@@ -2322,10 +2358,21 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 	case !types.matches(coredaemon.StreamTypeInitial):
 		telemetry.SSEInitialSkipped.Inc()
 	default:
-		state := st.Get()
-		themePayload := theming.CurrentPayload()
-		boot := s.bootStatus.Load()
-		if len(state.Workspaces) > 0 || state.PlanIndex != nil || themePayload != nil || (boot != nil && !boot.Done) {
+		// Built through the frame cache, keyed by (sequence, path filter). A
+		// reconnect storm is many clients arriving inside a few hundred
+		// milliseconds, and every one of them would otherwise build and marshal
+		// its own copy of the whole enriched-workspace map. Keying on the
+		// CURRENT sequence is what makes sharing safe: any store mutation
+		// advances it, so a cache hit can only ever be a snapshot of exactly the
+		// state this subscriber would have read for itself.
+		seq := st.CurrentSeq()
+		data, ok, err := s.frames.initial(initialFrameKey(seq, filter.Paths), func() ([]byte, bool, error) {
+			state := st.Get()
+			themePayload := theming.CurrentPayload()
+			boot := s.bootStatus.Load()
+			if len(state.Workspaces) == 0 && state.PlanIndex == nil && themePayload == nil && (boot == nil || boot.Done) {
+				return nil, false, nil
+			}
 			workspaces := make([]*models.EnrichedWorkspace, 0, len(state.Workspaces))
 			for _, ws := range state.Workspaces {
 				workspaces = append(workspaces, ws)
@@ -2333,22 +2380,31 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 			initialUpdate := &apiStateUpdate{
 				Workspaces:        workspaces,
 				UpdateType:        coredaemon.StreamTypeInitial,
-				Seq:               st.CurrentSeq(),
+				Seq:               seq,
 				Theme:             themePayload,
 				BootPhase:         boot,
 				PlanIndexSnapshot: state.PlanIndex,
 			}
-			if sent, ok := applyStreamFilter(filter, initialUpdate); ok {
-				send(sent)
-				telemetry.SSEInitialSent.Inc()
+			sent, keep := applyStreamFilter(filter, initialUpdate)
+			if !keep {
+				return nil, false, nil
 			}
+			frame, err := json.Marshal(sent)
+			return frame, true, err
+		})
+		switch {
+		case err != nil:
+			s.ulog.Error("Failed to marshal initial snapshot").Err(err).Log(r.Context())
+		case ok:
+			writeFrame(data)
+			telemetry.SSEInitialSent.Inc()
 		}
 	}
 
 	if !gap.Gapped() {
 		for _, update := range replay {
-			apiUpdate := convertToAPIUpdate(update)
-			if apiUpdate == nil || !types.matches(apiUpdate.UpdateType) {
+			apiUpdate, converted := s.frames.convert(update)
+			if !converted || !types.matches(apiUpdate.UpdateType) {
 				// Still advance the watermark: the frame was delivered as far
 				// as this subscription is concerned, and not advancing would
 				// let the live loop re-offer it.
@@ -2362,7 +2418,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				continue
 			}
-			send(sent)
+			deliver(update.Seq, apiUpdate, sent)
 		}
 	}
 
@@ -2376,9 +2432,11 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			lastSent = update.Seq
-			// Convert internal store.Update to public API format
-			apiUpdate := convertToAPIUpdate(update)
-			if apiUpdate == nil {
+			// Convert internal store.Update to public API format. Shared across
+			// every subscriber that reaches this sequence — the conversion is
+			// identical for all of them, and each one used to run it itself.
+			apiUpdate, converted := s.frames.convert(update)
+			if !converted {
 				continue
 			}
 			telemetry.SSEEventsPublished.Inc()
@@ -2395,7 +2453,7 @@ func (s *Server) handleStreamState(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			send(sent)
+			deliver(update.Seq, apiUpdate, sent)
 			telemetry.SSEEventsDelivered.Inc()
 		}
 	}
