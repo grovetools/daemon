@@ -791,8 +791,13 @@ func (s *Server) registerNormalRoutes(routes classifiedRouteRegistrar) {
 	go func() { _, _ = s.statsCache.get(0) }()
 	routes.HandleFunc("/api/system/boot", s.handleSystemBoot)
 	routes.HandleFunc("/api/system/treemux-status", s.handleTerminalStatus)
-	// Native agent pane relay endpoints
-	routes.HandleFunc("/api/agents/spawn", s.handleAgentSpawn)
+	// Native agent pane relay endpoints. Spawn shells a caller-supplied
+	// command, so it is pinned to the 0600 unix socket via unixOnly (defense in
+	// depth behind the TCP listener's browserCrossSiteGuard): the only shipped
+	// spawn client, core's RemoteClient, always dials the unix socket, and the
+	// browser web viewer needs read-only SSE only — nothing legitimately spawns
+	// over the localhost TCP listener.
+	routes.HandleFunc("/api/agents/spawn", unixOnly(s.handleAgentSpawn))
 	routes.HandleFunc("/api/agents/", s.handleAgentByID)
 
 	// Runtime profiling, always mounted, unix socket only. Attributing groved's
@@ -900,9 +905,14 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 			s.ulog.Info("HTTP server listening (web terminal viewer)").
 				Field("addr", addr).
 				Log(bgCtx)
+			// The TCP listener is unauthenticated and shares the same
+			// process-spawning mux as the 0600 unix socket, so its handler
+			// (and ONLY its handler — the unix path above is left bare) is
+			// wrapped to reject browser cross-site requests. This closes the
+			// drive-by-web-page → RCE vector without affecting native clients.
 			tcpServer := &http.Server{
 				Addr:              addr,
-				Handler:           handler,
+				Handler:           browserCrossSiteGuard(handler),
 				ReadHeaderTimeout: 10 * time.Second,
 			}
 			if err := tcpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
