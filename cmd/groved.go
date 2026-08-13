@@ -1305,6 +1305,7 @@ func newGrovedStartCmd() *cobra.Command {
 						srv.SetNotespaceAdopted(syncHandler.AdoptedNotespace)
 						srv.SetSyncNotespaceRoots(syncHandler.NotespaceRoots)
 						srv.SetSyncMaintenance(syncHandler.BeginMaintenance, syncHandler.EndMaintenance)
+						srv.SetSyncContested(syncHandler.ContestedDetails, syncHandler.AdoptContested)
 						workspaces := 0
 						if syncCfg != nil {
 							workspaces = len(syncCfg.Workspaces)

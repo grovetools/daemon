@@ -215,7 +215,14 @@ type Server struct {
 	// state so /api/sync/status can say "the server is rejecting this
 	// machine's token" instead of reporting a plausible-looking idle sync.
 	// Nil when sync is not configured; then the status payload omits it.
-	syncAuthFailure      func() (string, time.Time, bool)
+	syncAuthFailure func() (string, time.Time, bool)
+	// syncContested / syncAdoptContested (SetSyncContested) are the W3.5
+	// adoption surface: the watcher's contested verdicts, and the operator's
+	// adoption of one. Nil when sync is not configured; then both endpoints
+	// answer that rather than an empty list, which would read as "nothing is
+	// withheld" on a daemon that is not watching anything.
+	syncContested        func() []syncdb.ContestedNotespace
+	syncAdoptContested   func(string) (syncdb.ContestedNotespace, string, error)
 	syncDBError          func() string
 	notespaceAdopted     func(root, displayName string)
 	syncNotespaceRoots   func([]string) (map[string]string, error)
@@ -492,6 +499,8 @@ var daemonRoutes = []daemonRoute{
 	{pattern: "/api/sync/documents"},
 	{pattern: "/api/sync/outbox"},
 	{pattern: "/api/sync/conflicts"},
+	{pattern: "/api/sync/contested"},
+	{pattern: "/api/sync/contested/adopt"},
 	{pattern: "/web/treemux/"},
 	{pattern: "/api/pty/"},
 	{pattern: "/api/hub/"},
@@ -734,6 +743,8 @@ func (s *Server) registerNormalRoutes(routes classifiedRouteRegistrar) {
 	routes.HandleFunc("/api/sync/documents", unixOnly(s.handleSyncDocuments))
 	routes.HandleFunc("/api/sync/outbox", unixOnly(s.handleSyncOutbox))
 	routes.HandleFunc("/api/sync/conflicts", unixOnly(s.handleSyncConflicts))
+	routes.HandleFunc("/api/sync/contested", unixOnly(s.handleSyncContested))
+	routes.HandleFunc("/api/sync/contested/adopt", unixOnly(s.handleSyncAdoptContested))
 	// Static web viewer files
 	routes.Handle("/web/treemux/", http.StripPrefix("/web/treemux/", daemonweb.TreemuxFileServer()))
 

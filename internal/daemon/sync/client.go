@@ -383,6 +383,48 @@ func (c *Client) Register(ctx context.Context, req syncproto.RegisterRequest) (*
 	return &out, nil
 }
 
+// Inventory asks the server what notebooks and notespaces it holds.
+//
+// The daemon needs it for exactly one thing today: the W3.5 adoption gate's
+// subject-match evidence. Registration tells this machine that an id was
+// accepted, never what the server records ABOUT it, so a collision between an
+// incoming notespace and a pre-existing local tree could not otherwise be told
+// from a collision between two different subjects sharing a name.
+//
+// Inventory is the one v3 surface carried in query parameters rather than a
+// body (sync/pkg/server/registration.go reads protocol_version, idempotency_key
+// and device_id off the URL), so the request is assembled here.
+func (c *Client) Inventory(ctx context.Context) (*syncproto.InventoryResponse, error) {
+	url := fmt.Sprintf("/sync/inventory?protocol_version=%d&idempotency_key=%s&device_id=%s",
+		syncproto.ProtocolVersionNotespaceID,
+		neturl.QueryEscape("daemon-inventory-"+c.deviceID),
+		neturl.QueryEscape(c.deviceID))
+	httpReq, err := c.newRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create inventory request: %w", err)
+	}
+	resp, err := c.doAuthenticated(ctx, c.httpClient, "inventory request", replayableRequest(httpReq))
+	if err != nil {
+		return nil, fmt.Errorf("inventory request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if err := c.rejectIfUnauthorized("inventory request", resp); err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("inventory request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+	var out syncproto.InventoryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("failed to decode inventory response: %w", err)
+	}
+	if out.Error != nil {
+		return nil, fmt.Errorf("inventory rejected: %s: %s", out.Error.Code, out.Error.Message)
+	}
+	return &out, nil
+}
+
 // Push uploads a batch of outbox entries to the server. Returns the
 // per-event results in the same order as the input events.
 func (c *Client) Push(ctx context.Context, notespace string, events []syncproto.SyncEvent) (*syncproto.PushResponse, error) {

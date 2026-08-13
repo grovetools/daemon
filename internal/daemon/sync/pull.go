@@ -43,10 +43,30 @@ type PullPipeline struct {
 	// OnConflict surfaces artifact-backed pull/identity conflicts to SSE.
 	OnConflict func(kind, notespace, path, documentID, detail string)
 
+	// OnContested is the W3.5 adoption seam's caller: the gate below has found
+	// that this batch would write over un-synced local notes. The watcher wires
+	// it to SyncHandler.MarkContested, which tears the pull pipeline down until
+	// the operator adopts. nil is a legal no-op — the batch is still withheld
+	// and the evidence is still written, which is what makes the gate safe in
+	// the pipeline's own tests.
+	OnContested func(notespaceID string, evidence AdoptionEvidence)
+
 	// missingRootReported is the root whose refusal has already been reported
 	// for the current episode (see refuseMissingRoot). Touched only from the
 	// pull goroutine.
 	missingRootReported string
+	// adoptionSettled records that this pipeline has already answered the
+	// adoption question — either because nothing collided or because a receipt
+	// says the operator adopted. Touched only from the pull goroutine. It is
+	// per-pipeline on purpose: MarkContested tears the pipeline down, so the
+	// pipeline that runs after an adoption is a new one with a fresh answer.
+	adoptionSettled bool
+	// adoptionReported keeps a withheld batch from re-announcing itself. The
+	// pull loop retries on a timer and teardown is not instantaneous, so
+	// without it one contest would write a fresh artifact and a fresh SSE
+	// update every retry — the same once-per-episode discipline
+	// missingRootReported applies to a missing root.
+	adoptionReported bool
 }
 
 // NewPullPipeline creates a pull pipeline for a notespace.
@@ -128,6 +148,18 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, notespaceRoot string) er
 					return nil
 				}
 			}
+			// The adoption gate (W3.5), checked with the same per-batch timing
+			// and the same cursor discipline as the root precondition: a
+			// contested notespace takes NO writes, and the events stay owed to
+			// this machine until the operator adopts.
+			if err := p.guardAdoption(ctx, notespaceRoot, IncomingFromEvents(resp.Events)); err != nil {
+				select {
+				case <-time.After(30 * time.Second):
+					continue
+				case <-ctx.Done():
+					return nil
+				}
+			}
 			for _, ev := range resp.Events {
 				if err := p.applyEvent(ctx, notespaceRoot, &ev); err != nil {
 					p.log.Error("failed to apply event").
@@ -167,6 +199,15 @@ func (p *PullPipeline) snaphotResync(ctx context.Context, notespaceRoot string) 
 	}
 
 	p.log.Debug("snapshot received").Field("notespace", p.ws.Name).Field("documents", len(manifest.Documents)).Log(ctx)
+
+	// Hydration onto a tree that already holds notes is precisely the W3.5
+	// case, and the manifest is the richest input the gate ever gets: every
+	// document the server holds, with its hash, before a single byte is
+	// written. Refuse the whole hydration rather than adopt it document by
+	// document — the cursor is not advanced, so it replays after adoption.
+	if err := p.guardAdoption(ctx, notespaceRoot, IncomingFromManifest(manifest.Documents)); err != nil {
+		return 0, err
+	}
 
 	// Reconcile: for each document in the manifest, check if we have a hash match
 	for _, doc := range manifest.Documents {
@@ -280,6 +321,100 @@ func (p *PullPipeline) refuseMissingRoot(ctx context.Context, notespaceRoot stri
 		p.OnConflict(ConflictKindMissingRoot, p.ws.Name, ".", "", err.Error())
 	}
 	return err
+}
+
+// guardAdoption is the W3.5 pre-apply gate: it answers "would this batch write
+// over notes this machine has never synced?" before any handler touches disk.
+//
+// It runs at most once per pipeline in the settled case. An adoption verdict is
+// a property of the TREE, not of a batch — once the answer is "nothing
+// collides" (or "the operator adopted"), re-reading every incoming path off
+// disk on every ten-second tick would buy nothing. The unsettled case does not
+// linger either: a contested notespace loses its pull pipeline, so this gate
+// runs a handful of times at most before the transport is gone.
+func (p *PullPipeline) guardAdoption(ctx context.Context, notespaceRoot string, incoming []IncomingDocument) error {
+	if p.adoptionSettled || len(incoming) == 0 {
+		return nil
+	}
+	// An adopted notespace is an ordinary synced notespace. Without this the
+	// same untracked collision would be re-detected after every daemon restart
+	// and the notespace would re-contest itself forever.
+	if AdoptionRecorded(p.ws.Name) {
+		p.adoptionSettled = true
+		return nil
+	}
+
+	tracked := func(path string) bool {
+		doc, err := p.db.GetDocumentByPath(p.ws.Name, path)
+		// An unreadable row is not evidence that the path is untracked, and
+		// treating it as such would contest a notespace over a database error.
+		return err != nil || doc != nil
+	}
+	evidence := DetectAdoption(p.ws.Name, notespaceRoot, incoming, tracked, p.localSubject(notespaceRoot), p.serverSubject(ctx))
+	if !evidence.Contested() {
+		p.adoptionSettled = true
+		return nil
+	}
+
+	withheld := fmt.Errorf("notespace %s is contested: %d incoming path(s) would overwrite un-synced local notes; adopt it before it takes writes",
+		p.ws.Name, evidence.Divergent)
+	if p.adoptionReported {
+		return withheld
+	}
+	p.adoptionReported = true
+
+	detail := evidence.Detail()
+	p.log.Error("incoming apply withheld: notespace is contested and not adopted yet").
+		Field("notespace", p.ws.Name).
+		Field("root", notespaceRoot).
+		Field("colliding", len(evidence.Collisions)).
+		Field("divergent", evidence.Divergent).
+		Field("identical", evidence.Identical).
+		Field("subject_match", evidence.SubjectMatch()).
+		Log(ctx)
+	if _, err := WriteNotespaceConflict(p.ws.Name, ConflictKindAdoption, detail); err != nil {
+		p.log.Warn("failed to record adoption evidence").
+			Field("notespace", p.ws.Name).Err(err).Log(ctx)
+	}
+	if p.OnConflict != nil {
+		p.OnConflict(ConflictKindAdoption, p.ws.Name, ".", "", detail)
+	}
+	if p.OnContested != nil {
+		p.OnContested(p.ws.Name, evidence)
+	}
+	return withheld
+}
+
+// localSubject is this root's stamp subject, or "" when the root carries no
+// readable stamp. Absence is reported as unknown rather than as a mismatch:
+// "no stamp" and "a different subject" are different facts and the operator's
+// decision turns on which one it is.
+func (p *PullPipeline) localSubject(notespaceRoot string) string {
+	stamp, err := notespacepkg.LoadNotespace(notespaceRoot)
+	if err != nil || stamp == nil {
+		return ""
+	}
+	return stamp.Subject
+}
+
+// serverSubject is what the server records for this notespace. It is best
+// effort by design: an inventory the daemon cannot fetch makes the subject leg
+// of the evidence unknown, and unknown must never block the gate's real
+// question, which is answered entirely from local state and the batch.
+func (p *PullPipeline) serverSubject(ctx context.Context) string {
+	if p.client == nil {
+		return ""
+	}
+	inventory, err := p.client.Inventory(ctx)
+	if err != nil || inventory == nil {
+		return ""
+	}
+	for _, ns := range inventory.Notespaces {
+		if ns.ID.String() == p.ws.Name {
+			return ns.Subject
+		}
+	}
+	return ""
 }
 
 // applyEvent applies a single event: creates, updates, moves, or deletes a document.

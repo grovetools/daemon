@@ -153,7 +153,7 @@ type SyncHandler struct {
 	// Guarded by parkMu.
 	parkMu    sync.Mutex
 	parked    map[string]ParkedNotespace
-	contested map[string]string
+	contested map[string]ContestedNotespace
 
 	// duplicateScannedAt rate-limits the containing-notebook duplicate-stamp
 	// sweep; zero duplicateScanInterval selects the production cadence.
@@ -224,7 +224,7 @@ func NewSyncHandler(st *store.Store, cfg *config.Config, syncCfg *config.SyncCon
 		draining:     make(map[string]*pipelineState),
 		aePasses:     make(map[string]*syncdb.AntiEntropyPass),
 		parked:       make(map[string]ParkedNotespace),
-		contested:    make(map[string]string),
+		contested:    make(map[string]ContestedNotespace),
 		registryKick: make(chan struct{}, 1),
 	}
 	if db != nil {

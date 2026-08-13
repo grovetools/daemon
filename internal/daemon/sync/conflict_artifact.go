@@ -48,6 +48,13 @@ const (
 	// later one is parked. The artifact names both roots so `grove doctor
 	// --fix` can re-mint whichever copy the operator designates.
 	ConflictKindDuplicateStamp = "duplicate_stamp"
+
+	// ConflictKindAdoption records the W3.5 adoption case: an incoming batch
+	// would have written over un-synced local notes, so the notespace is
+	// contested and takes no writes until the operator adopts it. The artifact
+	// carries the evidence — hash overlap and subject match — because the
+	// decision is made from it.
+	ConflictKindAdoption = "adoption"
 )
 
 // namedConflictKinds are the kinds that appear as a filename segment. Merge is
@@ -59,6 +66,7 @@ var namedConflictKinds = map[string]bool{
 	ConflictKindRegistration:         true,
 	ConflictKindMissingRoot:          true,
 	ConflictKindDuplicateStamp:       true,
+	ConflictKindAdoption:             true,
 }
 
 const conflictArtifactSuffix = ".conflict.md"

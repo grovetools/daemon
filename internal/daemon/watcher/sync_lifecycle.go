@@ -524,30 +524,42 @@ func (h *SyncHandler) ParkedNotespaces() []ParkedNotespace {
 	return out
 }
 
+// ContestedNotespace is one notespace withheld by the W3.5 adoption gate, and
+// the evidence the operator decides from — GET /api/sync/contested serves it
+// and `grove sync adopt-notespace` renders it. It is defined beside the gate that
+// produces it (syncdb) because the HTTP layer reads it too, and aliased here so
+// the watcher's own surfaces read in the watcher's vocabulary.
+type ContestedNotespace = syncdb.ContestedNotespace
+
 // MarkContested is the W3.5 adoption seam.
 //
 // W3.5's rule is "no writes into a contested notespace until adopted": pulling
 // a shared notebook onto pre-existing un-synced local notes must let clean
-// documents flow while colliding subtrees wait for an operator decision. The
-// COLLISION DETECTOR that decides a notespace is contested needs inventory and
-// per-notebook membership the wire protocol does not carry yet (that half of
-// Phase 3 lands in core/ + sync/), so this daemon deliberately ships the
-// enforcement and not the detection:
+// documents flow while colliding subtrees wait for an operator decision. This
+// is the ENFORCEMENT half:
 //
 //	MarkContested(id, reason) → the notespace keeps its push pipeline (local
 //	work still reaches the server) and loses its pull pipeline, so nothing
 //	incoming is written into the contested tree. ClearContested(id) is
 //	adoption: the next reconcile pass restores the pull loop.
 //
-// The intended caller is the pull-side adoption check, once GET /sync/inventory
-// can tell this machine which notebook a notespace belongs to and which paths
-// collide. Wiring it to anything less would be inventing a protocol.
+// The DETECTION half is the pull pipeline's pre-apply gate (sync/adoption.go),
+// wired in through markContestedFromPull below: it withholds the batch, writes
+// the evidence to the conflicts feed, and calls here. Nothing else marks a
+// notespace contested — a verdict with no evidence behind it would be a
+// notespace that stops syncing for reasons the operator cannot read.
 func (h *SyncHandler) MarkContested(notespaceID, reason string) {
-	if notespaceID == "" {
+	h.markContested(ContestedNotespace{NotespaceID: notespaceID, Reason: reason})
+}
+
+// markContested installs a full verdict. MarkContested is the reason-only
+// spelling; both go through here so the map has one writer.
+func (h *SyncHandler) markContested(entry ContestedNotespace) {
+	if entry.NotespaceID == "" {
 		return
 	}
 	h.parkMu.Lock()
-	h.contested[notespaceID] = reason
+	h.contested[entry.NotespaceID] = entry
 	h.parkMu.Unlock()
 }
 
@@ -563,14 +575,75 @@ func (h *SyncHandler) ClearContested(notespaceID string) {
 func (h *SyncHandler) ContestedNotespaces() map[string]string {
 	h.parkMu.Lock()
 	defer h.parkMu.Unlock()
-	return maps.Clone(h.contested)
+	out := make(map[string]string, len(h.contested))
+	for id, entry := range h.contested {
+		out[id] = entry.Reason
+	}
+	return out
+}
+
+// ContestedDetails returns the full verdicts, sorted by id — the structured
+// view the adoption surfaces read.
+func (h *SyncHandler) ContestedDetails() []ContestedNotespace {
+	h.parkMu.Lock()
+	entries := maps.Clone(h.contested)
+	h.parkMu.Unlock()
+	out := make([]ContestedNotespace, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry)
+	}
+	slices.SortFunc(out, func(a, b ContestedNotespace) int {
+		return strings.Compare(a.NotespaceID, b.NotespaceID)
+	})
+	return out
+}
+
+// AdoptContested is the operator's adoption: it records the durable receipt
+// (so a restart does not re-contest a decision already made) and clears the
+// verdict, which lets the next reconcile pass restore the pull loop.
+//
+// The receipt is written FIRST. A cleared verdict with no receipt would let the
+// pull loop resume and then re-contest itself on its next batch, which reads to
+// an operator as an adoption that silently did nothing.
+func (h *SyncHandler) AdoptContested(notespaceID string) (ContestedNotespace, string, error) {
+	if notespaceID == "" {
+		return ContestedNotespace{}, "", fmt.Errorf("adoption requires a notespace id")
+	}
+	h.parkMu.Lock()
+	entry, ok := h.contested[notespaceID]
+	h.parkMu.Unlock()
+	if !ok {
+		return ContestedNotespace{}, "", fmt.Errorf("notespace %s is not contested; nothing to adopt", notespaceID)
+	}
+	receipt, err := syncdb.RecordAdoption(notespaceID, entry.Root, entry.Detail)
+	if err != nil {
+		return entry, "", fmt.Errorf("record adoption receipt for %s: %w", notespaceID, err)
+	}
+	h.ClearContested(notespaceID)
+	h.ulog.Info("notespace adopted: incoming applies resume").
+		Field("notespace_id", notespaceID).
+		Field("root", entry.Root).
+		Field("receipt", receipt).Log(h.baseCtx)
+	// Reconcile now rather than on the next transport tick: adoption is an
+	// interactive act and the operator is watching for the pull loop to come
+	// back.
+	go h.ensurePipelines()
+	return entry, receipt, nil
+}
+
+// markContestedFromPull is the pull gate's callback: the gate has already
+// withheld the batch, written the conflicts-feed artifact and broadcast the
+// SSE update, so all that is left here is installing the verdict that keeps the
+// pull pipeline down until the operator adopts.
+func (h *SyncHandler) markContestedFromPull(root string, evidence syncdb.AdoptionEvidence) {
+	h.markContested(evidence.Contest(root))
 }
 
 func (h *SyncHandler) isContested(id string) (string, bool) {
 	h.parkMu.Lock()
 	defer h.parkMu.Unlock()
-	reason, ok := h.contested[id]
-	return reason, ok
+	entry, ok := h.contested[id]
+	return entry.Reason, ok
 }
 
 // pullDesired is the pull-side desired state for a resolved notespace: the
@@ -845,6 +918,12 @@ func (h *SyncHandler) startPipeline(client *syncdb.Client, db *syncdb.DB, r reso
 		}
 		pullPipeline.OnConflict = func(kind, ws, path, documentID, detail string) {
 			h.broadcastConflict(&store.SyncConflictPayload{Kind: kind, NotespaceID: ws, NotespaceName: stamp.Name, Path: path, DocumentID: documentID, Detail: detail})
+		}
+		// W3.5: the gate's verdict becomes this daemon's. Marking tears the
+		// pull loop down on the next reconcile, so the batch the gate withheld
+		// is the last one this pipeline ever considers.
+		pullPipeline.OnContested = func(_ string, evidence syncdb.AdoptionEvidence) {
+			h.markContestedFromPull(root, evidence)
 		}
 		run("pull", func() error { return pullPipeline.RunPullLoop(pctx, root) })
 	}
