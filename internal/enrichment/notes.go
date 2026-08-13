@@ -82,6 +82,19 @@ func CountNotesInProcess(nodes []*workspace.WorkspaceNode, locator *workspace.No
 
 // IndexNotesInProcess builds a complete note index by walking all content directories.
 // Returns a map of file path -> NoteIndexEntry.
+//
+// Indexing EVERY workspace rather than the demanded ones is deliberate, and was
+// re-confirmed by measurement on 2026-08-13 rather than assumed. One generation
+// of this index at real scale — 38k entries over 691 workspaces — retains 20 MB,
+// about 557 bytes per entry, of which the absolute Path string is the largest
+// single field at 5.6 MB total. That is not a heap problem worth a demand tier:
+// the 244 MB this function was charged with on the live profile was ~12 retained
+// GENERATIONS, not breadth, and it belonged to the replay ring
+// (store.RingDropsPayload), which pinned every superseded index. Narrowing the
+// walk would have bought ~15 MB and cost every cold workspace a reveal path.
+//
+// TestIndexFootprintManual is the harness that measures this; re-run it before
+// concluding that index breadth has become expensive.
 func IndexNotesInProcess(nodes []*workspace.WorkspaceNode, locator *workspace.NotebookLocator) map[string]*models.NoteIndexEntry {
 	index := make(map[string]*models.NoteIndexEntry)
 

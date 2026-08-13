@@ -333,6 +333,35 @@ func TestEveryUpdateTypeIsConvertedOrDeclared(t *testing.T) {
 	}
 }
 
+// TestRingDropsAreUnreachableOnTheWire is the server half of the replay ring's
+// payload-drop contract (store.RingDropsPayload). The ring records those types
+// without their payload so it stops pinning every superseded generation of a
+// wholesale map replacement; that is only invisible to clients while the wire
+// shape carries no payload to begin with. Store.Replay is the ring's only
+// reader and it feeds convertUpdatePayload, so this is the complete check: a
+// dropped type must either not convert at all, or convert to a frame whose
+// payload-bearing fields are all empty.
+func TestRingDropsAreUnreachableOnTheWire(t *testing.T) {
+	for _, typ := range store.AllUpdateTypes() {
+		if !store.RingDropsPayload(typ) {
+			continue
+		}
+		frame := convertUpdatePayload(store.Update{Type: typ, Payload: representativePayloads[typ]})
+		if frame == nil {
+			continue // declared in apiUpdateSkipList; never reaches the wire at all
+		}
+		switch {
+		case frame.Payload != nil:
+			t.Errorf("update type %q is ring-dropped but its frame carries Payload — "+
+				"a ?since= replay would serve an empty payload where a live frame served data", typ)
+		case len(frame.Workspaces) > 0 || len(frame.WorkspaceDeltas) > 0 || len(frame.Sessions) > 0:
+			t.Errorf("update type %q is ring-dropped but its frame carries collection data", typ)
+		case frame.PlanIndex != nil || frame.PlanIndexSnapshot != nil || frame.BootPhase != nil || frame.Theme != nil:
+			t.Errorf("update type %q is ring-dropped but its frame carries a typed payload field", typ)
+		}
+	}
+}
+
 // A skip-list entry for a type nobody declares is dead documentation.
 func TestSkipListNamesOnlyRealTypes(t *testing.T) {
 	for typ, reason := range apiUpdateSkipList {

@@ -77,7 +77,10 @@ type Store struct {
 // 1024 entries is roughly a minute of a busy daemon's chatter (git enrichment
 // deltas dominate the volume) and a few hundred kilobytes of retained pointers
 // — the ring stores the same payload pointers the store already holds, so it
-// pins almost nothing the state does not.
+// pins almost nothing the state does not. That holds only because the types it
+// does NOT hold in common with the state — the wholesale map replacements, whose
+// every superseded generation the ring would otherwise pin — are recorded with
+// their payload stripped. See RingDropsPayload.
 //
 // Payloads are retained by REFERENCE. A replayed update carries whatever the
 // pointed-to model looks like now, not a snapshot of what it looked like when
@@ -1254,13 +1257,55 @@ func (s *Store) publishLocked(u Update) {
 	}
 }
 
+// RingDropsPayload reports whether an update's payload must be left out of the
+// replay ring.
+//
+// RingSize's bound reasons that the ring "stores the same payload pointers the
+// state already holds, so it pins almost nothing the state does not". That is
+// true of the deltas and per-entity events that dominate the ring's volume, and
+// FALSE of the handful of types whose payload is a WHOLESALE REPLACEMENT of a
+// large map: ApplyUpdate swaps state's pointer to the new generation, and the
+// ring keeps every SUPERSEDED generation alive until 1024 further updates evict
+// it. Measured on the live daemon (2026-08-13, 691 workspaces, 19h uptime): one
+// note-index generation retains 20 MB across 38k entries, the collector rebuilds
+// and republishes it whole every 5 minutes, and the ring was pinning ~12 of them
+// — 244 MB, 38% of the post-GC live heap.
+//
+// Dropping the payload is unobservable rather than merely cheap. Store.Replay is
+// the ring's ONLY reader; it feeds server.convertUpdatePayload, and these types
+// are exactly the ones that reach the wire without their payload ("note_index"
+// is a re-fetch signal carrying no data) or do not reach the wire at all
+// (declared in server.apiUpdateSkipList, which points consumers at GET /api/plans
+// and GET /api/plans/index). The sequence number, type and source still replay,
+// so a ?since= client sees the same frames it always did. Nothing in-process
+// reads these payloads off a subscription channel either — the store is their
+// only consumer, via ApplyUpdate, which has already run by the time the update
+// is recorded.
+//
+// TestRingDropsAreUnreachableOnTheWire pins that correspondence: a type may only
+// be listed here while its wire shape carries no payload.
+func RingDropsPayload(t UpdateType) bool {
+	switch t {
+	case UpdateNoteIndex, UpdatePlans, UpdatePlanIndexSnapshot:
+		return true
+	default:
+		return false
+	}
+}
+
 // recordLocked assigns the next sequence number and writes the stamped update
 // into the replay ring, returning the assigned sequence.
+//
+// u is taken BY VALUE: clearing the payload here bounds what the ring retains
+// without touching the copy publishLocked broadcasts to live subscribers.
 func (s *Store) recordLocked(u Update) uint64 {
 	s.busMu.Lock()
 	defer s.busMu.Unlock()
 	s.seq++
 	u.Seq = s.seq
+	if RingDropsPayload(u.Type) {
+		u.Payload = nil
+	}
 	if len(s.ring) > 0 {
 		s.ring[s.ringPos] = u
 		s.ringPos = (s.ringPos + 1) % len(s.ring)

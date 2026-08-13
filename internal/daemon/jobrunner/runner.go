@@ -910,9 +910,25 @@ func (jr *JobRunner) appendTranscriptAsync(info *models.JobInfo) {
 		defer jr.evaluateBlockedJobs()
 
 		ctx := context.Background()
-		plan, err := orchestration.LoadPlan(info.PlanDir)
-		if err != nil {
-			jr.ulog.Warn("Failed to load plan for auto-transcript").Err(err).Log(ctx)
+		// LoadPlanLenient, not LoadPlan: this path wants ONE job's identity out
+		// of the plan, and everything downstream of it reads only plan.Name,
+		// plan.Directory and plan.Config (AppendAgentTranscript and
+		// ArchiveWorkflowRuns splice files by path; neither touches a job's
+		// PromptBody). LoadPlan materializes every job's prompt body, and a job
+		// file accumulates its agent transcript — the perf-audit plan alone is
+		// hundreds of KB per job across a hundred jobs, so the whole-plan read
+		// showed up as 41.5 MB of allocation churn per completion on the
+		// 2026-08-13 heap profile, to answer a question about one job.
+		//
+		// Leniency is also the better failure mode here: LoadPlan fails the
+		// whole plan when any ONE job file has broken frontmatter, which cost a
+		// completed job its transcript for a reason unrelated to it.
+		plan, problems := orchestration.LoadPlanLenient(info.PlanDir)
+		if plan == nil {
+			jr.ulog.Warn("Failed to load plan for auto-transcript").
+				Field("plan_dir", info.PlanDir).
+				Field("problems", len(problems)).
+				Log(ctx)
 			return
 		}
 

@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -3350,7 +3351,46 @@ func (s *Server) handleNoteIndex(w http.ResponseWriter, r *http.Request) {
 		Field("entries", len(entries)).
 		Log(r.Context())
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(entries)
+	writeJSONArrayStreamed(w, entries)
+}
+
+// writeJSONArrayStreamed encodes a slice as a JSON array one element at a time.
+//
+// The obvious `json.NewEncoder(w).Encode(entries)` is a heap hazard at this
+// endpoint's scale, and not for the reason it looks like. encoding/json buffers
+// the WHOLE value in an internal bytes.Buffer before writing a byte to w, then
+// returns that buffer to a package-level sync.Pool — which keeps its grown
+// capacity, per P. The unfiltered note index is ~38k entries (~13 MB of JSON,
+// ~20 MB once the buffer's doubling growth overshoots), so a handful of
+// concurrent or successive requests left one such buffer parked on each of the
+// machine's Ps: 205 MB, 32% of the live heap on the 2026-08-13 profile, held by
+// a pool the daemon cannot see or drain.
+//
+// Encoding per element keeps every pooled buffer element-sized. The elements
+// are separated by commas and each Encode appends its own newline, which is
+// insignificant whitespace inside a JSON array, so the output parses exactly as
+// before. A nil or empty slice still writes "[]", never "null" — clients treat
+// the response as an array unconditionally.
+func writeJSONArrayStreamed[T any](w io.Writer, items []T) {
+	bw := bufio.NewWriterSize(w, 64<<10)
+	enc := json.NewEncoder(bw)
+	if _, err := bw.WriteString("["); err != nil {
+		return
+	}
+	for i := range items {
+		if i > 0 {
+			if _, err := bw.WriteString(","); err != nil {
+				return
+			}
+		}
+		if err := enc.Encode(items[i]); err != nil {
+			return
+		}
+	}
+	if _, err := bw.WriteString("]"); err != nil {
+		return
+	}
+	_ = bw.Flush()
 }
 
 // handleNoteEvent handles POST /api/notes/event for incremental note count updates.
