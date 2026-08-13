@@ -114,6 +114,41 @@ func TestSubjectMismatchIsReportedDistinctlyFromUnknown(t *testing.T) {
 	}
 }
 
+// The evidence an operator meets first has to describe the gate they are
+// actually behind. W3.5's veto is two-sided — pushDesired is pullDesired's twin
+// — so the detail must not promise that local work is leaving the machine while
+// the notespace is contested. It said exactly that while the gate was
+// one-directional, and the sentence outlived the fix.
+//
+// This pins the negative as well as the positive: an operator deciding which
+// copy wins may be about to reimage the machine holding the only copy of these
+// notes, and "still pushes" is the sentence that would make that safe-looking.
+func TestDetailDoesNotPromiseAContestedNotespaceStillPushes(t *testing.T) {
+	root := t.TempDir()
+	writeLocal(t, root, "notes/a.md", "local only, never synced")
+
+	evidence := detect(t, "01NS", root, []IncomingDocument{
+		{Path: "notes/a.md", Hash: hashContent([]byte("server's version"))},
+	}, untracked, "github.com/me/core", "github.com/me/core")
+	if !evidence.Contested() {
+		t.Fatal("a divergent un-synced collision did not contest the notespace")
+	}
+
+	detail := evidence.Detail()
+	if strings.Contains(detail, "local work still pushes") {
+		t.Fatalf("the evidence still promises a contested notespace pushes:\n%s", detail)
+	}
+	for _, want := range []string{
+		"No writes enter this notespace and none leave it",
+		"local edits keep queuing",
+		"adopting releases them",
+	} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("evidence detail is missing %q:\n%s", want, detail)
+		}
+	}
+}
+
 // Only content-writing events can clobber an un-synced note.
 func TestIncomingFromEventsCarriesOnlyWrites(t *testing.T) {
 	events := []syncproto.SyncEvent{

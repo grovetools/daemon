@@ -173,7 +173,14 @@ func (e AdoptionEvidence) Detail() string {
 	if e.Rejected > 0 {
 		fmt.Fprintf(&b, "%d incoming document(s) name a path outside this root and were ignored; the apply path refuses them too.\n", e.Rejected)
 	}
-	b.WriteString("No writes enter this notespace until it is adopted; local work still pushes.\n")
+	// Both directions, because the gate withholds both: pushDesired is
+	// pullDesired's twin, so a contested notespace moves neither way and its
+	// outbox is parked rather than drained. Saying "local work still pushes"
+	// here — as this line did while the gate was one-directional — tells an
+	// operator their un-synced notes are already off the machine when they are
+	// not, which is the one thing they must not believe while deciding whether
+	// this copy or the server's wins.
+	b.WriteString("No writes enter this notespace and none leave it until it is adopted; local edits keep queuing, and adopting releases them.\n")
 	for _, collision := range e.Collisions {
 		state, local := "differs", shortHash(collision.LocalHash)
 		switch {
