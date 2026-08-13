@@ -32,10 +32,13 @@ func TestSlowSweepWarningIgnoresIntentionalSlowness(t *testing.T) {
 	clearWarning(CondSlowGitTrickle)
 
 	// A four-minute sweep of 681 workspaces whose hot tier landed in 1.2s and
-	// whose trickle cost 70ms of git per workspace: the shipped happy path.
+	// whose trickle cost 570ms of git per workspace — the shipped happy path,
+	// with the trickle figure taken from the CONTENDED 08-10 boot (48.4s × 8
+	// workers / 681 ws), the worst healthy number on record. If that fires an
+	// alarm, the alarm is measuring the wrong thing.
 	RecordGitSweep("", 681, 30*time.Second, 4*time.Minute)
 	RecordGitSweepHot("", 8, 1200*time.Millisecond)
-	RecordGitSweepTrickle("", 600, 42*time.Second, 4*time.Minute)
+	RecordGitSweepTrickle("", 600, 342*time.Second, 4*time.Minute)
 
 	if offender, raised := hasWarning(CondSlowGitSweep); raised {
 		t.Errorf("paced sweep raised the slow-sweep warning (%q)", offender)

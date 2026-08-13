@@ -476,6 +476,13 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 			},
 			progress: func(p sweepProgress) {
 				telemetry.RecordGitSweepProgress(int(p.Tier)+1, p.TierDone, p.TierTotal, p.Done, p.Total)
+				// Re-publish the pending count every batch, not just at the
+				// sweep's ends: this is the number a fleet-wide aggregation
+				// checks before believing itself, and a sweep runs for
+				// minutes, so a gauge that only moves at the boundaries would
+				// read "650 unswept" for the entire trickle and then blink to
+				// zero. (Observed doing exactly that on the 650-workspace rig.)
+				telemetry.RecordGitSweepPending(len(swept.unswept(toScan)))
 				// The demanded tiers are done the moment the sweep starts
 				// working on a paced one — that is what Refresh waits for.
 				if p.Tier >= tierWarm {

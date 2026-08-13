@@ -44,10 +44,20 @@ const (
 	// slowTrickleWorkspaceMS is the trickle's own bar, and it is deliberately
 	// NOT a wall-clock measure: the cold tail is slow by design, so the alarm
 	// watches the mean COST of one workspace's git calls (summed per
-	// workspace, so worker count and pacing sleeps cannot move it). 70 ms per
-	// workspace was the contended-boot measurement; the storms this alarm
-	// historically caught ran ten times that.
-	slowTrickleWorkspaceMS = 500
+	// workspace, so neither worker count nor pacing sleeps can move it).
+	//
+	// Anchored on measurements, in summed-cost terms:
+	//   ~100 ms  scratch fleet of 650 repos, warm cache
+	//   ~335 ms  the healthy 08-01 boot sweep (24s × 8 workers / 573 ws)
+	//   ~570 ms  the CONTENDED 08-10 boot sweep this design set out to fix
+	//            (48.4s × 8 / 681) — slow from load and volume, not breakage,
+	//            and precisely the case that must not raise an alarm now
+	//   ~1400 ms the git-scan storms this alarm exists to catch (job 51's
+	//            watcher-scan mean over a single repo)
+	// So the bar sits between the worst healthy observation and the storm
+	// floor, nearer the former because the mean is taken over hundreds of
+	// workspaces and a real storm moves all of them.
+	slowTrickleWorkspaceMS = 1000
 	// slowScanMS is the watcher-side equivalent; the watcher scans ONE
 	// workspace, so its bar is lower than a whole-fleet sweep's.
 	slowScanMS = 750
