@@ -51,6 +51,7 @@ import (
 	"strings"
 	"time"
 
+	notespacepkg "github.com/grovetools/core/pkg/notespace"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/syncproto"
 )
@@ -127,6 +128,12 @@ type AdoptionEvidence struct {
 	// anything and must not contest; they are counted so the evidence does not
 	// silently drop a document the server claims to hold.
 	Rejected int `json:"rejected,omitempty"`
+	// IdentityStamps counts incoming identity stamps, which are excluded from
+	// the verdict entirely (see DetectAdoption). Counted rather than dropped
+	// for the same reason Rejected is: the evidence must account for every
+	// document the server claims to hold, including the ones this gate has
+	// nothing to say about.
+	IdentityStamps int `json:"identity_stamps,omitempty"`
 	// LocalSubject is this root's stamp subject. ServerSubject is the
 	// server's row for the incoming notespace, or "" when the inventory could
 	// not be read — reported as unknown rather than silently as a match.
@@ -172,6 +179,9 @@ func (e AdoptionEvidence) Detail() string {
 	}
 	if e.Rejected > 0 {
 		fmt.Fprintf(&b, "%d incoming document(s) name a path outside this root and were ignored; the apply path refuses them too.\n", e.Rejected)
+	}
+	if e.IdentityStamps > 0 {
+		fmt.Fprintf(&b, "%d incoming identity stamp(s) were not weighed here; a stamp is identity, not notes, and a divergent one is reported as a registration conflict instead.\n", e.IdentityStamps)
 	}
 	// Both directions, because the gate withholds both: pushDesired is
 	// pullDesired's twin, so a contested notespace moves neither way and its
@@ -234,6 +244,24 @@ func DetectAdoption(notespaceID, root string, incoming []IncomingDocument, track
 			continue
 		}
 		seen[doc.Path] = true
+
+		// An identity stamp is not notes, and this gate is about notes.
+		//
+		// Two machines that hold the same notespace hold two stamps for it,
+		// written by different verbs at different times — `grove notebook pull`
+		// installs one from the server's identity, `grove notespace new` and
+		// the lab's own fixtures mint others — so their BYTES differ routinely
+		// while naming the same id. Counted as a collision, that difference
+		// contested every freshly-pulled notespace over a file the operator
+		// never wrote and cannot sensibly adopt a decision about: no writes in,
+		// no writes out, until someone ran `grove sync adopt-notespace`. The
+		// stamp's own divergence is not ignored — it is a REGISTRATION
+		// conflict, recorded per document by the apply path, which also refuses
+		// to overwrite a local identity with a remote one.
+		if notespacepkg.IsIdentityStamp(doc.Path) {
+			evidence.IdentityStamps++
+			continue
+		}
 
 		local := filepath.Join(root, filepath.FromSlash(doc.Path))
 		// The same containment rule both apply paths run on this input. A

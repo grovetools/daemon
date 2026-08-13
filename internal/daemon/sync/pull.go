@@ -509,9 +509,31 @@ func (p *PullPipeline) applyCreate(ctx context.Context, notespaceRoot string, ev
 		}
 	}
 
+	filePath := p.joinPath(notespaceRoot, ev.Path)
+
+	// An identity stamp never overwrites a local identity. applyUpdate has
+	// refused that since B8 ("automatic merge is forbidden"), but a CREATE
+	// reaches a path this machine does not track — which is exactly the shape a
+	// stamp arrives in on a root some verb already stamped, because `grove
+	// notebook pull` writes the stamp from the SERVER's identity and the daemon
+	// has never recorded it as a document. Writing it here would let a remote
+	// file decide what this root IS. The one case that does write is the empty
+	// one: a replica with no stamp yet materializes the identity it was sent.
+	if notespacepkg.IsIdentityStamp(ev.Path) {
+		if localContent, readErr := readFile(filePath); readErr == nil && hashContent(localContent) != ev.ContentHash {
+			detail := "identity stamp differs from the registered local identity; automatic merge is forbidden"
+			if err := p.recordConflictArtifact(ctx, ev.Path, ev.DocumentID, ConflictKindRegistration, localContent); err != nil {
+				return fmt.Errorf("failed to record identity conflict: %w", err)
+			}
+			if p.OnConflict != nil {
+				p.OnConflict(ConflictKindRegistration, p.ws.Name, ev.Path, ev.DocumentID, detail)
+			}
+			return nil
+		}
+	}
+
 	// Write to disk, restoring the origin's file mtime when the event carries
 	// one (zero = old server/client: keep the write time, as before).
-	filePath := p.joinPath(notespaceRoot, ev.Path)
 	if err := writeFileUnderRoot(notespaceRoot, filePath, content, ev.Mtime); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
