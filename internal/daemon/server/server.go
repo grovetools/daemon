@@ -3088,6 +3088,18 @@ func convertUpdatePayload(u store.Update) *apiStateUpdate {
 			Source:     u.Source,
 			Payload:    u.Payload,
 		}
+
+	// Tiered git sweep progress. These carry *models.GitSweepProgress and are
+	// passed through untyped (like watcher_status) — a consumer decodes with
+	// coredaemon.ParseSweepProgress. Scanned mirrors the payload's Done so a
+	// client that only reads the generic envelope still sees progress.
+	case store.UpdateSweepStarted, store.UpdateSweepProgress, store.UpdateSweepCompleted:
+		return &apiStateUpdate{
+			UpdateType: string(u.Type),
+			Source:     u.Source,
+			Scanned:    u.Scanned,
+			Payload:    u.Payload,
+		}
 	case store.UpdateTaskResult:
 		if payload, ok := u.Payload.(*store.TaskResultPayload); ok {
 			delta := &models.WorkspaceDelta{

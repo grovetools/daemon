@@ -175,7 +175,7 @@ func TestTopChildren(t *testing.T) {
 // gauges, and budgets are evaluated SERVER-side so every client reads one
 // verdict.
 func TestHandleSystemStatsFillsCountersAndBudgets(t *testing.T) {
-	telemetry.RecordGitSweep("test-scope", 42, 30*time.Millisecond)
+	telemetry.RecordGitSweep("test-scope", 42, 30*time.Millisecond, 90*time.Millisecond)
 
 	s := New(false)
 	req := httptest.NewRequest(http.MethodGet, "/api/system/stats", nil)

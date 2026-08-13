@@ -224,6 +224,16 @@ const (
 	// Done=true. Only fires under --ready-at=bind; the default bind-last
 	// ordering never broadcasts because no client can connect until boot ends.
 	UpdateBootPhase UpdateType = "boot_phase"
+
+	// Tier-ordered git sweep progress. The boot/refresh/reconcile sweep runs
+	// hot workspaces at full concurrency and trickles the cold tail over
+	// minutes, so its position is a live fact rather than a completion
+	// notification: these let `groved monitor` and a treemux Inspector page
+	// render progress without polling /api/system/stats. Payload for all three
+	// is *models.GitSweepProgress; none of them mutate state.
+	UpdateSweepStarted   UpdateType = "sweep_started"
+	UpdateSweepProgress  UpdateType = "sweep_progress"
+	UpdateSweepCompleted UpdateType = "sweep_completed"
 )
 
 // allUpdateTypes is the canonical roster of the event vocabulary — every
@@ -251,7 +261,7 @@ var allUpdateTypes = []UpdateType{
 	UpdateMemoryIndex, UpdateMemoryReindex,
 	UpdateTaskResult, UpdateTestReport,
 	UpdateSpawnAgentPane, UpdateAttachAgentPane, UpdateAgentInput, UpdateCaptureRequest,
-	UpdateSyncConflict,
+	UpdateSyncConflict, UpdateForgeState,
 	UpdateSatelliteStatus, UpdateSatelliteSnapshot,
 	UpdateWorkflowRunDiscovered, UpdateWorkflowAgentStarted,
 	UpdateWorkflowAgentCompleted, UpdateWorkflowRunStale,
@@ -260,6 +270,7 @@ var allUpdateTypes = []UpdateType{
 	UpdateSubjobReportReady, UpdateSubjobJoined,
 	UpdateBuildQueued, UpdateBuildStarted, UpdateBuildFinished,
 	UpdateBootPhase,
+	UpdateSweepStarted, UpdateSweepProgress, UpdateSweepCompleted,
 }
 
 // AllUpdateTypes returns the event vocabulary, sorted, as a fresh slice.

@@ -114,6 +114,9 @@ func dynamicInterval(count int, baseInterval time.Duration) time.Duration {
 // GitStatusCollector updates git status for all workspaces.
 type GitStatusCollector struct {
 	interval time.Duration
+	// pacing is the tiered sweep's throttle (see git_sweep.go). Held on the
+	// collector so a test can shrink the batches and duty cycles.
+	pacing sweepPacing
 	// scope is this daemon's owning scope ("" == unscoped/global). A scoped
 	// collector's boot, Refresh, and background full sweeps cover only
 	// workspaces at or under scope — the global workspace list is populated on
@@ -143,6 +146,7 @@ func NewGitStatusCollector(interval time.Duration, scope string) *GitStatusColle
 	return &GitStatusCollector{
 		interval:     interval,
 		scope:        scope,
+		pacing:       defaultSweepPacing(),
 		refresh:      make(chan chan struct{}),
 		refreshPaths: make(chan pathRefreshRequest),
 	}
@@ -177,7 +181,17 @@ func (c *GitStatusCollector) scopedWorkspaces(workspaces map[string]*models.Enri
 	return out
 }
 
-// Refresh triggers an immediate full git status scan and blocks until it completes.
+// Refresh triggers an immediate full git status sweep and blocks until the
+// DEMANDED part of it is done — the focused and active tiers — not until the
+// whole fleet has been rescanned.
+//
+// That is a deliberate narrowing of the old contract ("blocks until the full
+// scan completes"). The sweep is now tier-ordered and paced: its cold tail is
+// minutes long on purpose, and no caller of a bodyless /api/refresh wants to
+// block for that. What every caller does want — the workspaces someone is
+// looking at, plus anything newly discovered — is what the demanded tiers
+// cover, and a workspace still in the cold tail carries GitStatusPending so
+// its row cannot be misread as fresh.
 func (c *GitStatusCollector) Refresh(ctx context.Context) error {
 	reply := make(chan struct{})
 	select {
@@ -221,6 +235,13 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 	ulog := logging.NewUnifiedLogger("groved.collector.git")
 	var lastFullScan time.Time
 	lastPathScan := make(map[string]time.Time)
+	// swept records which workspaces a sweep has covered THIS daemon lifetime.
+	// It backs two things: the GitStatusPending marker (a row nobody has
+	// scanned yet must not read as fresh) and the newly-discovered promotion
+	// in buildSweepSignals. Written only by the sweep goroutine, of which
+	// exactly one runs at a time.
+	swept := newSweptSet()
+	bootSweepDone := false
 	currentInterval := c.interval
 	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
@@ -230,34 +251,37 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 	// exists to make visible.
 	telemetry.SetCollectorInterval(c.Name(), currentInterval)
 
-	// scanWorkspaces runs git status on the given workspaces and emits a delta update.
-	scanWorkspaces := func(toScan []*models.EnrichedWorkspace) {
+	// send publishes a store update, giving up on shutdown. A tiered sweep
+	// publishes once per batch and runs for minutes, so an unguarded send into
+	// a channel whose consumer has already exited would hold the collector
+	// goroutine open forever and hang the engine's shutdown wait.
+	send := func(u store.Update) bool {
+		select {
+		case updates <- u:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	// scanBatch runs git status over one batch of workspaces with the given
+	// worker bound and publishes their deltas as soon as the batch finishes.
+	//
+	// Publishing per batch is load-bearing: a sweep is now tier-ordered and
+	// paced, so accumulating every delta and publishing once at the end would
+	// hold the hot tier's data — the data someone is looking at — hostage to
+	// the cold tail's several minutes.
+	scanBatch := func(toScan []*models.EnrichedWorkspace, workers int) sweepBatchResult {
+		res := sweepBatchResult{Scanned: len(toScan)}
 		if len(toScan) == 0 {
-			return
+			return res
+		}
+		if workers < 1 {
+			workers = 1
 		}
 
-		start := time.Now()
-		defer func() {
-			d := time.Since(start)
-			// Every sweep feeds the telemetry registry (last/mean/max duration
-			// + workspaces scanned) so /api/system/stats can answer "why is
-			// this daemon busy?" without anyone grepping logs — this incident
-			// class was historically found in Activity Monitor, not here.
-			telemetry.RecordGitSweep(c.scope, len(toScan), d)
-			if d > 1*time.Second {
-				// scope/pid disambiguate which daemon swept in the shared log;
-				// scanned separates a broad background sweep from a focused one.
-				ulog.Debug("Slow git status scan detected").
-					Field("duration", d).
-					Field("scope", c.scope).
-					Field("scanned", len(toScan)).
-					Field("pid", os.Getpid()).
-					Log(ctx)
-			}
-		}()
-
 		var wg sync.WaitGroup
-		sem := make(chan struct{}, gitWorkers)
+		sem := make(chan struct{}, workers)
 		var mu sync.Mutex
 		var deltas []*models.WorkspaceDelta
 
@@ -267,6 +291,19 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				defer wg.Done()
 				sem <- struct{}{}        // Acquire
 				defer func() { <-sem }() // Release
+
+				// Per-workspace cost is summed (not wall-timed) so the sweep's
+				// health measure stays independent of worker count and of the
+				// pacing sleeps — see telemetry.RecordGitSweepTrickle.
+				workStart := time.Now()
+				defer func() {
+					cost := time.Since(workStart)
+					mu.Lock()
+					res.Cost += cost
+					mu.Unlock()
+				}()
+
+				firstScan := !swept.has(store.NormalizePathKey(ws.Path))
 
 				status, err := git.GetExtendedStatus(ws.Path)
 				if err != nil {
@@ -292,7 +329,11 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				// ChangedFiles == nil: a clean repo's file list is nil, so the nil
 				// test would re-emit every tick.
 				needsFileBackfill := focused && !ws.ChangedFilesComputed
-				if !gitChanged && !needsFileBackfill {
+				// A first scan always emits, even when it found nothing to
+				// change: its delta is what clears GitStatusPending. Suppress
+				// it and a clean, unchanged workspace would stay marked
+				// pending for the daemon's whole lifetime.
+				if !gitChanged && !needsFileBackfill && !firstScan {
 					return
 				}
 				// On the TIMER path the coarse status is used as the focused-data
@@ -315,6 +356,10 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 					GitStatus:  status,
 					GitLanding: landing,
 				}
+				if firstScan {
+					notPending := false
+					delta.GitStatusPending = &notPending
+				}
 				if focused {
 					delta.ChangedFiles, delta.BlobHashes = files, hashes
 					computed := true
@@ -327,54 +372,159 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		}
 		wg.Wait()
 
+		res.Emitted = len(deltas)
 		if len(deltas) > 0 {
-			updates <- store.Update{
+			send(store.Update{
 				Type:    store.UpdateWorkspacesDelta,
 				Source:  "git",
 				Scanned: len(toScan),
 				Payload: deltas,
+			})
+		}
+		return res
+	}
+
+	// markPending publishes the honest-staleness marker for every workspace
+	// this daemon has not swept yet, and reports how many that is.
+	//
+	// It exists because a tiered sweep makes "the row is on screen" and "the
+	// row's git data has been computed" separate facts for minutes at a time.
+	// Without an explicit marker, a rail would render an empty status as
+	// clean, and a fleet-wide aggregation ("N dirty repos") would quietly
+	// count unscanned repos as clean ones.
+	markPending := func(items []sweepItem) int {
+		deltas := make([]*models.WorkspaceDelta, 0)
+		for _, it := range items {
+			if swept.has(it.key) {
+				continue
+			}
+			pending := true
+			deltas = append(deltas, &models.WorkspaceDelta{Path: it.ws.Path, GitStatusPending: &pending})
+		}
+		telemetry.RecordGitSweepPending(len(deltas))
+		if len(deltas) > 0 {
+			send(store.Update{
+				Type:    store.UpdateWorkspacesDelta,
+				Source:  "git",
+				Scanned: len(deltas),
+				Payload: deltas,
+			})
+		}
+		return len(deltas)
+	}
+
+	// runSweep executes one tier-ordered, paced sweep of the in-scope fleet.
+	// reason is "boot", "refresh" or "reconcile" — every full sweep the daemon
+	// runs goes through here, so a rebuild-triggered refresh gets the same
+	// treatment as boot rather than re-introducing a flat 681-workspace burst.
+	//
+	// demandDone is closed once the tiers a caller could reasonably wait for
+	// (hot + active) are complete; the cold tail keeps running afterwards.
+	runSweep := func(reason string, demandDone chan struct{}) {
+		demandReleased := false
+		releaseDemand := func() {
+			if !demandReleased {
+				demandReleased = true
+				close(demandDone)
 			}
 		}
-	}
+		defer releaseDemand()
+		defer telemetry.RecordGitSweepIdle()
 
-	// scan is the global HOURLY correctness reconciler — the ticker fires far
-	// more often (see currentInterval) but every tick before the hour is up
-	// returns here. Focus no longer causes timer-driven git forks: the
-	// recursive watcher and RefreshPaths are the latency/demand paths. Scoped
-	// collectors are passive RPC helpers and never run background scans, so on
-	// a scoped daemon this reconciler does not exist.
-	scan := func() {
-		if c.scope != "" || time.Since(lastFullScan) < backgroundScanInterval {
+		state := st.Get()
+		toScan := c.scopedWorkspaces(state.Workspaces)
+		if len(toScan) == 0 {
 			return
 		}
-		state := st.Get()
-		toScan := c.scopedWorkspaces(state.Workspaces)
-		if len(toScan) > 0 {
-			lastFullScan = time.Now()
+		now := time.Now()
+		sig := buildSweepSignals(state, st.GetFocus(), now)
+		if bootSweepDone {
+			// After the first sweep, "never swept" means "discovered since the
+			// daemon started" — an import, a new worktree, a repo someone just
+			// added. That is demand, so those do not go to the back of a
+			// minutes-long queue. On the boot sweep itself every workspace is
+			// unswept, which is why this is gated.
+			sig.newlyDiscovered = swept.unswept(toScan)
 		}
-		scanWorkspaces(toScan)
+		items := classifySweepItems(toScan, sig, now)
 
-		newInterval := dynamicInterval(len(state.Workspaces), c.interval)
-		if newInterval != currentInterval {
-			currentInterval = newInterval
-			ticker.Reset(currentInterval)
-			telemetry.SetCollectorInterval(c.Name(), currentInterval)
-		}
-	}
+		pending := markPending(items)
+		ulog.Info("Starting tiered git sweep").
+			Field("reason", reason).
+			Field("workspaces", len(items)).
+			Field("pending", pending).
+			Field("scope", c.scope).
+			Field("pid", os.Getpid()).
+			Log(ctx)
+		send(store.Update{
+			Type:    store.UpdateSweepStarted,
+			Source:  "git",
+			Scanned: len(items),
+			Payload: sweepStartPayload(reason, c.scope, items),
+		})
 
-	// fullScan forces a scan of all in-scope workspaces (used by Refresh and
-	// the boot pass).
-	fullScan := func() {
-		state := st.Get()
-		toScan := c.scopedWorkspaces(state.Workspaces)
-		// See scan(): an empty pass (pre-discovery cold start) must not spend
-		// the background budget, or the first real reconcile waits a full
-		// backgroundScanInterval — an hour, not the five minutes this comment
-		// used to claim.
-		if len(toScan) > 0 {
-			lastFullScan = time.Now()
+		sweep := &tieredSweep{
+			pacing: c.pacing,
+			items:  items,
+			hotSet: st.GetFocus,
+			scan: func(batch []*models.EnrichedWorkspace, workers int) sweepBatchResult {
+				res := scanBatch(batch, workers)
+				for _, ws := range batch {
+					swept.add(store.NormalizePathKey(ws.Path))
+				}
+				return res
+			},
+			progress: func(p sweepProgress) {
+				telemetry.RecordGitSweepProgress(int(p.Tier)+1, p.TierDone, p.TierTotal, p.Done, p.Total)
+				// The demanded tiers are done the moment the sweep starts
+				// working on a paced one — that is what Refresh waits for.
+				if p.Tier >= tierWarm {
+					releaseDemand()
+				}
+				send(store.Update{
+					Type:    store.UpdateSweepProgress,
+					Source:  "git",
+					Scanned: p.Done,
+					Payload: sweepProgressPayload(reason, c.scope, p),
+				})
+			},
+			sleep: sweepSleep,
+			now:   time.Now,
 		}
-		scanWorkspaces(toScan)
+		out := sweep.run(ctx)
+		releaseDemand()
+		if out.Completed {
+			// Only a sweep that actually finished licenses the
+			// newly-discovered promotion above: after a sweep cut short by
+			// shutdown, "never swept" would still mean "most of the fleet",
+			// and promoting all of it would rebuild the burst this replaced.
+			bootSweepDone = true
+		}
+		telemetry.RecordGitSweepPending(len(swept.unswept(toScan)))
+
+		// Three separate measurements, because they answer three different
+		// questions: how long the whole sweep took (informational, and long on
+		// purpose), how long the part users feel took (the alarm), and how
+		// expensive git itself was in the trickle (the other alarm).
+		telemetry.RecordGitSweep(c.scope, out.Scanned, out.Work, out.Elapsed)
+		telemetry.RecordGitSweepHot(c.scope, out.TierScanned[tierHot], out.HotElapsed)
+		telemetry.RecordGitSweepTrickle(c.scope, out.PacedScanned, out.PacedCost, out.PacedElapsed)
+		send(store.Update{
+			Type:    store.UpdateSweepCompleted,
+			Source:  "git",
+			Scanned: out.Scanned,
+			Payload: sweepDonePayload(reason, c.scope, out),
+		})
+		ulog.Info("Tiered git sweep finished").
+			Field("reason", reason).
+			Field("scanned", out.Scanned).
+			Field("emitted", out.Emitted).
+			Field("elapsed", out.Elapsed).
+			Field("work", out.Work).
+			Field("hot", out.HotElapsed).
+			Field("completed", out.Completed).
+			Field("scope", c.scope).
+			Log(ctx)
 	}
 
 	// scanPaths synchronously scans just the requested workspace paths (the
@@ -420,6 +570,11 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 				landing := git.GetLandingState(ws.Path, status.Branch)
 				files, hashes := focusedFileData(ws.Path)
 				computed := true
+				// An explicit refresh is a real scan, so it clears the
+				// pending marker too — otherwise a workspace the user just
+				// verified would keep claiming "not swept yet" until the cold
+				// tail reached it, minutes later.
+				notPending := false
 				delta := &models.WorkspaceDelta{
 					Path:                 ws.Path,
 					GitStatus:            status,
@@ -427,6 +582,7 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 					ChangedFiles:         files,
 					BlobHashes:           hashes,
 					ChangedFilesComputed: &computed,
+					GitStatusPending:     &notPending,
 				}
 				// Shallow copy for the response so the store's stored value (a
 				// shared pointer) isn't mutated outside ApplyUpdate.
@@ -446,40 +602,134 @@ func (c *GitStatusCollector) Run(ctx context.Context, st *store.Store, updates c
 		wg.Wait()
 		for _, path := range completedPaths {
 			lastPathScan[path] = now
+			swept.add(store.NormalizePathKey(path))
 		}
 
 		if len(deltas) > 0 {
-			updates <- store.Update{
+			send(store.Update{
 				Type:    store.UpdateWorkspacesDelta,
 				Source:  "git",
 				Scanned: len(resolved),
 				Payload: deltas,
-			}
+			})
 		}
 		return fresh
+	}
+
+	// Exactly one sweep runs at a time, and it runs on its OWN goroutine while
+	// this loop keeps serving RefreshPaths and ticks. That is new, and it is
+	// required: a sweep used to block the loop for its duration, which was
+	// tolerable at 48 seconds and would not be at the several minutes a paced
+	// cold tail takes — verify-on-reveal (/api/refresh with paths) must stay
+	// answerable while the fleet trickles.
+	var (
+		sweepFinished chan struct{} // non-nil while a sweep runs
+		sweepDemand   chan struct{} // non-nil until its demanded tiers are done
+		refreshWaits  []chan struct{}
+		refreshOwed   bool
+	)
+	releaseRefreshWaiters := func() {
+		for _, w := range refreshWaits {
+			close(w)
+		}
+		refreshWaits = nil
+	}
+	// startSweep launches a sweep unless one is already running or there is
+	// nothing in scope to sweep. An empty pass must not spend the background
+	// budget: leaving lastFullScan alone is what makes the next tick retry
+	// instead of waiting a full backgroundScanInterval (an hour) for the first
+	// real sweep on a daemon that booted before workspace discovery finished.
+	startSweep := func(reason string) bool {
+		if sweepFinished != nil {
+			return false
+		}
+		if len(c.scopedWorkspaces(st.Get().Workspaces)) == 0 {
+			return false
+		}
+		lastFullScan = time.Now()
+		demand, finished := make(chan struct{}), make(chan struct{})
+		sweepDemand, sweepFinished = demand, finished
+		go func() {
+			defer close(finished)
+			runSweep(reason, demand)
+		}()
+		return true
 	}
 
 	// The global owner establishes the initial snapshot after workspace
 	// discovery. Scoped collectors deliberately skip this boot scan; they exist
 	// only to serve explicit RefreshPaths without duplicating global work.
-	if c.scope == "" {
-		time.Sleep(1 * time.Second)
-		fullScan()
+	if c.scope == "" && sweepSleep(ctx, 1*time.Second) {
+		startSweep("boot")
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			// Give an in-flight sweep a moment to observe the cancellation and
+			// unwind (it checks between batches and inside its pacing sleep)
+			// rather than returning while it still has git children to reap.
+			if sweepFinished != nil {
+				select {
+				case <-sweepFinished:
+				case <-time.After(2 * time.Second):
+				}
+			}
 			return nil
 		case <-ticker.C:
-			scan()
+			// The hourly correctness reconciler. Focus no longer causes
+			// timer-driven git forks: the recursive watcher and RefreshPaths
+			// are the latency/demand paths. Scoped collectors are passive RPC
+			// helpers and never run background sweeps.
+			if c.scope == "" && time.Since(lastFullScan) >= backgroundScanInterval {
+				reason := "reconcile"
+				if lastFullScan.IsZero() {
+					reason = "boot"
+				}
+				startSweep(reason)
+			}
+			newInterval := dynamicInterval(len(st.Get().Workspaces), c.interval)
+			if newInterval != currentInterval {
+				currentInterval = newInterval
+				ticker.Reset(currentInterval)
+				telemetry.SetCollectorInterval(c.Name(), currentInterval)
+			}
+		case <-sweepDemand:
+			sweepDemand = nil
+			releaseRefreshWaiters()
+		case <-sweepFinished:
+			sweepFinished, sweepDemand = nil, nil
+			releaseRefreshWaiters()
+			if refreshOwed {
+				refreshOwed = false
+				startSweep("refresh")
+			}
 		case replyCh := <-c.refresh:
 			// Bodyless refresh cannot make every scoped daemon duplicate global
 			// state. Explicit path refresh remains available below.
-			if c.scope == "" {
-				fullScan()
+			if c.scope != "" {
+				close(replyCh)
+				continue
 			}
-			close(replyCh)
+			switch {
+			case sweepFinished == nil:
+				refreshWaits = append(refreshWaits, replyCh)
+				if !startSweep("refresh") {
+					releaseRefreshWaiters()
+				}
+			case sweepDemand != nil:
+				// A sweep is running and has not finished its demanded tiers;
+				// fold into it, and owe a follow-up so workspaces discovered
+				// after it was planned still get covered.
+				refreshWaits = append(refreshWaits, replyCh)
+				refreshOwed = true
+			default:
+				// The running sweep's demanded tiers are already done, so the
+				// caller's answer is ready now; the owed follow-up picks up
+				// anything discovered since.
+				refreshOwed = true
+				close(replyCh)
+			}
 		case req := <-c.refreshPaths:
 			req.reply <- scanPaths(req.paths)
 		}

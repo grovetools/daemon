@@ -20,6 +20,7 @@ import (
 // second, never-clearing warning instead of refreshing the first.
 const (
 	CondSlowGitSweep     = "slow git status sweep"
+	CondSlowGitTrickle   = "slow git status sweep (trickle)"
 	CondSlowGitScan      = "slow git watcher scan"
 	CondNoopStorm        = "repeated no-op git scans"
 	CondLargeBlobHash    = "large file hashed on every scan"
@@ -33,8 +34,20 @@ const (
 // Thresholds for the counter-derived warning rules.
 const (
 	// slowSweepMS mirrors the collector's existing "Slow git status scan
-	// detected" log threshold so the log line and the warning agree.
-	slowSweepMS = 1000
+	// detected" log threshold so the log line and the warning agree. It now
+	// measures the HOT TIER's completion time, not the whole sweep's: since
+	// the sweep became tier-ordered and paced, total wall time is a policy
+	// choice (minutes, on purpose) and only the hot tier is a latency anyone
+	// experiences. Budget is a little above the ~2s hot-tier target so a
+	// normal boot does not flap the alarm.
+	slowSweepMS = 2500
+	// slowTrickleWorkspaceMS is the trickle's own bar, and it is deliberately
+	// NOT a wall-clock measure: the cold tail is slow by design, so the alarm
+	// watches the mean COST of one workspace's git calls (summed per
+	// workspace, so worker count and pacing sleeps cannot move it). 70 ms per
+	// workspace was the contended-boot measurement; the storms this alarm
+	// historically caught ran ten times that.
+	slowTrickleWorkspaceMS = 500
 	// slowScanMS is the watcher-side equivalent; the watcher scans ONE
 	// workspace, so its bar is lower than a whole-fleet sweep's.
 	slowScanMS = 750
@@ -54,9 +67,37 @@ var gitWatcherNoops = newNoopStormTracker()
 
 var (
 	// Git status sweeps (collector: whole in-scope workspace set).
+	//
+	// git.sweep measures WORK time — the summed scan time of the sweep's
+	// batches, pacing sleeps excluded — so its mean stays comparable across
+	// the move to a paced sweep. Wall time (which now runs to minutes on
+	// purpose) is git.sweep.wall_ms, and the two diverging is the design
+	// working, not a stall.
 	GitSweep           = Default().Stat("git.sweep")
 	GitSweepWorkspaces = Default().Counter("git.sweep.workspaces")
 	gitSweepLastCount  = Default().Gauge("git.sweep.workspaces_last")
+	gitSweepWallMS     = Default().Gauge("git.sweep.wall_ms")
+	// Hot-tier completion: the part of a sweep a user waits on. This is what
+	// the re-tuned slow-sweep warning fires on.
+	GitSweepHot = Default().Stat("git.sweep.hot")
+	// Per-workspace git cost inside sweeps, summed per workspace rather than
+	// measured as wall time, so it is independent of worker count and pacing.
+	GitSweepWorkspaceCost = Default().Stat("git.sweep.workspace")
+	// Live position of the running sweep, for progress rendering without
+	// polling the event stream: tier code (0 idle, 1 hot, 2 active, 3 warm,
+	// 4 cold), overall done/total, and percent complete.
+	gitSweepTier      = Default().Gauge("git.sweep.tier")
+	gitSweepDone      = Default().Gauge("git.sweep.done")
+	gitSweepTotal     = Default().Gauge("git.sweep.total")
+	gitSweepProgress  = Default().Gauge("git.sweep.progress")
+	gitSweepTierDone  = Default().Gauge("git.sweep.tier_done")
+	gitSweepTierTotal = Default().Gauge("git.sweep.tier_total")
+	// Trickle throughput (workspaces per minute of paced-tier wall time) and
+	// the fleet-wide honesty gauge: how many in-scope workspaces have never
+	// been swept this daemon lifetime. A consumer aggregating "N dirty repos"
+	// across the fleet must read this before believing the number.
+	gitSweepTricklePerMin = Default().Gauge("git.sweep.trickle_per_min")
+	gitSweepPending       = Default().Gauge("git.sweep.pending")
 
 	// Git watcher scans (event-driven, one workspace each).
 	GitWatcherScan   = Default().Stat("git.watcher_scan")
@@ -166,24 +207,95 @@ var (
 	}
 )
 
-// RecordGitSweep records one collector git-status sweep over n workspaces.
-// A sweep slower than slowSweepMS also raises a health warning against the
-// scope, since that is precisely the degradation users otherwise only notice
-// as "the TUI feels stale".
-func RecordGitSweep(scope string, n int, d time.Duration) {
+// RecordGitSweep records one completed collector git-status sweep over n
+// workspaces: work is the summed scan time of its batches (pacing sleeps
+// excluded) and wall is how long it actually took end to end.
+//
+// It deliberately raises NO warning. Since the sweep became tier-ordered and
+// paced, a long sweep is the policy rather than a symptom — the two questions
+// worth alarming on are split out into RecordGitSweepHot (the latency users
+// feel) and RecordGitSweepTrickle (whether git itself got slow), so intentional
+// slowness cannot fire the alarm and a real regression still does.
+func RecordGitSweep(scope string, n int, work, wall time.Duration) {
 	if n <= 0 {
 		return
 	}
-	GitSweep.ObserveDuration(d)
+	GitSweep.ObserveDuration(work)
 	GitSweepWorkspaces.Add(int64(n))
 	gitSweepLastCount.Set(float64(n))
+	gitSweepWallMS.Set(float64(wall.Milliseconds()))
+}
+
+// RecordGitSweepHot records the hot tier's completion: n focused workspaces
+// swept within d of the sweep starting. This is the number a user experiences
+// as "the daemon caught up with what I am looking at", and the one the
+// slow-sweep warning fires on.
+func RecordGitSweepHot(scope string, n int, d time.Duration) {
+	if n <= 0 {
+		return
+	}
+	GitSweepHot.ObserveDuration(d)
 	if d.Milliseconds() >= slowSweepMS {
 		Default().Warnings().Raise(
 			scopeLabel(scope),
 			CondSlowGitSweep,
-			fmt.Sprintf("%d workspaces in %s", n, d.Round(time.Millisecond)),
+			fmt.Sprintf("hot tier: %d workspaces in %s", n, d.Round(time.Millisecond)),
 		)
 	}
+}
+
+// RecordGitSweepTrickle records the paced tail's throughput: n workspaces
+// scanned for cost of summed per-workspace git time, over elapsed wall time.
+//
+// The warning is on COST per workspace, never on elapsed: the trickle is slow
+// on purpose, and an alarm that could not tell that apart from a storm would
+// be turned off within a week. perMin is published as a gauge so the trickle's
+// actual throughput stays visible next to the reason it is low.
+func RecordGitSweepTrickle(scope string, n int, cost, elapsed time.Duration) {
+	if n <= 0 {
+		return
+	}
+	perWorkspace := cost / time.Duration(n)
+	GitSweepWorkspaceCost.ObserveDuration(perWorkspace)
+	if elapsed > 0 {
+		gitSweepTricklePerMin.Set(float64(n) / elapsed.Minutes())
+	}
+	if perWorkspace.Milliseconds() >= slowTrickleWorkspaceMS {
+		Default().Warnings().Raise(
+			scopeLabel(scope),
+			CondSlowGitTrickle,
+			fmt.Sprintf("%s of git per workspace over %d workspaces",
+				perWorkspace.Round(time.Millisecond), n),
+		)
+	}
+}
+
+// RecordGitSweepProgress publishes the running sweep's position. tier is the
+// numeric tier code (0 == idle, higher == colder); done/total are workspaces.
+func RecordGitSweepProgress(tier, tierDone, tierTotal, done, total int) {
+	gitSweepTier.Set(float64(tier))
+	gitSweepTierDone.Set(float64(tierDone))
+	gitSweepTierTotal.Set(float64(tierTotal))
+	gitSweepDone.Set(float64(done))
+	gitSweepTotal.Set(float64(total))
+	if total > 0 {
+		gitSweepProgress.Set(float64(done) * 100 / float64(total))
+	} else {
+		gitSweepProgress.Set(0)
+	}
+}
+
+// RecordGitSweepIdle marks no sweep in flight, so a stale tier code cannot be
+// read as a sweep that never ends.
+func RecordGitSweepIdle() {
+	gitSweepTier.Set(0)
+}
+
+// RecordGitSweepPending publishes how many in-scope workspaces have never been
+// swept this daemon lifetime — the fleet-wide counterpart of the per-workspace
+// GitStatusPending flag.
+func RecordGitSweepPending(n int) {
+	gitSweepPending.Set(float64(n))
 }
 
 // RecordGitWatcherScan records one event-driven per-workspace scan. The path

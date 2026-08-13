@@ -2312,6 +2312,14 @@ func newGrovedMonitorCmd() *cobra.Command {
 					emit("info", "Config Reload", map[string]interface{}{
 						"file": configFile,
 					})
+				case daemon.UpdateTypeSweepStarted, daemon.UpdateTypeSweepProgress, daemon.UpdateTypeSweepCompleted:
+					if p, ok := daemon.ParseSweepProgress(update); ok {
+						level := "info"
+						if update.UpdateType == daemon.UpdateTypeSweepProgress {
+							level = "debug"
+						}
+						emit(level, sweepEventLabel(store.UpdateType(update.UpdateType)), sweepMonitorFields(p))
+					}
 				case "watcher_status":
 					if p, ok := update.Payload.(map[string]interface{}); ok {
 						emit("info", "Watcher", p)
@@ -2347,6 +2355,47 @@ func newGrovedMonitorCmd() *cobra.Command {
 	cmd.Flags().Bool("compact", true, "Disable spacing between log entries")
 
 	return cmd
+}
+
+// sweepEventLabel names a tiered git-sweep event for the monitor.
+func sweepEventLabel(t store.UpdateType) string {
+	switch t {
+	case store.UpdateSweepStarted:
+		return "Git Sweep Start"
+	case store.UpdateSweepCompleted:
+		return "Git Sweep Done"
+	default:
+		return "Git Sweep"
+	}
+}
+
+// sweepMonitorFields renders a sweep payload for the monitor.
+//
+// It prints elapsed AND work time whenever they differ, because that gap is
+// the whole design: a cold tail that is 90% sleep looks like a stalled sweep
+// in any view that shows only wall time.
+func sweepMonitorFields(p *models.GitSweepProgress) map[string]interface{} {
+	fields := map[string]interface{}{
+		"reason":   p.Reason,
+		"progress": fmt.Sprintf("%d/%d", p.Done, p.Total),
+	}
+	if p.Tier != "" {
+		fields["tier"] = p.Tier
+		fields["tier_progress"] = fmt.Sprintf("%d/%d", p.TierDone, p.TierTotal)
+	}
+	for tier, n := range p.TierTotals {
+		fields["plan_"+tier] = n
+	}
+	if p.ElapsedMS > 0 {
+		fields["elapsed"] = (time.Duration(p.ElapsedMS) * time.Millisecond).Round(time.Millisecond).String()
+	}
+	if p.WorkMS > 0 && p.WorkMS != p.ElapsedMS {
+		fields["work"] = (time.Duration(p.WorkMS) * time.Millisecond).Round(time.Millisecond).String()
+	}
+	if p.Emitted > 0 {
+		fields["emitted"] = p.Emitted
+	}
+	return fields
 }
 
 // monitorState tracks previous values for change detection.
@@ -2492,6 +2541,17 @@ func runInlineMonitor(ctx context.Context, st *store.Store, format string, compa
 						fields["dest_paths"] = p.DestPaths
 						emit("info", "Skill Sync", fields)
 					}
+				}
+			case store.UpdateSweepStarted, store.UpdateSweepProgress, store.UpdateSweepCompleted:
+				if p, ok := update.Payload.(*models.GitSweepProgress); ok {
+					// Progress frames are debug: a paced sweep emits one per
+					// batch for minutes, and only its start and finish are
+					// events a human reading the monitor wants shouted.
+					level := "info"
+					if update.Type == store.UpdateSweepProgress {
+						level = "debug"
+					}
+					emit(level, sweepEventLabel(update.Type), sweepMonitorFields(p))
 				}
 			case store.UpdateSessionIntent:
 				if p, ok := update.Payload.(*store.SessionIntentPayload); ok {

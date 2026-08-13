@@ -193,9 +193,14 @@ func fmtChildren(children []models.ProcStat) string {
 // tailers). `--counters` prints every key instead. The table stays readable
 // for a fleet of five daemons while `--json` and `--counters` remain complete.
 var counterHighlights = []struct{ key, label string }{
-	{"git.sweep.last_ms", "git sweep last"},
-	{"git.sweep.mean_ms", "git sweep mean"},
+	{"git.sweep.last_ms", "git sweep last (work)"},
+	{"git.sweep.wall_ms", "git sweep last (wall)"},
+	{"git.sweep.hot.last_ms", "hot tier last"},
+	{"git.sweep.workspace.mean_ms", "per-workspace git"},
 	{"git.sweep.workspaces_last", "sweep workspaces"},
+	{"git.sweep.progress", "sweep progress %"},
+	{"git.sweep.pending", "never swept"},
+	{"git.sweep.trickle_per_min", "trickle ws/min"},
 	{"store.focused_workspaces", "focused set"},
 	{"git.blob_hash.batches", "blob-hash batches"},
 	{"git.blob_hash.largest_offender_bytes", "largest blob"},

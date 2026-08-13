@@ -430,6 +430,13 @@ func (s *Store) ApplyUpdate(u Update) {
 				if d.MachineSync != nil {
 					ws.MachineSync = d.MachineSync
 				}
+				// *bool: only the tiered sweep sets it — true when it has not
+				// reached this workspace yet this daemon lifetime, false on the
+				// delta carrying its first scan. Every other producer leaves it
+				// nil, so a note or plan delta can never claim git freshness.
+				if d.GitStatusPending != nil {
+					ws.GitStatusPending = *d.GitStatusPending
+				}
 			}
 		}
 
