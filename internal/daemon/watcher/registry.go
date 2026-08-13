@@ -13,6 +13,7 @@ import (
 	"github.com/grovetools/core/pkg/machine"
 	"github.com/grovetools/core/pkg/registry"
 	"github.com/grovetools/core/version"
+	syncdb "github.com/grovetools/daemon/internal/daemon/sync"
 )
 
 // registryScanInterval is how often the writer RE-EVALUATES this machine's
@@ -134,6 +135,17 @@ func (h *SyncHandler) writeRegistryNote(ctx context.Context) {
 	root, err := h.nodeNotespaceRoot(node)
 	if err != nil {
 		h.warnRegistryOnce(ctx, fmt.Sprintf("registry note skipped: cannot resolve a local root for notespace %q", sub.Name), err)
+		return
+	}
+	// Root-must-exist (W3.2). writeNoteAtomically below MkdirAlls the note's
+	// parent chain, which under a missing root resurrects the whole notebook
+	// tree at whatever path config resolved — the one write the daemon makes
+	// into a notebook would be the one that recreates a notebook the operator
+	// deleted or never materialized. The registry note is not important enough
+	// to conjure a root for; the machines/ subdirectory INSIDE an existing
+	// root is still created on demand.
+	if err := syncdb.RequireNotespaceRoot(root); err != nil {
+		h.warnRegistryOnce(ctx, fmt.Sprintf("registry note skipped: notespace %q has no materialized root", sub.Name), err)
 		return
 	}
 

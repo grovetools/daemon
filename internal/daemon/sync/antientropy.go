@@ -90,6 +90,22 @@ func (a *AntiEntropyPass) KickPending() bool { return len(a.kick) > 0 }
 // snapshot and diffs against the local filesystem, updating sync state for
 // matching files and enqueueing divergent ones.
 func (a *AntiEntropyPass) Run(ctx context.Context) error {
+	// Root-must-exist, before anything reads or enqueues (W3.2). This pass is
+	// the most destructive thing in the client: sweepMissingFile enqueues a
+	// document_deleted for every tracked document whose file is gone, so a
+	// notespace root that vanished — an unmounted volume, a deleted directory,
+	// a replica that was never materialized — would make the ENTIRE document
+	// set look deleted and replicate that deletion to the server and from
+	// there to every other machine. A missing root is a refusal, and the local
+	// state is left exactly as it is until the operator repairs the route.
+	if err := RequireNotespaceRoot(a.notespaceRoot); err != nil {
+		a.log.Error("anti-entropy pass refused: notespace root is missing").
+			Field("notespace", a.notespace).
+			Field("root", a.notespaceRoot).
+			Err(err).Log(ctx)
+		return err
+	}
+
 	// Server-epoch guard: the shared transport client performs the
 	// capabilities handshake exactly once, at construction, and is never
 	// reconnected — so a server recreated MID-RUN (disposable-VM redeploy)

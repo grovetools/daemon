@@ -865,21 +865,20 @@ func TestEnsurePipelinesRegistersBeforeRoutingAndParksDuplicateID(t *testing.T) 
 	defer db.Close()
 	st := store.New()
 	h := NewSyncHandler(st, nil, &config.SyncConfig{Workspaces: []config.SyncWorkspace{{Name: "a"}, {Name: "b"}}}, db, 50, 500)
-	h.baseCtx = context.Background()
+	baseCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	h.baseCtx = baseCtx
 	h.client = syncdb.NewClient(syncdb.ClientConfig{ServerURL: ts.URL, Token: "fixture", DeviceID: "device", OriginID: "origin"})
 	h.watchedPaths = map[string]*syncWatch{
 		rootA: {displayName: "a", root: rootA, space: syncdb.NewDocSpace(nil)},
 		rootB: {displayName: "b", root: rootB, space: syncdb.NewDocSpace(nil)},
 	}
-	// Keep the test synchronous: this id is treated as an already-running
-	// transport after the registration/duplicate classification boundary.
-	h.pipelines[id] = func() {}
 	updates := st.Subscribe()
 	defer st.Unsubscribe(updates)
 
 	h.ensurePipelines()
 	if registrations != 1 {
-		t.Fatalf("registrations=%d, want only first root registered", registrations)
+		t.Fatalf("registrations=%d, want only the first-seen root registered", registrations)
 	}
 	if h.watchedPaths[rootA].notespace != id || h.watchedPaths[rootB].notespace != "" {
 		t.Fatalf("routing: first=%q duplicate=%q", h.watchedPaths[rootA].notespace, h.watchedPaths[rootB].notespace)
@@ -887,14 +886,21 @@ func TestEnsurePipelinesRegistersBeforeRoutingAndParksDuplicateID(t *testing.T) 
 	select {
 	case update := <-updates:
 		payload, ok := update.Payload.(*store.SyncConflictPayload)
-		if update.Type != store.UpdateSyncConflict || !ok || payload.Kind != syncdb.ConflictKindRegistration || payload.NotespaceID != id {
+		if update.Type != store.UpdateSyncConflict || !ok || payload.Kind != syncdb.ConflictKindDuplicateStamp || payload.NotespaceID != id {
 			t.Fatalf("conflict update=%+v payload=%+v", update, payload)
 		}
+		if !strings.Contains(payload.Detail, rootA) || !strings.Contains(payload.Detail, rootB) {
+			t.Fatalf("duplicate evidence must name both roots: %q", payload.Detail)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("duplicate registration conflict was not broadcast")
+		t.Fatal("duplicate stamp conflict was not broadcast")
 	}
 	matches, err := filepath.Glob(filepath.Join(paths.StateDir(), "sync", "conflicts", id, "*"))
 	if err != nil || len(matches) != 1 {
-		t.Fatalf("registration conflict artifact matches=%v err=%v", matches, err)
+		t.Fatalf("duplicate stamp conflict artifact matches=%v err=%v", matches, err)
+	}
+	parked := h.ParkedNotespaces()
+	if len(parked) != 1 || parked[0].Root != rootB || parked[0].Keeper != rootA {
+		t.Fatalf("parked verdict = %+v", parked)
 	}
 }

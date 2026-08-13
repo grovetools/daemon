@@ -199,8 +199,10 @@ func TestMidRunRejectionResetsTheTransport(t *testing.T) {
 	// Register a pipeline the way ensurePipelines does, so the reset's
 	// teardown is observable.
 	pctx, pcancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	close(done)
 	h.pipelinesMu.Lock()
-	h.pipelines["testws"] = pcancel
+	h.pipelines["testws"] = &pipelineState{cancel: pcancel, done: done, root: "/notes/testws"}
 	h.pipelinesMu.Unlock()
 
 	// A live pipeline meets a rejected token; the server keeps rejecting so

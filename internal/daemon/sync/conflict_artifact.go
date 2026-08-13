@@ -36,6 +36,18 @@ const (
 	// ConflictKindRegistration records duplicate physical ids and server-side
 	// registration conflicts. Identity stamps are never document-merged.
 	ConflictKindRegistration = "registration"
+
+	// ConflictKindMissingRoot records an incoming apply refused because the
+	// notespace's recorded local root does not exist (W3.2). It is evidence,
+	// not a merge: nothing was written, and nothing will be until the operator
+	// materializes the root the config records.
+	ConflictKindMissingRoot = "missing_root"
+
+	// ConflictKindDuplicateStamp records the D8 runtime rule: two roots carry
+	// the same notespace stamp id, the first-seen one keeps syncing, and the
+	// later one is parked. The artifact names both roots so `grove doctor
+	// --fix` can re-mint whichever copy the operator designates.
+	ConflictKindDuplicateStamp = "duplicate_stamp"
 )
 
 // namedConflictKinds are the kinds that appear as a filename segment. Merge is
@@ -45,6 +57,8 @@ const (
 var namedConflictKinds = map[string]bool{
 	ConflictKindRegistryForeignWrite: true,
 	ConflictKindRegistration:         true,
+	ConflictKindMissingRoot:          true,
+	ConflictKindDuplicateStamp:       true,
 }
 
 const conflictArtifactSuffix = ".conflict.md"
@@ -52,13 +66,26 @@ const conflictArtifactSuffix = ".conflict.md"
 // WriteRegistrationConflict persists restart-safe evidence under the immutable
 // notespace id. It is intentionally separate from document merge machinery.
 func WriteRegistrationConflict(notespaceID, detail string) (string, error) {
+	return WriteNotespaceConflict(notespaceID, ConflictKindRegistration, detail)
+}
+
+// WriteNotespaceConflict persists restart-safe, notespace-level (as opposed to
+// document-level) evidence: a refusal or a parking decision, keyed by the
+// immutable notespace id and carrying its reason as the whole artifact body.
+// The kind rides in the filename because the conflicts endpoint rebuilds its
+// rows from these files and has nothing else to read.
+func WriteNotespaceConflict(notespaceID, kind, detail string) (string, error) {
+	if !namedConflictKinds[kind] {
+		return "", fmt.Errorf("conflict kind %q is not a notespace-level kind", kind)
+	}
 	dir := filepath.Join(paths.StateDir(), "sync", "conflicts", notespaceID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	name := conflictArtifactName(".notespace.toml", notespaceID, ConflictKindRegistration)
+	name := conflictArtifactName(".notespace.toml", notespaceID, kind)
 	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte("# Registration conflict\n\n"+detail+"\n"), 0o600); err != nil {
+	body := "# " + strings.ReplaceAll(kind, "_", " ") + " conflict\n\n" + detail + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil

@@ -315,3 +315,29 @@ func equalFold(a, b string) bool {
 	}
 	return true
 }
+
+// The presence note is the one write this handler makes into a notebook, and
+// writeNoteAtomically MkdirAlls its parent chain. Under a missing notespace
+// root that would resurrect the whole notebook tree — so the writer refuses
+// (Phase 3, W3.2) and leaves the recorded route for the operator to repair.
+func TestRegistryWriterRefusesAMissingNotespaceRoot(t *testing.T) {
+	h, root, id := registryFixture(t, `[machine]
+name = "fixture-a"
+`)
+	// The note writes normally while the root is there.
+	h.writeRegistryNote(t.Context())
+	readNote(t, root, id)
+
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	h.registryWarned = false
+	h.writeRegistryNote(t.Context())
+
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("the registry writer recreated the notespace root: %v", err)
+	}
+	if !h.registryWarned {
+		t.Fatal("the refusal was not surfaced to the operator")
+	}
+}

@@ -42,6 +42,11 @@ type PullPipeline struct {
 	OnRegistryForeignWrite func(notespace, path, detail string)
 	// OnConflict surfaces artifact-backed pull/identity conflicts to SSE.
 	OnConflict func(kind, notespace, path, documentID, detail string)
+
+	// missingRootReported is the root whose refusal has already been reported
+	// for the current episode (see refuseMissingRoot). Touched only from the
+	// pull goroutine.
+	missingRootReported string
 }
 
 // NewPullPipeline creates a pull pipeline for a notespace.
@@ -111,6 +116,18 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, notespaceRoot string) er
 
 		// Apply each event
 		if len(resp.Events) > 0 {
+			// Root-must-exist, checked ONCE per apply batch (W3.2). The cursor
+			// deliberately does not advance on refusal: the events are still
+			// owed to this machine and must replay unchanged once the operator
+			// materializes the recorded root.
+			if err := p.refuseMissingRoot(ctx, notespaceRoot); err != nil {
+				select {
+				case <-time.After(30 * time.Second):
+					continue
+				case <-ctx.Done():
+					return nil
+				}
+			}
 			for _, ev := range resp.Events {
 				if err := p.applyEvent(ctx, notespaceRoot, &ev); err != nil {
 					p.log.Error("failed to apply event").
@@ -137,6 +154,11 @@ func (p *PullPipeline) RunPullLoop(ctx context.Context, notespaceRoot string) er
 // It returns the manifest cursor it persisted, which the pull loop must adopt
 // as its resume point.
 func (p *PullPipeline) snaphotResync(ctx context.Context, notespaceRoot string) (int64, error) {
+	// Hydration is the largest incoming apply there is; refuse it whole rather
+	// than materializing a notespace root one document at a time.
+	if err := p.refuseMissingRoot(ctx, notespaceRoot); err != nil {
+		return 0, err
+	}
 	p.log.Debug("fetching snapshot manifest").Field("notespace", p.ws.Name).Log(ctx)
 
 	manifest, err := p.client.Snapshot(ctx, p.ws.Name)
@@ -217,9 +239,46 @@ func (p *PullPipeline) snaphotResync(ctx context.Context, notespaceRoot string) 
 	return manifest.Cursor, nil
 }
 
+// refuseMissingRoot is the per-batch root precondition (W3.2). It reports the
+// refusal exactly once per episode — to the log, to the conflicts feed as
+// durable evidence, and to OnConflict for the live SSE surface — because the
+// pull loop retries on a timer and an unmaterialized root is a condition that
+// persists for as long as the operator takes to fix it. A later successful
+// check re-arms the report, so a recurrence is not swallowed.
+func (p *PullPipeline) refuseMissingRoot(ctx context.Context, notespaceRoot string) error {
+	err := RequireNotespaceRoot(notespaceRoot)
+	if err == nil {
+		p.missingRootReported = ""
+		return nil
+	}
+	if p.missingRootReported == notespaceRoot {
+		return err
+	}
+	p.missingRootReported = notespaceRoot
+
+	p.log.Error("incoming apply refused: notespace root is missing").
+		Field("notespace", p.ws.Name).
+		Field("root", notespaceRoot).
+		Err(err).Log(ctx)
+	if _, werr := WriteNotespaceConflict(p.ws.Name, ConflictKindMissingRoot, err.Error()); werr != nil {
+		p.log.Warn("failed to record missing-root evidence").
+			Field("notespace", p.ws.Name).Err(werr).Log(ctx)
+	}
+	if p.OnConflict != nil {
+		p.OnConflict(ConflictKindMissingRoot, p.ws.Name, ".", "", err.Error())
+	}
+	return err
+}
+
 // applyEvent applies a single event: creates, updates, moves, or deletes a document.
 // Merge conflicts during update are recorded as conflict artifacts.
 func (p *PullPipeline) applyEvent(ctx context.Context, notespaceRoot string, ev *syncproto.SyncEvent) error {
+	// Defence in depth behind the per-batch check: applyEvent is also reached
+	// from the snapshot path and from callers that hold a root resolved on an
+	// earlier tick, and a root can vanish mid-batch.
+	if err := RequireNotespaceRoot(notespaceRoot); err != nil {
+		return err
+	}
 	if p.guardOwnRegistryNote(ctx, ev) {
 		return nil
 	}
@@ -258,7 +317,7 @@ func (p *PullPipeline) applyCreate(ctx context.Context, notespaceRoot string, ev
 	// Write to disk, restoring the origin's file mtime when the event carries
 	// one (zero = old server/client: keep the write time, as before).
 	filePath := p.joinPath(notespaceRoot, ev.Path)
-	if err := writeFile(filePath, content, ev.Mtime); err != nil {
+	if err := writeFileUnderRoot(notespaceRoot, filePath, content, ev.Mtime); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
@@ -328,7 +387,7 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, notespaceRoot string, ev
 	if localHash == doc.LastSyncedHash || localHash == ev.ContentHash {
 		// Fast-forward: disk becomes exactly the remote content, so the
 		// origin's mtime is restored with it (zero mtime = keep write time).
-		if err := writeFile(filePath, content, ev.Mtime); err != nil {
+		if err := writeFileUnderRoot(notespaceRoot, filePath, content, ev.Mtime); err != nil {
 			return fmt.Errorf("failed to write file: %w", err)
 		}
 		doc.ContentHash = ev.ContentHash
@@ -371,7 +430,7 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, notespaceRoot string, ev
 	// Merged bytes are neither side's file verbatim, so no fidelity mtime
 	// applies — the merge is a genuinely-new local modification (write time).
 	mergedContent := reconstructDocument(merged, frontmatterKeys(localContent), mergedBody)
-	if err := writeFile(filePath, mergedContent, time.Time{}); err != nil {
+	if err := writeFileUnderRoot(notespaceRoot, filePath, mergedContent, time.Time{}); err != nil {
 		return fmt.Errorf("failed to write merged file: %w", err)
 	}
 
@@ -405,7 +464,7 @@ func (p *PullPipeline) applyMove(ctx context.Context, notespaceRoot string, ev *
 	oldPath := p.joinPath(notespaceRoot, ev.PrevPath)
 	newPath := p.joinPath(notespaceRoot, ev.Path)
 
-	if err := moveFile(oldPath, newPath); err != nil {
+	if err := moveFileUnderRoot(notespaceRoot, oldPath, newPath); err != nil {
 		return fmt.Errorf("failed to move file: %w", err)
 	}
 	// Restore the origin's mtime after the rename (a move event carries the
@@ -475,7 +534,7 @@ func (p *PullPipeline) applyPrefixMove(ctx context.Context, notespaceRoot string
 	oldPath := p.joinPath(notespaceRoot, ev.PrevPath)
 	newPath := p.joinPath(notespaceRoot, ev.Path)
 
-	if err := moveFile(oldPath, newPath); err != nil {
+	if err := moveFileUnderRoot(notespaceRoot, oldPath, newPath); err != nil {
 		return fmt.Errorf("failed to move prefix: %w", err)
 	}
 

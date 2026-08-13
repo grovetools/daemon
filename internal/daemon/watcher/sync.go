@@ -118,12 +118,44 @@ type SyncHandler struct {
 	// pipelinesMu, same lifecycle as pipelines).
 	client      *syncdb.Client
 	clientMu    sync.RWMutex
-	pipelines   map[string]context.CancelFunc
+	pipelines   map[string]*pipelineState
 	aePasses    map[string]*syncdb.AntiEntropyPass
 	pipelinesMu sync.Mutex
 	baseCtx     context.Context
 	maintenance atomic.Bool
 	drainMu     sync.Mutex
+
+	// Pipeline lifecycle (sync_lifecycle.go). reconcileMu serializes whole
+	// reconcile passes — they are called from the transport tick, the unified
+	// watcher's path refresh, and the adoption notification, and a teardown
+	// interleaved with a start would leave orphaned transports. draining holds
+	// pipelines that were cancelled but whose goroutines have not all returned
+	// yet: no replacement pipeline for the same notespace id starts until the
+	// old one is provably gone, which is what makes a re-root generation-safe.
+	// configGeneration is bumped by every config reload and stamped onto each
+	// pipeline, so a pass that started under stale config never installs.
+	reconcileMu      sync.Mutex
+	draining         map[string]*pipelineState
+	configGeneration atomic.Uint64
+
+	// parked/contested are the notespaces this daemon refuses to sync, keyed
+	// by immutable id (sync_lifecycle.go): parked is the D8 duplicate-stamp
+	// verdict recomputed each pass, contested is the W3.5 adoption seam.
+	// Guarded by parkMu.
+	parkMu    sync.Mutex
+	parked    map[string]ParkedNotespace
+	contested map[string]string
+
+	// duplicateScannedAt rate-limits the containing-notebook duplicate-stamp
+	// sweep; zero duplicateScanInterval selects the production cadence.
+	duplicateScannedAt    time.Time
+	duplicateScanInterval time.Duration
+
+	// ContainmentAutoRegister enables W3.2's "containment is consent"
+	// inheritance (sync_containment.go). Dark by default and set by nothing in
+	// the daemon: its recorded input, `[notebooks.<name>.sync] share = true`,
+	// is the core half of Phase 3 and does not parse yet.
+	ContainmentAutoRegister bool
 
 	// Token-rejection state (sync_auth.go): the stale-token trap's detection,
 	// reporting, and reconnect-backoff machinery. transportInterval and the
@@ -175,8 +207,11 @@ func NewSyncHandler(st *store.Store, cfg *config.Config, syncCfg *config.SyncCon
 		maxWaitMs:    maxWaitMs,
 		timers:       make(map[string]*time.Timer),
 		firstSeen:    make(map[string]time.Time),
-		pipelines:    make(map[string]context.CancelFunc),
+		pipelines:    make(map[string]*pipelineState),
+		draining:     make(map[string]*pipelineState),
 		aePasses:     make(map[string]*syncdb.AntiEntropyPass),
+		parked:       make(map[string]ParkedNotespace),
+		contested:    make(map[string]string),
 		registryKick: make(chan struct{}, 1),
 	}
 	if db != nil {
@@ -508,6 +543,12 @@ func (h *SyncHandler) NotespaceRoots(ids []string) (map[string]string, error) {
 			if err != nil || stamp == nil {
 				continue
 			}
+			// A parked duplicate must not become an authorized apply target:
+			// its whole point is that it does not sync, and the escrow path
+			// writes into whatever root it is handed (W3.6 / D8).
+			if h.isParkedRoot(root) {
+				continue
+			}
 			for _, id := range ids {
 				if stamp.ID == id {
 					roots[id] = root
@@ -618,7 +659,12 @@ func computeNotespaceWatches(sub *config.SyncWorkspace, recordedRoot string, con
 // and pipeline creation immediately; the unified watcher's next normal refresh
 // installs the corresponding fsnotify directories.
 func (h *SyncHandler) AdoptedNotespace(root, displayName string) {
-	sub := h.subscription(displayName)
+	// The post-mint hook is exactly where "containment is consent" applies: a
+	// notespace that was just minted inside a shared notebook inherits that
+	// notebook's subscription instead of needing its own (W3.2). With
+	// containment dark, effectiveSubscription is the literal config lookup this
+	// always was.
+	sub := h.effectiveSubscription(displayName, root)
 	if sub == nil || sub.Mode == config.SyncModeSearchOnly {
 		return
 	}
@@ -641,7 +687,7 @@ func (h *SyncHandler) ComputeWatchPaths(notespaces []*models.EnrichedWorkspace) 
 		if node == nil {
 			continue
 		}
-		sub := h.subscription(node.Name)
+		sub := h.effectiveSubscription(node.Name, h.discoveredNotespaceRoot(node))
 		if sub == nil {
 			continue
 		}
@@ -695,6 +741,13 @@ func (h *SyncHandler) ComputeWatchPaths(notespaces []*models.EnrichedWorkspace) 
 		}
 		dirs := recordedContentDirs(root)
 		maps.Copy(newWatches, computeNotespaceWatches(&sub, root, dirs))
+	}
+
+	// Containment is consent (W3.2): stamped notespaces inside a shared
+	// notebook that neither an explicit subscription nor discovery covers.
+	// Dark unless ContainmentAutoRegister — see sync_containment.go.
+	for _, contained := range h.containedNotespaces(covered) {
+		maps.Copy(newWatches, computeNotespaceWatches(&contained.sub, contained.root, recordedContentDirs(contained.root)))
 	}
 
 	h.pathsMutex.Lock()
@@ -973,6 +1026,11 @@ func (h *SyncHandler) recordDelete(ctx context.Context, ws, rel string) {
 func (h *SyncHandler) HandleStoreUpdate(update store.Update) {
 	switch update.Type {
 	case store.UpdateConfigReload:
+		// The config/notebook delta W3.3 reacts to. Bumping BEFORE the reload
+		// is deliberate: a reconcile that raced this update and is mid-pass now
+		// observes a newer generation and abandons its remaining work instead
+		// of installing pipelines against config that is already superseded.
+		generation := h.bumpConfigGeneration()
 		if newCfg, err := config.LoadDefault(); err == nil {
 			h.cfg = newCfg
 			h.locator = workspace.NewNotebookLocator(newCfg)
@@ -990,6 +1048,16 @@ func (h *SyncHandler) HandleStoreUpdate(update store.Update) {
 			// (a `grove join` on a machine that has never synced) rather than
 			// waiting for the transport tick. Dormant on nil/empty config.
 			h.ensureDB()
+			h.ulog.Info("sync config reloaded").
+				Field("generation", generation).
+				Field("subscriptions", len(syncCfg.Workspaces)).
+				StructuredOnly().Emit()
+			// Reconcile now rather than at the next transport tick, so a
+			// removed subscription stops its pipelines promptly (W3.3) and a
+			// re-rooted notebook begins draining immediately. Off the store
+			// dispatch goroutine because a reconcile registers over the
+			// network; reconcileMu serializes it against the tick.
+			go h.ensurePipelines()
 		}
 		// A config reload is the structural change the writer cannot observe
 		// any other way: subscriptions and ecosystem declarations both live in
@@ -1251,12 +1319,6 @@ func (h *SyncHandler) probeServerEpoch(ctx context.Context, db *syncdb.DB) {
 	}
 }
 
-// ensurePipelines spawns push/pull/anti-entropy loops for any subscribed
-// notespace that has no running transport yet. Notespace roots come from two
-// sources: the discovery-driven watch set (push-side real trees), and — for
-// pull = true subscriptions — direct config resolution, so a pull replica
-// spawns even when code-notespace discovery finds nothing.
-// Idempotent; called on each transport tick and after watch-path updates.
 func registrationIntent(stamp *notespacepkg.NotespaceStamp) (string, error) {
 	machineCfg, err := config.LoadMachineConfig()
 	if err != nil {
@@ -1297,195 +1359,6 @@ func (h *SyncHandler) registerRoot(ctx context.Context, client *syncdb.Client, s
 		}
 	}
 	return nil
-}
-
-func (h *SyncHandler) ensurePipelines() {
-	h.clientMu.RLock()
-	client := h.client
-	h.clientMu.RUnlock()
-	// A client only exists once the DB is open (transportLoop connects after
-	// ensureDB), so db is non-nil here — the check keeps that ordering explicit
-	// rather than assumed.
-	db := h.database()
-	if client == nil || db == nil || h.baseCtx == nil {
-		return
-	}
-
-	// Display subscription -> root from the current watch set. Display names
-	// locate configuration only; registration replaces them with stamp ids
-	// before any DB or wire operation.
-	roots := make(map[string]string)
-	h.pathsMutex.RLock()
-	for _, w := range h.watchedPaths {
-		name := w.displayName
-		if name == "" { // direct test/legacy construction
-			name = w.notespace
-		}
-		if name != "" {
-			roots[name] = w.root
-		}
-	}
-	h.pathsMutex.RUnlock()
-
-	// Pull subscriptions are config-determined, not discovery-determined:
-	// merge in roots derived from sync.toml + notebook definitions so pull
-	// pipelines spawn even when the watch set is empty (pure notes satellite
-	// with an empty ~/code, or a replica tree that doesn't exist yet — the
-	// pull pipeline creates it). A discovery-derived root wins when both
-	// exist; in a centralized notebook layout they resolve identically.
-	pullRoots, err := h.configuredPullRoots()
-	if err != nil {
-		h.ulog.Error("sync routing configuration error; pipelines not started").Err(err).Log(h.baseCtx)
-		return
-	}
-	for name, root := range pullRoots {
-		if _, ok := roots[name]; !ok {
-			roots[name] = root
-		}
-	}
-
-	names := slices.Collect(maps.Keys(roots))
-	slices.SortFunc(names, func(a, b string) int { return strings.Compare(roots[a], roots[b]) })
-	seenIDs := make(map[string]string)
-	for _, displayName := range names {
-		root := roots[displayName]
-		stamp, err := notespacepkg.LoadNotespace(root)
-		if err != nil || stamp == nil {
-			if err == nil {
-				err = fmt.Errorf("notespace %q at %s has no .notespace.toml; run grove migrate (step 2)", displayName, root)
-			} else {
-				err = fmt.Errorf("load notespace identity at %s: %w", root, err)
-			}
-			h.ulog.Error("notespace registration failed; pipeline parked").Err(err).Field("root", root).Log(h.baseCtx)
-			continue
-		}
-		name := stamp.ID
-		// Check copied ids before registration so the parked root cannot mutate
-		// server-side display metadata or create any data-plane state.
-		if first, duplicate := seenIDs[name]; duplicate && first != root {
-			detail := fmt.Sprintf("duplicate notespace id %s: first root %s keeps syncing; later root %s is parked", name, first, root)
-			_, _ = syncdb.WriteRegistrationConflict(name, detail)
-			h.broadcastConflict(&store.SyncConflictPayload{Kind: syncdb.ConflictKindRegistration, NotespaceID: name, NotespaceName: stamp.Name, Path: ".notespace.toml", Detail: detail})
-			continue
-		}
-		seenIDs[name] = root
-		if err := h.registerRoot(h.baseCtx, client, stamp, root); err != nil {
-			h.ulog.Error("notespace registration failed; pipeline parked").Err(err).Field("root", root).Log(h.baseCtx)
-			continue
-		}
-
-		// Capture switches to immutable identity as soon as registration succeeds,
-		// including after a watch-set refresh when the transport already exists.
-		h.pathsMutex.Lock()
-		for _, watch := range h.watchedPaths {
-			if watch.root == root {
-				watch.notespace = name
-			}
-		}
-		h.pathsMutex.Unlock()
-
-		h.pipelinesMu.Lock()
-		_, running := h.pipelines[name]
-		if running {
-			h.pipelinesMu.Unlock()
-			continue
-		}
-		pctx, cancel := context.WithCancel(h.baseCtx)
-		h.pipelines[name] = cancel
-		h.pipelinesMu.Unlock()
-
-		sub := h.subscription(displayName)
-
-		push := syncdb.NewPushPipeline(db, client, name, h.ulog, syncdb.PushConfig{})
-		// Surface server-ceiling oversize skips as a sync_conflict SSE update
-		// (convertToAPIUpdate already forwards UpdateSyncConflict). The quiet
-		// per-notespace MaxFileSize skip stays in flush; this is the loud one.
-		push.OnOversizeSkipped = func(ws, path string, size, limit int64) {
-			h.broadcastConflict(&store.SyncConflictPayload{
-				Kind:        "oversize_skipped",
-				NotespaceID: ws,
-				Path:        path,
-				Detail:      fmt.Sprintf("%d bytes exceeds server blob ceiling %d", size, limit),
-			})
-		}
-		// Surface a push-side divergence (S5): the merged server head was pushed
-		// but the local file was left untouched, so it lags until the user runs
-		// `nb sync adopt`. Same SSE surfacing as an oversize skip.
-		push.OnDiverged = func(ws, path string) {
-			h.broadcastConflict(&store.SyncConflictPayload{
-				Kind:        "diverged",
-				NotespaceID: ws,
-				Path:        path,
-				Detail:      "local file lags the merged server head; run `nb sync adopt` to take it",
-			})
-		}
-		push.OnConflict = func(kind, ws, path, documentID, detail string) {
-			h.broadcastConflict(&store.SyncConflictPayload{Kind: kind, NotespaceID: ws, NotespaceName: stamp.Name, Path: path, DocumentID: documentID, Detail: detail})
-		}
-		go h.runWithRecovery(pctx, name, "push", func() error {
-			return push.RunPushLoop(pctx, root)
-		})
-
-		if sub != nil && sub.Pull {
-			idSub := *sub
-			idSub.Name = name
-			pull := syncdb.NewPullPipeline(&idSub, client, db, h.ulog)
-			// Own-note guard (registry-role subscriptions only): an inbound
-			// event for machines/<our id>.md cannot be a legitimate
-			// replication of our own write, because the registry is
-			// single-writer. Dropped and surfaced, never applied — see
-			// PullPipeline.guardOwnRegistryNote for why this is detection
-			// rather than prevention under the interim trust model.
-			pull.OwnMachineID = machine.ID()
-			pull.OnRegistryForeignWrite = func(ws, path, detail string) {
-				h.broadcastConflict(&store.SyncConflictPayload{
-					Kind:        syncdb.ConflictKindRegistryForeignWrite,
-					NotespaceID: ws,
-					Path:        path,
-					Detail:      detail,
-				})
-			}
-			pull.OnConflict = func(kind, ws, path, documentID, detail string) {
-				h.broadcastConflict(&store.SyncConflictPayload{Kind: kind, NotespaceID: ws, NotespaceName: stamp.Name, Path: path, DocumentID: documentID, Detail: detail})
-			}
-			go h.runWithRecovery(pctx, name, "pull", func() error {
-				return pull.RunPullLoop(pctx, root)
-			})
-		}
-
-		// Build the reconcile with the same per-notespace DocSpace the watcher
-		// uses (sub is already resolved above), so walk coverage and reconcile
-		// coverage judge the doc space identically.
-		ae := syncdb.NewAntiEntropyPass(db, client, name, root, syncdb.NewDocSpace(sub), h.ulog, syncdb.AntiEntropyConfig{})
-		// A recreated server is detected by whichever pass handshakes first,
-		// but CheckServerEpoch voids EVERY notespace's synced state and
-		// clears their outboxes. Fan the sweep out so the others re-push in
-		// this cycle rather than sitting empty until their own hourly tick.
-		ae.OnEpochReset = h.kickAntiEntropyExcept
-		h.pipelinesMu.Lock()
-		h.aePasses[name] = ae
-		h.pipelinesMu.Unlock()
-		go h.runWithRecovery(pctx, name, "anti-entropy", func() error {
-			// One immediate pass (initial reconciliation), then the loop.
-			if err := ae.Run(pctx); err != nil {
-				return err
-			}
-			return ae.RunAntiEntropyLoop(pctx)
-		})
-
-		// Materialize the sync_state row immediately so /api/sync/status
-		// reflects the subscription as soon as transport starts (readiness
-		// probes key on this; rows otherwise appear only on first activity).
-		if cur, err := db.GetNotespaceCursor(name); err == nil {
-			_ = db.UpdateNotespaceCursor(name, cur)
-		}
-
-		h.ulog.Info("sync transport started").
-			Field("notespace_id", name).
-			Field("notespace_name", stamp.Name).
-			Field("pull", sub != nil && sub.Pull).
-			StructuredOnly().Log(pctx)
-	}
 }
 
 // BeginMaintenance flushes debounce, reconcile, and push state synchronously.
@@ -1536,7 +1409,10 @@ func (h *SyncHandler) BeginMaintenance(ctx context.Context) error {
 		if loadErr != nil {
 			return loadErr
 		}
-		if stamp != nil {
+		// Parked duplicates are excluded here for the same reason they have no
+		// pipeline: a maintenance drain must not reconcile or push a root the
+		// daemon has decided is not the one that syncs.
+		if stamp != nil && !h.isParkedRoot(root) {
 			roots[stamp.ID] = root
 		}
 	}

@@ -247,12 +247,23 @@ func (h *SyncHandler) AuthFailure() (detail string, since time.Time, failing boo
 // outbox is in sync.db, so everything queued survives into the rebuilt
 // pipelines; nothing local is deleted or rewritten.
 func (h *SyncHandler) resetTransport(ctx context.Context) {
+	// Held for the same reason a reconcile pass holds it: a wholesale teardown
+	// interleaved with a start would leave a transport running with no entry in
+	// the map, invisible to every later reconcile.
+	h.reconcileMu.Lock()
+	defer h.reconcileMu.Unlock()
+
 	h.pipelinesMu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(h.pipelines))
-	for _, cancel := range h.pipelines {
-		cancels = append(cancels, cancel)
+	for id, state := range h.pipelines {
+		cancels = append(cancels, state.cancel)
+		// The replacement pipelines are built against a fresh client, but they
+		// are still the same notespaces at the same roots: park them as
+		// draining so the reconnect cannot start a second transport for a
+		// notespace whose old goroutines are still winding down.
+		h.draining[id] = state
 	}
-	h.pipelines = make(map[string]context.CancelFunc)
+	h.pipelines = make(map[string]*pipelineState)
 	h.aePasses = make(map[string]*syncdb.AntiEntropyPass)
 	h.pipelinesMu.Unlock()
 
