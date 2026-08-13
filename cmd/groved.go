@@ -937,7 +937,9 @@ func newGrovedStartCmd() *cobra.Command {
 					}, daemonchannels.HAConfig{
 						Enabled:          notifyCfg.HomeAssistant.Enabled,
 						WebhookPort:      notifyCfg.HomeAssistant.WebhookPort,
+						WebhookBind:      notifyCfg.HomeAssistant.WebhookBind,
 						WebhookSecret:    notifyCfg.HomeAssistant.WebhookSecret,
+						WebhookSecretErr: notifyCfg.HomeAssistant.WebhookSecretErr,
 						URL:              notifyCfg.HomeAssistant.URL,
 						Token:            notifyCfg.HomeAssistant.Token,
 						DefaultSatellite: notifyCfg.HomeAssistant.DefaultSatellite,

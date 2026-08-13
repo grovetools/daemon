@@ -39,9 +39,17 @@ type SignalConfig struct {
 
 // HAConfig holds the configuration needed to create a Home Assistant channel.
 type HAConfig struct {
-	Enabled          bool
-	WebhookPort      int
-	WebhookSecret    string
+	Enabled     bool
+	WebhookPort int
+	// WebhookBind is the interface the inbound webhook listener binds to.
+	// Empty means loopback (127.0.0.1); the channel refuses to serve on a
+	// broader interface unless the operator sets this explicitly.
+	WebhookBind   string
+	WebhookSecret string
+	// WebhookSecretErr carries a secret-resolution failure (e.g. a failed
+	// webhook_secret_command) so the channel fails CLOSED instead of opening
+	// an unauthenticated endpoint.
+	WebhookSecretErr string
 	URL              string
 	Token            string
 	DefaultSatellite string
@@ -175,7 +183,9 @@ func (m *Manager) Start(ctx context.Context) {
 		m.mu.Lock()
 		haCh := ha.NewChannel(ha.Config{
 			WebhookPort:      m.haCfg.WebhookPort,
+			WebhookBind:      m.haCfg.WebhookBind,
 			WebhookSecret:    m.haCfg.WebhookSecret,
+			WebhookSecretErr: m.haCfg.WebhookSecretErr,
 			HAURL:            m.haCfg.URL,
 			HAToken:          m.haCfg.Token,
 			DefaultSatellite: m.haCfg.DefaultSatellite,
