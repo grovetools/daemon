@@ -613,13 +613,24 @@ func (h *SyncHandler) AdoptContested(notespaceID string) (ContestedNotespace, st
 	entry, ok := h.contested[notespaceID]
 	h.parkMu.Unlock()
 	if !ok {
-		return ContestedNotespace{}, "", fmt.Errorf("notespace %s is not contested; nothing to adopt", notespaceID)
+		// Wrapped in the sentinel so the HTTP layer can keep its promise that a
+		// script can tell the operator's mistake from a broken daemon.
+		return ContestedNotespace{}, "", fmt.Errorf("notespace %s is not contested; nothing to adopt: %w", notespaceID, syncdb.ErrNotContested)
 	}
 	receipt, err := syncdb.RecordAdoption(notespaceID, entry.Root, entry.Detail)
 	if err != nil {
 		return entry, "", fmt.Errorf("record adoption receipt for %s: %w", notespaceID, err)
 	}
 	h.ClearContested(notespaceID)
+	// The case has an explicit positive resolution, and the operator has just
+	// been told incoming writes resume; leaving the artifact in place would
+	// have `grove sync conflicts` still reporting it. Best effort: the receipt
+	// is the decision, and a stale artifact must not fail an adoption that
+	// already took effect.
+	if err := syncdb.RetireNotespaceConflict(notespaceID, syncdb.ConflictKindAdoption); err != nil {
+		h.ulog.Warn("adoption receipt written, but its conflict artifact could not be retired").
+			Field("notespace_id", notespaceID).Err(err).Log(h.baseCtx)
+	}
 	h.ulog.Info("notespace adopted: incoming applies resume").
 		Field("notespace_id", notespaceID).
 		Field("root", entry.Root).

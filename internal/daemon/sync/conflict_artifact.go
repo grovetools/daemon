@@ -99,6 +99,26 @@ func WriteNotespaceConflict(notespaceID, kind, detail string) (string, error) {
 	return path, nil
 }
 
+// RetireNotespaceConflict removes the notespace-level artifact of one kind, if
+// it is there. It is the counterpart of WriteNotespaceConflict for the one kind
+// that has an explicit positive resolution act: an adoption tells the operator
+// "incoming writes resume", and a conflicts feed that keeps reporting the case
+// they just resolved is a feed they stop believing.
+//
+// Absence is success — the case may have been resolved on an earlier run, or
+// the artifact removed by hand.
+func RetireNotespaceConflict(notespaceID, kind string) error {
+	if !namedConflictKinds[kind] {
+		return fmt.Errorf("conflict kind %q is not a notespace-level kind", kind)
+	}
+	path := filepath.Join(paths.StateDir(), "sync", "conflicts", notespaceID,
+		conflictArtifactName(".notespace.toml", notespaceID, kind))
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // conflictArtifactName builds the artifact filename for one conflict.
 //
 //	merge:                 <path>.<document_id>.conflict.md

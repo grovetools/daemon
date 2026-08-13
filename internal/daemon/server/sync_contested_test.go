@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -102,8 +104,8 @@ func TestHandleSyncAdoptContestedReportsAnUncontestedNotespaceAsConflict(t *test
 	s := New(false)
 	s.SetSyncContested(
 		func() []syncdb.ContestedNotespace { return nil },
-		func(string) (syncdb.ContestedNotespace, string, error) {
-			return syncdb.ContestedNotespace{}, "", errNotContested{}
+		func(id string) (syncdb.ContestedNotespace, string, error) {
+			return syncdb.ContestedNotespace{}, "", fmt.Errorf("notespace %s is not contested; nothing to adopt: %w", id, syncdb.ErrNotContested)
 		})
 	w := httptest.NewRecorder()
 	s.handleSyncAdoptContested(w, httptest.NewRequest(http.MethodPost, "/api/sync/contested/adopt", bytes.NewBufferString(`{"notespace_id":"01NS"}`)))
@@ -112,9 +114,23 @@ func TestHandleSyncAdoptContestedReportsAnUncontestedNotespaceAsConflict(t *test
 	}
 }
 
-type errNotContested struct{}
-
-func (errNotContested) Error() string { return "notespace 01NS is not contested; nothing to adopt" }
+// F9 of the W3.5 review: adoption ALSO fails when the receipt cannot be
+// written, and a 409 there tells a script the operator made a mistake when in
+// fact the daemon could not record the decision. The distinction rides the
+// sentinel, not the message text.
+func TestHandleSyncAdoptContestedReportsAReceiptFailureAsServerError(t *testing.T) {
+	s := New(false)
+	s.SetSyncContested(
+		func() []syncdb.ContestedNotespace { return nil },
+		func(id string) (syncdb.ContestedNotespace, string, error) {
+			return contestedFixture(), "", fmt.Errorf("record adoption receipt for %s: %w", id, errors.New("no space left on device"))
+		})
+	w := httptest.NewRecorder()
+	s.handleSyncAdoptContested(w, httptest.NewRequest(http.MethodPost, "/api/sync/contested/adopt", bytes.NewBufferString(`{"notespace_id":"01NS"}`)))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500 for a receipt the daemon could not write; body=%s", w.Code, w.Body.String())
+	}
+}
 
 func TestContestedEndpointsRejectTheWrongMethod(t *testing.T) {
 	s := New(false)

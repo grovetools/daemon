@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -86,7 +87,7 @@ func TestAdoptContestedRecordsAReceiptAndRestoresPull(t *testing.T) {
 	if _, statErr := os.Stat(receipt); statErr != nil {
 		t.Fatalf("adoption receipt %s is not on disk: %v", receipt, statErr)
 	}
-	if !syncdb.AdoptionRecorded(idA) {
+	if !syncdb.AdoptionRecorded(idA, root) {
 		t.Fatal("the adoption receipt is not where the pull gate looks for it")
 	}
 	if len(lh.h.ContestedDetails()) != 0 {
@@ -111,5 +112,44 @@ func TestAdoptContestedRefusesAnUncontestedNotespace(t *testing.T) {
 	}
 	if _, _, err := lh.h.AdoptContested(""); err == nil {
 		t.Fatal("adoption accepted an empty notespace id")
+	}
+}
+
+// F7: the conflicts feed is artifact-backed, so the case the gate wrote has to
+// be retired by the act that resolves it. An operator told "incoming writes
+// resume" must not still see the notespace listed as contested.
+func TestAdoptContestedRetiresTheConflictArtifact(t *testing.T) {
+	lh := newLifecycleHarness(t)
+	root := lh.notespace(t, "alpha", idA)
+	lh.subscribe(config.SyncWorkspace{Name: "alpha", Role: config.SyncRolePeer, Pull: true})
+	lh.watch(map[string]string{"alpha": root})
+
+	artifact, err := syncdb.WriteNotespaceConflict(idA, syncdb.ConflictKindAdoption, "the gate's evidence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lh.h.markContestedFromPull(root, syncdb.AdoptionEvidence{
+		NotespaceID: idA, Root: root, Divergent: 1,
+		Collisions: []syncdb.AdoptionCollision{{Path: "notes/a.md"}},
+	})
+
+	if _, _, err := lh.h.AdoptContested(idA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("`grove sync conflicts` still reports the resolved adoption case: %v", err)
+	}
+}
+
+// F8: the two ways adoption fails are different failures, and a script has to
+// tell them apart. "Not contested" carries the sentinel; nothing else does.
+func TestAdoptContestedMarksAnUncontestedNotespaceWithTheSentinel(t *testing.T) {
+	lh := newLifecycleHarness(t)
+	_, _, err := lh.h.AdoptContested(idA)
+	if err == nil {
+		t.Fatal("adopting a notespace that is not contested was accepted")
+	}
+	if !errors.Is(err, syncdb.ErrNotContested) {
+		t.Fatalf("error %v does not carry ErrNotContested; the HTTP layer cannot tell it from a broken daemon", err)
 	}
 }

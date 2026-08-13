@@ -15,6 +15,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -103,7 +104,16 @@ func (s *Server) handleSyncAdoptContested(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		// A notespace that is not contested is the operator's mistake, not the
 		// daemon's failure — 409, so a script can tell it from a broken daemon.
-		http.Error(w, err.Error(), http.StatusConflict)
+		// Everything else IS the daemon's failure: adoption also errors when
+		// the receipt cannot be written (disk full, bad perms, no resolvable
+		// state dir), and a 409 there would tell a script the exact opposite of
+		// what happened. The distinction rides a sentinel rather than the
+		// message text.
+		if errors.Is(err, syncdb.ErrNotContested) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

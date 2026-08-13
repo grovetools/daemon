@@ -42,7 +42,9 @@ package sync
 // is an ordinary synced notespace and ordinary merge machinery governs it.
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -52,6 +54,13 @@ import (
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/syncproto"
 )
+
+// ErrNotContested is the sentinel behind "this notespace is not contested".
+// Adoption has exactly two failure shapes and an operator's script has to tell
+// them apart: naming a notespace that is not withheld is the operator's
+// mistake, and a receipt that could not be written is the daemon's failure.
+// The HTTP layer maps this one to 409 and everything else to 500.
+var ErrNotContested = errors.New("notespace is not contested")
 
 // IncomingDocument is one document an incoming batch would write: the wire path
 // and the content hash the server holds for it. Both the snapshot manifest and
@@ -93,6 +102,11 @@ type AdoptionCollision struct {
 	IncomingHash string `json:"incoming_hash"`
 	// Identical is the per-path half of the hash-overlap evidence.
 	Identical bool `json:"identical"`
+	// Unreadable marks a local file that is present but could not be read
+	// (mode 000, an EACCES on the parent). It is un-synced local content the
+	// apply path would replace, so it collides — but its hash is unknown, so
+	// it can never be identical and the operator is told which one it is.
+	Unreadable bool `json:"unreadable,omitempty"`
 }
 
 // AdoptionEvidence is the whole verdict for one notespace: what collides, how
@@ -108,6 +122,11 @@ type AdoptionEvidence struct {
 	Identical int `json:"identical"`
 	Divergent int `json:"divergent"`
 	Clean     int `json:"clean"`
+	// Rejected counts incoming documents whose path does not resolve inside
+	// the root. The apply paths refuse them, so they cannot write over
+	// anything and must not contest; they are counted so the evidence does not
+	// silently drop a document the server claims to hold.
+	Rejected int `json:"rejected,omitempty"`
 	// LocalSubject is this root's stamp subject. ServerSubject is the
 	// server's row for the incoming notespace, or "" when the inventory could
 	// not be read — reported as unknown rather than silently as a match.
@@ -151,13 +170,19 @@ func (e AdoptionEvidence) Detail() string {
 	default:
 		fmt.Fprintf(&b, "subject match: unknown (the server's inventory could not be read for this notespace).\n")
 	}
+	if e.Rejected > 0 {
+		fmt.Fprintf(&b, "%d incoming document(s) name a path outside this root and were ignored; the apply path refuses them too.\n", e.Rejected)
+	}
 	b.WriteString("No writes enter this notespace until it is adopted; local work still pushes.\n")
 	for _, collision := range e.Collisions {
-		state := "differs"
-		if collision.Identical {
+		state, local := "differs", shortHash(collision.LocalHash)
+		switch {
+		case collision.Unreadable:
+			state, local = "unreadable", "(cannot read)"
+		case collision.Identical:
 			state = "identical"
 		}
-		fmt.Fprintf(&b, "  %-9s %s (local %s, server %s)\n", state, collision.Path, shortHash(collision.LocalHash), shortHash(collision.IncomingHash))
+		fmt.Fprintf(&b, "  %-10s %s (local %s, server %s)\n", state, collision.Path, local, shortHash(collision.IncomingHash))
 	}
 	fmt.Fprintf(&b, "Adopt it with `grove sync adopt-notespace %s --confirm` once the evidence above says these are the same notes.\n", e.NotespaceID)
 	return b.String()
@@ -183,7 +208,13 @@ func shortHash(h string) string {
 // row for is one it has synced before, so an incoming write to it is ordinary
 // replication (and, on divergence, an ordinary merge conflict) rather than an
 // adoption case. Only paths with no row can be pre-existing local notes.
-func DetectAdoption(notespaceID, root string, incoming []IncomingDocument, tracked func(path string) bool, localSubject, serverSubject string) AdoptionEvidence {
+//
+// tracked returns an ERROR rather than a bool alone, and that error aborts the
+// whole verdict. A sync.db that cannot be read is not evidence that a path is
+// untracked; answering "tracked" on a database error would clear every
+// collision and wave the batch through, which is the one direction this gate
+// must never fail in. The caller withholds and retries instead.
+func DetectAdoption(notespaceID, root string, incoming []IncomingDocument, tracked func(path string) (bool, error), localSubject, serverSubject string) (AdoptionEvidence, error) {
 	evidence := AdoptionEvidence{
 		NotespaceID:   notespaceID,
 		Root:          root,
@@ -198,34 +229,70 @@ func DetectAdoption(notespaceID, root string, incoming []IncomingDocument, track
 		seen[doc.Path] = true
 
 		local := filepath.Join(root, filepath.FromSlash(doc.Path))
-		content, err := os.ReadFile(local)
-		if err != nil {
-			// Absent (the common case) or unreadable: nothing local is at
-			// risk from this write.
+		// The same containment rule both apply paths run on this input. A
+		// server row of ../../x cannot be applied, so it must not be read,
+		// hashed, or allowed to contest the notespace — that would hold a
+		// tree hostage over a document that was going to be rejected anyway.
+		if err := requireUnderRoot(root, local); err != nil {
+			evidence.Rejected++
+			continue
+		}
+		// Stat before read, and read only what the gate is actually about: an
+		// untracked path with a local file on it. The gate now runs on every
+		// batch (see PullPipeline.guardAdoption), so the ordinary case — an
+		// incoming write to a path this machine already syncs — must not cost
+		// a full read of the local file every time.
+		if info, statErr := os.Lstat(local); statErr == nil && info.IsDir() {
+			// A document write cannot replace a directory: the apply fails
+			// loudly instead of overwriting anything.
+			evidence.Clean++
+			continue
+		} else if statErr != nil && errors.Is(statErr, fs.ErrNotExist) {
+			// Nothing local is at risk from this write.
 			evidence.Clean++
 			continue
 		}
-		if tracked != nil && tracked(doc.Path) {
-			// Already a synced document here — replication, not adoption.
+		if tracked != nil {
+			isTracked, err := tracked(doc.Path)
+			if err != nil {
+				return AdoptionEvidence{}, fmt.Errorf("adoption gate could not read the sync state of %s: %w", doc.Path, err)
+			}
+			if isTracked {
+				// Already a synced document here — replication, not adoption.
+				continue
+			}
+		}
+		content, readErr := os.ReadFile(local)
+		if readErr != nil && errors.Is(readErr, fs.ErrNotExist) {
+			// Raced away between the stat and the read.
+			evidence.Clean++
 			continue
 		}
 		collision := AdoptionCollision{
 			Path:         doc.Path,
-			LocalHash:    hashContent(content),
 			IncomingHash: doc.Hash,
 		}
-		collision.Identical = collision.LocalHash == collision.IncomingHash
-		if collision.Identical {
-			evidence.Identical++
-		} else {
+		if readErr != nil {
+			// Present but unreadable. applyCreate will replace it, so it is
+			// exactly the un-synced local content this gate protects; its
+			// hash is unknown, so it can never read as identical.
+			collision.Unreadable = true
 			evidence.Divergent++
+		} else {
+			collision.LocalHash = hashContent(content)
+			collision.Identical = collision.LocalHash == collision.IncomingHash
+			if collision.Identical {
+				evidence.Identical++
+			} else {
+				evidence.Divergent++
+			}
 		}
 		evidence.Collisions = append(evidence.Collisions, collision)
 	}
 	sort.Slice(evidence.Collisions, func(i, j int) bool {
 		return evidence.Collisions[i].Path < evidence.Collisions[j].Path
 	})
-	return evidence
+	return evidence, nil
 }
 
 // ContestedNotespace is one notespace withheld by the gate, and the evidence
@@ -283,9 +350,19 @@ func AdoptionReceiptPath(notespaceID string) string {
 
 // RecordAdoption writes the durable receipt for an operator's adoption. It is
 // idempotent: adopting twice rewrites the same path with the later decision.
+//
+// The ROOT is part of the decision, not decoration. The operator adopted the
+// tree they were shown evidence about; under D8 one id can have two physical
+// roots, and W3.4's `notespace move` carries an id into a different tree
+// entirely. A receipt that only named the id would silently disable the gate
+// for a root nobody ever looked at, so the root is recorded here and checked
+// by AdoptionRecorded.
 func RecordAdoption(notespaceID, root, detail string) (string, error) {
 	if notespaceID == "" {
 		return "", fmt.Errorf("adoption requires a notespace id")
+	}
+	if strings.TrimSpace(root) == "" {
+		return "", fmt.Errorf("adoption requires the root it was decided for; a receipt that names no root cannot be verified against the tree it would unblock")
 	}
 	if err := os.MkdirAll(adoptionReceiptDir(), 0o700); err != nil {
 		return "", err
@@ -304,14 +381,78 @@ func RecordAdoption(notespaceID, root, detail string) (string, error) {
 }
 
 // AdoptionRecorded reports whether this notespace has already been adopted on
-// this machine. An unreadable receipts directory reads as "not adopted": the
-// conservative direction is to withhold writes, never to let them through.
-func AdoptionRecorded(notespaceID string) bool {
-	if notespaceID == "" {
+// this machine FOR THIS ROOT. An unreadable, unparseable, or root-mismatched
+// receipt reads as "not adopted": the conservative direction is to withhold
+// writes, never to let them through.
+//
+// The root is compared physically (symlinks resolved), the same way
+// requireUnderRoot compares a server-supplied path against the root, so the
+// /var -> /private/var aliasing the rest of the daemon tolerates does not read
+// as a different tree.
+func AdoptionRecorded(notespaceID, root string) bool {
+	if notespaceID == "" || strings.TrimSpace(root) == "" {
 		return false
 	}
-	_, err := os.Stat(AdoptionReceiptPath(notespaceID))
-	return err == nil
+	receipt, err := readAdoptionReceipt(AdoptionReceiptPath(notespaceID))
+	if err != nil {
+		return false
+	}
+	return samePhysicalPath(receipt.Root, root)
+}
+
+// adoptionReceipt is the decision on disk: which notespace, and which tree it
+// was decided for.
+type adoptionReceipt struct {
+	NotespaceID string
+	Root        string
+}
+
+// readAdoptionReceipt parses a receipt written by RecordAdoption. It reads the
+// exact shape that function writes — `key = "value"` with quoteTOML's escapes —
+// rather than reaching for a general parser, so the two halves cannot drift.
+func readAdoptionReceipt(path string) (adoptionReceipt, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return adoptionReceipt{}, err
+	}
+	var out adoptionReceipt
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || strings.HasPrefix(strings.TrimSpace(key), "#") {
+			continue
+		}
+		unquoted, ok := unquoteTOML(strings.TrimSpace(value))
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "notespace_id":
+			out.NotespaceID = unquoted
+		case "root":
+			out.Root = unquoted
+		}
+	}
+	if out.Root == "" {
+		return adoptionReceipt{}, fmt.Errorf("adoption receipt %s records no root", path)
+	}
+	return out, nil
+}
+
+// samePhysicalPath reports whether two recorded roots name the same directory.
+// Neither side has to exist: a receipt outlives the tree it names, and an
+// adoption for a root that is currently absent is still an adoption for that
+// root, not for whatever else the id resolves to now.
+func samePhysicalPath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	resolve := func(p string) string {
+		if resolved, err := resolveExisting(p); err == nil {
+			return filepath.Clean(resolved)
+		}
+		return filepath.Clean(p)
+	}
+	return resolve(a) == resolve(b)
 }
 
 // ForgetAdoption removes a receipt. It exists for tests and for an operator
@@ -327,4 +468,39 @@ func ForgetAdoption(notespaceID string) error {
 func quoteTOML(value string) string {
 	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\t", `\t`, "\r", `\r`)
 	return `"` + replacer.Replace(value) + `"`
+}
+
+// unquoteTOML reverses quoteTOML. ok is false for anything that is not one of
+// its strings, so a hand-edited receipt is refused rather than half-read.
+func unquoteTOML(value string) (string, bool) {
+	if len(value) < 2 || !strings.HasPrefix(value, `"`) || !strings.HasSuffix(value, `"`) {
+		return "", false
+	}
+	body := value[1 : len(value)-1]
+	var b strings.Builder
+	for i := 0; i < len(body); i++ {
+		if body[i] != '\\' {
+			b.WriteByte(body[i])
+			continue
+		}
+		i++
+		if i >= len(body) {
+			return "", false
+		}
+		switch body[i] {
+		case '\\':
+			b.WriteByte('\\')
+		case '"':
+			b.WriteByte('"')
+		case 'n':
+			b.WriteByte('\n')
+		case 't':
+			b.WriteByte('\t')
+		case 'r':
+			b.WriteByte('\r')
+		default:
+			return "", false
+		}
+	}
+	return b.String(), true
 }

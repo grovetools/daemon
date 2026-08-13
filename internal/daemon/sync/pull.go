@@ -55,11 +55,10 @@ type PullPipeline struct {
 	// for the current episode (see refuseMissingRoot). Touched only from the
 	// pull goroutine.
 	missingRootReported string
-	// adoptionSettled records that this pipeline has already answered the
-	// adoption question — either because nothing collided or because a receipt
-	// says the operator adopted. Touched only from the pull goroutine. It is
-	// per-pipeline on purpose: MarkContested tears the pipeline down, so the
-	// pipeline that runs after an adoption is a new one with a fresh answer.
+	// adoptionSettled records that the operator's ADOPTION receipt has been
+	// seen for this root, which is the only thing that retires the gate for the
+	// life of the pipeline. A clean batch settles nothing — no batch is the
+	// tree. Touched only from the pull goroutine. See guardAdoption.
 	adoptionSettled bool
 	// adoptionReported keeps a withheld batch from re-announcing itself. The
 	// pull loop retries on a timer and teardown is not instantaneous, so
@@ -326,35 +325,62 @@ func (p *PullPipeline) refuseMissingRoot(ctx context.Context, notespaceRoot stri
 // guardAdoption is the W3.5 pre-apply gate: it answers "would this batch write
 // over notes this machine has never synced?" before any handler touches disk.
 //
-// It runs at most once per pipeline in the settled case. An adoption verdict is
-// a property of the TREE, not of a batch — once the answer is "nothing
-// collides" (or "the operator adopted"), re-reading every incoming path off
-// disk on every ten-second tick would buy nothing. The unsettled case does not
-// linger either: a contested notespace loses its pull pipeline, so this gate
-// runs a handful of times at most before the transport is gone.
+// EVERY batch is evaluated. A clean verdict settles nothing, because no batch
+// is the tree: `PullEvents` returns a bounded window, so a shared notebook with
+// more events than fit in one is split across batches, and a machine whose
+// un-synced notes collide with a path in batch 2 would have had that batch
+// applied unchecked by a flag set from batch 1. The same hole arrives more
+// slowly on a hydrated notespace — a server document landing on a note the
+// operator wrote locally in the meantime is the identical case, just later.
+// Only the operator's ADOPTION settles the question, which is what the receipt
+// below is.
+//
+// The cost of that is one stat per incoming path in the batch, plus a sync.db
+// lookup and a read only where a local file actually sits on an incoming path
+// (DetectAdoption's ordering). The one expensive leg — the server's inventory,
+// for the subject evidence — is fetched only once a collision has already been
+// found, because it is evidence for the operator's decision and never part of
+// the verdict.
 func (p *PullPipeline) guardAdoption(ctx context.Context, notespaceRoot string, incoming []IncomingDocument) error {
 	if p.adoptionSettled || len(incoming) == 0 {
 		return nil
 	}
 	// An adopted notespace is an ordinary synced notespace. Without this the
 	// same untracked collision would be re-detected after every daemon restart
-	// and the notespace would re-contest itself forever.
-	if AdoptionRecorded(p.ws.Name) {
+	// and the notespace would re-contest itself forever. The receipt is checked
+	// against THIS root: one id can have two physical roots (D8) and an id
+	// survives a move (W3.4), so an adoption made for another tree is not an
+	// adoption for this one.
+	if AdoptionRecorded(p.ws.Name, notespaceRoot) {
 		p.adoptionSettled = true
 		return nil
 	}
 
-	tracked := func(path string) bool {
+	tracked := func(path string) (bool, error) {
 		doc, err := p.db.GetDocumentByPath(p.ws.Name, path)
-		// An unreadable row is not evidence that the path is untracked, and
-		// treating it as such would contest a notespace over a database error.
-		return err != nil || doc != nil
+		if err != nil {
+			return false, err
+		}
+		return doc != nil, nil
 	}
-	evidence := DetectAdoption(p.ws.Name, notespaceRoot, incoming, tracked, p.localSubject(notespaceRoot), p.serverSubject(ctx))
+	evidence, err := DetectAdoption(p.ws.Name, notespaceRoot, incoming, tracked, p.localSubject(notespaceRoot), "")
+	if err != nil {
+		// A sync.db that cannot be read leaves the gate with no verdict at
+		// all. Withhold and retry on the existing timer: the batch is still
+		// owed to this machine, and the one thing that must not happen is
+		// letting it through because a lookup failed. Nothing is contested —
+		// this is a daemon fault, not the operator's decision to make.
+		p.log.Error("incoming apply withheld: the adoption gate could not read local sync state").
+			Field("notespace", p.ws.Name).
+			Field("root", notespaceRoot).
+			Err(err).Log(ctx)
+		return err
+	}
 	if !evidence.Contested() {
-		p.adoptionSettled = true
 		return nil
 	}
+	// Contested: now the subject leg of the evidence is worth a round trip.
+	evidence.ServerSubject = p.serverSubject(ctx)
 
 	withheld := fmt.Errorf("notespace %s is contested: %d incoming path(s) would overwrite un-synced local notes; adopt it before it takes writes",
 		p.ws.Name, evidence.Divergent)
