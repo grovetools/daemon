@@ -44,6 +44,30 @@ types_registry_test.go:63: allUpdateTypes is missing 1 constant(s): [UpdateForge
 | **Not P3** | predates the P3 base; P3 touches no store update type |
 | **Owner** | forgepoll. One line in `allUpdateTypes` clears it. |
 
+### `internal/daemon/watcher` — `TestFlowHoldLifecycleIsNotLostToDebounce`
+
+```
+flow_test.go:255: filesystem watcher did not publish lifecycle "" before debounce window
+```
+
+| | |
+|---|---|
+| **Failing since** | not cheaply identifiable — see below. Red at daemon `main` `d496e03` paired with core `main` `ee6147f` (3/3 runs), and at `8811e5e` (2026-08-11), the oldest candidate that still builds. |
+| **Cause** | the *unhold* edge, not the hold. `awaitLifecycle("hold")` passes; `awaitLifecycle("")` times out, and the snapshot at failure still reads `Lifecycle:hold` at `Revision:1` — so `SetHold(dir, false)` never reaches the plan index at all, rather than reaching it late. |
+| **Not P3** | `git diff main..HEAD` over `internal/daemon/watcher` is `sync_*` files only; `flow.go`, `flow_test.go` and `plan_index.go` are untouched by every P3 commit. The test also fails with all three repos at `main`, before any P3 commit exists. |
+| **Owner** | the flow watcher's plan-index publish path. The test was introduced by `79a636a` (2026-07-23) — *fix(watcher): publish plan lifecycle edges immediately* — to guard exactly this, so it once passed. |
+
+Deterministic (5/5 at the P3 heads, 3/3 at `main`), not flaky — do not re-run it hoping.
+
+The introducing commit is left undetermined on purpose. The natural suspects are
+the three `perf(flow-watcher)` commits of 2026-08-09 (`308439b`, `e0456c3`,
+`f6e0fbf` — the last two fence and filter the publish path) and `29421e3`
+(2026-08-07), but none of them builds against the current ecosystem: the
+notespace layout cutover landed between them and today, so a historical daemon
+paired with a same-dated core still fails to compile. A real bisect needs all 26
+`go.work` repos pinned to the same instant, which is worth doing when this is
+fixed and not to satisfy a declaration.
+
 ### `internal/daemon/server` — `TestBootEndpointAdvancesInBindMode`, `TestBootPhaseBroadcastReachesStream`
 
 ```
