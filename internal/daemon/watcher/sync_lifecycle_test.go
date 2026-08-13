@@ -402,9 +402,11 @@ func TestFirstSeenRootComesFromTheDurableBinding(t *testing.T) {
 	}
 }
 
-// W3.5 seam: a contested notespace keeps pushing local work and takes no
-// incoming writes until it is adopted.
-func TestContestedNotespaceGetsNoPullPipeline(t *testing.T) {
+// W3.5 seam: a contested notespace takes no incoming writes AND sends nothing
+// out until it is adopted. It keeps its root binding, so local edits queue in
+// the parked outbox and adoption releases them — see
+// sync_contested_outbound_test.go for the two-machine proof.
+func TestContestedNotespaceGetsNeitherPipeline(t *testing.T) {
 	lh := newLifecycleHarness(t)
 	root := lh.notespace(t, "alpha", idA)
 	lh.subscribe(config.SyncWorkspace{Name: "alpha", Role: config.SyncRolePeer, Pull: true})
@@ -415,10 +417,13 @@ func TestContestedNotespaceGetsNoPullPipeline(t *testing.T) {
 
 	state := lh.pipeline(idA)
 	if state == nil {
-		t.Fatal("a contested notespace lost its push pipeline too")
+		t.Fatal("a contested notespace lost its root binding; local edits would stop queuing")
 	}
 	if state.pull {
 		t.Fatal("a contested notespace was given a pull pipeline")
+	}
+	if state.push {
+		t.Fatal("a contested notespace was given a push pipeline; the other machine's copy is decided for it")
 	}
 	if reasons := lh.h.ContestedNotespaces(); len(reasons) != 1 || reasons[idA] == "" {
 		t.Fatalf("contested = %+v", reasons)

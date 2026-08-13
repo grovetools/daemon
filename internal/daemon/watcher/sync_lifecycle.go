@@ -88,6 +88,11 @@ type pipelineState struct {
 	// makes this pipeline wrong rather than stale.
 	root string
 	pull bool
+	// push is the push/anti-entropy side of the same desired state. Both are
+	// recorded so the health test in stopUndesired can compare a running
+	// pipeline against what the contested set says NOW, rather than treating
+	// the verdict at birth as permanent.
+	push bool
 	// generation is the config generation that installed this pipeline.
 	generation uint64
 	// drainWaits counts reconcile passes that found this cancelled pipeline
@@ -323,9 +328,10 @@ func (h *SyncHandler) resolveIdentities(desired map[string]string) map[string]re
 
 	h.recordParked(parked)
 
-	// A contested notespace (the W3.5 adoption seam) still resolves — its push
-	// side is unaffected — but startPipeline gives it no pull loop, so nothing
-	// is written into it until it is adopted.
+	// A contested notespace (the W3.5 adoption seam) still RESOLVES — it keeps
+	// its identity, its root binding and its watch — but startPipeline gives it
+	// neither loop, so nothing is written into it and nothing leaves it until
+	// it is adopted.
 	return resolved
 }
 
@@ -575,15 +581,22 @@ type ContestedNotespace = syncdb.ContestedNotespace
 
 // MarkContested is the W3.5 adoption seam.
 //
-// W3.5's rule is "no writes into a contested notespace until adopted": pulling
-// a shared notebook onto pre-existing un-synced local notes must let clean
+// W3.5's rule is "no unadopted content moves in either direction": pulling a
+// shared notebook onto pre-existing un-synced local notes must let clean
 // documents flow while colliding subtrees wait for an operator decision. This
 // is the ENFORCEMENT half:
 //
-//	MarkContested(id, reason) → the notespace keeps its push pipeline (local
-//	work still reaches the server) and loses its pull pipeline, so nothing
-//	incoming is written into the contested tree. ClearContested(id) is
-//	adoption: the next reconcile pass restores the pull loop.
+//	MarkContested(id, reason) → the notespace loses BOTH pipelines. Nothing
+//	incoming is written into the contested tree, and nothing outgoing leaves
+//	it: no push loop, no anti-entropy sweep, and no maintenance drain. The
+//	outbox is parked, not discarded — local edits keep queuing behind the
+//	gate. ClearContested(id) is adoption: the next reconcile pass restores
+//	both loops, and the queued local work goes out then.
+//
+// Withholding push is not symmetry for its own sake. The collision the gate
+// detects has two machines in it, and an inbound-only gate protects the one
+// that raised it while deciding the other side automatically in favour of the
+// newcomer — see pushDesired for the four-step walk-through.
 //
 // The DETECTION half is the pull pipeline's pre-apply gate (sync/adoption.go),
 // wired in through markContestedFromPull below: it withholds the batch, writes
@@ -714,6 +727,46 @@ func (h *SyncHandler) pullDesired(r resolvedNotespace) bool {
 	return !contested
 }
 
+// pushDesired is the push side of the same question: a recorded subscription
+// pushes — there is no `push` flag, push is what a subscription IS — unless the
+// W3.5 gate has contested it.
+//
+// The contested veto belongs on BOTH sides, and the one-sided version was a
+// hazard rather than a preference. The gate exists for a collision between two
+// machines' copies of the same notespace, and it was protecting only the
+// machine that raised it:
+//
+//  1. B holds pre-existing un-synced `plans/x.md`; A's copy in the shared
+//     notebook differs.
+//  2. B pulls. The pre-apply gate sees the divergence, withholds the batch,
+//     writes the evidence, marks B contested. B's tree is protected.
+//  3. B's push loop and anti-entropy pass — started unconditionally, in the
+//     same reconcile, with no ordering between them and the pull that
+//     contests — upload B's version. The server takes it: its only share-state
+//     gate is ApplyPush, and B's notebook is shared. Anti-entropy is the wider
+//     hole of the two, because walkLocalTree seeds every UNTRACKED local file
+//     into the outbox, which is exactly what a machine with pre-existing notes
+//     is full of.
+//  4. A pulls, and A's `plans/x.md` is replaced by content no operator ever
+//     adopted.
+//
+// The evidence-based decision W3.5 exists to offer was thereby pre-empted, in
+// favour of whichever machine joined last, before anyone was asked. So a
+// contested notespace now moves in neither direction: nothing is written into
+// its tree, and nothing leaves it.
+//
+// The outbox is PARKED rather than drained by this — local edits keep queuing
+// (the watch stays bound, since the pipeline is still installed at its root),
+// and adoption releases them. Withholding push is not discarding local work; it
+// is holding it until the operator says which copy wins.
+func (h *SyncHandler) pushDesired(r resolvedNotespace) bool {
+	if r.sub == nil {
+		return false
+	}
+	_, contested := h.isContested(r.id)
+	return !contested
+}
+
 // bindWatchIdentities stamps the immutable id onto every watch entry whose
 // directory belongs to a running, registered pipeline. Until a watch carries an
 // id, flush refuses to capture through it — which is what keeps a parked
@@ -746,12 +799,15 @@ func (h *SyncHandler) stopUndesired(resolved map[string]resolvedNotespace, desir
 		desiredRoots[root] = true
 	}
 
-	// Desired pull state per id, computed before pipelinesMu is taken so the
-	// health test below needs no lock of its own (parkMu under pipelinesMu is
-	// the established order, but not needing it at all is better).
+	// Desired pull AND push state per id, computed before pipelinesMu is taken
+	// so the health test below needs no lock of its own (parkMu under
+	// pipelinesMu is the established order, but not needing it at all is
+	// better).
 	wantPull := make(map[string]bool, len(resolved))
+	wantPush := make(map[string]bool, len(resolved))
 	for id, r := range resolved {
 		wantPull[id] = h.pullDesired(r)
+		wantPush[id] = h.pushDesired(r)
 	}
 
 	type stopping struct {
@@ -765,17 +821,23 @@ func (h *SyncHandler) stopUndesired(resolved map[string]resolvedNotespace, desir
 	h.pipelinesMu.Lock()
 	for id, state := range h.pipelines {
 		if want, ok := resolved[id]; ok {
-			// Health is the root AND the pull state. Comparing only the root
+			// Health is the root AND BOTH directions. Comparing only the root
 			// made a running pipeline healthy forever regardless of what
 			// config or the contested set now said, which falsified W3.5's
 			// contract in both directions (MarkContested took effect only if
 			// it beat the first reconcile) and let a subscription downgraded
 			// to pull = false keep writing into the tree until a restart.
-			if samePhysicalPath(want.root, state.root) && state.pull == wantPull[id] {
+			//
+			// Push is compared for the same reason, and it is the half that
+			// matters most for a contest raised by the pull loop of a pipeline
+			// already running: without it, a notespace marked contested at
+			// 10:00:01 would keep uploading the disputed tree until something
+			// unrelated re-rooted it.
+			if samePhysicalPath(want.root, state.root) && state.pull == wantPull[id] && state.push == wantPush[id] {
 				continue // healthy
 			}
 			if samePhysicalPath(want.root, state.root) {
-				stops = append(stops, stopping{id: id, state: state, reason: "pull state changed"})
+				stops = append(stops, stopping{id: id, state: state, reason: "push/pull state changed"})
 				continue
 			}
 			stops = append(stops, stopping{id: id, state: state, reason: "re-root", toRoot: want.root})
@@ -914,6 +976,104 @@ func (h *SyncHandler) startPipeline(client *syncdb.Client, db *syncdb.DB, r reso
 	name, root, stamp := r.id, r.root, r.stamp
 	sub := r.sub
 
+	// The W3.5 verdict, read once for this pipeline. It vetoes BOTH directions:
+	// see pushDesired for why a one-sided gate protected the machine that
+	// raised the collision and decided the other side of it automatically.
+	contestedReason, contested := h.isContested(name)
+	push := h.pushDesired(r)
+	pull := h.pullDesired(r)
+	if contested {
+		h.ulog.Warn("sync withheld in both directions: notespace is contested and not adopted yet").
+			Field("notespace_id", name).
+			Field("root", root).
+			Field("reason", contestedReason).Log(h.baseCtx)
+	}
+
+	if push {
+		h.startOutbound(pctx, run, db, client, name, root, stamp, sub)
+	}
+
+	if pull {
+		idSub := *sub
+		idSub.Name = name
+		pullPipeline := syncdb.NewPullPipeline(&idSub, client, db, h.ulog)
+		// Own-note guard (registry-role subscriptions only): an inbound
+		// event for machines/<our id>.md cannot be a legitimate
+		// replication of our own write, because the registry is
+		// single-writer. Dropped and surfaced, never applied — see
+		// PullPipeline.guardOwnRegistryNote for why this is detection
+		// rather than prevention under the interim trust model.
+		pullPipeline.OwnMachineID = machine.ID()
+		pullPipeline.OnRegistryForeignWrite = func(ws, path, detail string) {
+			h.broadcastConflict(&store.SyncConflictPayload{
+				Kind:        syncdb.ConflictKindRegistryForeignWrite,
+				NotespaceID: ws,
+				Path:        path,
+				Detail:      detail,
+			})
+		}
+		pullPipeline.OnConflict = func(kind, ws, path, documentID, detail string) {
+			h.broadcastConflict(&store.SyncConflictPayload{Kind: kind, NotespaceID: ws, NotespaceName: stamp.Name, Path: path, DocumentID: documentID, Detail: detail})
+		}
+		// W3.5: the gate's verdict becomes this daemon's. Marking tears BOTH
+		// loops down on the next reconcile, so the batch the gate withheld is
+		// the last one this pipeline ever considers — and the local content it
+		// collided with does not leave this machine in the meantime.
+		pullPipeline.OnContested = func(_ string, evidence syncdb.AdoptionEvidence) {
+			h.markContestedFromPull(root, evidence)
+		}
+		run("pull", func() error { return pullPipeline.RunPullLoop(pctx, root) })
+	}
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	h.pipelinesMu.Lock()
+	h.pipelines[name] = &pipelineState{
+		cancel: cancel, done: done, root: root, pull: pull, push: push, generation: generation,
+	}
+	h.pipelinesMu.Unlock()
+
+	// Materialize the sync_state row immediately so /api/sync/status
+	// reflects the subscription as soon as transport starts (readiness
+	// probes key on this; rows otherwise appear only on first activity).
+	if cur, err := db.GetNotespaceCursor(name); err == nil {
+		_ = db.UpdateNotespaceCursor(name, cur)
+	}
+
+	// Hydration and transport log lines name the RESOLVED ROOT (W3.3): a
+	// re-root is otherwise indistinguishable from a restart in the log.
+	h.ulog.Info("sync transport started").
+		Field("notespace_id", name).
+		Field("notespace_name", stamp.Name).
+		Field("root", root).
+		Field("push", push).
+		Field("pull", pull).
+		Field("generation", generation).
+		StructuredOnly().Log(pctx)
+}
+
+// startOutbound spawns everything that sends local content to the server: the
+// push loop, and the anti-entropy pass that feeds it.
+//
+// The two are started together, and withheld together, because they are one
+// direction. Anti-entropy is not a "reconcile" that happens to push — it is the
+// push side's own sweep (it never writes the local tree; see the cursor note in
+// AntiEntropyPass.Run), and walkLocalTree seeds untracked local files straight
+// into the outbox. Leaving it running for a contested notespace while holding
+// back the push loop would queue exactly the content under dispute, to be
+// uploaded the moment anything drained the outbox.
+func (h *SyncHandler) startOutbound(
+	pctx context.Context,
+	run func(kind string, fn func() error),
+	db *syncdb.DB,
+	client *syncdb.Client,
+	name, root string,
+	stamp *notespacepkg.NotespaceStamp,
+	sub *config.SyncWorkspace,
+) {
 	push := syncdb.NewPushPipeline(db, client, name, h.ulog, syncdb.PushConfig{})
 	// Surface server-ceiling oversize skips as a sync_conflict SSE update
 	// (convertToAPIUpdate already forwards UpdateSyncConflict). The quiet
@@ -941,45 +1101,6 @@ func (h *SyncHandler) startPipeline(client *syncdb.Client, db *syncdb.DB, r reso
 		h.broadcastConflict(&store.SyncConflictPayload{Kind: kind, NotespaceID: ws, NotespaceName: stamp.Name, Path: path, DocumentID: documentID, Detail: detail})
 	}
 	run("push", func() error { return push.RunPushLoop(pctx, root) })
-
-	contestedReason, contested := h.isContested(name)
-	pull := h.pullDesired(r)
-	if contested {
-		h.ulog.Warn("sync pull withheld: notespace is contested and not adopted yet").
-			Field("notespace_id", name).
-			Field("root", root).
-			Field("reason", contestedReason).Log(h.baseCtx)
-	}
-	if pull {
-		idSub := *sub
-		idSub.Name = name
-		pullPipeline := syncdb.NewPullPipeline(&idSub, client, db, h.ulog)
-		// Own-note guard (registry-role subscriptions only): an inbound
-		// event for machines/<our id>.md cannot be a legitimate
-		// replication of our own write, because the registry is
-		// single-writer. Dropped and surfaced, never applied — see
-		// PullPipeline.guardOwnRegistryNote for why this is detection
-		// rather than prevention under the interim trust model.
-		pullPipeline.OwnMachineID = machine.ID()
-		pullPipeline.OnRegistryForeignWrite = func(ws, path, detail string) {
-			h.broadcastConflict(&store.SyncConflictPayload{
-				Kind:        syncdb.ConflictKindRegistryForeignWrite,
-				NotespaceID: ws,
-				Path:        path,
-				Detail:      detail,
-			})
-		}
-		pullPipeline.OnConflict = func(kind, ws, path, documentID, detail string) {
-			h.broadcastConflict(&store.SyncConflictPayload{Kind: kind, NotespaceID: ws, NotespaceName: stamp.Name, Path: path, DocumentID: documentID, Detail: detail})
-		}
-		// W3.5: the gate's verdict becomes this daemon's. Marking tears the
-		// pull loop down on the next reconcile, so the batch the gate withheld
-		// is the last one this pipeline ever considers.
-		pullPipeline.OnContested = func(_ string, evidence syncdb.AdoptionEvidence) {
-			h.markContestedFromPull(root, evidence)
-		}
-		run("pull", func() error { return pullPipeline.RunPullLoop(pctx, root) })
-	}
 
 	// Build the reconcile with the same per-notespace DocSpace the watcher
 	// uses, so walk coverage and reconcile coverage judge the doc space
@@ -1016,32 +1137,11 @@ func (h *SyncHandler) startPipeline(client *syncdb.Client, db *syncdb.DB, r reso
 		return ae.RunAntiEntropyLoop(pctx)
 	})
 
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
+	// Registered only when the pass is actually running. KickAntiEntropy and
+	// the maintenance drain both fan out over this map, so an entry for a
+	// notespace whose outbound side is withheld would be a second way to sweep
+	// a contested tree into the outbox.
 	h.pipelinesMu.Lock()
-	h.pipelines[name] = &pipelineState{
-		cancel: cancel, done: done, root: root, pull: pull, generation: generation,
-	}
 	h.aePasses[name] = ae
 	h.pipelinesMu.Unlock()
-
-	// Materialize the sync_state row immediately so /api/sync/status
-	// reflects the subscription as soon as transport starts (readiness
-	// probes key on this; rows otherwise appear only on first activity).
-	if cur, err := db.GetNotespaceCursor(name); err == nil {
-		_ = db.UpdateNotespaceCursor(name, cur)
-	}
-
-	// Hydration and transport log lines name the RESOLVED ROOT (W3.3): a
-	// re-root is otherwise indistinguishable from a restart in the log.
-	h.ulog.Info("sync transport started").
-		Field("notespace_id", name).
-		Field("notespace_name", stamp.Name).
-		Field("root", root).
-		Field("pull", pull).
-		Field("generation", generation).
-		StructuredOnly().Log(pctx)
 }

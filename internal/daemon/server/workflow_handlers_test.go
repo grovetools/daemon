@@ -182,12 +182,19 @@ func TestHandleGetWorkflows(t *testing.T) {
 			RunID: "wf_1", AgentID: "a1", Timestamp: ts, Source: models.WorkflowSourceJournal,
 		}},
 	})
+	// A run-less agent must carry a GENUINE spawn id — 'a' + 16 hex, the shape
+	// Claude Code mints for a real Task spawn. Since d2e1dbb the store drops a
+	// run-less started event whose agent id is any other shape, because that is
+	// the phantom type-registration the harness fires once per agent definition
+	// at session init (see isSpawnAgentID / store.TestPhantom…). This test was
+	// written before that guard and kept a placeholder id, so it asserted the
+	// ad-hoc bucket would fill from an event the store is right to discard.
 	st.ApplyUpdate(store.Update{
 		Type:   store.UpdateWorkflowAgentStarted,
 		Source: "hooks",
 		Payload: &store.WorkflowEventPayload{Event: models.WorkflowEvent{
 			Kind: models.WorkflowAgentStarted, JobID: "job-2", ClaudeSessionID: "sess-2",
-			AgentID: "x1", AgentType: "Explore", Timestamp: ts, Source: models.WorkflowSourceHooks,
+			AgentID: adhocSpawnAgentID, AgentType: "Explore", Timestamp: ts, Source: models.WorkflowSourceHooks,
 		}},
 	})
 
@@ -208,10 +215,36 @@ func TestHandleGetWorkflows(t *testing.T) {
 	if snapshot.Runs["wf_1"] == nil || snapshot.Runs["wf_1"].Agents["a1"] == nil {
 		t.Errorf("snapshot missing run agent: %+v", snapshot.Runs)
 	}
-	if snapshot.Adhoc["job-2"]["x1"] == nil {
+	if snapshot.Adhoc["job-2"][adhocSpawnAgentID] == nil {
 		t.Errorf("snapshot missing ad-hoc agent: %+v", snapshot.Adhoc)
 	}
+
+	// The other half of the same contract: a phantom-shaped id reaches the
+	// snapshot from nowhere. Pinned here, not only in the store, because this
+	// handler is what the TUI reads and a regression would show up as agents
+	// appearing that were never spawned.
+	st.ApplyUpdate(store.Update{
+		Type:   store.UpdateWorkflowAgentStarted,
+		Source: "hooks",
+		Payload: &store.WorkflowEventPayload{Event: models.WorkflowEvent{
+			Kind: models.WorkflowAgentStarted, JobID: "job-3", ClaudeSessionID: "sess-3",
+			AgentID: "a03e225", AgentType: "Explore", Timestamp: ts, Source: models.WorkflowSourceHooks,
+		}},
+	})
+	w = httptest.NewRecorder()
+	s.handleGetWorkflows(w, httptest.NewRequest(http.MethodGet, "/api/workflows", nil))
+	snapshot.Adhoc = nil
+	if err := json.Unmarshal(w.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if len(snapshot.Adhoc["job-3"]) != 0 {
+		t.Errorf("a phantom type-registration reached the snapshot: %+v", snapshot.Adhoc["job-3"])
+	}
 }
+
+// adhocSpawnAgentID is a genuine spawn id: 'a' followed by exactly 16 hex
+// digits. Any other shape is a phantom registration the store discards.
+const adhocSpawnAgentID = "a62124203bfeb94f0"
 
 func TestUnixOnlyMiddleware(t *testing.T) {
 	handler := unixOnly(func(w http.ResponseWriter, r *http.Request) {

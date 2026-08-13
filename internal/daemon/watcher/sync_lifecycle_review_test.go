@@ -68,7 +68,7 @@ func TestConfigReloadWithoutSyncTomlDoesNotPanic(t *testing.T) {
 // collision. isContested was consulted once, inside startPipeline, and the
 // health test compared only the root — so a running pipeline stayed "healthy"
 // forever and kept writing into the contested tree.
-func TestMarkContestedTearsDownPullOnARunningPipeline(t *testing.T) {
+func TestMarkContestedTearsDownBothLoopsOnARunningPipeline(t *testing.T) {
 	lh := newLifecycleHarness(t)
 	root := lh.notespace(t, "alpha", idA)
 	lh.subscribe(config.SyncWorkspace{Name: "alpha", Role: config.SyncRolePeer, Pull: true})
@@ -88,17 +88,24 @@ func TestMarkContestedTearsDownPullOnARunningPipeline(t *testing.T) {
 		return state != nil && !state.pull
 	})
 
-	// Push survives: local work still reaches the server while adoption waits.
-	if state := lh.pipeline(idA); state == nil || state.root != root {
-		t.Fatalf("contested notespace lost its push pipeline too: %+v", state)
+	// The outbound side goes with it (holistic review F1): local work stops
+	// reaching the server too, because the collision has two machines in it and
+	// pushing would decide it for the other one. The pipeline itself survives
+	// at its root, so the outbox is parked rather than orphaned.
+	state = lh.pipeline(idA)
+	if state == nil || state.root != root {
+		t.Fatalf("contested notespace lost its root binding: %+v", state)
+	}
+	if state.push {
+		t.Fatal("a contested notespace kept pushing; the peer's copy is overwritten by unadopted content")
 	}
 
-	// ClearContested is adoption: the next pass restores the pull loop.
+	// ClearContested is adoption: the next pass restores both loops.
 	lh.h.ClearContested(idA)
-	waitForLifecycle(t, "adoption to restore the pull pipeline", func() bool {
+	waitForLifecycle(t, "adoption to restore both pipelines", func() bool {
 		lh.h.ensurePipelines()
 		state := lh.pipeline(idA)
-		return state != nil && state.pull
+		return state != nil && state.pull && state.push
 	})
 }
 

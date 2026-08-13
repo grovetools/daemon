@@ -1467,6 +1467,19 @@ func (h *SyncHandler) BeginMaintenance(ctx context.Context) error {
 	}
 	h.pipelinesMu.Unlock()
 	for name, root := range roots {
+		// A contested notespace (W3.5) is withheld in BOTH directions until the
+		// operator adopts, and this drain is an outbound path like any other —
+		// it reconciles and then pushes the outbox directly, bypassing the
+		// pipeline whose absence is the enforcement everywhere else. Draining
+		// here would upload exactly the local content the gate is holding back
+		// for a decision, which is the whole hazard the two-sided gate closes.
+		if reason, contested := h.isContested(name); contested {
+			h.ulog.Warn("maintenance drain skipped: notespace is contested and not adopted yet").
+				Field("notespace_id", name).
+				Field("root", root).
+				Field("reason", reason).Log(ctx)
+			continue
+		}
 		if ae := passes[name]; ae != nil {
 			if err := ae.Run(ctx); err != nil {
 				return fmt.Errorf("reconcile %s: %w", name, err)
