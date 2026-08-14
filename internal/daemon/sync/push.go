@@ -718,14 +718,28 @@ func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, notespaceRoot 
 		doc.DocumentID = docID
 	}
 
+	// Echo dissolution, head case: a "local edit" byte-identical to the
+	// server head carries no local information — it is the residue of an
+	// applied (or half-applied) pull, not user intent. Converge the doc onto
+	// the head and let drain's no-op guard retire the entry, instead of
+	// parking an unresolvable conflict forever.
+	if localHash == hashContent(serverContent) {
+		return p.dissolveEchoEntry(ctx, entry, doc, result.Version, localContent, localHash), false
+	}
+
+	// The merge base is verified by hash and repaired from server history
+	// when the recorded base_content lies (see repairMergeBase) — a bogus
+	// ancestor turns disjoint edits into overlapping hunks.
+	baseContent := repairMergeBase(ctx, p.client, p.log, p.notespace, doc)
+
 	// Frontmatter merges per-key (LWW-map semantics — never conflicts);
 	// only overlapping body hunks park the document.
 	mergedVals := mergeValues(
-		parseFrontmatter(doc.BaseContent),
+		parseFrontmatter(baseContent),
 		parseFrontmatter(localContent),
 		parseFrontmatter(serverContent))
 	mergedBody, clean := diff3Merge(
-		extractBody(doc.BaseContent),
+		extractBody(baseContent),
 		extractBody(localContent),
 		extractBody(serverContent))
 	var merged []byte
@@ -744,6 +758,18 @@ func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, notespaceRoot 
 		p.recordConflictArtifact(ctx, entry.Path, docID, localContent)
 		merged = append([]byte(nil), serverContent...)
 	default:
+		// Echo dissolution, history case (S2.2): before declaring a genuine
+		// conflict, check whether the local bytes are verbatim SOME server
+		// version between our base and the head — the signature of an echoed
+		// apply whose row bookkeeping was lost (the entry then carries a
+		// permanently stale base and would otherwise park forever, 9 retries
+		// deep, while every later remote edit false-conflicts against it).
+		// A user's deliberate edit virtually never reproduces an intermediate
+		// server revision byte-for-byte; when it does, dissolving still loses
+		// nothing the server does not already hold.
+		if v := p.matchServerVersion(ctx, docID, doc.LastSyncedVersion, result.Version, localHash); v > 0 {
+			return p.dissolveEchoEntry(ctx, entry, doc, v, localContent, localHash), false
+		}
 		p.recordConflictArtifact(ctx, entry.Path, docID, localContent)
 		return false, false
 	}
@@ -805,6 +831,65 @@ func (p *PushPipeline) rebaseConflictedEntry(ctx context.Context, notespaceRoot 
 		Field("base_version", result.Version).
 		Field("diverged", diverged).Log(ctx)
 	return true, diverged
+}
+
+// echoProbeMaxVersions caps how many historical server versions the echo
+// probe fetches per rebase attempt. An echoed apply is at most a few versions
+// behind the head in practice; a deep miss just parks the entry as before.
+const echoProbeMaxVersions = 8
+
+// matchServerVersion reports the newest server version in (base, head) whose
+// content is byte-identical to the local file (localHash), or 0 when none of
+// the probed versions match or a fetch fails (transient: the entry parks and
+// the probe re-runs on the next retry). The head itself is the caller's
+// (free) comparison; this probes strictly older versions, newest first,
+// bounded by echoProbeMaxVersions.
+func (p *PushPipeline) matchServerVersion(ctx context.Context, docID string, base, head int64, localHash string) int64 {
+	lo := base + 1
+	if head-lo >= echoProbeMaxVersions {
+		lo = head - echoProbeMaxVersions + 1
+	}
+	for v := head - 1; v >= lo; v-- {
+		content, err := p.client.HistoryBlob(ctx, p.notespace, docID, v)
+		if err != nil {
+			return 0
+		}
+		if hashContent(content) == localHash {
+			return v
+		}
+	}
+	return 0
+}
+
+// dissolveEchoEntry retires a conflicted outbox entry whose local content is
+// verbatim server version `version`: there is no local information to push,
+// so the doc row converges on that version as its synced state (disk ==
+// last-synced — a later remote head then fast-forwards cleanly instead of
+// phantom-conflicting) and the entry is retargeted at the local bytes so the
+// next drain's no-op guard (push hash == last_synced_hash) deletes it without
+// a round trip. Strict push-only holds: the notespace file is never touched.
+// Returns true when the dissolution landed (the caller parks the entry once
+// more; it dies on the next drainable pass), false to fall back to the plain
+// park-and-retry path.
+func (p *PushPipeline) dissolveEchoEntry(ctx context.Context, entry *OutboxEntry, doc *Document, version int64, localContent []byte, localHash string) bool {
+	if err := p.db.UpdateOutboxEntryContent(entry.ID, string(localContent), localHash); err != nil {
+		p.log.Warn("echo dissolution: failed to retarget outbox entry").
+			Field("path", entry.Path).Err(err).Log(ctx)
+		return false
+	}
+	doc.ContentHash = localHash
+	doc.LastSyncedHash = localHash
+	doc.LastSyncedVersion = version
+	doc.BaseContent = localContent
+	if err := p.db.UpdateDocument(doc); err != nil {
+		p.log.Warn("echo dissolution: failed to update document record").
+			Field("path", entry.Path).Err(err).Log(ctx)
+		return false
+	}
+	p.log.Info("dissolved echo push: local content is a server revision verbatim, nothing local to push").
+		Field("path", entry.Path).
+		Field("matched_version", version).Log(ctx)
+	return true
 }
 
 // recordConflictArtifact writes a conflict artifact for an unmergeable

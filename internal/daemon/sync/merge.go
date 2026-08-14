@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/grovetools/core/logging"
 )
 
 // Frontmatter represents parsed YAML frontmatter as key-value pairs.
@@ -221,6 +224,36 @@ func equal(a, b interface{}) bool {
 	as := fmt.Sprintf("%v", a)
 	bs := fmt.Sprintf("%v", b)
 	return as == bs
+}
+
+// repairMergeBase returns a document's 3-way merge base, verified: when the
+// stored base_content does not hash to last_synced_hash (a corrupt or stale
+// base — the phantom-conflict trap: bogus ancestor → ordinary edits become
+// overlapping hunks, observed in the S2.2 wedge as a pre-share base_content
+// under a v1 last_synced_hash), the true base is re-fetched from server
+// history at last_synced_version. Shared by pull's applyUpdate and push's
+// rebaseConflictedEntry so both merge engines judge the base identically.
+//
+// Every failure mode falls back to the recorded base: a never-synced doc
+// (version 0 / empty hash) legitimately has no server base, and a fetch
+// failure must not block the merge that has always run on the recorded bytes.
+func repairMergeBase(ctx context.Context, client *Client, log *logging.UnifiedLogger, notespace string, doc *Document) []byte {
+	if doc.LastSyncedVersion == 0 || doc.LastSyncedHash == "" ||
+		hashContent(doc.BaseContent) == doc.LastSyncedHash || client == nil {
+		return doc.BaseContent
+	}
+	trueBase, err := client.HistoryBlob(ctx, notespace, doc.DocumentID, doc.LastSyncedVersion)
+	if err != nil || hashContent(trueBase) != doc.LastSyncedHash {
+		log.Warn("stale merge base could not be repaired from server history; merging over the recorded base").
+			Field("path", doc.Path).
+			Field("last_synced_version", doc.LastSyncedVersion).
+			Err(err).Log(ctx)
+		return doc.BaseContent
+	}
+	log.Info("repaired stale merge base from server history").
+		Field("path", doc.Path).
+		Field("last_synced_version", doc.LastSyncedVersion).Log(ctx)
+	return trueBase
 }
 
 // bytesEqual returns true if two byte slices are equal.

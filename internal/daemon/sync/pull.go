@@ -532,13 +532,44 @@ func (p *PullPipeline) applyCreate(ctx context.Context, notespaceRoot string, ev
 		}
 	}
 
+	// The row lookup runs BEFORE the file write so a sync.db read failure
+	// refuses the whole event instead of leaving disk written with no
+	// bookkeeping (the half-applied state behind the echo-outbox wedge).
+	existing, err := p.db.GetDocumentByPath(p.ws.Name, ev.Path)
+	if err != nil {
+		return fmt.Errorf("failed to look up document: %w", err)
+	}
+
+	// Register the write as the daemon's own before it lands: the watcher's
+	// debounced flush observes it through fsnotify, and without a registration
+	// a flush that reads sync.db ahead of this apply's row write manufactures
+	// an echo outbox entry plus v-era bookkeeping (selfwrite.go). Pure server
+	// content — suppressing its capture can never lose a local edit.
+	p.db.NoteSelfWrite(p.ws.Name, ev.Path, hashContent(content))
+
 	// Write to disk, restoring the origin's file mtime when the event carries
 	// one (zero = old server/client: keep the write time, as before).
 	if err := writeFileUnderRoot(notespaceRoot, filePath, content, ev.Mtime); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
-	// Record in sync DB
+	// Record in sync DB. A row may already exist at this path (snapshot
+	// replay, a recreated server re-sending creates, a watcher capture that
+	// raced this apply): InsertDocument would then fail UNIQUE(notespace,
+	// path) AFTER the file write above, leaving disk at the server head with
+	// the old row's bookkeeping — the half-applied state that manufactured
+	// the S2.2 echo-outbox + phantom-conflict wedge. Adopt in place instead:
+	// same synced-state roll, row re-identified to the event's document id.
+	if existing != nil {
+		if err := p.db.AdoptDocument(p.ws.Name, ev.Path, ev.DocumentID, ev.Version, ev.ContentHash, content); err != nil {
+			return fmt.Errorf("failed to adopt document over existing row: %w", err)
+		}
+		p.log.Debug("created document over existing row (adopted in place)").
+			Field("path", ev.Path).
+			Field("id", ev.DocumentID).
+			Field("previous_id", existing.DocumentID).Log(ctx)
+		return nil
+	}
 	doc := &Document{
 		DocumentID:        ev.DocumentID,
 		Notespace:         p.ws.Name,
@@ -604,6 +635,12 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, notespaceRoot string, ev
 	if localHash == doc.LastSyncedHash || localHash == ev.ContentHash {
 		// Fast-forward: disk becomes exactly the remote content, so the
 		// origin's mtime is restored with it (zero mtime = keep write time).
+		// Registered as a self-write BEFORE it lands so the watcher's flush
+		// cannot capture the apply's own write as a local edit even when it
+		// reads sync.db ahead of the UpdateDocument below (selfwrite.go) —
+		// the echo-outbox + clobbered-row half of the S2.2 wedge. Pure server
+		// content: suppression can never lose a local edit.
+		p.db.NoteSelfWrite(p.ws.Name, ev.Path, hashContent(content))
 		if err := writeFileUnderRoot(notespaceRoot, filePath, content, ev.Mtime); err != nil {
 			return fmt.Errorf("failed to write file: %w", err)
 		}
@@ -618,13 +655,24 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, notespaceRoot string, ev
 	// per-key (LWW-map semantics — frontmatter never conflicts, by design;
 	// see mergeValues), the body goes through line-based diff3. Disjoint
 	// edits from both sides compose; only overlapping body hunks conflict.
-	baseVals := parseFrontmatter(doc.BaseContent)
+	//
+	// The stored base must actually BE the last server-confirmed content. A
+	// row whose base_content predates its last_synced_hash (a half-applied
+	// earlier event, pre-share seeding) turns ordinary edits into overlapping
+	// hunks against a bogus ancestor — the observed false "merge conflict
+	// detected" that refused v3 on a byte-clean replica (S2.2). Verify the
+	// base by hash and re-fetch the true one from server history when it
+	// lies; an unreachable server falls back to the recorded base, which is
+	// exactly the previous behavior.
+	baseContent := p.repairedMergeBase(ctx, doc)
+
+	baseVals := parseFrontmatter(baseContent)
 	localVals := parseFrontmatter(localContent)
 	remoteVals := parseFrontmatter(content)
 
 	merged := mergeValues(baseVals, localVals, remoteVals)
 
-	baseBody := extractBody(doc.BaseContent)
+	baseBody := extractBody(baseContent)
 	localBody := extractBody(localContent)
 	remoteBody := extractBody(content)
 
@@ -666,6 +714,11 @@ func (p *PullPipeline) applyUpdate(ctx context.Context, notespaceRoot string, ev
 		p.log.Warn("failed to retarget outbox after merge").Field("path", ev.Path).Err(err).Log(ctx)
 	}
 	return p.db.UpdateDocument(doc)
+}
+
+// repairedMergeBase is the pull-side wrapper for repairMergeBase.
+func (p *PullPipeline) repairedMergeBase(ctx context.Context, doc *Document) []byte {
+	return repairMergeBase(ctx, p.client, p.log, p.ws.Name, doc)
 }
 
 // applyMove renames a document locally and updates the database.

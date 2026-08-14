@@ -36,6 +36,20 @@ import (
 func InsertAndEnqueue(db *DB, notespace, rel string, content []byte, mtime time.Time) (quarantineReason string, err error) {
 	hash := hashContent(content)
 
+	// Self-write suppression, ahead of every row read: content byte-identical
+	// to what the pull apply registered before writing this path is the
+	// daemon's OWN write observed back through fsnotify (or the reconcile
+	// walk), never a user edit. It must neither enqueue (the echo-outbox
+	// wedge: base_version can only be stale, the entry parks forever) nor
+	// touch the doc row (the apply owns that bookkeeping; upserting here
+	// against a row the apply has not updated yet stamps v-era state over
+	// it). The doc-row hash-gate below cannot cover this case — it only
+	// works once the apply's row update has committed, and this flush may
+	// have raced ahead of it. See selfwrite.go.
+	if db.MatchesSelfWrite(notespace, rel, hash) {
+		return "", nil
+	}
+
 	doc, err := db.GetDocumentByPath(notespace, rel)
 	if err != nil {
 		return "", err

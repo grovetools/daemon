@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	gosync "sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -99,6 +100,12 @@ type DB struct {
 	db       *sql.DB
 	path     string
 	originID string
+
+	// selfWrites is the in-memory (never persisted) pull-apply echo-suppression
+	// registry — see selfwrite.go. It lives on DB because DB is the one object
+	// the pull pipelines and the watcher's capture path already share.
+	selfWritesMu gosync.Mutex
+	selfWrites   map[string]selfWrite
 }
 
 // Document is one row of sync_documents: the identity map entry and sync
