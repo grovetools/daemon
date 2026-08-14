@@ -1974,6 +1974,17 @@ func (s *Server) handleSessionIntent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ns := s.fixtureIntentNamespace(&intent); ns != "" {
+		s.ulog.Warn("Refused session intent from a test fixture").
+			Field("job_id", intent.JobID).
+			Field("title", intent.Title).
+			Field("fixture_namespace", ns).
+			Field("work_dir", intent.WorkDir).
+			Log(r.Context())
+		http.Error(w, "session belongs to test fixture namespace "+ns, http.StatusForbidden)
+		return
+	}
+
 	s.engine.Store().ApplyUpdate(store.Update{
 		Type:    store.UpdateSessionIntent,
 		Source:  "api",
@@ -1993,6 +2004,32 @@ func (s *Server) handleSessionIntent(w http.ResponseWriter, r *http.Request) {
 	s.ulog.Debug("Session intent registered").Field("job_id", intent.JobID).Log(r.Context())
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "registered", "job_id": intent.JobID})
+}
+
+// fixtureIntentNamespace reports the test-fixture namespace an intent belongs
+// to, or "" when the intent is ordinary work this daemon should record.
+//
+// A REAL daemon must never adopt a session whose job lives inside a tend/lab/
+// tui-pilot sandbox. Those jobs are fictional — mock binaries, temp-dir plans,
+// processes that often never start — and nothing ever ends them, so each one
+// parks in the Agents drawer forever ("Env Dump", "pi Headless E2E", jobs from
+// /tmp/grove-tend-* that the user could not dismiss). The sandbox env is the
+// primary defense (harness.HostIdentityEnv); this is the backstop for older
+// harnesses and for any other route by which a fixture finds the real socket.
+//
+// A FIXTURE daemon keeps recording them: its own socket lives in the same
+// namespace, and inside the sandbox those sessions are exactly what the
+// scenario is asserting on.
+func (s *Server) fixtureIntentNamespace(intent *store.SessionIntentPayload) string {
+	if intent == nil || coredaemon.FixtureNamespace(s.socketPath) != "" {
+		return ""
+	}
+	for _, p := range []string{intent.WorkDir, intent.JobFilePath} {
+		if ns := coredaemon.FixtureNamespace(p); ns != "" {
+			return ns
+		}
+	}
+	return ""
 }
 
 // handleSessionConfirm handles POST /api/sessions/confirm - confirm session with PID.
