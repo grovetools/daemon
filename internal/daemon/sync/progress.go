@@ -11,7 +11,12 @@ import (
 // freshness benchmark read hydration wall-time and files/sec off
 // /api/sync/status without a bespoke endpoint.
 type HydrationProgress struct {
-	Notespace   string    `json:"notespace"`
+	Notespace string `json:"notespace"`
+	// Root is the tree the walk actually enumerated. A notespace resolved to
+	// the wrong root hydrates perfectly happily — plausible counts, no errors —
+	// and the only way to see it was to correlate with the daemon's spawn log,
+	// so the answer is reported alongside the counters it explains.
+	Root        string    `json:"root"`
 	Running     bool      `json:"running"`
 	Scanned     int64     `json:"scanned"`
 	Enqueued    int64     `json:"enqueued"`

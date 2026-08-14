@@ -436,6 +436,7 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 	var scanned, enqueued, quarantined int64
 	setHydrationProgress(HydrationProgress{
 		Notespace: a.notespace,
+		Root:      a.notespaceRoot,
 		Running:   true,
 		StartedAt: start,
 	})
@@ -502,12 +503,14 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 			rate := filesPerSec(scanned, time.Since(start))
 			a.log.Info("hydration progress").
 				Field("notespace", a.notespace).
+				Field("root", a.notespaceRoot).
 				Field("scanned", scanned).
 				Field("enqueued", enqueued).
 				Field("quarantined", quarantined).
 				Field("files_per_sec", rate).Log(ctx)
 			setHydrationProgress(HydrationProgress{
 				Notespace:   a.notespace,
+				Root:        a.notespaceRoot,
 				Running:     true,
 				Scanned:     scanned,
 				Enqueued:    enqueued,
@@ -522,6 +525,7 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 	finished := time.Now()
 	setHydrationProgress(HydrationProgress{
 		Notespace:   a.notespace,
+		Root:        a.notespaceRoot,
 		Running:     false,
 		Scanned:     scanned,
 		Enqueued:    enqueued,
@@ -537,6 +541,7 @@ func (a *AntiEntropyPass) walkLocalTree(ctx context.Context) error {
 
 	a.log.Info("hydration pass complete").
 		Field("notespace", a.notespace).
+		Field("root", a.notespaceRoot).
 		Field("scanned", scanned).
 		Field("enqueued", enqueued).
 		Field("quarantined", quarantined).
