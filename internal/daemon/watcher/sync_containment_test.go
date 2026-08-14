@@ -216,6 +216,46 @@ func TestANotespaceCreatedInsideASharedNotebookAutoRegisters(t *testing.T) {
 	})
 }
 
+// A recorded share alone must wake the dormant handler. `grove notebook
+// share` writes notebooks.toml and nothing into sync.toml, so a machine whose
+// only sync intent is containment has zero [[workspaces]] entries — and a
+// dormancy gate counting only those left exactly that machine asleep:
+// registered on the server, share printed, pipelines never spawned, sync.db
+// never opened (found live on the first real share, 2026-08-14). An absent
+// sync.toml must stay dormant regardless: no server relationship means there
+// is nothing to wake for.
+func TestARecordedShareAloneWakesTheDormantHandler(t *testing.T) {
+	lh := newLifecycleHarness(t)
+	lh.notespace(t, "beta", idBeta)
+
+	// Server recorded, nothing subscribed, nothing shared: dormant.
+	lh.subscribe()
+	if lh.h.hasSubscriptions() {
+		t.Fatal("handler awake with no subscriptions and nothing shared")
+	}
+
+	// The share is the wake condition.
+	lh.share(true)
+	if !lh.h.hasSubscriptions() {
+		t.Fatal("a recorded share alone did not wake the dormant handler")
+	}
+
+	// Withdrawing the share puts it back to sleep.
+	lh.share(false)
+	if lh.h.hasSubscriptions() {
+		t.Fatal("handler stayed awake after the share was withdrawn")
+	}
+
+	// No sync.toml at all: dormant even with a share recorded.
+	lh.share(true)
+	lh.h.syncCfgMu.Lock()
+	lh.h.syncCfg = nil
+	lh.h.syncCfgMu.Unlock()
+	if lh.h.hasSubscriptions() {
+		t.Fatal("handler awake with no sync.toml; a share cannot sync without a server relationship")
+	}
+}
+
 func contains(haystack []string, needle string) bool {
 	for _, item := range haystack {
 		if item == needle {

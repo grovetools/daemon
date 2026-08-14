@@ -265,12 +265,22 @@ func (h *SyncHandler) SyncDBError() string {
 	return h.dbOpenError
 }
 
-// hasSubscriptions reports whether the live config carries any subscription —
-// the condition that wakes a dormant handler.
+// hasSubscriptions reports whether recorded config gives this machine anything
+// to sync — the condition that wakes a dormant handler. Two records qualify:
+// an explicit [[workspaces]] entry in sync.toml, and a notebook recorded
+// `share = true` — `grove notebook share` writes notebooks.toml and nothing
+// into sync.toml, so a machine whose only sync intent is containment has zero
+// subscription entries and would otherwise sleep through its own share. An
+// absent sync.toml stays dormant regardless: no server relationship is the
+// documented "sync is disabled" state, whatever notebooks.toml says.
 func (h *SyncHandler) hasSubscriptions() bool {
 	h.syncCfgMu.RLock()
-	defer h.syncCfgMu.RUnlock()
-	return h.syncCfg != nil && len(h.syncCfg.Workspaces) > 0
+	syncCfg := h.syncCfg
+	h.syncCfgMu.RUnlock()
+	if syncCfg == nil {
+		return false
+	}
+	return len(syncCfg.Workspaces) > 0 || h.anySharedNotebook()
 }
 
 // ensureDB returns the sync database, opening it on first need once the config
