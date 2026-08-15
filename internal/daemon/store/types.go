@@ -433,7 +433,8 @@ type SessionStatusPayload struct {
 // SessionEndPayload contains data for ending a session.
 type SessionEndPayload struct {
 	JobID   string `json:"job_id"`
-	Outcome string `json:"outcome"` // "completed", "interrupted", "failed"
+	Outcome string `json:"outcome"`          // "completed", "interrupted", "failed"
+	Reason  string `json:"reason,omitempty"` // lifecycle evidence, e.g. process_dead or api_kill
 }
 
 // SessionTokenUpdate carries daemon-computed live token usage for one session.

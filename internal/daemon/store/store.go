@@ -356,11 +356,11 @@ func (s *Store) ApplyUpdate(u Update) {
 	// Session lifecycle updates
 	case UpdateSessionIntent:
 		if payload, ok := u.Payload.(*SessionIntentPayload); ok {
-			s.applySessionIntent(payload)
+			s.applySessionIntent(payload, u.Source)
 		}
 	case UpdateSessionConfirmation:
 		if payload, ok := u.Payload.(*SessionConfirmationPayload); ok {
-			s.applySessionConfirmation(payload)
+			s.applySessionConfirmation(payload, u.Source)
 		}
 	case UpdateSessionStatus:
 		if payload, ok := u.Payload.(*SessionStatusPayload); ok {
@@ -368,7 +368,7 @@ func (s *Store) ApplyUpdate(u Update) {
 		}
 	case UpdateSessionEnd:
 		if payload, ok := u.Payload.(*SessionEndPayload); ok {
-			s.applySessionEnd(payload)
+			s.applySessionEnd(payload, u.Source)
 		}
 	case UpdateSessionTokens:
 		if payload, ok := u.Payload.(*SessionTokensPayload); ok {
@@ -862,7 +862,14 @@ func terminalJobUpdateType(status string) (UpdateType, bool) {
 // registration "interactive_agent" told treemux a headless job had a terminal
 // to attach, which is what opened an empty shell on click instead of the job's
 // transcript stream.
-func (s *Store) applySessionIntent(payload *SessionIntentPayload) {
+func lifecycleReason(reason string) string {
+	if strings.TrimSpace(reason) == "" {
+		return "unknown"
+	}
+	return reason
+}
+
+func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string) {
 	session := &models.Session{
 		ID:               payload.JobID,
 		Type:             models.SessionTypeOrDefault(payload.Type),
@@ -883,10 +890,16 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload) {
 		Mux:              payload.Mux,
 	}
 	s.state.Sessions[payload.JobID] = session
+	s.ulog.Info("Session lifecycle: intent registered").
+		Field("event", "session.lifecycle.intent").
+		Field("job_id", payload.JobID).
+		Field("reason", lifecycleReason(source)).
+		StructuredOnly().
+		Log(context.Background())
 }
 
 // applySessionConfirmation updates a pending session with actual process info.
-func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload) {
+func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, source string) {
 	session, exists := s.state.Sessions[payload.JobID]
 	if !exists {
 		// Create a new session if intent was missed
@@ -921,9 +934,12 @@ func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload) {
 	// Diagnostic (permanent, Debug): proves the PID arrived non-zero and
 	// whether the JobInfo was present in the store at confirm time. Observe via
 	// `core logs --component groved.store --level debug -f`.
-	s.ulog.Debug("Session confirmation: propagating PID to JobInfo").
+	s.ulog.Info("Session lifecycle: process confirmed").
+		Field("event", "session.lifecycle.confirmed").
 		Field("job_id", payload.JobID).
+		Field("native_id", payload.NativeID).
 		Field("pid", payload.PID).
+		Field("reason", lifecycleReason(source)).
 		Field("job_exists_in_store", jobExists).
 		StructuredOnly().
 		Log(context.Background())
@@ -1046,10 +1062,12 @@ func (s *Store) syncSessionStatusToJobMarkdown(session *models.Session, prevStat
 }
 
 // applySessionEnd marks a session as ended.
-func (s *Store) applySessionEnd(payload *SessionEndPayload) {
+func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) {
 	now := time.Now()
+	nativeID := ""
 
 	if session, exists := s.state.Sessions[payload.JobID]; exists {
+		nativeID = session.ClaudeSessionID
 		session.Status = payload.Outcome
 		session.EndedAt = &now
 		session.LastActivity = now
@@ -1060,6 +1078,20 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload) {
 		job.Status = payload.Outcome
 		job.CompletedAt = &now
 	}
+
+	reason := payload.Reason
+	if strings.TrimSpace(reason) == "" {
+		reason = source
+	}
+	reason = lifecycleReason(reason)
+	s.ulog.Info("Session lifecycle: terminal").
+		Field("event", "session.lifecycle.terminal").
+		Field("job_id", payload.JobID).
+		Field("native_id", nativeID).
+		Field("outcome", payload.Outcome).
+		Field("reason", reason).
+		StructuredOnly().
+		Log(context.Background())
 }
 
 // applySessionTokens overlays daemon-computed live token usage onto existing

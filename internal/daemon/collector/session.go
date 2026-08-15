@@ -322,6 +322,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 					Payload: &store.SessionEndPayload{
 						JobID:   session.ID,
 						Outcome: "interrupted",
+						Reason:  "process_dead",
 					},
 				}
 

@@ -360,6 +360,21 @@ func scopedAssistantStatus(ctx context.Context) *models.AssistantStatus {
 
 const defaultDaemonMemoryLimit = int64(2 << 30) // 2 GiB allocation-spike backstop
 
+func daemonSignalName(sig os.Signal) string {
+	switch sig {
+	case os.Interrupt:
+		return "SIGINT"
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	case syscall.SIGUSR1:
+		return "SIGUSR1"
+	case nil:
+		return "unknown"
+	default:
+		return sig.String()
+	}
+}
+
 func applyDefaultDaemonMemoryLimit(getenv func(string) string, setLimit func(int64) int64) bool {
 	if strings.TrimSpace(getenv("GOMEMLIMIT")) != "" {
 		return false
@@ -495,6 +510,12 @@ func newGrovedStartCmd() *cobra.Command {
 			// here so both the readiness hook that arms the watcher and the
 			// signal handler that acts on it can see it.
 			shadowed := make(chan struct{})
+
+			ulog.Info("Daemon lifecycle: starting").
+				Field("event", "daemon.lifecycle.starting").
+				Field("pid", os.Getpid()).
+				Field("scope", scope).
+				StructuredOnly().Log(cmd.Context())
 
 			// Record the exact resolved scope in a sidecar next to the pidfile so
 			// `groved upgrade` can hand the successor the identical GROVE_SCOPE.
@@ -803,6 +824,12 @@ func newGrovedStartCmd() *cobra.Command {
 			//     pidfile-acquire so that the whole boot is covered — this is
 			//     only the moment the socket behind it starts answering.
 			srv.OnReady = func() {
+				ulog.Info("Daemon lifecycle: ready").
+					Field("event", "daemon.lifecycle.ready").
+					Field("pid", os.Getpid()).
+					Field("scope", scope).
+					Field("ready_at", readyAt).
+					StructuredOnly().Log(context.Background())
 				if readyFd > 0 {
 					if err := syscall.Close(readyFd); err != nil {
 						ulog.Warn("failed to close ready-fd").
@@ -948,7 +975,8 @@ func newGrovedStartCmd() *cobra.Command {
 					// adoption reap another scope's agents as orphans (their PtyIDs
 					// live in a different scoped tuimux), reopening the cross-scope
 					// leak this feature closes.
-					if recovered, rerr := sessions.RecoverSessionsForScope(scope); rerr != nil {
+					recovered, rerr := sessions.RecoverSessionsForScope(scope)
+					if rerr != nil {
 						ulog.Warn("Synchronous session recovery failed; continuing").Err(rerr).Log(ctx)
 					} else if len(recovered) > 0 {
 						st.ApplyUpdate(store.Update{
@@ -957,6 +985,11 @@ func newGrovedStartCmd() *cobra.Command {
 							Payload: recovered,
 						})
 					}
+					ulog.Info("Daemon lifecycle: registry recovered").
+						Field("event", "daemon.lifecycle.recovered").
+						Field("count", len(recovered)).
+						Field("scope", scope).
+						StructuredOnly().Log(ctx)
 
 					// Collapse duplicate job records before adoption reads them.
 					// A job submitted through the daemon used to persist under a
@@ -1246,15 +1279,19 @@ func newGrovedStartCmd() *cobra.Command {
 
 				go func() {
 					bgCtx := context.Background()
+					stopSignal := "auto_shutdown"
 					select {
-					case <-stop:
-						ulog.Info("Received stop signal").Field("event", "daemon.stopped").Log(bgCtx)
+					case sig := <-stop:
+						stopSignal = daemonSignalName(sig)
 					case <-shutdownReq:
+						stopSignal = "auto_shutdown"
 						ulog.Info("Auto-shutdown fired (idle TerminalHub)").Field("event", "daemon.stopped").Log(bgCtx)
 					case <-yieldReq:
+						stopSignal = "scope_yield"
 						ulog.Info("Yielding scope to host daemon").
 							Field("event", "daemon.stopped").Field("scope", scope).Log(bgCtx)
 					case <-shadowed:
+						stopSignal = "shadowed"
 						// Another process owns our socket or our pidfile. No
 						// client can reach us and no census can see us, so the
 						// only thing left to do is stop burning CPU. The
@@ -1265,6 +1302,11 @@ func newGrovedStartCmd() *cobra.Command {
 						ulog.Error("Shutting down: this daemon has been shadowed").
 							Field("event", "daemon.stopped").Field("pid", os.Getpid()).Log(bgCtx)
 					}
+					ulog.Info("Daemon lifecycle: stopping").
+						Field("event", "daemon.lifecycle.stopping").
+						Field("reason", "signal").
+						Field("signal", stopSignal).
+						StructuredOnly().Log(bgCtx)
 					// Reap the agent PTYs this daemon owns. With PTYs out-of-process,
 					// a plain stop (this SIGTERM/auto-shutdown path — NOT the SIGUSR1
 					// drain path, which leaves PTYs untouched for upgrade survival)
@@ -1335,7 +1377,11 @@ func newGrovedStartCmd() *cobra.Command {
 				go func() {
 					bgCtx := context.Background()
 					<-drain
-					ulog.Info("Received SIGUSR1 - entering drain mode").Log(bgCtx)
+					ulog.Info("Daemon lifecycle: stopping for upgrade").
+						Field("event", "daemon.lifecycle.stopping").
+						Field("reason", "upgrade").
+						Field("signal", daemonSignalName(syscall.SIGUSR1)).
+						StructuredOnly().Log(bgCtx)
 					srv.EnterDrainMode(bgCtx)
 				}()
 
@@ -1664,7 +1710,6 @@ func newGrovedStartCmd() *cobra.Command {
 
 			// 8. Start Server.
 			httpPort, _ := cmd.Flags().GetInt("http-port")
-			ulog.Info("Starting daemon").Field("event", "daemon.started").Field("pid", os.Getpid()).Log(ctx)
 
 			if earlyBind {
 				// Bind first so the spawning client unblocks in milliseconds,
@@ -1674,10 +1719,16 @@ func newGrovedStartCmd() *cobra.Command {
 				// until Serve begins accepting.
 				srv.SetBootStatus(&daemon.BootStatus{PhaseTotal: len(bootPhases)})
 				if err := srv.Listen(sockPath, httpPort); err != nil {
+					ulog.Error("Daemon lifecycle: stopping after server error").
+						Field("event", "daemon.lifecycle.stopping").Field("reason", "error").
+						Err(err).StructuredOnly().Log(ctx)
 					return fmt.Errorf("server error: %w", err)
 				}
 				go runBoot()
 				if err := srv.Serve(); err != nil {
+					ulog.Error("Daemon lifecycle: stopping after server error").
+						Field("event", "daemon.lifecycle.stopping").Field("reason", "error").
+						Err(err).StructuredOnly().Log(ctx)
 					return fmt.Errorf("server error: %w", err)
 				}
 				return nil
@@ -1688,6 +1739,9 @@ func newGrovedStartCmd() *cobra.Command {
 			// the socket binds, so no client ever observes a booting daemon.
 			runBoot()
 			if err := srv.ListenAndServe(sockPath, httpPort); err != nil {
+				ulog.Error("Daemon lifecycle: stopping after server error").
+					Field("event", "daemon.lifecycle.stopping").Field("reason", "error").
+					Err(err).StructuredOnly().Log(ctx)
 				return fmt.Errorf("server error: %w", err)
 			}
 			return nil
@@ -1739,6 +1793,12 @@ func serveConfigDegraded(
 	// rather than spawn scoped daemons that would be just as degraded. The
 	// record was published before config load (step 1.5); mark it ready here.
 	srv.OnReady = func() {
+		ulog.Info("Daemon lifecycle: ready").
+			Field("event", "daemon.lifecycle.ready").
+			Field("pid", os.Getpid()).
+			Field("scope", scope).
+			Field("ready_at", "degraded").
+			StructuredOnly().Log(context.Background())
 		if readyFd > 0 {
 			if err := syscall.Close(readyFd); err != nil {
 				ulog.Warn("failed to close ready-fd").Field("fd", readyFd).Err(err).Log(ctx)
@@ -1760,6 +1820,9 @@ func serveConfigDegraded(
 	}
 
 	if err := srv.Listen(socketPath, httpPort); err != nil {
+		ulog.Error("Daemon lifecycle: stopping after server error").
+			Field("event", "daemon.lifecycle.stopping").Field("reason", "error").
+			Err(err).StructuredOnly().Log(ctx)
 		return fmt.Errorf("degraded server error: %w", err)
 	}
 
@@ -1776,14 +1839,23 @@ func serveConfigDegraded(
 	}
 
 	go func() {
+		stopSignal := "context_cancelled"
 		select {
 		case <-ctx.Done():
-		case <-stop:
+		case sig := <-stop:
+			stopSignal = daemonSignalName(sig)
 		case <-srv.TerminalHubShutdownReq():
+			stopSignal = "auto_shutdown"
 		case <-shadowed:
+			stopSignal = "shadowed"
 			ulog.Error("Shutting down: this degraded daemon has been shadowed").
 				Field("event", "daemon.stopped").Field("pid", os.Getpid()).Log(ctx)
 		}
+		ulog.Info("Daemon lifecycle: stopping").
+			Field("event", "daemon.lifecycle.stopping").
+			Field("reason", "signal").
+			Field("signal", stopSignal).
+			StructuredOnly().Log(context.Background())
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		hostReg.Unregister()
@@ -1798,6 +1870,9 @@ func serveConfigDegraded(
 		Err(configErr).
 		Log(ctx)
 	if err := srv.Serve(); err != nil {
+		ulog.Error("Daemon lifecycle: stopping after server error").
+			Field("event", "daemon.lifecycle.stopping").Field("reason", "error").
+			Err(err).StructuredOnly().Log(ctx)
 		return fmt.Errorf("degraded server error: %w", err)
 	}
 	return nil

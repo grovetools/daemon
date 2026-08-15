@@ -1708,6 +1708,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			Payload: &store.SessionEndPayload{
 				JobID:   sessionID,
 				Outcome: req.Outcome,
+				Reason:  "api_end",
 			},
 		})
 		w.WriteHeader(http.StatusOK)
@@ -1917,10 +1918,9 @@ func (s *Server) killSession(sessionID string) error {
 		Payload: &store.SessionEndPayload{
 			JobID:   sessionID,
 			Outcome: "interrupted",
+			Reason:  "api_kill",
 		},
 	})
-
-	s.ulog.Info("Session killed via API").Field("session_id", sessionID).Log(context.Background())
 	return nil
 }
 
