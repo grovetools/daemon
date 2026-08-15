@@ -14,6 +14,7 @@ import (
 	"github.com/grovetools/core/util/frontmatter"
 	"github.com/grovetools/daemon/internal/daemon/jobattr"
 	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/daemon/internal/daemon/telemetry"
 	"github.com/sirupsen/logrus"
 )
 
@@ -32,8 +33,8 @@ type JobCollector struct {
 	// exactly like the session reaper, so a scoped daemon can never
 	// rewrite another scope's job files.
 	scope string
-	// cfg supplies the reconciliation settings. Nil means defaults,
-	// which are report-only.
+	// cfg supplies reconciliation and terminal-row retention settings.
+	// Nil means conservative default-on loss correction and 14d retention.
 	cfg *config.Config
 	// stateDir overrides paths.StateDir() for the session-registry read
 	// the reconciliation sweep does. Empty uses the real one; only
@@ -69,7 +70,22 @@ func (c *JobCollector) Run(ctx context.Context, st *store.Store, updates chan<- 
 		// Reconcile job files claiming to run with nothing behind them.
 		// Runs after the store update so the sweep sees the freshest
 		// session picture it can.
-		c.sweepStuckJobFiles(ctx, ulog, st, jobs, time.Now())
+		now := time.Now()
+		c.sweepStuckJobFiles(ctx, ulog, st, jobs, now)
+
+		settings := resolveReconcileSettings(c.cfg)
+		cutoff := now.Add(-settings.sessionRetention)
+		for _, id := range st.PruneTerminalSessions(cutoff, "job_reconcile") {
+			telemetry.SessionTerminalRowsDropped.Inc()
+			ulog.Info("Pruned retained terminal session row").
+				Field("event", "session.retention_pruned").
+				Field("job_id", id).
+				Field("observed", "terminal row older than retention").
+				Field("concluded", "in-memory history retention expired").
+				Field("changed", true).
+				Field("retention", settings.sessionRetention.String()).
+				StructuredOnly().Log(ctx)
+		}
 	}
 
 	// Wait for workspaces to be populated first

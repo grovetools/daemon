@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,9 +10,12 @@ import (
 	"time"
 
 	"github.com/grovetools/core/config"
+	"github.com/grovetools/core/logging"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/sessions"
 	"github.com/grovetools/core/pkg/sessions/health"
+	"github.com/grovetools/daemon/internal/daemon/store"
+	"github.com/grovetools/flow/pkg/orchestration"
 )
 
 // writeJobFile lays down a plan job file with the given frontmatter
@@ -60,6 +64,25 @@ func settings(quiet time.Duration) reconcileSettings {
 	return reconcileSettings{enabled: true, quietFor: quiet, maxPerRun: 25}
 }
 
+func TestSweepOnePassConvergesWithoutSuccessOrAbandonment(t *testing.T) {
+	planDir := filepath.Join(t.TempDir(), "plans", "p")
+	path := writeJobFile(t, planDir, "one-pass.md", "running", time.Hour)
+	job := jobFor(planDir, "one-pass.md", "running")
+	c := collectorWithRegistry("", t.TempDir())
+
+	changed := c.sweepStuckJobFiles(context.Background(), logging.NewUnifiedLogger("test.reconcile"), store.New(), []*models.JobInfo{job}, time.Now())
+	if changed != 1 {
+		t.Fatalf("changed = %d, want 1", changed)
+	}
+	status, ok, err := orchestration.ReadJobFileStatus(path)
+	if err != nil || !ok || status != "orphaned" {
+		t.Fatalf("status = %q, ok=%v err=%v; want orphaned", status, ok, err)
+	}
+	if status == "completed" || status == "abandoned" {
+		t.Fatalf("unsafe reconciliation status %q", status)
+	}
+}
+
 // TestSweepConvictsAnAbandonedRunningJob is the ghost this exists for:
 // a file claiming "running", no session anywhere, no live process, long
 // since touched.
@@ -70,7 +93,7 @@ func TestSweepConvictsAnAbandonedRunningJob(t *testing.T) {
 	c := collectorWithRegistry("")
 	got := c.collectCandidates(
 		[]*models.JobInfo{jobFor(planDir, "87-commit.md", "running")},
-		map[string]struct{}{}, map[string]struct{}{},
+		map[string]*models.Session{}, map[string]*models.Session{},
 		settings(10*time.Minute), time.Now(),
 	)
 
@@ -85,9 +108,9 @@ func TestSweepConvictsAnAbandonedRunningJob(t *testing.T) {
 	}
 }
 
-// TestSweepSkipsJobsWithAnActiveSession: jobs the daemon still tracks
-// belong to the reaper, not to this sweep. Both paths acting on the
-// same file is how you get a double flip.
+// TestSweepSkipsJobsWithAnActiveSessionWithoutAStaleVerdict: presence alone
+// no longer vetoes reconciliation, but empty/unverified/alive rows do. Only
+// Phase 2's authoritative stale verdict crosses the mutation gate.
 func TestSweepSkipsJobsWithAnActiveSession(t *testing.T) {
 	planDir := filepath.Join(t.TempDir(), "plans", "p")
 	path := writeJobFile(t, planDir, "01-job.md", "running", time.Hour)
@@ -95,26 +118,40 @@ func TestSweepSkipsJobsWithAnActiveSession(t *testing.T) {
 
 	c := collectorWithRegistry("")
 
-	byFile := map[string]struct{}{path: {}}
-	if got := c.collectCandidates([]*models.JobInfo{job}, byFile, map[string]struct{}{}, settings(time.Minute), time.Now()); len(got) != 0 {
+	byFile := map[string]*models.Session{path: {ID: job.ID, Status: "running"}}
+	if got := c.collectCandidates([]*models.JobInfo{job}, byFile, map[string]*models.Session{}, settings(time.Minute), time.Now()); len(got) != 0 {
 		t.Errorf("candidates = %d, want 0 — a job with an active session is the reaper's", len(got))
 	}
 
-	byID := map[string]struct{}{job.ID: {}}
-	if got := c.collectCandidates([]*models.JobInfo{job}, map[string]struct{}{}, byID, settings(time.Minute), time.Now()); len(got) != 0 {
+	byID := map[string]*models.Session{job.ID: {ID: job.ID, Status: "running"}}
+	if got := c.collectCandidates([]*models.JobInfo{job}, map[string]*models.Session{}, byID, settings(time.Minute), time.Now()); len(got) != 0 {
 		t.Errorf("candidates = %d, want 0 — matched by session ID", len(got))
 	}
 }
 
 // TestSweepRespectsTheQuietThreshold: a file that was touched recently
 // has a live writer, whatever the process table says.
+func TestSweepAcceptsOnlyAuthoritativeStalePresentRow(t *testing.T) {
+	planDir := filepath.Join(t.TempDir(), "plans", "p")
+	path := writeJobFile(t, planDir, "01-job.md", "running", time.Hour)
+	job := jobFor(planDir, "01-job.md", "running")
+	row := &models.Session{ID: job.ID, JobFilePath: path, Status: "running", Verified: "stale"}
+
+	got := collectorWithRegistry("").collectCandidates([]*models.JobInfo{job},
+		map[string]*models.Session{path: row}, map[string]*models.Session{job.ID: row},
+		settings(time.Minute), time.Now())
+	if len(got) != 1 || got[0].source != "stored_verdict" || got[0].to != "orphaned" {
+		t.Fatalf("candidates = %+v, want one stored-stale orphan correction", got)
+	}
+}
+
 func TestSweepRespectsTheQuietThreshold(t *testing.T) {
 	planDir := filepath.Join(t.TempDir(), "plans", "p")
 	writeJobFile(t, planDir, "01-job.md", "running", time.Minute)
 	job := jobFor(planDir, "01-job.md", "running")
 
 	c := collectorWithRegistry("")
-	if got := c.collectCandidates([]*models.JobInfo{job}, map[string]struct{}{}, map[string]struct{}{},
+	if got := c.collectCandidates([]*models.JobInfo{job}, map[string]*models.Session{}, map[string]*models.Session{},
 		settings(10*time.Minute), time.Now()); len(got) != 0 {
 		t.Errorf("candidates = %d, want 0 — the file was touched a minute ago", len(got))
 	}
@@ -130,7 +167,7 @@ func TestSweepIgnoresTerminalStatuses(t *testing.T) {
 		name := status + ".md"
 		writeJobFile(t, planDir, name, status, time.Hour)
 		got := c.collectCandidates([]*models.JobInfo{jobFor(planDir, name, status)},
-			map[string]struct{}{}, map[string]struct{}{}, settings(time.Minute), time.Now())
+			map[string]*models.Session{}, map[string]*models.Session{}, settings(time.Minute), time.Now())
 		if len(got) != 0 {
 			t.Errorf("status %q produced %d candidates, want 0", status, len(got))
 		}
@@ -158,7 +195,7 @@ func TestSweepSparesJobsWithALivePID(t *testing.T) {
 	}
 
 	c := collectorWithRegistry("", stateDir)
-	got := c.collectCandidates([]*models.JobInfo{job}, map[string]struct{}{}, map[string]struct{}{},
+	got := c.collectCandidates([]*models.JobInfo{job}, map[string]*models.Session{}, map[string]*models.Session{},
 		settings(time.Minute), time.Now())
 	if len(got) != 0 {
 		t.Errorf("candidates = %d, want 0 — a live pid.lock must protect the job", len(got))
@@ -189,28 +226,28 @@ func TestSweepIsScopeGated(t *testing.T) {
 	}
 
 	foreign := collectorWithRegistry("/my/ecosystem", stateDir)
-	if got := foreign.collectCandidates([]*models.JobInfo{job}, map[string]struct{}{}, map[string]struct{}{},
+	if got := foreign.collectCandidates([]*models.JobInfo{job}, map[string]*models.Session{}, map[string]*models.Session{},
 		settings(time.Minute), time.Now()); len(got) != 0 {
 		t.Errorf("candidates = %d, want 0 — another scope's job", len(got))
 	}
 
 	owner := collectorWithRegistry("/other/ecosystem", stateDir)
-	if got := owner.collectCandidates([]*models.JobInfo{job}, map[string]struct{}{}, map[string]struct{}{},
+	if got := owner.collectCandidates([]*models.JobInfo{job}, map[string]*models.Session{}, map[string]*models.Session{},
 		settings(time.Minute), time.Now()); len(got) != 1 {
 		t.Errorf("candidates = %d, want 1 — the owning daemon may reconcile it", len(got))
 	}
 }
 
-// TestReconcileSettingsDefaultToReportOnly: rewriting somebody's job
-// file on inference must be an explicit opt-in for its first release.
-func TestReconcileSettingsDefaultToReportOnly(t *testing.T) {
+// TestReconcileSettingsDefaultOn pins the conservative anti-entropy default.
+// The sweep can only retract unsupported active claims; false remains an off-switch.
+func TestReconcileSettingsDefaultOn(t *testing.T) {
 	s := resolveReconcileSettings(nil)
-	if s.enabled {
-		t.Error("reconciliation defaulted to enabled; it must be opt-in")
+	if !s.enabled {
+		t.Error("reconciliation defaulted off, want conservative loss correction enabled")
 	}
-	if s.quietFor != defaultReconcileQuietFor || s.maxPerRun != defaultReconcileMaxPerRun {
-		t.Errorf("defaults = %v/%d, want %v/%d", s.quietFor, s.maxPerRun,
-			defaultReconcileQuietFor, defaultReconcileMaxPerRun)
+	if s.quietFor != defaultReconcileQuietFor || s.maxPerRun != defaultReconcileMaxPerRun || s.sessionRetention != defaultSessionRetention {
+		t.Errorf("defaults = %v/%d/%v, want %v/%d/%v", s.quietFor, s.maxPerRun, s.sessionRetention,
+			defaultReconcileQuietFor, defaultReconcileMaxPerRun, defaultSessionRetention)
 	}
 
 	on := true
@@ -221,6 +258,15 @@ func TestReconcileSettingsDefaultToReportOnly(t *testing.T) {
 	}})
 	if !s.enabled || s.quietFor != 30*time.Minute || s.maxPerRun != 5 {
 		t.Errorf("configured settings = %+v", s)
+	}
+
+	off := false
+	s = resolveReconcileSettings(&config.Config{Daemon: &config.DaemonConfig{
+		JobReconcile:     &config.DaemonJobReconcileConfig{Enabled: &off},
+		SessionRetention: "48h",
+	}})
+	if s.enabled || s.sessionRetention != 48*time.Hour {
+		t.Errorf("off-switch/retention settings = %+v", s)
 	}
 
 	// A malformed duration falls back rather than reconciling instantly.

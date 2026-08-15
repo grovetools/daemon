@@ -243,6 +243,10 @@ var (
 	TranscriptUnchanged  = Default().Counter("transcript.unchanged")
 	TranscriptParse      = Default().Stat("transcript.parse")
 
+	// Anti-entropy retention. Counts terminal session rows removed from the
+	// daemon's in-memory roster after the configured queryability window.
+	SessionTerminalRowsDropped = Default().Counter("session.terminal_rows_dropped")
+
 	// Effective (not configured) collector intervals.
 	collectorInterval = func(name string) *Gauge {
 		return Default().Gauge("collector." + name + ".interval_ms")

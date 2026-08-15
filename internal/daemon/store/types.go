@@ -77,6 +77,7 @@ const (
 	UpdateSessionStatus       UpdateType = "session_status"       // Update session status (running/idle/pending_user)
 	UpdateSessionEnd          UpdateType = "session_end"          // Mark session as completed/interrupted/failed/exited
 	UpdateSessionVerdict      UpdateType = "session_verdict"      // Derived health verdict; never session activity
+	UpdateSessionsPruned      UpdateType = "sessions_pruned"      // Retention-bounded deletion of old terminal rows
 	UpdateSessionTokens       UpdateType = "session_tokens"       // In-place live token/cost/context fields (daemon-computed)
 
 	// Job lifecycle update types for the daemon's JobRunner.
@@ -250,7 +251,7 @@ var allUpdateTypes = []UpdateType{
 	UpdateWorkspaces, UpdateSessions, UpdateFocus, UpdateConfigReload,
 	UpdateThemeChanged, UpdateSkillSync, UpdateWatcherStatus,
 	UpdateSessionIntent, UpdateSessionConfirmation, UpdateSessionStatus,
-	UpdateSessionEnd, UpdateSessionVerdict, UpdateSessionTokens,
+	UpdateSessionEnd, UpdateSessionVerdict, UpdateSessionsPruned, UpdateSessionTokens,
 	UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed,
 	UpdateJobCancelled, UpdateJobPendingUser, UpdateJobOrphaned,
 	UpdateJobsDiscovered,
@@ -443,6 +444,13 @@ type SessionEndPayload struct {
 type SessionVerdictPayload struct {
 	JobID    string `json:"job_id"`
 	Verified string `json:"verified"` // alive|unverified|stale
+}
+
+// SessionsPrunedPayload announces retention-based removal of terminal rows.
+// IDs are included for audit/debug consumers; active rows are never eligible.
+type SessionsPrunedPayload struct {
+	IDs    []string  `json:"ids"`
+	Before time.Time `json:"before"`
 }
 
 // SessionTokenUpdate carries daemon-computed live token usage for one session.

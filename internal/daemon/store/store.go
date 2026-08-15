@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -198,6 +199,44 @@ func (s *Store) GetSession(sessionID string) *models.Session {
 		return &sessCopy
 	}
 	return nil
+}
+
+// PruneTerminalSessions drops terminal in-memory rows whose best available
+// terminal timestamp is strictly before cutoff. The fallback order is EndedAt,
+// LastActivity, then StartedAt so legacy/recovered rows remain bounded. It is a
+// locked store mutation and publishes one reconciliation event when anything
+// changes; callers own provenance logging and metrics.
+func (s *Store) PruneTerminalSessions(cutoff time.Time, source string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var ids []string
+	for key, sess := range s.state.Sessions {
+		if sess == nil || !isTerminalSessionStatus(sess.Status) {
+			continue
+		}
+		stamp := sess.StartedAt
+		if !sess.LastActivity.IsZero() {
+			stamp = sess.LastActivity
+		}
+		if sess.EndedAt != nil && !sess.EndedAt.IsZero() {
+			stamp = *sess.EndedAt
+		}
+		if stamp.IsZero() || !stamp.Before(cutoff) {
+			continue
+		}
+		delete(s.state.Sessions, key)
+		ids = append(ids, sess.ID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	sort.Strings(ids)
+	s.publishLocked(Update{
+		Type: UpdateSessionsPruned, Source: source, Scanned: len(ids),
+		Payload: &SessionsPrunedPayload{IDs: append([]string(nil), ids...), Before: cutoff},
+	})
+	return ids
 }
 
 // GetJob returns a specific job by ID, or nil if not found.

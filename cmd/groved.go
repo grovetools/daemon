@@ -28,6 +28,7 @@ import (
 	"github.com/grovetools/core/pkg/pairwatch"
 	"github.com/grovetools/core/pkg/paths"
 	"github.com/grovetools/core/pkg/sessions"
+	"github.com/grovetools/core/pkg/sessions/health"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/daemon/internal/daemon/assistant"
@@ -1014,10 +1015,41 @@ func newGrovedStartCmd() *cobra.Command {
 					// long-dead records. Boot-time and once a day thereafter.
 					go func() {
 						purge := func() {
-							purged, perr := sessions.PurgeStaleSessions(sessions.DefaultSessionRetention)
+							type gcCandidate struct {
+								dir string
+								md  sessions.SessionMetadata
+							}
+							var candidates []gcCandidate
+							baseCorroborate := registryRecoveryCorroborator(st, scope)
+							corroborate := func(dir string, md sessions.SessionMetadata) bool {
+								ok := baseCorroborate(dir, md)
+								if ok {
+									candidates = append(candidates, gcCandidate{dir: dir, md: md})
+								}
+								return ok
+							}
+							purged, perr := sessions.PurgeStaleSessionsWithCorroboration(
+								sessions.DefaultSessionRetention, corroborate)
 							if perr != nil {
 								ulog.Warn("Session registry GC failed").Err(perr).Log(ctx)
 								return
+							}
+							for _, candidate := range candidates {
+								lock := filepath.Join(paths.StateDir(), "hooks", "sessions", candidate.dir, "pid.lock")
+								_, statErr := os.Stat(lock)
+								changed := os.IsNotExist(statErr)
+								jobID := candidate.md.JobID
+								if jobID == "" {
+									jobID = candidate.md.SessionID
+								}
+								ulog.Info("Reconciled dead registry recovery claim").
+									Field("event", "session.registry_reconcile").
+									Field("job_id", jobID).
+									Field("native_id", candidate.md.ClaudeSessionID).
+									Field("observed", "dead pid.lock; daemon row terminal or absent").
+									Field("concluded", "recovery claim must not resurrect").
+									Field("changed", changed).
+									StructuredOnly().Log(ctx)
 							}
 							if purged > 0 {
 								ulog.Info("Session registry GC purged stale records").
@@ -1882,6 +1914,39 @@ const (
 	maxActiveLogBytes = int64(256 << 20) // 256 MiB per active dated log
 	logSizeCheckEvery = 5 * time.Minute
 )
+
+// registryRecoveryCorroborator supplies the daemon-authoritative half of
+// registry GC. A dead pid.lock may be cleared only when every matching roster
+// row is terminal, or no row matches at all. Alias matching covers both legacy
+// job-ID and native-ID keyed registry directories.
+func registryRecoveryCorroborator(st *store.Store, scope string) sessions.RecoveryCorroborator {
+	return func(sessionDir string, metadata sessions.SessionMetadata) bool {
+		if metadata.Scope != scope {
+			return false
+		}
+		keys := map[string]struct{}{sessionDir: {}}
+		for _, key := range []string{metadata.SessionID, metadata.JobID, metadata.ClaudeSessionID} {
+			if key != "" {
+				keys[key] = struct{}{}
+			}
+		}
+		for _, row := range st.GetSessions() {
+			if row == nil {
+				continue
+			}
+			_, idMatch := keys[row.ID]
+			_, nativeMatch := keys[row.ClaudeSessionID]
+			if !idMatch && !nativeMatch {
+				continue
+			}
+			if health.IsActiveSessionStatus(row.Status) || row.Status == "pending" {
+				return false
+			}
+		}
+		// Both absence and terminal-only matches corroborate cleanup.
+		return true
+	}
+}
 
 // runLogRetentionJanitor owns daemon-side log hygiene: daily age retention plus
 // a frequent copy-truncate size backstop. Copy-truncate preserves the active

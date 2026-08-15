@@ -32,33 +32,44 @@ import (
 // every one of these holds:
 //
 //   - its frontmatter claims an active status (running/in_progress)
-//   - the daemon store has no active session for it
-//   - the shared classifier, over the on-disk session registry, finds
-//     no live process
+//   - a matching daemon row has authoritative Verified=stale, OR no row
+//     exists and the shared classifier freshly finds stale
 //   - the file itself has been untouched for QuietFor (default 10m)
 //   - the job belongs to this daemon's scope
 //
-// and even then the default is to log what it would have done rather
-// than do it (see DaemonJobReconcileConfig).
+// The default applies these conservative loss corrections. The config retains
+// a report-only off-switch. Success and unattended abandonment are forbidden.
 
 const (
 	defaultReconcileQuietFor  = 10 * time.Minute
 	defaultReconcileMaxPerRun = 25
+	defaultSessionRetention   = 14 * 24 * time.Hour
 )
 
 // reconcileSettings is the resolved, defaulted configuration.
 type reconcileSettings struct {
-	enabled   bool
-	quietFor  time.Duration
-	maxPerRun int
+	enabled          bool
+	quietFor         time.Duration
+	maxPerRun        int
+	sessionRetention time.Duration
 }
 
 func resolveReconcileSettings(cfg *config.Config) reconcileSettings {
 	s := reconcileSettings{
-		quietFor:  defaultReconcileQuietFor,
-		maxPerRun: defaultReconcileMaxPerRun,
+		enabled:          true,
+		quietFor:         defaultReconcileQuietFor,
+		maxPerRun:        defaultReconcileMaxPerRun,
+		sessionRetention: defaultSessionRetention,
 	}
-	if cfg == nil || cfg.Daemon == nil || cfg.Daemon.JobReconcile == nil {
+	if cfg == nil || cfg.Daemon == nil {
+		return s
+	}
+	if cfg.Daemon.SessionRetention != "" {
+		if d, err := time.ParseDuration(cfg.Daemon.SessionRetention); err == nil && d > 0 {
+			s.sessionRetention = d
+		}
+	}
+	if cfg.Daemon.JobReconcile == nil {
 		return s
 	}
 	jr := cfg.Daemon.JobReconcile
@@ -87,10 +98,11 @@ type reconcileCandidate struct {
 	quiet     time.Duration
 	verdict   health.Verdict
 	scopeSeen string
+	source    string // stored_verdict | fresh_probe
 }
 
 func (c reconcileCandidate) evidence() string {
-	return fmt.Sprintf("no active session; %s; file untouched %s", c.verdict.Reason, health.RoundDur(c.quiet))
+	return fmt.Sprintf("source=%s; %s; file untouched %s", c.source, c.verdict.Reason, health.RoundDur(c.quiet))
 }
 
 // sweepStuckJobFiles reconciles job files with no live process behind
@@ -105,21 +117,21 @@ func (c *JobCollector) sweepStuckJobFiles(
 ) int {
 	settings := resolveReconcileSettings(c.cfg)
 
-	// Sessions the daemon still tracks are the reaper's business, not
-	// ours. Index them by job file so an active session vetoes its job.
-	activeByFile := make(map[string]struct{})
-	activeByID := make(map[string]struct{})
+	// Index active rows. A present row is eligible only when Phase 2's
+	// authoritative verdict is stale; unverified and empty remain vetoes.
+	byFile := make(map[string]*models.Session)
+	byID := make(map[string]*models.Session)
 	for _, s := range st.GetSessions() {
-		if !health.IsActiveSessionStatus(s.Status) && s.Status != "pending" {
+		if s == nil || (!health.IsActiveSessionStatus(s.Status) && s.Status != "pending") {
 			continue
 		}
 		if s.JobFilePath != "" {
-			activeByFile[s.JobFilePath] = struct{}{}
+			byFile[s.JobFilePath] = s
 		}
-		activeByID[s.ID] = struct{}{}
+		byID[s.ID] = s
 	}
 
-	candidates := c.collectCandidates(jobs, activeByFile, activeByID, settings, now)
+	candidates := c.collectCandidates(jobs, byFile, byID, settings, now)
 	if len(candidates) == 0 {
 		return 0
 	}
@@ -137,33 +149,39 @@ func (c *JobCollector) sweepStuckJobFiles(
 	changed := 0
 	for _, cand := range candidates {
 		if !settings.enabled {
-			ulog.Info("Would reconcile stuck job file (reporting only)").
+			ulog.Info("Would reconcile unsupported active job claim (reporting only)").
+				Field("event", "job.reconcile").
 				Field("job_id", cand.job.ID).
 				Field("job_file", cand.path).
-				Field("from", cand.from).
-				Field("to", cand.to).
-				Field("evidence", cand.evidence()).
-				Field("hint", "set daemon.job_reconcile.enabled = true to apply").
-				Log(ctx)
+				Field("observed", cand.evidence()).
+				Field("concluded", cand.from+" -> "+cand.to).
+				Field("changed", false).
+				Field("hint", "remove daemon.job_reconcile.enabled=false to apply").
+				StructuredOnly().Log(ctx)
 			continue
 		}
 		didChange, err := orchestration.ReconcileJobFile(cand.path, cand.to)
 		switch {
 		case err != nil:
-			ulog.Warn("Failed to reconcile stuck job file").
+			ulog.Warn("Failed to reconcile unsupported active job claim").
 				Err(err).
+				Field("event", "job.reconcile").
 				Field("job_id", cand.job.ID).
 				Field("job_file", cand.path).
-				Log(ctx)
+				Field("observed", cand.evidence()).
+				Field("concluded", cand.from+" -> "+cand.to).
+				Field("changed", false).
+				StructuredOnly().Log(ctx)
 		case didChange:
 			changed++
-			ulog.Info("Reconciled stuck job file").
+			ulog.Info("Reconciled unsupported active job claim").
+				Field("event", "job.reconcile").
 				Field("job_id", cand.job.ID).
 				Field("job_file", cand.path).
-				Field("from", cand.from).
-				Field("to", cand.to).
-				Field("evidence", cand.evidence()).
-				Log(ctx)
+				Field("observed", cand.evidence()).
+				Field("concluded", cand.from+" -> "+cand.to).
+				Field("changed", true).
+				StructuredOnly().Log(ctx)
 		}
 	}
 	return changed
@@ -174,7 +192,7 @@ func (c *JobCollector) sweepStuckJobFiles(
 // is testable without a store, a config or a filesystem write.
 func (c *JobCollector) collectCandidates(
 	jobs []*models.JobInfo,
-	activeByFile, activeByID map[string]struct{},
+	byFile, byID map[string]*models.Session,
 	settings reconcileSettings,
 	now time.Time,
 ) []reconcileCandidate {
@@ -198,10 +216,11 @@ func (c *JobCollector) collectCandidates(
 			continue
 		}
 		path := filepath.Join(job.PlanDir, job.JobFile)
-		if _, taken := activeByFile[path]; taken {
-			continue
+		present := byFile[path]
+		if present == nil {
+			present = byID[job.ID]
 		}
-		if _, taken := activeByID[job.ID]; taken {
+		if present != nil && present.Verified != "stale" {
 			continue
 		}
 
@@ -214,7 +233,17 @@ func (c *JobCollector) collectCandidates(
 			continue
 		}
 
-		// Synthesize the session this job claims to be, and put it
+		if present != nil {
+			out = append(out, reconcileCandidate{
+				job: job, path: path, from: job.Status,
+				to: health.ReconciledStatusFor(string(job.Type)), quiet: quiet,
+				verdict: health.Verdict{State: health.Stale, Reason: "daemon stored verified=stale"},
+				source:  "stored_verdict",
+			})
+			continue
+		}
+
+		// No daemon row: synthesize the session this job claims to be, and put it
 		// through the same ladder every other surface uses. Reusing the
 		// classifier here is the point of promoting it to core: the
 		// daemon's unattended sweep and the user's 'X' key convict on
@@ -251,6 +280,7 @@ func (c *JobCollector) collectCandidates(
 			quiet:     quiet,
 			verdict:   probe[0].Verdict,
 			scopeSeen: seenScope,
+			source:    "fresh_probe",
 		})
 	}
 	return out

@@ -405,10 +405,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 					if nativeID == "" && recovered != nil && recovered.ClaudeSessionID != "" {
 						nativeID = recovered.ClaudeSessionID
 					}
-					if nativeID == "" {
-						nativeID = session.ID
-					}
-					_ = registry.RemoveRecoveryFiles(nativeID)
+					_, _ = registry.RemoveRecoveryFilesForJobInScope(session.ID, nativeID, c.scope)
 				}
 
 				delete(c.liveness, session.ID)

@@ -1905,7 +1905,7 @@ func (s *Server) killSession(sessionID string) error {
 		dirName = md.ClaudeSessionID
 	}
 	if registry, err := sessions.NewFileSystemRegistry(); err == nil {
-		_ = registry.RemoveRecoveryFiles(dirName)
+		_, _ = registry.RemoveRecoveryFilesForJobInScope(sessionID, dirName, s.scope)
 	}
 
 	// Mark as interrupted in the in-memory store so SSE subscribers
@@ -3423,7 +3423,7 @@ func convertUpdatePayload(u store.Update) *apiStateUpdate {
 	// Session lifecycle updates - broadcast as session changes
 	case store.UpdateSessionIntent, store.UpdateSessionConfirmation,
 		store.UpdateSessionStatus, store.UpdateSessionEnd,
-		store.UpdateSessionVerdict, store.UpdateSessionTokens:
+		store.UpdateSessionVerdict, store.UpdateSessionsPruned, store.UpdateSessionTokens:
 		return &apiStateUpdate{
 			UpdateType: "session",
 			Source:     u.Source,
