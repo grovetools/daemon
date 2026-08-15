@@ -85,7 +85,7 @@ func TestPullRootFollowsBoundNotebookNotDefault(t *testing.T) {
 		t.Errorf("syntheticNodeFor(bound) = %+v, %v; want notebook canary-nb", notebook, err)
 	}
 
-	roots, err := h.configuredPullRoots()
+	roots, err := h.configuredPullRoots(h.newRouting())
 	if err != nil {
 		t.Fatalf("configuredPullRoots: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestPullRootsResolveDeclaredNotebookSpellings(t *testing.T) {
 		t.Errorf("syntheticNodeFor(bound) = %+v, %v; want notebook canary-nb", node, err)
 	}
 
-	roots, err := h.configuredPullRoots()
+	roots, err := h.configuredPullRoots(h.newRouting())
 	if err != nil {
 		t.Fatalf("configuredPullRoots: %v", err)
 	}

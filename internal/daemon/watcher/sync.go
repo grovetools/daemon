@@ -401,47 +401,6 @@ func (h *SyncHandler) setConfig(cfg *config.Config) {
 	h.locator = workspace.NewNotebookLocator(cfg)
 }
 
-// recordedNotebookRoot returns the authoritative name+root pair. An exact
-// compiled code-root binding is literal rung 0; a stamped notespace whose id is
-// the recorded primary for its subject is rung 1; the recorded default is the
-// only fallback. The compiled NotebookRoot is returned directly, never
-// re-resolved through Definitions by notebook name.
-func (h *SyncHandler) recordedNotebookRoot(name string) (string, string, error) {
-	cfg := h.configSnapshot()
-	if cfg == nil || name == "" {
-		return "", "", fmt.Errorf("notespace %q has no recorded code-root/notebook binding", name)
-	}
-	if grove, ok := cfg.Groves[name]; ok {
-		if grove.Notebook != "" || grove.NotebookRoot != "" {
-			if grove.Notebook == "" || grove.NotebookRoot == "" {
-				return "", "", fmt.Errorf("notespace %q has an incomplete recorded code-root/notebook binding", name)
-			}
-			return grove.Notebook, grove.NotebookRoot, nil
-		}
-	}
-	// Identity rung, ahead of the default: a notes-plane subscription with no
-	// compiled code-root binding is still locatable BY IDENTITY — its stamp id
-	// has to be the recorded primary for its subject in machine.toml. Dropping
-	// straight to notebooks.rules.default here is what sent a notespace bound
-	// to a non-default notebook to <default>/notespaces/<name>, the wrong-root
-	// class P2 exists to eliminate. Nothing is inferred: an unstamped tree (a
-	// pull replica that does not exist yet) or a name that does not identify
-	// exactly one recorded primary falls through to the default rung below,
-	// byte for byte as before.
-	if notebook, root, ok := h.stampedNotebookRoot(name); ok {
-		return notebook, root, nil
-	}
-	if cfg.Notebooks == nil || cfg.Notebooks.Rules == nil || cfg.Notebooks.Rules.Default == "" {
-		return "", "", fmt.Errorf("notespace %q has no recorded code-root/notebook binding or default notebook", name)
-	}
-	notebook := cfg.Notebooks.Rules.Default
-	definition := cfg.Notebooks.Definitions[notebook]
-	if definition == nil || definition.RootDir == "" {
-		return "", "", fmt.Errorf("notespace %q routes to default notebook %q without a recorded root", name, notebook)
-	}
-	return notebook, notebookRootDir(definition), nil
-}
-
 // notebookRootDir resolves a recorded notebook definition's root to a path the
 // daemon can watch, join and stat.
 //
@@ -457,57 +416,6 @@ func notebookRootDir(definition *config.Notebook) string {
 		return ""
 	}
 	return coderoot.ExpandPath(definition.RootDir)
-}
-
-// stampedNotebookRoot answers which recorded notebook holds the stamped
-// notespace a display name identifies, using core's recorded-primary resolver
-// (stamp id + machine.toml [primaries]) rather than any name-to-directory
-// guess — the same chain nb, grove.nvim and skills already route through.
-//
-// ok is false whenever that chain cannot answer EXACTLY: no readable
-// machine.toml, no stamp, a name that is not a recorded primary, a name
-// ambiguous across roots, a resolved root that is not
-// <recorded notebook root>/notespaces/<name>, or a notebook root that
-// notebooks.toml does not record. Every one of those leaves the decision to the
-// caller's remaining rungs instead of inventing a root.
-func (h *SyncHandler) stampedNotebookRoot(name string) (string, string, bool) {
-	cfg := h.configSnapshot()
-	if cfg == nil || cfg.Notebooks == nil || len(cfg.Notebooks.Definitions) == 0 {
-		return "", "", false
-	}
-	machineCfg, err := config.LoadMachineConfig()
-	if err != nil || machineCfg == nil {
-		return "", "", false
-	}
-	resolution, err := workspace.ResolveNotespaceName(name, cfg, machineCfg)
-	if err != nil || resolution.Root == "" {
-		return "", "", false
-	}
-	// recordedNotebookRoot's contract is a NOTEBOOK root that nodeNotespaceRoot
-	// re-joins with "notespaces/<name>", so only a resolution that round-trips
-	// through that join can be reported here.
-	if filepath.Base(resolution.Root) != name {
-		return "", "", false
-	}
-	notespacesDir := filepath.Dir(resolution.Root)
-	if filepath.Base(notespacesDir) != workspace.NotespaceDirectory {
-		return "", "", false
-	}
-	notebookRoot := filepath.Dir(notespacesDir)
-	// Both sides are normalized before comparison. resolution.Root is an
-	// absolute path built by walking the notespace index; a definition's
-	// RootDir is a RECORDED value, and comparing a recorded value to a
-	// resolved one by raw string equality is exactly the mistake this rung
-	// exists to correct one layer down. A declared "~/notebooks/canary-nb"
-	// never equals "/Users/…/notebooks/canary-nb", so the rung would report
-	// "no recorded notebook" and hand the decision back to the default — the
-	// same wrong root, arrived at more expensively.
-	for _, notebook := range slices.Sorted(maps.Keys(cfg.Notebooks.Definitions)) {
-		if samePhysicalPath(notebookRootDir(cfg.Notebooks.Definitions[notebook]), notebookRoot) {
-			return notebook, notebookRoot, true
-		}
-	}
-	return "", "", false
 }
 
 // samePhysicalPath reports whether two paths name the same directory.
@@ -528,42 +436,6 @@ func samePhysicalPath(a, b string) bool {
 	canonicalA, errA := pathutil.CanonicalPath(a)
 	canonicalB, errB := pathutil.CanonicalPath(b)
 	return errA == nil && errB == nil && canonicalA == canonicalB
-}
-
-func (h *SyncHandler) syntheticNodeFor(name string) (*workspace.WorkspaceNode, error) {
-	node := &workspace.WorkspaceNode{Name: name}
-	notebook, _, err := h.recordedNotebookRoot(name)
-	if err != nil {
-		return node, err
-	}
-	node.NotebookName = notebook
-	return node, nil
-}
-
-// nodeNotespaceRoot consumes a compiled root literally for discovered nodes as
-// well as synthetic subscriptions. It has no existence requirement: pull must
-// be able to materialize a replica into a tree that does not exist yet.
-func (h *SyncHandler) nodeNotespaceRoot(node *workspace.WorkspaceNode) (string, error) {
-	if node == nil {
-		return "", fmt.Errorf("cannot route a nil notespace node")
-	}
-	_, root, err := h.recordedNotebookRoot(node.Name)
-	if err != nil && node.Path != "" {
-		binding := config.ResolveNotebook(config.NotebookQuery{
-			Path:       node.Path,
-			OwnerPaths: []string{node.ParentProjectPath, node.ParentEcosystemPath, node.RootEcosystemPath},
-		}, h.configSnapshot())
-		if binding.Notebook != "" && binding.NotebookRoot != "" {
-			root, err = binding.NotebookRoot, nil
-		}
-	}
-	if err != nil {
-		return "", err
-	}
-	if !filepath.IsAbs(root) {
-		return "", fmt.Errorf("notespace %q has non-absolute recorded notebook root %q", node.Name, root)
-	}
-	return filepath.Join(root, "notespaces", node.Name), nil
 }
 
 // NotespaceRoots resolves explicitly selected subscribed notespaces to their
@@ -589,12 +461,13 @@ func (h *SyncHandler) NotespaceRoots(ids []string) (map[string]string, error) {
 		missing = missing || roots[id] == ""
 	}
 	if missing {
+		routing := h.newRouting()
 		for _, sub := range h.subscriptionsSnapshot() {
-			node, err := h.syntheticNodeFor(sub.Name)
+			node, err := routing.syntheticNodeFor(sub.Name)
 			if err != nil {
 				return nil, err
 			}
-			root, err := h.nodeNotespaceRoot(node)
+			root, err := routing.nodeNotespaceRoot(node)
 			if err != nil {
 				return nil, err
 			}
@@ -628,17 +501,17 @@ func (h *SyncHandler) NotespaceRoots(ids []string) (map[string]string, error) {
 // code-notespace discovery. Pull targets are notebook notespaces whose paths
 // are fully config-determined; requiring a .git under a grove path to
 // materialize notes was accidental coupling (the empty-~/code satellite bug).
-func (h *SyncHandler) configuredPullRoots() (map[string]string, error) {
+func (h *SyncHandler) configuredPullRoots(routing *syncRouting) (map[string]string, error) {
 	roots := make(map[string]string)
 	for _, sub := range h.subscriptionsSnapshot() {
 		if !sub.Pull || sub.Mode == config.SyncModeSearchOnly {
 			continue
 		}
-		node, err := h.syntheticNodeFor(sub.Name)
+		node, err := routing.syntheticNodeFor(sub.Name)
 		if err != nil {
 			return nil, err
 		}
-		root, err := h.nodeNotespaceRoot(node)
+		root, err := routing.nodeNotespaceRoot(node)
 		if err != nil {
 			return nil, err
 		}
@@ -741,12 +614,17 @@ func (h *SyncHandler) ComputeWatchPaths(notespaces []*models.EnrichedWorkspace) 
 	covered := make(map[string]bool) // subscription names covered by discovery
 	var routingErrors []string
 
+	// One routing snapshot for the whole pass. Every workspace below asks it the
+	// same questions against the same config and the same stamps; taking it per
+	// question is what made this loop 37% of a 250%-CPU daemon.
+	routing := h.newRouting()
+
 	for _, ew := range notespaces {
 		node := ew.WorkspaceNode
 		if node == nil {
 			continue
 		}
-		sub := h.effectiveSubscription(node.Name, h.discoveredNotespaceRoot(node))
+		sub := routing.effectiveSubscription(node.Name, routing.discoveredNotespaceRoot(node))
 		if sub == nil {
 			continue
 		}
@@ -756,7 +634,7 @@ func (h *SyncHandler) ComputeWatchPaths(notespaces []*models.EnrichedWorkspace) 
 			continue
 		}
 
-		root, err := h.nodeNotespaceRoot(node)
+		root, err := routing.nodeNotespaceRoot(node)
 		if err != nil {
 			routingErrors = append(routingErrors, err.Error())
 			continue
@@ -788,12 +666,12 @@ func (h *SyncHandler) ComputeWatchPaths(notespaces []*models.EnrichedWorkspace) 
 		if covered[sub.Name] || sub.Mode == config.SyncModeSearchOnly {
 			continue
 		}
-		node, err := h.syntheticNodeFor(sub.Name)
+		node, err := routing.syntheticNodeFor(sub.Name)
 		if err != nil {
 			routingErrors = append(routingErrors, err.Error())
 			continue
 		}
-		root, err := h.nodeNotespaceRoot(node)
+		root, err := routing.nodeNotespaceRoot(node)
 		if err != nil {
 			routingErrors = append(routingErrors, err.Error())
 			continue
@@ -807,7 +685,7 @@ func (h *SyncHandler) ComputeWatchPaths(notespaces []*models.EnrichedWorkspace) 
 	// discovery covers — see sync_containment.go. This is also how a notespace
 	// CREATED inside an already-shared notebook starts syncing: it is simply
 	// present on the next reconcile.
-	for _, contained := range h.containedNotespaces(covered) {
+	for _, contained := range routing.containedNotespaces(covered) {
 		maps.Copy(newWatches, computeNotespaceWatches(&contained.sub, contained.root, recordedContentDirs(contained.root)))
 	}
 
@@ -1467,7 +1345,7 @@ func (h *SyncHandler) BeginMaintenance(ctx context.Context) error {
 		}
 	}
 	h.pathsMutex.RUnlock()
-	pullRoots, err := h.configuredPullRoots()
+	pullRoots, err := h.configuredPullRoots(h.newRouting())
 	if err != nil {
 		return err
 	}

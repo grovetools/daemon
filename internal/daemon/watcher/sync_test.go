@@ -249,7 +249,7 @@ func TestConfiguredPullRootsZeroDiscovery(t *testing.T) {
 		t.Fatalf("expected no watch paths for a nonexistent tree, got %v", paths)
 	}
 
-	roots, err := h.configuredPullRoots()
+	roots, err := h.configuredPullRoots(h.newRouting())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +332,7 @@ func TestSyntheticNodeNotebookResolution(t *testing.T) {
 	if node, err := h.syntheticNodeFor("ws"); err == nil || node.NotebookName != "" {
 		t.Errorf("bare config: node=%+v err=%v, want missing-binding error", node, err)
 	}
-	if roots, err := h.configuredPullRoots(); err == nil || roots != nil {
+	if roots, err := h.configuredPullRoots(h.newRouting()); err == nil || roots != nil {
 		t.Errorf("configuredPullRoots = %v, %v; want explicit missing-binding error", roots, err)
 	}
 	h.ComputeWatchPaths(nil)
@@ -451,7 +451,7 @@ func TestComputeWatchPathsPushOnlyBareNotebook(t *testing.T) {
 
 	// configuredPullRoots is pull-side only — it must still ignore this
 	// subscription, which is precisely why the watch loop has to cover it.
-	if roots, err := h.configuredPullRoots(); err != nil || len(roots) != 0 {
+	if roots, err := h.configuredPullRoots(h.newRouting()); err != nil || len(roots) != 0 {
 		t.Fatalf("configuredPullRoots = %v, %v; want empty for a push-only subscription", roots, err)
 	}
 

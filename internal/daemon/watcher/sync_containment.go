@@ -61,16 +61,16 @@ import (
 // recorded as shared — the one it inherits from that notebook.
 // Every caller that used to call subscription(name) directly for ROUTING goes
 // through this; subscription(name) itself stays the literal config lookup.
-func (h *SyncHandler) effectiveSubscription(displayName, root string) *config.SyncWorkspace {
-	if sub := h.subscription(displayName); sub != nil {
+func (r *syncRouting) effectiveSubscription(displayName, root string) *config.SyncWorkspace {
+	if sub := r.h.subscription(displayName); sub != nil {
 		return sub
 	}
-	return h.containmentSubscription(root)
+	return r.containmentSubscription(root)
 }
 
 // containmentSubscription derives the inherited subscription for a stamped
 // notespace inside a shared notebook, or nil when containment does not apply.
-func (h *SyncHandler) containmentSubscription(root string) *config.SyncWorkspace {
+func (r *syncRouting) containmentSubscription(root string) *config.SyncWorkspace {
 	if root == "" {
 		return nil
 	}
@@ -78,11 +78,20 @@ func (h *SyncHandler) containmentSubscription(root string) *config.SyncWorkspace
 	if !ok {
 		return nil
 	}
-	// Consent is recorded by the mint, not inferred from the directory.
+	// A notespace directory that is not there has no stamp to read, and on a
+	// discovery pass that is the answer for nearly every workspace.
+	if exists, listed := r.notespaceExists(notebookRoot, filepath.Base(root)); listed && !exists {
+		return nil
+	}
+	// Consent is recorded by the mint, not inferred from the directory. The
+	// stamp is read here rather than taken from the routing snapshot's index on
+	// purpose: the index refuses to build at all when ANY stamp under a recorded
+	// notebook is malformed, and one bad stamp must not withdraw containment
+	// from every other notespace beside it.
 	if stamp, err := notespacepkg.LoadNotespace(root); err != nil || stamp == nil {
 		return nil
 	}
-	template := h.notebookShareTemplate(notebookRoot)
+	template := r.notebookShareTemplate(notebookRoot)
 	if template == nil {
 		return nil
 	}
@@ -97,11 +106,11 @@ func (h *SyncHandler) containmentSubscription(root string) *config.SyncWorkspace
 // resolution (and its own routing-error reporting) a few lines later, and a
 // node whose root cannot be resolved simply inherits nothing. The
 // anySharedNotebook guard keeps it free on a machine that shares nothing.
-func (h *SyncHandler) discoveredNotespaceRoot(node *workspace.WorkspaceNode) string {
-	if !h.anySharedNotebook() {
+func (r *syncRouting) discoveredNotespaceRoot(node *workspace.WorkspaceNode) string {
+	if !r.anySharedNotebook() {
 		return ""
 	}
-	root, err := h.nodeNotespaceRoot(node)
+	root, err := r.nodeNotespaceRoot(node)
 	if err != nil {
 		return ""
 	}
@@ -111,8 +120,8 @@ func (h *SyncHandler) discoveredNotespaceRoot(node *workspace.WorkspaceNode) str
 // anySharedNotebook reports whether this machine records ANY shared notebook.
 // It is the cheap pre-check in front of the per-node work: containment cannot
 // apply anywhere until at least one notebook says `share = true`.
-func (h *SyncHandler) anySharedNotebook() bool {
-	cfg := h.configSnapshot()
+func (r *syncRouting) anySharedNotebook() bool {
+	cfg := r.cfg
 	if cfg == nil || cfg.Notebooks == nil {
 		return false
 	}
@@ -136,8 +145,8 @@ type containedNotespace struct {
 // the notespace an operator created inside a shared notebook a minute ago.
 // Without this the containment rule would hold only for notespaces that happen
 // to have a checkout under a scan root.
-func (h *SyncHandler) containedNotespaces(covered map[string]bool) []containedNotespace {
-	cfg := h.configSnapshot()
+func (r *syncRouting) containedNotespaces(covered map[string]bool) []containedNotespace {
+	cfg := r.cfg
 	if cfg == nil || cfg.Notebooks == nil {
 		return nil
 	}
@@ -160,7 +169,7 @@ func (h *SyncHandler) containedNotespaces(covered map[string]bool) []containedNo
 				continue
 			}
 			root := filepath.Join(notebookRoot, workspace.NotespaceDirectory, entry.Name())
-			sub := h.containmentSubscription(root)
+			sub := r.containmentSubscription(root)
 			if sub == nil {
 				continue
 			}
@@ -227,11 +236,11 @@ func containmentTerms() config.SyncWorkspace {
 // registry's pull posture. Since `grove join` writes exactly one registry entry
 // and nothing else, skipping it is what makes the default terms the usual
 // answer rather than a rare one.
-func (h *SyncHandler) notebookShareTemplate(notebookRoot string) *config.SyncWorkspace {
-	if !h.notebookRecordedShared(notebookRoot) {
+func (r *syncRouting) notebookShareTemplate(notebookRoot string) *config.SyncWorkspace {
+	if !r.notebookRecordedShared(notebookRoot) {
 		return nil
 	}
-	subs := h.subscriptionsSnapshot()
+	subs := r.h.subscriptionsSnapshot()
 	slices.SortFunc(subs, func(a, b config.SyncWorkspace) int {
 		switch {
 		case a.Name < b.Name:
@@ -247,7 +256,7 @@ func (h *SyncHandler) notebookShareTemplate(notebookRoot string) *config.SyncWor
 		if sub.Mode == config.SyncModeSearchOnly || sub.Role == config.SyncRoleRegistry {
 			continue
 		}
-		_, subNotebookRoot, err := h.recordedNotebookRoot(sub.Name)
+		_, subNotebookRoot, err := r.recordedNotebookRoot(sub.Name)
 		if err != nil {
 			continue
 		}
@@ -264,8 +273,8 @@ func (h *SyncHandler) notebookShareTemplate(notebookRoot string) *config.SyncWor
 // because that is what the caller has, and roots are compared physically for
 // the same reason every other comparison in this file is: a recorded spelling
 // and a resolved path are not the same string.
-func (h *SyncHandler) notebookRecordedShared(notebookRoot string) bool {
-	cfg := h.configSnapshot()
+func (r *syncRouting) notebookRecordedShared(notebookRoot string) bool {
+	cfg := r.cfg
 	if cfg == nil || cfg.Notebooks == nil {
 		return false
 	}

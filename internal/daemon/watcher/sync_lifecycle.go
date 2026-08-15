@@ -167,13 +167,18 @@ func (h *SyncHandler) ensurePipelines() {
 
 	generation := h.configGeneration.Load()
 
-	desired, err := h.desiredRoots()
+	// One routing snapshot for the whole reconcile: desiredRoots and
+	// resolveIdentities both route names, and every pass would otherwise
+	// re-resolve the same names against the same config and stamps.
+	routing := h.newRouting()
+
+	desired, err := h.desiredRoots(routing)
 	if err != nil {
 		h.ulog.Error("sync routing configuration error; pipelines not started").Err(err).Log(h.baseCtx)
 		return
 	}
 
-	resolved := h.resolveIdentities(desired)
+	resolved := h.resolveIdentities(routing, desired)
 
 	h.reclaimDrained()
 	h.stopUndesired(resolved, desired, generation)
@@ -199,7 +204,7 @@ func (h *SyncHandler) ensurePipelines() {
 	// pipeline was already running from an earlier pass — a notebook shared
 	// after the fact, a machine that predates this rule — would otherwise never
 	// be asked about at all.
-	h.attachContainedNotespaces(client, resolved)
+	h.attachContainedNotespaces(routing, client, resolved)
 
 	// Capture switches to immutable identity only for roots that have a
 	// REGISTERED, running transport — including after a watch-set refresh that
@@ -214,7 +219,7 @@ func (h *SyncHandler) ensurePipelines() {
 // discovery-driven watch set (push-side real trees), and direct config
 // resolution for pull = true subscriptions, so a pull replica is desired even
 // when code discovery finds nothing.
-func (h *SyncHandler) desiredRoots() (map[string]string, error) {
+func (h *SyncHandler) desiredRoots(routing *syncRouting) (map[string]string, error) {
 	roots := make(map[string]string)
 	h.pathsMutex.RLock()
 	for _, w := range h.watchedPaths {
@@ -228,7 +233,7 @@ func (h *SyncHandler) desiredRoots() (map[string]string, error) {
 	}
 	h.pathsMutex.RUnlock()
 
-	pullRoots, err := h.configuredPullRoots()
+	pullRoots, err := h.configuredPullRoots(routing)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +251,7 @@ func (h *SyncHandler) desiredRoots() (map[string]string, error) {
 // stopUndesired — an unreadable stamp is usually transient and must not tear a
 // working transport down). Duplicate ids are settled here: exactly one root per
 // id survives, the rest are parked.
-func (h *SyncHandler) resolveIdentities(desired map[string]string) map[string]resolvedNotespace {
+func (h *SyncHandler) resolveIdentities(routing *syncRouting, desired map[string]string) map[string]resolvedNotespace {
 	// Deterministic order: by root, as the pre-P3 pass did.
 	names := slices.Collect(maps.Keys(desired))
 	slices.SortFunc(names, func(a, b string) int { return strings.Compare(desired[a], desired[b]) })
@@ -264,7 +269,7 @@ func (h *SyncHandler) resolveIdentities(desired map[string]string) map[string]re
 			h.ulog.Error("notespace registration failed; pipeline parked").Err(err).Field("root", root).Log(h.baseCtx)
 			continue
 		}
-		sub := h.effectiveSubscription(displayName, root)
+		sub := routing.effectiveSubscription(displayName, root)
 		candidates[stamp.ID] = append(candidates[stamp.ID], resolvedNotespace{
 			id: stamp.ID, displayName: displayName, root: root, stamp: stamp, sub: sub,
 		})

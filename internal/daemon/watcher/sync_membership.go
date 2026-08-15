@@ -126,11 +126,11 @@ type containedMembership struct {
 // It never gates a transport. A notespace that cannot be attached still syncs
 // for this machine exactly as it did before; what it does not do is reach any
 // other machine, which is the condition being reported and repaired here.
-func (h *SyncHandler) attachContainedNotespaces(client *syncdb.Client, resolved map[string]resolvedNotespace) {
+func (h *SyncHandler) attachContainedNotespaces(routing *syncRouting, client *syncdb.Client, resolved map[string]resolvedNotespace) {
 	if client == nil || h.baseCtx == nil {
 		return
 	}
-	pending := h.pendingMemberships(resolved)
+	pending := h.pendingMemberships(routing, resolved)
 	if len(pending) == 0 {
 		return
 	}
@@ -160,12 +160,12 @@ func (h *SyncHandler) attachContainedNotespaces(client *syncdb.Client, resolved 
 // pendingMemberships is the contained notespaces whose membership is not
 // already settled, in a deterministic order. It reads only local state, which is
 // what keeps a fully-settled machine from making any request at all.
-func (h *SyncHandler) pendingMemberships(resolved map[string]resolvedNotespace) []containedMembership {
+func (h *SyncHandler) pendingMemberships(routing *syncRouting, resolved map[string]resolvedNotespace) []containedMembership {
 	var pending []containedMembership
 	for _, id := range slices.Sorted(maps.Keys(resolved)) {
 		r := resolved[id]
 		notebookRoot, ok := containingNotebookRoot(r.root)
-		if !ok || !h.notebookRecordedShared(notebookRoot) {
+		if !ok || !routing.notebookRecordedShared(notebookRoot) {
 			continue
 		}
 		// The notebook's own identity is the .notebook.toml an operator verb
