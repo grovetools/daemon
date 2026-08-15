@@ -618,6 +618,17 @@ func (h *SyncHandler) MarkContested(notespaceID, reason string) {
 
 // markContested installs a full verdict. MarkContested is the reason-only
 // spelling; both go through here so the map has one writer.
+//
+// Installing the verdict is SYNCHRONOUSLY enough to stop this notespace's own
+// outbound loops, and that is the whole point of where the write sits. The
+// caller is usually the pull gate's OnContested, running on the pull goroutine
+// of the pipeline that is also pushing; the loops read the same map through
+// outboundVeto, so by the time this returns the next outbox batch — and the
+// next anti-entropy phase — is already refused. What the reconcile pass adds
+// afterwards is teardown, not enforcement. Before the veto was consulted by
+// the loops, the reconcile WAS the enforcement, and the nine to twenty seconds
+// it took to arrive were long enough for the push loop to drain the disputed
+// tree to the server.
 func (h *SyncHandler) markContested(entry ContestedNotespace) {
 	if entry.NotespaceID == "" {
 		return
@@ -625,6 +636,28 @@ func (h *SyncHandler) markContested(entry ContestedNotespace) {
 	h.parkMu.Lock()
 	h.contested[entry.NotespaceID] = entry
 	h.parkMu.Unlock()
+}
+
+// outboundVeto is the W3.5 gate as the RUNNING loops consult it: a live read of
+// the contested set for one notespace id, handed to the push loop and the
+// anti-entropy sweep at spawn time and evaluated per outbox batch and per pass.
+//
+// It is keyed by id and closes over nothing else on purpose. The alternative
+// shape — a flag on pipelineState, flipped by OnContested — has a window that
+// this one does not: startPipeline spawns push, anti-entropy and pull BEFORE it
+// installs the pipelineState, so a contest raised by the pull loop's first
+// batch can land while there is still no state to flip, and the loops that were
+// already running would consult a flag nobody could reach. A notespace id
+// exists from the first line of startPipeline, and the verdict is stored
+// against it, so there is no such window here. It also makes the veto correct
+// for a pipeline that is torn down and respawned mid-verdict, and it keeps one
+// source of truth: pushDesired, pullDesired, the maintenance drain and the
+// loops all read the same map.
+func (h *SyncHandler) outboundVeto(notespaceID string) func() bool {
+	return func() bool {
+		_, contested := h.isContested(notespaceID)
+		return contested
+	}
 }
 
 // ClearContested records that a contested notespace has been adopted.
@@ -768,6 +801,13 @@ func (h *SyncHandler) pullDesired(r resolvedNotespace) bool {
 // (the watch stays bound, since the pipeline is still installed at its root),
 // and adoption releases them. Withholding push is not discarding local work; it
 // is holding it until the operator says which copy wins.
+//
+// This function answers the question at pipeline BIRTH and at reconcile time,
+// which is necessary and was not sufficient: the pipeline that raises a
+// contest is normally one that is already pushing, and it went on pushing
+// until the reconcile arrived — 9-20s in the field, enough to publish the
+// disputed tree. The running loops therefore consult the same verdict
+// themselves, per outbox batch and per anti-entropy pass; see outboundVeto.
 func (h *SyncHandler) pushDesired(r resolvedNotespace) bool {
 	if r.sub == nil {
 		return false
@@ -1024,10 +1064,15 @@ func (h *SyncHandler) startPipeline(client *syncdb.Client, db *syncdb.DB, r reso
 		pullPipeline.OnConflict = func(kind, ws, path, documentID, detail string) {
 			h.broadcastConflict(&store.SyncConflictPayload{Kind: kind, NotespaceID: ws, NotespaceName: stamp.Name, Path: path, DocumentID: documentID, Detail: detail})
 		}
-		// W3.5: the gate's verdict becomes this daemon's. Marking tears BOTH
-		// loops down on the next reconcile, so the batch the gate withheld is
-		// the last one this pipeline ever considers — and the local content it
-		// collided with does not leave this machine in the meantime.
+		// W3.5: the gate's verdict becomes this daemon's, and it takes effect
+		// before this callback returns. Marking installs the verdict the
+		// outbound loops of THIS pipeline consult per batch (outboundVeto), so
+		// the batch the gate withheld is the last one this pipeline ever
+		// considers in either direction — the next reconcile tears the
+		// transport down, but nothing waits for it. The one thing that could
+		// still be in flight is a push whose HTTP request was already on the
+		// wire when the gate closed; everything the loops have not yet sent
+		// stays parked in the outbox.
 		pullPipeline.OnContested = func(_ string, evidence syncdb.AdoptionEvidence) {
 			h.markContestedFromPull(root, evidence)
 		}
@@ -1084,6 +1129,12 @@ func (h *SyncHandler) startOutbound(
 	sub *config.SyncWorkspace,
 ) {
 	push := syncdb.NewPushPipeline(db, client, name, h.ulog, syncdb.PushConfig{})
+	// The W3.5 veto, live rather than decided at birth. `push` here is already
+	// the answer to "should this loop exist at all", taken one pass ago; this
+	// is the answer to "may this batch leave", taken now. The pull loop spawned
+	// below is what usually raises the verdict, and it raises it against the
+	// pipeline these two loops belong to.
+	push.Withheld = h.outboundVeto(name)
 	// Surface server-ceiling oversize skips as a sync_conflict SSE update
 	// (convertToAPIUpdate already forwards UpdateSyncConflict). The quiet
 	// per-notespace MaxFileSize skip stays in flush; this is the loud one.
@@ -1115,6 +1166,9 @@ func (h *SyncHandler) startOutbound(
 	// uses, so walk coverage and reconcile coverage judge the doc space
 	// identically.
 	ae := syncdb.NewAntiEntropyPass(db, client, name, root, syncdb.NewDocSpace(sub), h.ulog, syncdb.AntiEntropyConfig{})
+	// Same veto as the push loop: the sweep is the other half of this
+	// direction, and walkLocalTree is the leg that seeds the disputed tree.
+	ae.Withheld = h.outboundVeto(name)
 	// A recreated server is detected by whichever pass handshakes first,
 	// but CheckServerEpoch voids EVERY notespace's synced state and
 	// clears their outboxes. Fan the sweep out so the others re-push in

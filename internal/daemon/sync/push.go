@@ -78,6 +78,54 @@ type PushPipeline struct {
 	// Same decoupling pattern as OnOversizeSkipped.
 	OnDiverged func(notespace, path string)
 	OnConflict func(kind, notespace, path, documentID, detail string)
+
+	// Withheld, when non-nil, is the outbound veto this LOOP consults — the
+	// W3.5 adoption gate as a running push loop sees it, rather than as a
+	// decision taken once at pipeline birth.
+	//
+	// The owner (the watcher) decides at birth whether a push loop exists at
+	// all. That answer is not enough, because the verdict is usually raised by
+	// the PULL loop of the very pipeline that is already pushing: between
+	// OnContested and the reconcile that tears the transport down, this loop
+	// went on draining the outbox — nine to twenty seconds of it in the field,
+	// which was long enough to publish the disputed tree to the server and
+	// thence to every other machine. See MarkContested in the watcher.
+	//
+	// So it is checked THREE times per drain pass, and every one of them is a
+	// point at which content would otherwise leave this machine:
+	//
+	//	before a batch is fetched — the steady state;
+	//	after a batch is in hand, before its blobs are uploaded — a blob
+	//	upload is content leaving, ahead of any /sync/push;
+	//	before every push attempt, retries included — a retry backoff is
+	//	seconds long and a verdict landing inside one must win.
+	//
+	// A veto is not an error and never discards work: the fetched entries stay
+	// in the outbox, parked for the operator's decision, and adoption releases
+	// them. nil means no gate (the pre-W3.5 shape, and what the tests that do
+	// not exercise adoption see).
+	Withheld func() bool
+}
+
+// withheld reports the outbound veto. A nil hook is "not vetoed", so a
+// pipeline constructed without one behaves exactly as before.
+func (p *PushPipeline) withheld() bool { return p.Withheld != nil && p.Withheld() }
+
+// abortWithheld is the mid-flight half of the veto: the batch has already been
+// fetched, read from disk and turned into events, and the verdict landed
+// anyway. It is logged at Warn rather than Debug because it is rare by
+// construction — the loop-top check catches the steady state, so reaching here
+// means the gate closed inside one drain pass, which is the exact race the
+// field incident was — and because the operator wants the timestamp beside the
+// contest in the log.
+func (p *PushPipeline) abortWithheld(ctx context.Context, events int) bool {
+	if !p.withheld() {
+		return false
+	}
+	p.log.Warn("push abandoned mid-batch: the notespace was contested with its outbox batch in hand").
+		Field("notespace", p.notespace).
+		Field("events", events).Log(ctx)
+	return true
 }
 
 // NewPushPipeline constructs a push pipeline for a single notespace.
@@ -122,6 +170,15 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, notespaceRoot string) (i
 		case <-ctx.Done():
 			return successCount, ctx.Err()
 		default:
+		}
+
+		// The W3.5 outbound veto, per batch (see the Withheld field). Not an
+		// error: nothing has failed, this notespace is simply waiting for an
+		// operator decision, and the outbox is parked until it comes.
+		if p.withheld() {
+			p.log.Debug("push withheld: notespace is contested and not adopted yet").
+				Field("notespace", p.notespace).StructuredOnly().Log(ctx)
+			return successCount, nil
 		}
 
 		// Fetch a batch of drainable outbox entries. ListOutboxDrainable skips
@@ -263,6 +320,16 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, notespaceRoot string) (i
 			continue
 		}
 
+		// The verdict can land between the fetch above and the send below —
+		// that window IS the race W3.5's gate was losing, and a batch already
+		// in hand is exactly what drained to the server in the field. Re-check
+		// with the events assembled and before the first byte moves: the blob
+		// upload beneath this is content leaving the machine just as much as
+		// the push that follows it.
+		if p.abortWithheld(ctx, len(events)) {
+			return successCount, nil
+		}
+
 		// Handle blob uploads for large files, with per-entry oversize
 		// disposition. A file larger than the server's advertised blob ceiling
 		// is NOT a batch error (that livelocked the whole outbox on one file:
@@ -347,6 +414,13 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, notespaceRoot string) (i
 			case <-ctx.Done():
 				return successCount, ctx.Err()
 			default:
+			}
+
+			// Per attempt, not once before the loop: a retry backoff runs to
+			// seconds, and a verdict raised inside one must not be beaten by
+			// the retry that was already scheduled.
+			if p.abortWithheld(ctx, len(events)) {
+				return successCount, nil
 			}
 
 			pushResp, pushErr = p.client.Push(ctx, p.notespace, events)

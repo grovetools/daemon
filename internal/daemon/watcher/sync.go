@@ -1510,6 +1510,11 @@ func (h *SyncHandler) BeginMaintenance(ctx context.Context) error {
 			}
 		}
 		push := syncdb.NewPushPipeline(db, client, name, h.ulog, syncdb.PushConfig{})
+		// The skip above is decided once, before the reconcile and the drain
+		// loop beneath it; a drain of a large outbox outlives that reading, and
+		// a verdict raised by a pull loop in the meantime has to reach this
+		// path too. Same live veto the pipeline loops carry.
+		push.Withheld = h.outboundVeto(name)
 		for {
 			n, err := push.DrainOutbox(ctx, root)
 			if err != nil {

@@ -44,6 +44,34 @@ type AntiEntropyPass struct {
 	// them, instead of leaving them un-pushed until their own hourly tick.
 	// Optional; nil means the other notespaces wait for their tick.
 	OnEpochReset func(notespace string)
+
+	// Withheld, when non-nil, is the W3.5 outbound veto as a RUNNING sweep
+	// sees it — the same hook PushPipeline carries, for the same reason.
+	//
+	// Anti-entropy is the push side's own sweep, and the wider of the two
+	// outbound holes: walkLocalTree seeds every untracked local file into the
+	// outbox, which on a machine with pre-existing notes is exactly the
+	// disputed content. A pass that was already running when the pull loop
+	// raised the verdict would otherwise queue that tree up wholesale, and the
+	// gate would be relying on push alone to hold it back.
+	//
+	// Checked at entry and again between the pass's phases, so a verdict
+	// raised mid-pass stops the sweep at the next phase boundary rather than
+	// after it has walked the tree. A veto is not an error: Run returns nil,
+	// nothing local is changed, and the pass runs normally again after
+	// adoption.
+	Withheld func() bool
+}
+
+// withheld reports the outbound veto. A nil hook is "not vetoed".
+func (a *AntiEntropyPass) withheld(ctx context.Context) bool {
+	if a.Withheld == nil || !a.Withheld() {
+		return false
+	}
+	a.log.Debug("anti-entropy pass withheld: notespace is contested and not adopted yet").
+		Field("notespace", a.notespace).
+		Field("root", a.notespaceRoot).StructuredOnly().Log(ctx)
+	return true
 }
 
 // NewAntiEntropyPass constructs an anti-entropy reconciler. space is the same
@@ -90,6 +118,12 @@ func (a *AntiEntropyPass) KickPending() bool { return len(a.kick) > 0 }
 // snapshot and diffs against the local filesystem, updating sync state for
 // matching files and enqueueing divergent ones.
 func (a *AntiEntropyPass) Run(ctx context.Context) error {
+	// The W3.5 outbound veto, before the handshake and before the snapshot:
+	// a contested notespace is not swept at all (see the Withheld field).
+	if a.withheld(ctx) {
+		return nil
+	}
+
 	// Root-must-exist, before anything reads or enqueues (W3.2). This pass is
 	// the most destructive thing in the client: sweepMissingFile enqueues a
 	// document_deleted for every tracked document whose file is gone, so a
@@ -137,6 +171,13 @@ func (a *AntiEntropyPass) Run(ctx context.Context) error {
 		Field("document_count", len(manifest.Documents)).
 		Field("cursor", manifest.Cursor).Log(ctx)
 
+	// Phase boundary: the manifest fetch is a round trip, so re-check before
+	// the three phases that ENQUEUE. Everything from here on can put the
+	// disputed tree into the outbox.
+	if a.withheld(ctx) {
+		return nil
+	}
+
 	// Build a set of documents in the manifest for fast lookup
 	manifestByPath := make(map[string]*syncproto.DocumentSnapshot)
 	for i := range manifest.Documents {
@@ -159,6 +200,9 @@ func (a *AntiEntropyPass) Run(ctx context.Context) error {
 	// without this sweep they stay invisible to sync forever. It runs AFTER
 	// the adopt pass so a stale-hash false-dirty (defect #13) gets repaired
 	// by adoption instead of being pointlessly re-pushed.
+	if a.withheld(ctx) {
+		return nil
+	}
 	if err := a.sweepLocalDocuments(ctx); err != nil {
 		return fmt.Errorf("anti-entropy push sweep failed: %w", err)
 	}
@@ -173,6 +217,9 @@ func (a *AntiEntropyPass) Run(ctx context.Context) error {
 	// seeds genuinely-new files via the shared InsertAndEnqueue. Ordered last
 	// so already-adopted/tracked rows are settled before the walk's existence
 	// check runs (the create-storm guard).
+	if a.withheld(ctx) {
+		return nil
+	}
 	if err := a.walkLocalTree(ctx); err != nil {
 		return fmt.Errorf("anti-entropy tree walk failed: %w", err)
 	}

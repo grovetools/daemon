@@ -50,6 +50,16 @@ type peerServer struct {
 	// pushedPaths records every path B pushed, in order. The empty case is the
 	// assertion this file is built around.
 	pushedPaths []string
+	// pushedAt is when each pushedPaths entry arrived, index-aligned with it.
+	// The birth-race case cannot be stated as "nothing was pushed" — a
+	// pipeline that starts uncontested is entitled to push until the verdict
+	// exists — so it is stated as "nothing was pushed AFTER the verdict".
+	pushedAt []time.Time
+	// servedEventsAt is when the contesting batch left this server, which is
+	// the last moment before the gate can possibly have raised its verdict.
+	// Using it as the verdict timestamp is the conservative direction: it can
+	// only make a push look EARLIER than the verdict, never later.
+	servedEventsAt time.Time
 	// snapshots counts anti-entropy passes: the sweep that seeds untracked
 	// local files into the outbox begins with a snapshot fetch, so a nonzero
 	// count for a contested notespace means the outbound side ran at all.
@@ -73,6 +83,26 @@ func (p *peerServer) document(path string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.documents[path]
+}
+
+// pushedAfter is every path this server accepted at or after the given moment.
+func (p *peerServer) pushedAfter(when time.Time) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var late []string
+	for i, at := range p.pushedAt {
+		if !at.Before(when) {
+			late = append(late, p.pushedPaths[i])
+		}
+	}
+	return late
+}
+
+// contestedAt is when the batch that contests was served; zero until it is.
+func (p *peerServer) contestedAt() time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.servedEventsAt
 }
 
 func (p *peerServer) snapshotCount() int {
@@ -105,6 +135,11 @@ func (p *peerServer) handler() http.Handler {
 			cursor := int64(0)
 			if r.URL.Query().Get("cursor") == "0" && len(events) > 0 {
 				cursor = 1
+				p.mu.Lock()
+				if p.servedEventsAt.IsZero() {
+					p.servedEventsAt = time.Now()
+				}
+				p.mu.Unlock()
 			} else {
 				events = nil
 			}
@@ -129,6 +164,7 @@ func (p *peerServer) handler() http.Handler {
 			p.mu.Lock()
 			for i, ev := range req.Events {
 				p.pushedPaths = append(p.pushedPaths, ev.Path)
+				p.pushedAt = append(p.pushedAt, time.Now())
 				if len(ev.Content) > 0 {
 					p.documents[ev.Path] = string(ev.Content)
 				}
@@ -183,6 +219,24 @@ func waitForOutbound(t *testing.T, what string, cond func() bool) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// queueLocal puts an un-synced local file in the outbox the way the hydration
+// pass does at pipeline birth: a create for a path sync.db holds no document
+// row for. The field case had exactly this — two rows enqueued seconds before
+// the gate contested, and drained to the server while the verdict waited for a
+// reconcile.
+func queueLocal(t *testing.T, db *syncdb.DB, notespaceID, rel, content string) {
+	t.Helper()
+	if _, err := db.EnqueueOutbox(&syncdb.OutboxEntry{
+		DocumentID:  "local-" + rel,
+		Notespace:   notespaceID,
+		EventType:   syncproto.EventDocumentCreated,
+		Path:        rel,
+		ContentHash: hashOf(content),
+	}); err != nil {
+		t.Fatalf("EnqueueOutbox %s: %v", rel, err)
+	}
 }
 
 // writeLocal drops an un-synced file into a notespace root: content this
@@ -324,5 +378,103 @@ func TestAContestRaisedMidFlightStopsTheOutboundSide(t *testing.T) {
 	}
 	if after := peer.pushed(); len(after) != before {
 		t.Errorf("the maintenance drain pushed %v from a contested notespace", after[before:])
+	}
+}
+
+// The birth race, end to end: the pipeline that raises the verdict is the one
+// that is already draining, and the verdict has to stop it BY ITSELF.
+//
+// This is the field case (2026-08-14, machine A, canary-nb-test) reproduced
+// against the fixture server. There, the sequence was:
+//
+//	12:02:20  transport started, push:true pull:true
+//	12:02:20  the hydration pass enqueued 2 outbox rows
+//	12:02:20  the pull gate contested — verdict raised
+//	12:02:29  the reconcile finally stopped the transport
+//	12:02:40  it restarted with push:false pull:false
+//
+// and in the nine seconds between the verdict and the reconcile, the push loop
+// drained both rows to the server. The gate's own decision — which copy of the
+// divergent path wins — had already been made for the operator, in favour of
+// this machine, by a loop that had not been told.
+//
+// So the test never reconciles after the verdict. Nothing calls
+// ensurePipelines, the pipelineState still says push:true at the end (asserted,
+// because a teardown would prove the OLD mechanism rather than this one), and
+// the claim is exactly the ticket's: nothing reaches the server after the
+// verdict timestamp.
+func TestAContestOnTheFirstPullBatchStopsTheOutboundSideWithoutAReconcile(t *testing.T) {
+	lh, peer := contestedHarness(t)
+	root := lh.notespace(t, "alpha", idA)
+
+	// Machine A's copy of the divergent path: on the server, and in the batch
+	// this machine is about to be served.
+	const serverCopy = "machine A's plan"
+	peer.mu.Lock()
+	peer.documents["plans/x.md"] = serverCopy
+	peer.events = []syncproto.SyncEvent{{
+		Type:        syncproto.EventDocumentCreated,
+		Path:        "plans/x.md",
+		DocumentID:  "doc-plans/x.md",
+		ContentHash: hashOf(serverCopy),
+		Size:        int64(len(serverCopy)),
+	}}
+	peer.mu.Unlock()
+
+	// Machine B's side: the divergent copy plus an ordinary un-synced note,
+	// both already queued for push before the transport starts. A non-empty
+	// outbox at pipeline birth is the precondition the race needs, and it is
+	// the ordinary state of a machine that has just hydrated.
+	writeLocal(t, root, "plans/x.md", "machine B's plan")
+	writeLocal(t, root, "notes/local.md", "machine B's note")
+	queueLocal(t, lh.db, idA, "plans/x.md", "machine B's plan")
+	queueLocal(t, lh.db, idA, "notes/local.md", "machine B's note")
+
+	lh.subscribe(config.SyncWorkspace{Name: "alpha", Role: config.SyncRolePeer, Pull: true})
+	lh.watch(map[string]string{"alpha": root})
+
+	// Nothing is contested yet: this pipeline is born with both directions, as
+	// the real one was, and its own pull loop raises the verdict a moment later.
+	lh.h.ensurePipelines()
+	state := lh.pipeline(idA)
+	if state == nil || !state.push || !state.pull {
+		t.Fatalf("precondition: want a pipeline born with both directions, got %+v", state)
+	}
+
+	waitForOutbound(t, "the pull gate to contest on its first batch", func() bool {
+		_, contested := lh.h.isContested(idA)
+		return contested
+	})
+	verdict := peer.contestedAt()
+	if verdict.IsZero() {
+		t.Fatal("the contesting batch was never served; the gate cannot have run on it")
+	}
+
+	// Past the push loop's first tick (PushConfig.CheckInterval, 5s) and the
+	// anti-entropy initial pass — the whole window the field incident uploaded
+	// in — with no reconcile anywhere in it.
+	time.Sleep(pushWindow)
+
+	if late := peer.pushedAfter(verdict); len(late) != 0 {
+		t.Errorf("the outbox drained %v after the verdict; the contested copy is being published while the operator is still being asked", late)
+	}
+	if got := peer.document("plans/x.md"); got != serverCopy {
+		t.Errorf("the server holds %q; machine A's copy of the divergent path was replaced by unadopted content", got)
+	}
+
+	// The enforcement above must have come from the verdict, not from a
+	// teardown: the pipeline is still installed exactly as it was born.
+	if state := lh.pipeline(idA); state == nil || !state.push {
+		t.Fatalf("the pipeline was torn down after all (%+v); this test proves the SYNCHRONOUS gate, and a reconcile in the window would prove nothing about it", state)
+	}
+
+	// And the work is parked, not lost — the queued rows are still owed to the
+	// server, and adoption is what releases them.
+	queued, err := lh.db.CountOutbox()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued == 0 {
+		t.Error("the contested notespace's outbox was emptied; withholding push must park local work, not discard it")
 	}
 }
