@@ -64,6 +64,11 @@ type peerServer struct {
 	// local files into the outbox begins with a snapshot fetch, so a nonzero
 	// count for a contested notespace means the outbound side ran at all.
 	snapshots int
+	// snapshotRelease optionally holds the anti-entropy snapshot response. The
+	// birth-race test uses it to make pull's adoption gate deterministically win
+	// the startup race instead of letting hydration settle the colliding row
+	// first; the production race under test begins once that verdict exists.
+	snapshotRelease <-chan struct{}
 	// events is the batch B's pull loop is served, i.e. what A pushed.
 	events []syncproto.SyncEvent
 }
@@ -146,6 +151,16 @@ func (p *peerServer) handler() http.Handler {
 			_ = json.NewEncoder(w).Encode(syncproto.PullResponse{Events: events, Cursor: cursor})
 
 		case "/sync/snapshot":
+			p.mu.Lock()
+			release := p.snapshotRelease
+			p.mu.Unlock()
+			if release != nil {
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					return
+				}
+			}
 			p.mu.Lock()
 			p.snapshots++
 			docs := make([]syncproto.DocumentSnapshot, 0, len(p.documents))
@@ -406,6 +421,16 @@ func TestAContestRaisedMidFlightStopsTheOutboundSide(t *testing.T) {
 func TestAContestOnTheFirstPullBatchStopsTheOutboundSideWithoutAReconcile(t *testing.T) {
 	lh, peer := contestedHarness(t)
 	root := lh.notespace(t, "alpha", idA)
+
+	// Hold the sibling anti-entropy startup pass so it cannot adopt/settle the
+	// colliding row before pull's first batch reaches the adoption gate. The
+	// field ordering was pull-first; making it explicit removes scheduler load
+	// from this regression without reconciling or stopping the outbound loops.
+	releaseSnapshot := make(chan struct{})
+	defer close(releaseSnapshot)
+	peer.mu.Lock()
+	peer.snapshotRelease = releaseSnapshot
+	peer.mu.Unlock()
 
 	// Machine A's copy of the divergent path: on the server, and in the batch
 	// this machine is about to be served.
