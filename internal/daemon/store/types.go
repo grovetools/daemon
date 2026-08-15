@@ -75,7 +75,7 @@ const (
 	UpdateSessionIntent       UpdateType = "session_intent"       // Pre-register session before agent launch
 	UpdateSessionConfirmation UpdateType = "session_confirmation" // Link intent with actual PID
 	UpdateSessionStatus       UpdateType = "session_status"       // Update session status (running/idle/pending_user)
-	UpdateSessionEnd          UpdateType = "session_end"          // Mark session as completed/interrupted/failed
+	UpdateSessionEnd          UpdateType = "session_end"          // Mark session as completed/interrupted/failed/exited
 	UpdateSessionTokens       UpdateType = "session_tokens"       // In-place live token/cost/context fields (daemon-computed)
 
 	// Job lifecycle update types for the daemon's JobRunner.
@@ -433,7 +433,7 @@ type SessionStatusPayload struct {
 // SessionEndPayload contains data for ending a session.
 type SessionEndPayload struct {
 	JobID   string `json:"job_id"`
-	Outcome string `json:"outcome"`          // "completed", "interrupted", "failed"
+	Outcome string `json:"outcome"`          // "completed", "interrupted", "failed", "exited" (neutral; job gate remains authoritative)
 	Reason  string `json:"reason,omitempty"` // lifecycle evidence, e.g. process_dead or api_kill
 }
 

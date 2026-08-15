@@ -368,7 +368,12 @@ func (s *Store) ApplyUpdate(u Update) {
 		}
 	case UpdateSessionEnd:
 		if payload, ok := u.Payload.(*SessionEndPayload); ok {
-			s.applySessionEnd(payload, u.Source)
+			// Terminal session rows are an event-idempotency boundary. Multiple
+			// observers may report the same process exit; only the first report
+			// mutates state and reaches subscribers.
+			if !s.applySessionEnd(payload, u.Source) {
+				return
+			}
 		}
 	case UpdateSessionTokens:
 		if payload, ok := u.Payload.(*SessionTokensPayload); ok {
@@ -1061,20 +1066,26 @@ func (s *Store) syncSessionStatusToJobMarkdown(session *models.Session, prevStat
 		Log(context.Background())
 }
 
-// applySessionEnd marks a session as ended.
-func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) {
-	now := time.Now()
+// applySessionEnd marks a session as ended. It returns false when the session
+// was already terminal so callers can suppress the duplicate lifecycle update.
+func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) bool {
+	now := s.now()
 	nativeID := ""
 
 	if session, exists := s.state.Sessions[payload.JobID]; exists {
+		if session.EndedAt != nil || isTerminalSessionStatus(session.Status) {
+			return false
+		}
 		nativeID = session.ClaudeSessionID
 		session.Status = payload.Outcome
 		session.EndedAt = &now
 		session.LastActivity = now
 	}
 
-	// Also update the job if it exists in the Jobs map (from JobCollector discovery)
-	if job, exists := s.state.Jobs[payload.JobID]; exists {
+	// Also update the job if it exists in the Jobs map (from JobCollector
+	// discovery). "exited" is deliberately session-only: a supervised process
+	// can exit successfully before Flow's completion gate decides the job result.
+	if job, exists := s.state.Jobs[payload.JobID]; exists && payload.Outcome != "exited" {
 		job.Status = payload.Outcome
 		job.CompletedAt = &now
 	}
@@ -1092,6 +1103,16 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) {
 		Field("reason", reason).
 		StructuredOnly().
 		Log(context.Background())
+	return true
+}
+
+func isTerminalSessionStatus(status string) bool {
+	switch status {
+	case "completed", "interrupted", "failed", "exited", "stopped", "error", "abandoned":
+		return true
+	default:
+		return false
+	}
 }
 
 // applySessionTokens overlays daemon-computed live token usage onto existing
