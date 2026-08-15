@@ -161,6 +161,71 @@ func TestHandleSyncOutbox(t *testing.T) {
 	}
 }
 
+func TestHandleSyncActivity(t *testing.T) {
+	db, _ := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	t.Cleanup(func() { _ = db.Close() })
+	s := New(false)
+	s.SetSyncDB(db)
+
+	if err := db.RecordActivity(&syncdb.ActivityEntry{
+		Notespace: "ws", Direction: syncdb.ActivityOutgoing, EventType: "document_updated",
+		Path: "a.md", Result: syncdb.ActivityResultSynced, Version: 2,
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if err := db.RecordActivity(&syncdb.ActivityEntry{
+		Notespace: "other", Direction: syncdb.ActivityIncoming, EventType: "document_created",
+		Path: "b.md", DocumentID: "d2", Result: syncdb.ActivityResultError, Detail: "boom",
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/sync/activity", nil)
+	w := httptest.NewRecorder()
+	s.handleSyncActivity(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	var entries []syncActivityResponse
+	if err := json.NewDecoder(w.Body).Decode(&entries); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 activity entries, got %d", len(entries))
+	}
+	// Newest-first, with the issue row's detail intact.
+	if entries[0].Path != "b.md" || entries[0].Direction != "incoming" ||
+		entries[0].Result != "error" || entries[0].Detail != "boom" {
+		t.Errorf("unexpected first entry: %+v", entries[0])
+	}
+	if entries[1].Result != "synced" || entries[1].Version != 2 {
+		t.Errorf("unexpected second entry: %+v", entries[1])
+	}
+	if entries[0].OccurredAt.IsZero() {
+		t.Error("occurred_at was not stamped")
+	}
+
+	// Notespace filter + limit.
+	req = httptest.NewRequest(http.MethodGet, "/api/sync/activity?notespace_id=ws&limit=1", nil)
+	w = httptest.NewRecorder()
+	s.handleSyncActivity(w, req)
+	var filtered []syncActivityResponse
+	if err := json.NewDecoder(w.Body).Decode(&filtered); err != nil {
+		t.Fatalf("decode filtered: %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].NotespaceID != "ws" {
+		t.Fatalf("expected only the 'ws' entry, got %+v", filtered)
+	}
+
+	// A bad limit is a 400, not a silent full listing.
+	req = httptest.NewRequest(http.MethodGet, "/api/sync/activity?limit=nope", nil)
+	w = httptest.NewRecorder()
+	s.handleSyncActivity(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a bad limit, got %d", w.Code)
+	}
+}
+
 // TestHandleSyncStatusReportsServerAndDirection proves /api/sync/status
 // answers "where is this syncing": the configured server URL plus each
 // notespace's subscription direction (pull) and mode, overlaid onto the

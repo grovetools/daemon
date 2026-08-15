@@ -93,6 +93,20 @@ CREATE TABLE IF NOT EXISTS sync_quarantine_override (
 	path      TEXT NOT NULL,
 	PRIMARY KEY (notespace, path)
 );
+
+CREATE TABLE IF NOT EXISTS sync_activity (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	notespace   TEXT NOT NULL,
+	direction   TEXT NOT NULL,
+	event_type  TEXT NOT NULL,
+	path        TEXT NOT NULL,
+	prev_path   TEXT NOT NULL DEFAULT '',
+	document_id TEXT NOT NULL DEFAULT '',
+	result      TEXT NOT NULL,
+	detail      TEXT NOT NULL DEFAULT '',
+	version     INTEGER NOT NULL DEFAULT 0,
+	occurred_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 `
 
 // DB wraps the sync SQLite database.

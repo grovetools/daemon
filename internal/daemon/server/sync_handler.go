@@ -368,6 +368,80 @@ func (s *Server) handleSyncOutbox(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// syncActivityResponse is one entry of the GET /api/sync/activity payload: a
+// terminal transfer outcome from the capped sync_activity feed — an outgoing
+// change the server answered, or an incoming event applied (or refused)
+// locally. Distinct from /api/sync/history, which is a per-document version
+// history proxied to the server; this is the machine-local "what moved
+// recently, in which direction" feed behind the Notebook Sync history page.
+type syncActivityResponse struct {
+	ID            int64     `json:"id"`
+	NotespaceID   string    `json:"notespace_id"`
+	NotespaceName string    `json:"notespace_name,omitempty"`
+	Direction     string    `json:"direction"`
+	EventType     string    `json:"event_type"`
+	Path          string    `json:"path"`
+	PrevPath      string    `json:"prev_path,omitempty"`
+	DocumentID    string    `json:"document_id,omitempty"`
+	Result        string    `json:"result"`
+	Detail        string    `json:"detail,omitempty"`
+	Version       int64     `json:"version,omitempty"`
+	OccurredAt    time.Time `json:"occurred_at"`
+}
+
+// handleSyncActivity handles GET /api/sync/activity[?notespace_id=W&limit=N],
+// returning recent transfer outcomes newest-first. Read-only.
+func (s *Server) handleSyncActivity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.scope != "" {
+		s.forwardSyncToGlobal(w, r)
+		return
+	}
+	if s.syncDatabase() == nil {
+		http.Error(w, "sync is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			http.Error(w, "invalid limit", http.StatusBadRequest)
+			return
+		}
+		limit = n
+	}
+	entries, err := s.syncDatabase().ListActivity(r.URL.Query().Get("notespace_id"), limit)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to list activity: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	out := make([]syncActivityResponse, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, syncActivityResponse{
+			ID:            e.ID,
+			NotespaceID:   e.Notespace,
+			NotespaceName: s.syncNotespaceName(e.Notespace),
+			Direction:     e.Direction,
+			EventType:     e.EventType,
+			Path:          e.Path,
+			PrevPath:      e.PrevPath,
+			DocumentID:    e.DocumentID,
+			Result:        e.Result,
+			Detail:        e.Detail,
+			Version:       e.Version,
+			OccurredAt:    e.OccurredAt,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
 // syncConflictResponse is one entry of the GET /api/sync/conflicts payload: a
 // conflict artifact on disk plus the 3-way-merge base recovered from sync.db.
 // BaseContent is the "base" leg of the conflict inspector's diff; the "local"

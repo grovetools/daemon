@@ -66,6 +66,13 @@ type PullPipeline struct {
 	// update every retry — the same once-per-episode discipline
 	// missingRootReported applies to a missing root.
 	adoptionReported bool
+
+	// pendingConflictKind carries a conflict recorded during the current
+	// applyEvent call to the activity row applyEvent writes on exit. Needed
+	// because a merge conflict returns nil (the artifact IS the resolution),
+	// so the error alone cannot distinguish "applied" from "conflicted".
+	// Touched only from the pull goroutine.
+	pendingConflictKind string
 }
 
 // NewPullPipeline creates a pull pipeline for a notespace.
@@ -445,7 +452,15 @@ func (p *PullPipeline) serverSubject(ctx context.Context) string {
 
 // applyEvent applies a single event: creates, updates, moves, or deletes a document.
 // Merge conflicts during update are recorded as conflict artifacts.
-func (p *PullPipeline) applyEvent(ctx context.Context, notespaceRoot string, ev *syncproto.SyncEvent) error {
+//
+// Every call leaves one incoming row on the activity feed: applied, conflict
+// (via pendingConflictKind — a conflicted merge returns nil), or error. The
+// snapshot-resync path deliberately bypasses this — hydration would flood a
+// feed meant for steady-state changes, and it is already visible as
+// hydration progress on /api/sync/status.
+func (p *PullPipeline) applyEvent(ctx context.Context, notespaceRoot string, ev *syncproto.SyncEvent) (err error) {
+	p.pendingConflictKind = ""
+	defer func() { p.recordApplyActivity(ctx, ev, err) }()
 	// Defence in depth behind the per-batch check: applyEvent is also reached
 	// from the snapshot path and from callers that hold a root resolved on an
 	// earlier tick, and a root can vanish mid-batch.
@@ -911,8 +926,38 @@ func (p *PullPipeline) recordConflictArtifact(ctx context.Context, relPath, docI
 		Field("path", relPath).
 		Field("kind", kind).
 		Field("artifact", conflictFile).Log(ctx)
+	// Note the kind for the activity row the enclosing applyEvent writes;
+	// harmless when reached outside applyEvent (cleared on its next entry).
+	p.pendingConflictKind = kind
 	// TODO: Emit store.UpdateSyncConflict SSE event
 	return nil
+}
+
+// recordApplyActivity writes the incoming activity row for one applied (or
+// refused) pull event. Best-effort: a failed insert is logged and never
+// disturbs the apply outcome it describes.
+func (p *PullPipeline) recordApplyActivity(ctx context.Context, ev *syncproto.SyncEvent, applyErr error) {
+	result, detail := ActivityResultApplied, ""
+	switch {
+	case applyErr != nil:
+		result, detail = ActivityResultError, applyErr.Error()
+	case p.pendingConflictKind != "":
+		result, detail = ActivityResultConflict, p.pendingConflictKind
+	}
+	if err := p.db.RecordActivity(&ActivityEntry{
+		Notespace:  p.ws.Name,
+		Direction:  ActivityIncoming,
+		EventType:  ev.Type,
+		Path:       ev.Path,
+		PrevPath:   ev.PrevPath,
+		DocumentID: ev.DocumentID,
+		Result:     result,
+		Detail:     detail,
+		Version:    ev.Version,
+	}); err != nil {
+		p.log.Warn("failed to record sync activity").
+			Field("path", ev.Path).Err(err).Log(ctx)
+	}
 }
 
 func (p *PullPipeline) joinPath(root, path string) string {

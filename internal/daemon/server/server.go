@@ -499,6 +499,7 @@ var daemonRoutes = []daemonRoute{
 	{pattern: "/api/sync/documents"},
 	{pattern: "/api/sync/outbox"},
 	{pattern: "/api/sync/conflicts"},
+	{pattern: "/api/sync/activity"},
 	{pattern: "/api/sync/contested"},
 	{pattern: "/api/sync/contested/adopt"},
 	{pattern: "/web/treemux/"},
@@ -743,6 +744,7 @@ func (s *Server) registerNormalRoutes(routes classifiedRouteRegistrar) {
 	routes.HandleFunc("/api/sync/documents", unixOnly(s.handleSyncDocuments))
 	routes.HandleFunc("/api/sync/outbox", unixOnly(s.handleSyncOutbox))
 	routes.HandleFunc("/api/sync/conflicts", unixOnly(s.handleSyncConflicts))
+	routes.HandleFunc("/api/sync/activity", unixOnly(s.handleSyncActivity))
 	routes.HandleFunc("/api/sync/contested", unixOnly(s.handleSyncContested))
 	routes.HandleFunc("/api/sync/contested/adopt", unixOnly(s.handleSyncAdoptContested))
 	// Static web viewer files

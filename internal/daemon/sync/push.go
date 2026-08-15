@@ -381,6 +381,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, notespaceRoot string) (i
 			switch result.Status {
 			case syncproto.PushStatusAccepted:
 				idsToDelete = append(idsToDelete, entries[i].ID)
+				p.recordActivity(ctx, &events[i], &result, ActivityResultSynced, "")
 				// Accepted deletes and moves (reachable since B7 — with
 				// base_version 0 they always conflicted) must not fall into the
 				// content-roll below: a delete's doc row is already gone
@@ -507,6 +508,9 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, notespaceRoot string) (i
 				} else {
 					parkedCount++
 				}
+				// reason is "conflict" or "diverged" — the ActivityResult*
+				// vocabulary on purpose, so the park outcome IS the feed row.
+				p.recordActivity(ctx, &events[i], &result, reason, "parked: base_version was stale")
 
 			case syncproto.PushStatusRejected:
 				// Unknown-document self-heal: the server holds neither the
@@ -533,6 +537,8 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, notespaceRoot string) (i
 						// Deleting the entry is the drain-loop progress signal
 						// (same as an ack); the sweep owns the re-enqueue.
 						idsToDelete = append(idsToDelete, entries[i].ID)
+						p.recordActivity(ctx, &events[i], &result, ActivityResultRequeued,
+							"unknown document — re-enqueued as create")
 						break
 					}
 				}
@@ -554,6 +560,7 @@ func (p *PushPipeline) DrainOutbox(ctx context.Context, notespaceRoot string) (i
 				} else {
 					parkedCount++
 				}
+				p.recordActivity(ctx, &events[i], &result, ActivityResultRejected, result.Error)
 			}
 		}
 
@@ -896,6 +903,31 @@ func (p *PushPipeline) dissolveEchoEntry(ctx context.Context, entry *OutboxEntry
 // push-side divergence — same format and location as the pull pipeline's
 // recordConflict — unless one already exists for this document (the entry is
 // retried every tick; the artifact is written once per divergence).
+// recordActivity appends one outgoing row to the sync activity feed
+// (GET /api/sync/activity). Best-effort: the feed is a diagnostic surface,
+// so a failed insert is logged and never disturbs the drain outcome it
+// describes.
+func (p *PushPipeline) recordActivity(ctx context.Context, ev *syncproto.SyncEvent, result *syncproto.PushResult, activityResult, detail string) {
+	docID := result.DocumentID
+	if docID == "" {
+		docID = ev.DocumentID
+	}
+	if err := p.db.RecordActivity(&ActivityEntry{
+		Notespace:  p.notespace,
+		Direction:  ActivityOutgoing,
+		EventType:  ev.Type,
+		Path:       ev.Path,
+		PrevPath:   ev.PrevPath,
+		DocumentID: docID,
+		Result:     activityResult,
+		Detail:     detail,
+		Version:    result.Version,
+	}); err != nil {
+		p.log.Warn("failed to record sync activity").
+			Field("path", ev.Path).Err(err).Log(ctx)
+	}
+}
+
 func (p *PushPipeline) recordConflictArtifact(ctx context.Context, path, docID string, localContent []byte) {
 	conflictDir := filepath.Join(paths.StateDir(), "sync", "conflicts", p.notespace)
 	conflictFile := filepath.Join(conflictDir, fmt.Sprintf("%s.%s.conflict.md", path, docID))
