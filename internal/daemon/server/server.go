@@ -3423,7 +3423,7 @@ func convertUpdatePayload(u store.Update) *apiStateUpdate {
 	// Session lifecycle updates - broadcast as session changes
 	case store.UpdateSessionIntent, store.UpdateSessionConfirmation,
 		store.UpdateSessionStatus, store.UpdateSessionEnd,
-		store.UpdateSessionTokens:
+		store.UpdateSessionVerdict, store.UpdateSessionTokens:
 		return &apiStateUpdate{
 			UpdateType: "session",
 			Source:     u.Source,

@@ -10,6 +10,7 @@ import (
 	grovelogging "github.com/grovetools/core/logging"
 	coredaemon "github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/models"
+	"github.com/grovetools/core/pkg/sessions/health"
 	"github.com/grovetools/core/pkg/workspace"
 	"github.com/grovetools/core/util/pathutil"
 	"github.com/grovetools/daemon/internal/daemon/telemetry"
@@ -345,8 +346,18 @@ func (s *Store) ApplyUpdate(u Update) {
 				}
 			}
 			for _, sess := range sessions {
-				if prev, ok := s.state.Sessions[sessionKey(sess)]; ok && sess.LiveChildren == 0 {
-					sess.LiveChildren = prev.LiveChildren
+				if prev, ok := s.state.Sessions[sessionKey(sess)]; ok {
+					if sess.LiveChildren == 0 {
+						sess.LiveChildren = prev.LiveChildren
+					}
+					// Verified is daemon-derived and not persisted. Preserve it across
+					// local recovery/discovery snapshots just like other derived state.
+					if sess.Verified == "" && health.IsActiveSessionStatus(sess.Status) {
+						sess.Verified = prev.Verified
+					}
+				}
+				if !health.IsActiveSessionStatus(sess.Status) {
+					sess.Verified = ""
 				}
 				newMap[sessionKey(sess)] = sess
 			}
@@ -372,6 +383,12 @@ func (s *Store) ApplyUpdate(u Update) {
 			// observers may report the same process exit; only the first report
 			// mutates state and reaches subscribers.
 			if !s.applySessionEnd(payload, u.Source) {
+				return
+			}
+		}
+	case UpdateSessionVerdict:
+		if payload, ok := u.Payload.(*SessionVerdictPayload); ok {
+			if !s.applySessionVerdict(payload) {
 				return
 			}
 		}
@@ -970,6 +987,9 @@ func (s *Store) applySessionStatus(payload *SessionStatusPayload) {
 
 	prevStatus := session.Status
 	session.Status = payload.Status
+	if isTerminalSessionStatus(payload.Status) {
+		session.Verified = ""
+	}
 	session.LastActivity = time.Now()
 
 	// Interactive (tmux-detached) agents have no foreground runtime loop to
@@ -1066,6 +1086,29 @@ func (s *Store) syncSessionStatusToJobMarkdown(session *models.Session, prevStat
 		Log(context.Background())
 }
 
+// applySessionVerdict changes only the derived verdict for an existing active
+// local session. It deliberately does not touch LastActivity: observation by a
+// health poller is not evidence of agent activity.
+func (s *Store) applySessionVerdict(payload *SessionVerdictPayload) bool {
+	if payload == nil {
+		return false
+	}
+	session, exists := s.state.Sessions[payload.JobID]
+	if !exists || session.Origin != "" || !health.IsActiveSessionStatus(session.Status) {
+		return false
+	}
+	switch payload.Verified {
+	case "alive", "unverified", "stale":
+	default:
+		return false
+	}
+	if session.Verified == payload.Verified {
+		return false
+	}
+	session.Verified = payload.Verified
+	return true
+}
+
 // applySessionEnd marks a session as ended. It returns false when the session
 // was already terminal so callers can suppress the duplicate lifecycle update.
 func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) bool {
@@ -1078,6 +1121,7 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) bool 
 		}
 		nativeID = session.ClaudeSessionID
 		session.Status = payload.Outcome
+		session.Verified = ""
 		session.EndedAt = &now
 		session.LastActivity = now
 	}

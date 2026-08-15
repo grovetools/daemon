@@ -76,6 +76,7 @@ const (
 	UpdateSessionConfirmation UpdateType = "session_confirmation" // Link intent with actual PID
 	UpdateSessionStatus       UpdateType = "session_status"       // Update session status (running/idle/pending_user)
 	UpdateSessionEnd          UpdateType = "session_end"          // Mark session as completed/interrupted/failed/exited
+	UpdateSessionVerdict      UpdateType = "session_verdict"      // Derived health verdict; never session activity
 	UpdateSessionTokens       UpdateType = "session_tokens"       // In-place live token/cost/context fields (daemon-computed)
 
 	// Job lifecycle update types for the daemon's JobRunner.
@@ -249,7 +250,7 @@ var allUpdateTypes = []UpdateType{
 	UpdateWorkspaces, UpdateSessions, UpdateFocus, UpdateConfigReload,
 	UpdateThemeChanged, UpdateSkillSync, UpdateWatcherStatus,
 	UpdateSessionIntent, UpdateSessionConfirmation, UpdateSessionStatus,
-	UpdateSessionEnd, UpdateSessionTokens,
+	UpdateSessionEnd, UpdateSessionVerdict, UpdateSessionTokens,
 	UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed,
 	UpdateJobCancelled, UpdateJobPendingUser, UpdateJobOrphaned,
 	UpdateJobsDiscovered,
@@ -435,6 +436,13 @@ type SessionEndPayload struct {
 	JobID   string `json:"job_id"`
 	Outcome string `json:"outcome"`          // "completed", "interrupted", "failed", "exited" (neutral; job gate remains authoritative)
 	Reason  string `json:"reason,omitempty"` // lifecycle evidence, e.g. process_dead or api_kill
+}
+
+// SessionVerdictPayload carries the daemon's derived health classification.
+// Applying it changes only Session.Verified; it must never renew LastActivity.
+type SessionVerdictPayload struct {
+	JobID    string `json:"job_id"`
+	Verified string `json:"verified"` // alive|unverified|stale
 }
 
 // SessionTokenUpdate carries daemon-computed live token usage for one session.

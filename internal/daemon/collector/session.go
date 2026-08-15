@@ -10,6 +10,7 @@ import (
 	aglogsession "github.com/grovetools/agentlogs/pkg/sessioninfo"
 	"github.com/grovetools/agentlogs/pkg/usage"
 	"github.com/grovetools/core/logging"
+	coredaemon "github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/models"
 	"github.com/grovetools/core/pkg/process"
 	"github.com/grovetools/core/pkg/sessions"
@@ -88,6 +89,16 @@ type pidLiveness struct {
 	deadStrikes int
 }
 
+func sessionVerdictUpdate(jobID, verified string) store.Update {
+	return store.Update{
+		Type:   store.UpdateSessionVerdict,
+		Source: "session_collector",
+		Payload: &store.SessionVerdictPayload{
+			JobID: jobID, Verified: verified,
+		},
+	}
+}
+
 // SessionCollector monitors active sessions in the store for process liveness.
 // It also performs initial crash recovery on daemon startup.
 //
@@ -116,6 +127,7 @@ type SessionCollector struct {
 	lastTokenRefresh time.Time
 	// Injectable seams keep backoff tests deterministic and avoid global scans.
 	now               func() time.Time
+	probeHealth       func(context.Context, []*models.Session, time.Time) []*health.Probe
 	resolveTranscript func(string) (path, provider string, err error)
 }
 
@@ -133,6 +145,22 @@ func NewSessionCollector(interval time.Duration, scope string) *SessionCollector
 		liveness:   make(map[string]*pidLiveness),
 		tokenCache: make(map[string]liveTokenSummary),
 		now:        time.Now,
+		probeHealth: func(ctx context.Context, rows []*models.Session, now time.Time) []*health.Probe {
+			// Resolve the client lazily: at collector construction the daemon's
+			// socket is not listening yet. On poll ticks this reaches our own PTY
+			// proxy, while registry/ps/job-file/tmux evidence is gathered directly.
+			prober := &health.Prober{
+				Client:  coredaemon.New(scope),
+				JobFile: orchestration.ReadJobFileStatus,
+				Tmux: &health.CLITmuxProber{SocketFor: func(s *models.Session) string {
+					if s != nil && s.Type == "isolated_agent" {
+						return orchestration.TmuxSocketName(s.ID)
+					}
+					return ""
+				}},
+			}
+			return prober.ProbeAt(ctx, rows, now)
+		},
 		resolveTranscript: func(spec string) (string, string, error) {
 			info, err := aglogsession.Resolve(spec)
 			if err != nil {
@@ -198,16 +226,42 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 			return nil
 
 		case <-ticker.C:
-			start := time.Now()
+			start := c.now()
 
 			// Get all active sessions from the canonical store
 			activeSessions := st.GetSessions()
+
+			// Gather the complete shared health ladder once for this tick. The
+			// batch shares the PTY query and registry scan across every row.
+			now := c.now()
+			probeRows := make([]*models.Session, 0, len(activeSessions))
+			for _, session := range activeSessions {
+				if session == nil || session.Origin != "" {
+					continue
+				}
+				if session.Status != "running" && session.Status != "idle" && session.Status != "pending_user" && session.Status != "pending" {
+					continue
+				}
+				if now.Sub(session.LastActivity) < sessionReapGracePeriod && now.Sub(session.StartedAt) < sessionReapGracePeriod {
+					continue
+				}
+				probeRows = append(probeRows, session)
+			}
+			probesByID := make(map[string]*health.Probe, len(probeRows))
+			for _, probe := range c.probeHealth(ctx, probeRows, now) {
+				if probe != nil && probe.Session != nil {
+					probesByID[probe.Session.ID] = probe
+				}
+			}
 
 			// Track which sessions are still active this tick so we can prune
 			// liveness bookkeeping for sessions that have since ended.
 			activeIDs := make(map[string]struct{}, len(activeSessions))
 
 			for _, session := range activeSessions {
+				if session == nil {
+					continue
+				}
 				// Remote (federated) sessions never enter the local liveness state
 				// machine (C8): their PID/PTY/transcript belong to a satellite, so
 				// IsProcessAlive would judge an unrelated local PID and the reaper
@@ -231,68 +285,72 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				}
 				activeIDs[session.ID] = struct{}{}
 
-				// Grace period: leave freshly-started sessions completely alone.
-				// During agent startup the registered PID may be a short-lived
-				// intermediate process (shell, grove meta-tool) that exits before
-				// the real agent starts.
-				if time.Since(session.LastActivity) < sessionReapGracePeriod && time.Since(session.StartedAt) < sessionReapGracePeriod {
+				// Grace period protects startup from both flagging and reaping. A
+				// provider that dies during grace is classified on the first pass
+				// after grace rather than being protected forever by seenAlive.
+				if now.Sub(session.LastActivity) < sessionReapGracePeriod && now.Sub(session.StartedAt) < sessionReapGracePeriod {
 					continue
 				}
 
-				// PID 0 means this daemon's record was never confirmed with a real
-				// PID. That happens for genuinely unstarted intents AND for sessions
-				// confirmed against a different scoped daemon (the filesystem
-				// job-watcher synthesizes a PID-0 record here). For the latter the
-				// real PID is in the global crash-recovery registry; recover it so
-				// the session is reapable instead of lingering "running" forever.
-				// A registry entry only exists post-confirmation, so its presence is
-				// proof the session was alive — seed seenAlive=true so an
-				// already-dead orphan reaps without needing a fresh alive reading.
+				// The batch probe includes registry, PTY proxy, job file and the
+				// correctly-scoped tmux server. Missing perspectives classify as
+				// unverified, never stale.
+				probe := probesByID[session.ID]
+				if probe == nil {
+					continue
+				}
+				if probe.Evidence.HasMetadata && probe.Evidence.MetaScope != c.scope {
+					continue
+				}
+
 				pid := session.PID
 				var recovered *sessions.SessionMetadata
 				if pid == 0 {
-					if registry != nil {
-						if md, err := registry.Find(session.ID); err == nil && md != nil && md.PID > 0 {
-							// registry.Find is a global cross-scope point-lookup. Only
-							// adopt its PID (and thus make this record reapable) when the
-							// recovered record's owning scope matches ours; otherwise this
-							// is another scope's confirmed session and reaping it would be
-							// the cross-scope leak we're guarding against.
-							if md.Scope == c.scope {
-								pid = md.PID
-								recovered = md
-							}
-						}
-					}
-					if pid == 0 {
-						// No confirmed PID for our scope — a true unstarted intent or a
-						// foreign-scope record we must not touch. Can't/shouldn't judge.
+					if probe.Evidence.RegistryPID <= 0 {
+						// A true unstarted intent has no process evidence and remains
+						// untouched. PID-0 is flaggable only with a confirmed registry PID.
 						continue
+					}
+					pid = probe.Evidence.RegistryPID
+					if registry != nil {
+						recovered, _ = registry.Find(session.ID)
 					}
 				}
 
 				ls := c.liveness[session.ID]
 				if ls == nil {
+					// A confirmed registry record proves this attempt was alive even
+					// when its process died before this collector's first observation.
 					ls = &pidLiveness{seenAlive: recovered != nil}
 					c.liveness[session.ID] = ls
 				}
 
-				if process.IsProcessAlive(pid) {
-					// Confirmed alive — eligible for reaping only if it later dies.
-					// Reset any transient dead strikes.
+				if process.IsProcessAlive(pid) || probe.Verdict.State == health.Alive {
 					ls.seenAlive = true
 					ls.deadStrikes = 0
+					updates <- sessionVerdictUpdate(session.ID, "alive")
 					continue
 				}
 
-				// PID reads dead. Only reap a PID we have positively observed alive:
-				// a never-confirmed-alive PID is more likely a slow/handoff startup
-				// than a crashed agent, and reaping it would race the starting agent.
-				if !ls.seenAlive {
-					continue
+				// Flagging is intentionally independent of seenAlive. Classification
+				// can therefore expose startup deaths and dead PID-0 registry rows,
+				// but this path never kills or ends a session.
+				if health.IsActiveSessionStatus(session.Status) {
+					verified := "unverified"
+					if probe.Verdict.State == health.Stale {
+						verified = "stale"
+					}
+					updates <- sessionVerdictUpdate(session.ID, verified)
 				}
 
-				// Debounce: require N consecutive dead reads before reaping.
+				// Killing remains conservative: only a classifier-stale PID that was
+				// positively seen alive and then read dead twice may be reaped. Pending
+				// is not a verdict-bearing active status, but retains the legacy kill
+				// behavior for confirmed startup strands.
+				killConvicted := probe.Verdict.State == health.Stale || session.Status == "pending"
+				if !killConvicted || !ls.seenAlive {
+					continue
+				}
 				ls.deadStrikes++
 				if ls.deadStrikes < reapDeadStrikes {
 					continue
