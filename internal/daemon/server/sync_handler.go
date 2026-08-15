@@ -147,6 +147,12 @@ type syncNotespaceStatus struct {
 	// Empty is a legacy role-less entry (push-only) — or a notespace with no
 	// matching subscription at all.
 	Role string `json:"role,omitempty"`
+	// Contested is the watcher adoption gate's live verdict. A contested
+	// notespace has neither transport, so surface the reason and the directions
+	// withheld instead of letting an old LastSyncedAt make it look idle.
+	Contested bool     `json:"contested,omitempty"`
+	Reason    string   `json:"reason,omitempty"`
+	Withheld  []string `json:"withheld,omitempty"`
 }
 
 // handleSyncStatus handles GET /api/sync/status.
@@ -216,6 +222,12 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 				subsByName[sub.Name] = sub
 			}
 		}
+		contestedByID := map[string]syncdb.ContestedNotespace{}
+		if s.syncContested != nil {
+			for _, entry := range s.syncContested() {
+				contestedByID[entry.NotespaceID] = entry
+			}
+		}
 		if states, err := s.syncDatabase().ListStates(); err == nil {
 			for _, st := range states {
 				ws := syncNotespaceStatus{
@@ -235,6 +247,11 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 					ws.Pull = sub.Pull
 					ws.Mode = sub.Mode
 					ws.Role = sub.Role
+				}
+				if contested, ok := contestedByID[ws.NotespaceID]; ok {
+					ws.Contested = true
+					ws.Reason = contested.Reason
+					ws.Withheld = []string{"push", "pull"}
 				}
 				out.Notespaces = append(out.Notespaces, ws)
 			}

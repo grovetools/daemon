@@ -92,9 +92,12 @@ func TestSyncStatusPayloadMirrorsCoreModel(t *testing.T) {
 				FinishedAt:  stamp,
 				FilesPerSec: 83.5,
 			},
-			Pull: true,
-			Mode: "full",
-			Role: "peer",
+			Pull:      true,
+			Mode:      "full",
+			Role:      "peer",
+			Contested: true,
+			Reason:    "adoption pending: divergent local notes",
+			Withheld:  []string{"push", "pull"},
 		}},
 	}
 	assertMirrors(t, "GET /api/sync/status", daemonValue, &models.SyncStatus{})

@@ -279,6 +279,42 @@ func TestHandleSyncStatusReportsServerAndDirection(t *testing.T) {
 	}
 }
 
+// TestHandleSyncStatusReportsContestedWithheldVerdict proves the designated
+// status surface carries the watcher's live adoption verdict rather than
+// presenting a transport-less notespace as merely idle.
+func TestHandleSyncStatusReportsContestedWithheldVerdict(t *testing.T) {
+	db, _ := syncdb.Open(filepath.Join(t.TempDir(), "sync.db"))
+	t.Cleanup(func() { _ = db.Close() })
+	const id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+	if err := db.SetCursor(id, 72); err != nil {
+		t.Fatalf("set cursor: %v", err)
+	}
+
+	s := New(false)
+	s.SetSyncDB(db)
+	s.SetSyncContested(func() []syncdb.ContestedNotespace {
+		return []syncdb.ContestedNotespace{{NotespaceID: id, Reason: "adoption pending: divergent local notes"}}
+	}, nil)
+
+	w := httptest.NewRecorder()
+	s.handleSyncStatus(w, httptest.NewRequest(http.MethodGet, "/api/sync/status", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	var out syncStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out.Notespaces) != 1 {
+		t.Fatalf("notespaces = %+v, want one row", out.Notespaces)
+	}
+	got := out.Notespaces[0]
+	if !got.Contested || got.Reason != "adoption pending: divergent local notes" ||
+		len(got.Withheld) != 2 || got.Withheld[0] != "push" || got.Withheld[1] != "pull" {
+		t.Fatalf("contested status = %+v, want reason and both directions withheld", got)
+	}
+}
+
 // TestHandleSyncStatusWithoutSubscriptions proves the pre-existing payload is
 // unchanged when the subscription view is not wired (nil-safe): no server, no
 // direction, and the notespace rows still come from sync.db.
