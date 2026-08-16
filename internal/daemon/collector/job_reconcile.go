@@ -117,12 +117,15 @@ func (c *JobCollector) sweepStuckJobFiles(
 ) int {
 	settings := resolveReconcileSettings(c.cfg)
 
-	// Index active rows. A present row is eligible only when Phase 2's
-	// authoritative verdict is stale; unverified and empty remain vetoes.
+	// Index rows that can decide whether an active frontmatter claim still has
+	// process support. Active rows require Phase 2's authoritative stale verdict;
+	// retained terminal rows are themselves authoritative evidence that the
+	// matching attempt ended. Remote rows never authorize a local markdown write.
 	byFile := make(map[string]*models.Session)
 	byID := make(map[string]*models.Session)
 	for _, s := range st.GetSessions() {
-		if s == nil || (!health.IsActiveSessionStatus(s.Status) && s.Status != "pending") {
+		if s == nil || s.Origin != "" ||
+			(!health.IsActiveSessionStatus(s.Status) && s.Status != "pending" && !isTerminalReconcileEvidence(s.Status)) {
 			continue
 		}
 		if s.JobFilePath != "" {
@@ -217,10 +220,19 @@ func (c *JobCollector) collectCandidates(
 		}
 		path := filepath.Join(job.PlanDir, job.JobFile)
 		present := byFile[path]
+		if present != nil && !reconcileAttemptMatches(job, present) {
+			// A retained row for another identified attempt is uncertainty, not
+			// evidence that the current attempt has no session. Wait for the store
+			// projection to catch up rather than falling through to a job-ID probe.
+			continue
+		}
 		if present == nil {
 			present = byID[job.ID]
+			if present != nil && !reconcileAttemptMatches(job, present) {
+				continue
+			}
 		}
-		if present != nil && present.Verified != "stale" {
+		if present != nil && !isTerminalReconcileEvidence(present.Status) && present.Verified != "stale" {
 			continue
 		}
 
@@ -234,11 +246,17 @@ func (c *JobCollector) collectCandidates(
 		}
 
 		if present != nil {
+			reason := "daemon stored verified=stale"
+			source := "stored_verdict"
+			if isTerminalReconcileEvidence(present.Status) {
+				reason = "daemon session is terminal: " + present.Status
+				source = "terminal_session"
+			}
 			out = append(out, reconcileCandidate{
 				job: job, path: path, from: job.Status,
 				to: health.ReconciledStatusFor(string(job.Type)), quiet: quiet,
-				verdict: health.Verdict{State: health.Stale, Reason: "daemon stored verified=stale"},
-				source:  "stored_verdict",
+				verdict: health.Verdict{State: health.Stale, Reason: reason},
+				source:  source,
 			})
 			continue
 		}
@@ -284,4 +302,29 @@ func (c *JobCollector) collectCandidates(
 		})
 	}
 	return out
+}
+
+// isTerminalReconcileEvidence is the retained daemon-session evidence that no
+// provider process still supports a job file's active claim. "exited" is
+// included: it is intentionally session-only at the lifecycle edge because the
+// reporter still owns the Flow result, but after the quiet window an unchanged
+// running file is unsupported and must converge conservatively.
+func isTerminalReconcileEvidence(status string) bool {
+	switch status {
+	case "completed", "interrupted", "failed", "exited", "stopped", "error", "abandoned":
+		return true
+	default:
+		return false
+	}
+}
+
+// reconcileAttemptMatches prevents a retained terminal row from an older run
+// of a reusable job ID from convicting the current attempt. A legacy job file
+// without an attempt ID may still consume identified evidence, matching the
+// store's forward-upgrade compatibility rule.
+func reconcileAttemptMatches(job *models.JobInfo, session *models.Session) bool {
+	if job == nil || session == nil {
+		return false
+	}
+	return job.AttemptID == "" || job.AttemptID == session.AttemptID
 }

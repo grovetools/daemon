@@ -83,6 +83,51 @@ func TestSweepOnePassConvergesWithoutSuccessOrAbandonment(t *testing.T) {
 	}
 }
 
+// The pane-host fallback can end the daemon session after both the supervisor
+// and provider disappear, without a reporter left to update Flow frontmatter.
+// Retained terminal evidence must therefore converge the matching old running
+// claim instead of being discarded by the sweep's active-session index.
+func TestSweepConvergesRunningFrontmatterFromTerminalSession(t *testing.T) {
+	planDir := filepath.Join(t.TempDir(), "plans", "p")
+	path := writeJobFile(t, planDir, "pane-host-loss.md", "running", time.Hour)
+	job := jobFor(planDir, "pane-host-loss.md", "running")
+	job.AttemptID = "attempt-current"
+
+	endedAt := time.Now().Add(-30 * time.Minute)
+	st := store.New()
+	st.ApplyUpdate(store.Update{Type: store.UpdateSessions, Payload: []*models.Session{{
+		ID: job.ID, AttemptID: job.AttemptID, Type: string(job.Type), Status: "interrupted",
+		JobFilePath: path, StartedAt: endedAt.Add(-time.Hour), LastActivity: endedAt, EndedAt: &endedAt,
+	}}})
+
+	changed := collectorWithRegistry("", t.TempDir()).sweepStuckJobFiles(
+		context.Background(), logging.NewUnifiedLogger("test.reconcile"), st, []*models.JobInfo{job}, time.Now())
+	if changed != 1 {
+		t.Fatalf("changed = %d, want 1 from matching terminal daemon evidence", changed)
+	}
+	status, ok, err := orchestration.ReadJobFileStatus(path)
+	if err != nil || !ok || status != "orphaned" {
+		t.Fatalf("status = %q, ok=%v err=%v; want orphaned", status, ok, err)
+	}
+}
+
+func TestSweepIgnoresTerminalSessionFromPriorAttempt(t *testing.T) {
+	planDir := filepath.Join(t.TempDir(), "plans", "p")
+	path := writeJobFile(t, planDir, "retried.md", "running", time.Hour)
+	job := jobFor(planDir, "retried.md", "running")
+	job.AttemptID = "attempt-current"
+	prior := &models.Session{
+		ID: job.ID, AttemptID: "attempt-prior", Type: string(job.Type), Status: "interrupted", JobFilePath: path,
+	}
+
+	got := collectorWithRegistry("", t.TempDir()).collectCandidates(
+		[]*models.JobInfo{job}, map[string]*models.Session{path: prior}, map[string]*models.Session{job.ID: prior},
+		settings(time.Minute), time.Now())
+	if len(got) != 0 {
+		t.Fatalf("prior-attempt terminal row produced %d candidates, want 0", len(got))
+	}
+}
+
 // TestSweepConvictsAnAbandonedRunningJob is the ghost this exists for:
 // a file claiming "running", no session anywhere, no live process, long
 // since touched.
