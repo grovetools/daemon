@@ -1033,19 +1033,37 @@ func (s *Server) IsDraining() bool {
 	return s.isDraining
 }
 
+// privateSocketPath returns a randomized sibling path whose basename is never
+// longer than the public basename. Keeping it no longer is load-bearing on
+// Darwin, where sockaddr_un paths are short: a valid public path near the limit
+// must not become invalid merely because publication uses a private name.
+func privateSocketPath(publicPath string) (string, error) {
+	nameLen := len(filepath.Base(publicPath))
+	if nameLen == 0 {
+		return "", fmt.Errorf("socket path %q has no basename", publicPath)
+	}
+	var random [8]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", fmt.Errorf("generate private socket name: %w", err)
+	}
+	encoded := hex.EncodeToString(random[:])
+	if nameLen > len(encoded) {
+		nameLen = len(encoded)
+	}
+	return filepath.Join(filepath.Dir(publicPath), encoded[:nameLen]), nil
+}
+
 // bindPublishedUnixSocket binds a short unguessable name beside publicPath,
 // captures that private pathname's filesystem identity, and atomically renames
 // it into place. The socket remains reachable after rename on supported Unix
 // systems. The caller owns both the listener and identity-checked cleanup.
 func bindPublishedUnixSocket(publicPath string) (net.Listener, os.FileInfo, error) {
-	dir := filepath.Dir(publicPath)
 	var lastErr error
-	for range 10 {
-		var random [8]byte
-		if _, err := rand.Read(random[:]); err != nil {
-			return nil, nil, fmt.Errorf("generate private socket name: %w", err)
+	for range 32 {
+		privatePath, err := privateSocketPath(publicPath)
+		if err != nil {
+			return nil, nil, err
 		}
-		privatePath := filepath.Join(dir, ".g"+hex.EncodeToString(random[:]))
 		listener, err := net.Listen("unix", privatePath)
 		if err != nil {
 			lastErr = err
@@ -1070,7 +1088,9 @@ func bindPublishedUnixSocket(publicPath string) (net.Listener, os.FileInfo, erro
 		}
 		if err != nil {
 			_ = listener.Close()
-			_, _ = removeSocketIfOwned(privatePath, info)
+			if info != nil {
+				_ = os.Remove(privatePath)
+			}
 			return nil, nil, err
 		}
 		return listener, info, nil
@@ -1078,30 +1098,75 @@ func bindPublishedUnixSocket(publicPath string) (net.Listener, os.FileInfo, erro
 	return nil, nil, fmt.Errorf("could not allocate private socket name: %w", lastErr)
 }
 
-// removeSocketIfOwned removes path only when it still names identity. A missing
-// or replaced path is successful: in particular, cleanup must never unlink a
-// successor daemon's socket.
+// removeSocketIfOwned atomically detaches the public direntry before deciding
+// whether to delete it. A stat-then-remove sequence is unsafe: a successor can
+// publish between those calls and be unlinked by its predecessor. If the
+// detached entry belongs to somebody else, restore it with a no-overwrite hard
+// link before removing the private quarantine link.
 func removeSocketIfOwned(path string, identity os.FileInfo) (bool, error) {
+	return removeSocketIfOwnedBeforeDetach(path, identity, nil)
+}
+
+func removeSocketIfOwnedBeforeDetach(path string, identity os.FileInfo, beforeDetach func()) (bool, error) {
 	if path == "" || identity == nil {
 		return false, nil
 	}
-	current, err := os.Stat(path)
+	if beforeDetach != nil {
+		beforeDetach()
+	}
+
+	var quarantine string
+	for range 32 {
+		candidate, err := privateSocketPath(path)
+		if err != nil {
+			return false, err
+		}
+		// Reserve the destination with O_EXCL. Rename atomically replaces our
+		// reservation, so another cleanup cannot choose the same quarantine and
+		// we never overwrite an unrelated socket after a racy existence check.
+		reservation, err := os.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		_ = reservation.Close()
+		quarantine = candidate
+		break
+	}
+	if quarantine == "" {
+		return false, fmt.Errorf("could not allocate socket quarantine path")
+	}
+	if err := os.Rename(path, quarantine); err != nil {
+		_ = os.Remove(quarantine)
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	current, err := os.Stat(quarantine)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
 		return false, err
 	}
-	if !os.SameFile(identity, current) {
-		return false, nil
+	if os.SameFile(identity, current) {
+		return true, os.Remove(quarantine)
 	}
-	if err := os.Remove(path); err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
+
+	// We detached a successor. Link it back only if no still-newer publisher has
+	// already occupied the public path. The quarantine link is removed only
+	// after another link preserves the successor inode.
+	if err := os.Link(quarantine, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, fmt.Errorf("socket changed during cleanup; preserved displaced entry at %s", quarantine)
 		}
-		return false, err
+		return false, fmt.Errorf("restore socket changed during cleanup: %w", err)
 	}
-	return true, nil
+	if err := os.Remove(quarantine); err != nil {
+		return false, fmt.Errorf("remove restored socket quarantine: %w", err)
+	}
+	return false, nil
 }
 
 func (s *Server) removeBoundSocket() (bool, error) {

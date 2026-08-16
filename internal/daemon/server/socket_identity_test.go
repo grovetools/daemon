@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -33,8 +32,19 @@ func assertSocketIdentity(t *testing.T, path string, want os.FileInfo) {
 	}
 }
 
+func TestPrivateSocketPathDoesNotLengthenPublicPath(t *testing.T) {
+	public := shortSocketPath(t)
+	private, err := privateSocketPath(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(private) > len(public) {
+		t.Fatalf("private socket path grew from %d to %d bytes: %q", len(public), len(private), private)
+	}
+}
+
 func TestSocketIdentityHealthy(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "groved.sock")
+	path := shortSocketPath(t)
 	s := New(false)
 	if err := s.Listen(path); err != nil {
 		t.Fatal(err)
@@ -47,7 +57,7 @@ func TestSocketIdentityHealthy(t *testing.T) {
 }
 
 func TestSocketIdentityDetectsPathReplacement(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "groved.sock")
+	path := shortSocketPath(t)
 	s := New(false)
 	if err := s.Listen(path); err != nil {
 		t.Fatal(err)
@@ -62,7 +72,7 @@ func TestSocketIdentityDetectsPathReplacement(t *testing.T) {
 }
 
 func TestPublishedSocketAcceptsConnectionsAfterRename(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "groved.sock")
+	path := shortSocketPath(t)
 	listener, _ := newTestSocket(t, path)
 
 	accepted := make(chan error, 1)
@@ -94,7 +104,7 @@ func TestPublishedSocketAcceptsConnectionsAfterRename(t *testing.T) {
 
 func TestShutdownRemovesOnlyOwnedSocket(t *testing.T) {
 	t.Run("owned", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "groved.sock")
+		path := shortSocketPath(t)
 		s := New(false)
 		if err := s.Listen(path); err != nil {
 			t.Fatal(err)
@@ -109,7 +119,7 @@ func TestShutdownRemovesOnlyOwnedSocket(t *testing.T) {
 	})
 
 	t.Run("successor", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "groved.sock")
+		path := shortSocketPath(t)
 		s := New(false)
 		if err := s.Listen(path); err != nil {
 			t.Fatal(err)
@@ -123,8 +133,52 @@ func TestShutdownRemovesOnlyOwnedSocket(t *testing.T) {
 	})
 }
 
+func TestCleanupInterleavingPreservesSuccessorSocket(t *testing.T) {
+	path := shortSocketPath(t)
+	original, originalIdentity := newTestSocket(t, path)
+	defer original.Close()
+
+	var successor net.Listener
+	var successorIdentity os.FileInfo
+	removed, err := removeSocketIfOwnedBeforeDetach(path, originalIdentity, func() {
+		var bindErr error
+		successor, successorIdentity, bindErr = bindPublishedUnixSocket(path)
+		if bindErr != nil {
+			t.Fatalf("publish successor: %v", bindErr)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed {
+		t.Fatal("cleanup reported removing its own socket after successor publication")
+	}
+	t.Cleanup(func() {
+		_ = successor.Close()
+		_, _ = removeSocketIfOwned(path, successorIdentity)
+	})
+	assertSocketIdentity(t, path, successorIdentity)
+
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := successor.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+		accepted <- err
+	}()
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		t.Fatalf("dial restored successor: %v", err)
+	}
+	_ = conn.Close()
+	if err := <-accepted; err != nil {
+		t.Fatalf("accept restored successor: %v", err)
+	}
+}
+
 func TestDrainDoesNotRemoveSuccessorSocket(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "groved.sock")
+	path := shortSocketPath(t)
 	s := New(false)
 	if err := s.Listen(path); err != nil {
 		t.Fatal(err)
