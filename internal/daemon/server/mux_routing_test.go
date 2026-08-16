@@ -119,12 +119,13 @@ func addSession(st *store.Store, session models.Session) {
 		Source: "test",
 		Payload: &store.SessionIntentPayload{
 			JobID:      session.ID,
+			AttemptID:  session.AttemptID,
 			Mux:        session.Mux,
 			TmuxTarget: session.TmuxTarget,
 		},
 	})
 	if session.PtyID != "" {
-		st.SetSessionPtyID(session.ID, session.PtyID)
+		st.SetSessionPtyID(session.ID, session.AttemptID, session.PtyID)
 	}
 }
 

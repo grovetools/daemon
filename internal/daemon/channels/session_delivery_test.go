@@ -17,12 +17,13 @@ func newDeliveryTestManager(t *testing.T, sessions ...models.Session) *Manager {
 			Source: "test",
 			Payload: &store.SessionIntentPayload{
 				JobID:      session.ID,
+				AttemptID:  session.AttemptID,
 				Mux:        session.Mux,
 				TmuxTarget: session.TmuxTarget,
 			},
 		})
 		if session.PtyID != "" {
-			st.SetSessionPtyID(session.ID, session.PtyID)
+			st.SetSessionPtyID(session.ID, session.AttemptID, session.PtyID)
 		}
 	}
 	m := NewManager(st, SignalConfig{}, HAConfig{}, "test-scope", "test.sock")
