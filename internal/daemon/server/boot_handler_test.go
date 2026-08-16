@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -35,7 +34,7 @@ func unixHTTPClient(sock string) *http.Client {
 // the endpoint answers from the earliest serving moment. This is the daemon
 // half of the treemux splash's loading screen.
 func TestBootEndpointAdvancesInBindMode(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "groved.sock")
+	sock := shortSocketPath(t)
 	s := New(false)
 	// Deliberately no SetEngine — the boot endpoint must not depend on it.
 
@@ -97,7 +96,7 @@ func TestBootEndpointAdvancesInBindMode(t *testing.T) {
 // reaches it once the daemon is already serving, which under that ordering
 // means boot already finished.
 func TestBootEndpointDefaultsDone(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "groved.sock")
+	sock := shortSocketPath(t)
 	s := New(false)
 	if err := s.Listen(sock); err != nil {
 		t.Fatalf("Listen: %v", err)
@@ -151,7 +150,7 @@ func TestConvertToAPIUpdateBootPhase(t *testing.T) {
 // /api/stream SSE frame, decoding back into a StateUpdate with a populated
 // boot_phase.
 func TestBootPhaseBroadcastReachesStream(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "groved.sock")
+	sock := shortSocketPath(t)
 	st := store.New()
 	eng := engine.New(st)
 	s := New(false)

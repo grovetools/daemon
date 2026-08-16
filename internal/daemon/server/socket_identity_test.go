@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -40,6 +42,57 @@ func TestPrivateSocketPathDoesNotLengthenPublicPath(t *testing.T) {
 	}
 	if len(private) > len(public) {
 		t.Fatalf("private socket path grew from %d to %d bytes: %q", len(public), len(private), private)
+	}
+	if private == public {
+		t.Fatal("private socket path reused the public direntry")
+	}
+}
+
+func TestNearLimitPublicSocketPublishesUnderDefaultTempDir(t *testing.T) {
+	root, err := os.MkdirTemp("", "gsse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+	// Darwin permits 103 pathname bytes plus the terminating NUL. Use 100 to
+	// stay valid there while still catching any private-name length growth.
+	const targetLen = 100
+	const base = "pub.sock"
+	padLen := targetLen - len(root) - len(base) - 2
+	if padLen < 1 {
+		t.Skipf("default temporary root %q is too long for near-limit socket test", root)
+	}
+	dir := filepath.Join(root, strings.Repeat("x", padLen))
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	public := filepath.Join(dir, base)
+	if len(public) != targetLen {
+		t.Fatalf("constructed path has length %d, want %d", len(public), targetLen)
+	}
+	listener, identity := newTestSocket(t, public)
+	assertSocketIdentity(t, public, identity)
+	assertSocketConnectable(t, listener, public)
+}
+
+func assertSocketConnectable(t *testing.T, listener net.Listener, path string) {
+	t.Helper()
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+		accepted <- err
+	}()
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		t.Fatalf("dial %s: %v", path, err)
+	}
+	_ = conn.Close()
+	if err := <-accepted; err != nil {
+		t.Fatalf("accept %s: %v", path, err)
 	}
 }
 
@@ -116,6 +169,13 @@ func TestShutdownRemovesOnlyOwnedSocket(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("owned socket survived shutdown: %v", err)
 		}
+		entries, err := os.ReadDir(filepath.Dir(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("socket cleanup leaked sibling entries: %v", entries)
+		}
 	})
 
 	t.Run("successor", func(t *testing.T) {
@@ -159,22 +219,48 @@ func TestCleanupInterleavingPreservesSuccessorSocket(t *testing.T) {
 	})
 	assertSocketIdentity(t, path, successorIdentity)
 
-	accepted := make(chan error, 1)
-	go func() {
-		conn, err := successor.Accept()
-		if err == nil {
-			_ = conn.Close()
+	assertSocketConnectable(t, successor, path)
+}
+
+func TestCleanupPreservesDetachedSuccessorWhenNewerSocketPublishes(t *testing.T) {
+	path := shortSocketPath(t)
+	original, originalIdentity := newTestSocket(t, path)
+	defer original.Close()
+
+	var displaced, newest net.Listener
+	var displacedIdentity, newestIdentity os.FileInfo
+	var quarantine string
+	removed, err := removeSocketIfOwnedInterleaved(path, originalIdentity, func() {
+		var bindErr error
+		displaced, displacedIdentity, bindErr = bindPublishedUnixSocket(path)
+		if bindErr != nil {
+			t.Fatalf("publish displaced successor: %v", bindErr)
 		}
-		accepted <- err
-	}()
-	conn, err := net.DialTimeout("unix", path, time.Second)
-	if err != nil {
-		t.Fatalf("dial restored successor: %v", err)
+	}, func(detached string) {
+		quarantine = detached
+		var bindErr error
+		newest, newestIdentity, bindErr = bindPublishedUnixSocket(path)
+		if bindErr != nil {
+			t.Fatalf("publish newest successor: %v", bindErr)
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "preserved displaced entry") {
+		t.Fatalf("cleanup error = %v, want preserved-displaced diagnostic", err)
 	}
-	_ = conn.Close()
-	if err := <-accepted; err != nil {
-		t.Fatalf("accept restored successor: %v", err)
+	if removed {
+		t.Fatal("cleanup reported removing its own socket")
 	}
+	t.Cleanup(func() {
+		_ = displaced.Close()
+		_, _ = removeSocketIfOwned(quarantine, displacedIdentity)
+		_ = newest.Close()
+		_, _ = removeSocketIfOwned(path, newestIdentity)
+	})
+
+	assertSocketIdentity(t, quarantine, displacedIdentity)
+	assertSocketIdentity(t, path, newestIdentity)
+	assertSocketConnectable(t, displaced, quarantine)
+	assertSocketConnectable(t, newest, path)
 }
 
 func TestDrainDoesNotRemoveSuccessorSocket(t *testing.T) {

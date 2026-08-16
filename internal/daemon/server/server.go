@@ -1050,7 +1050,17 @@ func privateSocketPath(publicPath string) (string, error) {
 	if nameLen > len(encoded) {
 		nameLen = len(encoded)
 	}
-	return filepath.Join(filepath.Dir(publicPath), encoded[:nameLen]), nil
+	privateName := encoded[:nameLen]
+	if privateName == filepath.Base(publicPath) {
+		// Even a one-byte public basename must never be selected: bind cleanup
+		// may unlink its candidate, and quarantine rename(path, path) is a no-op.
+		alternate := byte('0')
+		if privateName[0] == alternate {
+			alternate = '1'
+		}
+		privateName = string(alternate) + privateName[1:]
+	}
+	return filepath.Join(filepath.Dir(publicPath), privateName), nil
 }
 
 // bindPublishedUnixSocket binds a short unguessable name beside publicPath,
@@ -1104,10 +1114,16 @@ func bindPublishedUnixSocket(publicPath string) (net.Listener, os.FileInfo, erro
 // detached entry belongs to somebody else, restore it with a no-overwrite hard
 // link before removing the private quarantine link.
 func removeSocketIfOwned(path string, identity os.FileInfo) (bool, error) {
-	return removeSocketIfOwnedBeforeDetach(path, identity, nil)
+	return removeSocketIfOwnedInterleaved(path, identity, nil, nil)
 }
 
 func removeSocketIfOwnedBeforeDetach(path string, identity os.FileInfo, beforeDetach func()) (bool, error) {
+	return removeSocketIfOwnedInterleaved(path, identity, beforeDetach, nil)
+}
+
+// removeSocketIfOwnedInterleaved exposes the two publication boundaries only
+// to deterministic package tests. Production cleanup passes nil hooks.
+func removeSocketIfOwnedInterleaved(path string, identity os.FileInfo, beforeDetach func(), afterDetach func(string)) (bool, error) {
 	if path == "" || identity == nil {
 		return false, nil
 	}
@@ -1144,6 +1160,9 @@ func removeSocketIfOwnedBeforeDetach(path string, identity os.FileInfo, beforeDe
 			return false, nil
 		}
 		return false, err
+	}
+	if afterDetach != nil {
+		afterDetach(quarantine)
 	}
 
 	current, err := os.Stat(quarantine)
