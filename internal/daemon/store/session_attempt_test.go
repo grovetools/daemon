@@ -7,6 +7,47 @@ import (
 	"github.com/grovetools/core/pkg/models"
 )
 
+func TestPhase5FixturesProduceOneProjectedDaemonRowPerCurrentAttempt(t *testing.T) {
+	cases := []struct {
+		name       string
+		attempts   []string
+		confirm    bool
+		terminal   string
+		wantStatus string
+	}{
+		{name: "a claude killed before hook", attempts: []string{"attempt-a"}, wantStatus: "pending"},
+		{name: "b pi startup failure", attempts: []string{"attempt-b"}, terminal: "failed", wantStatus: "failed"},
+		{name: "c sigkill mid-turn", attempts: []string{"attempt-c"}, confirm: true, terminal: "interrupted", wantStatus: "interrupted"},
+		{name: "d daemon restart mid-session", attempts: []string{"attempt-d"}, confirm: true, wantStatus: "running"},
+		{name: "e retry reusing job id", attempts: []string{"attempt-e-old", "attempt-e-current"}, confirm: true, wantStatus: "running"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			for i, attemptID := range tc.attempts {
+				st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
+					JobID: "reused-job", AttemptID: attemptID, Provider: "pi", Type: models.SessionTypeInteractiveAgent,
+				}})
+				if tc.confirm {
+					st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
+						JobID: "reused-job", AttemptID: attemptID, NativeID: "native-" + attemptID, PID: 100 + i,
+					}})
+				}
+			}
+			current := tc.attempts[len(tc.attempts)-1]
+			if tc.terminal != "" {
+				st.ApplyUpdate(Update{Type: UpdateSessionEnd, Payload: &SessionEndPayload{
+					JobID: "reused-job", AttemptID: current, Outcome: tc.terminal,
+				}})
+			}
+			rows := st.GetSessions()
+			if len(rows) != 1 || rows[0].AttemptID != current || rows[0].Status != tc.wantStatus {
+				t.Fatalf("projected rows = %+v, want one current attempt %s status %s", rows, current, tc.wantStatus)
+			}
+		})
+	}
+}
+
 func TestSessionLifecycleRejectsStalePriorAttempt(t *testing.T) {
 	st := newTestStore(t)
 	st.mu.Lock()
