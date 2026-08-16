@@ -4,6 +4,8 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -275,13 +277,13 @@ type Server struct {
 	isDraining bool
 	requestsWg sync.WaitGroup
 
-	// boundSocket is the stat of the socket file as it existed the instant
-	// Listen bound it. Listen unlinks whatever is already at the path before
-	// binding, so any process that starts after us replaces our inode with its
-	// own while our listener keeps accepting on a socket nothing can reach.
-	// Keeping the identity lets a daemon notice that it has been unbound from
-	// the world instead of running on as an invisible duplicate. Guarded by
-	// boundSocketMu; written once in Listen, read by SocketIdentityLost.
+	// boundSocket is the pathname identity captured while the listener still
+	// had an unguessable private name. Listen atomically publishes that socket
+	// at socketPath, so this identity cannot accidentally capture a concurrent
+	// replacement at the public path. Keeping it lets a daemon notice that it
+	// has been unbound from the world instead of running on as an invisible
+	// duplicate. Guarded by boundSocketMu; written once in Listen, read during
+	// identity checks and cleanup.
 	boundSocketMu sync.Mutex
 	boundSocket   os.FileInfo
 }
@@ -902,30 +904,20 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	// PHASE 2: Store socket path for drain mode
 	s.socketPath = socketPath
 
-	// Cleanup stale socket
-	if _, err := os.Stat(socketPath); err == nil {
-		if err := os.Remove(socketPath); err != nil {
-			return fmt.Errorf("failed to remove stale socket: %w", err)
-		}
-	}
-
-	// Ensure directory exists
+	// Ensure directory exists before creating the private bind name.
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil { //nolint:gosec // G301: daemon/test dir
 		return fmt.Errorf("failed to create socket directory: %w", err)
 	}
 
-	listener, err := net.Listen("unix", socketPath)
+	// Bind and identify the socket under an unguessable private pathname, then
+	// atomically publish it over the well-known path. Looking up the public path
+	// after a direct bind is racy: another process can replace it between bind
+	// and stat, causing us to remember the replacement as our own. The listener
+	// has auto-unlink disabled because its remembered name is the private one;
+	// all public-path cleanup below is explicit and identity checked.
+	listener, info, err := bindPublishedUnixSocket(socketPath)
 	if err != nil {
 		return fmt.Errorf("failed to listen on socket: %w", err)
-	}
-
-	// Capture identity from the bound listener FD, never by looking the path up
-	// again. Another process may unlink/rebind the pathname immediately after
-	// bind; a path stat in that race would record the thief's inode as ours.
-	info, err := boundListenerInfo(listener)
-	if err != nil {
-		_ = listener.Close()
-		return fmt.Errorf("failed to record bound socket identity: %w", err)
 	}
 	s.boundSocketMu.Lock()
 	s.boundSocket = info
@@ -933,12 +925,6 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 
 	// PHASE 2: Store listener for drain mode socket unlink
 	s.listener = listener
-
-	// Set restrictive permissions on socket
-	if err := os.Chmod(socketPath, 0o600); err != nil {
-		_ = listener.Close()
-		return fmt.Errorf("failed to set socket permissions: %w", err)
-	}
 
 	// The socket is bound and chmod'd — clients can connect now even though
 	// Serve hasn't been called yet (kernel holds accept-queue entries until
@@ -998,6 +984,7 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 // It must be called after Listen; calling it without a prior successful Listen
 // panics on the nil server (a programmer error, not a runtime condition).
 func (s *Server) Serve() error {
+	defer func() { _, _ = s.removeBoundSocket() }()
 	err := s.server.Serve(s.listener)
 
 	// A graceful drain (SIGUSR1 → EnterDrainMode) closes the listener out from
@@ -1020,10 +1007,21 @@ func (s *Server) Serve() error {
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.ulog.Info("Shutting down server...").Log(ctx)
+	var shutdownErr error
 	if s.server != nil {
-		return s.server.Shutdown(ctx)
+		shutdownErr = s.server.Shutdown(ctx)
 	}
-	return nil
+	// Shutdown only knows about listeners after Serve has registered them. Close
+	// explicitly as well so a Listen-without-Serve failure cannot leak a socket.
+	if s.listener != nil {
+		if err := s.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			shutdownErr = errors.Join(shutdownErr, err)
+		}
+	}
+	if _, err := s.removeBoundSocket(); err != nil {
+		shutdownErr = errors.Join(shutdownErr, err)
+	}
+	return shutdownErr
 }
 
 // IsDraining reports whether a graceful drain (SIGUSR1 → EnterDrainMode) is in
@@ -1035,20 +1033,82 @@ func (s *Server) IsDraining() bool {
 	return s.isDraining
 }
 
-// boundListenerInfo returns the identity of the socket attached to listener's
-// FD. UnixListener.File duplicates the descriptor; closing the duplicate does
-// not affect the listener.
-func boundListenerInfo(listener net.Listener) (os.FileInfo, error) {
-	ul, ok := listener.(*net.UnixListener)
-	if !ok {
-		return nil, fmt.Errorf("listener is %T, want *net.UnixListener", listener)
+// bindPublishedUnixSocket binds a short unguessable name beside publicPath,
+// captures that private pathname's filesystem identity, and atomically renames
+// it into place. The socket remains reachable after rename on supported Unix
+// systems. The caller owns both the listener and identity-checked cleanup.
+func bindPublishedUnixSocket(publicPath string) (net.Listener, os.FileInfo, error) {
+	dir := filepath.Dir(publicPath)
+	var lastErr error
+	for range 10 {
+		var random [8]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return nil, nil, fmt.Errorf("generate private socket name: %w", err)
+		}
+		privatePath := filepath.Join(dir, ".g"+hex.EncodeToString(random[:]))
+		listener, err := net.Listen("unix", privatePath)
+		if err != nil {
+			lastErr = err
+			if errors.Is(err, syscall.EADDRINUSE) {
+				continue
+			}
+			return nil, nil, err
+		}
+		ul, ok := listener.(*net.UnixListener)
+		if !ok {
+			_ = listener.Close()
+			return nil, nil, fmt.Errorf("listener is %T, want *net.UnixListener", listener)
+		}
+		ul.SetUnlinkOnClose(false)
+
+		info, err := os.Stat(privatePath)
+		if err == nil {
+			err = os.Chmod(privatePath, 0o600)
+		}
+		if err == nil {
+			err = os.Rename(privatePath, publicPath)
+		}
+		if err != nil {
+			_ = listener.Close()
+			_, _ = removeSocketIfOwned(privatePath, info)
+			return nil, nil, err
+		}
+		return listener, info, nil
 	}
-	f, err := ul.File()
+	return nil, nil, fmt.Errorf("could not allocate private socket name: %w", lastErr)
+}
+
+// removeSocketIfOwned removes path only when it still names identity. A missing
+// or replaced path is successful: in particular, cleanup must never unlink a
+// successor daemon's socket.
+func removeSocketIfOwned(path string, identity os.FileInfo) (bool, error) {
+	if path == "" || identity == nil {
+		return false, nil
+	}
+	current, err := os.Stat(path)
 	if err != nil {
-		return nil, err
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
 	}
-	defer func() { _ = f.Close() }()
-	return f.Stat()
+	if !os.SameFile(identity, current) {
+		return false, nil
+	}
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Server) removeBoundSocket() (bool, error) {
+	s.boundSocketMu.Lock()
+	bound := s.boundSocket
+	s.boundSocketMu.Unlock()
+	return removeSocketIfOwned(s.socketPath, bound)
 }
 
 // SocketIdentityLost reports whether the socket path this server bound is now
@@ -1107,13 +1167,12 @@ func (s *Server) EnterDrainMode(ctx context.Context) {
 
 	s.ulog.Info("Entering drain mode").Log(ctx)
 
-	// Unlink the socket immediately so the new daemon can bind
-	if s.socketPath != "" {
-		if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
-			s.ulog.Warn("Failed to unlink socket").Field("path", s.socketPath).Err(err).Log(ctx)
-		} else {
-			s.ulog.Info("Socket unlinked").Field("path", s.socketPath).Log(ctx)
-		}
+	// Unlink our socket immediately so the new daemon can bind. If the public
+	// path is already a successor's socket, leave it untouched.
+	if removed, err := s.removeBoundSocket(); err != nil {
+		s.ulog.Warn("Failed to unlink socket").Field("path", s.socketPath).Err(err).Log(ctx)
+	} else if removed {
+		s.ulog.Info("Socket unlinked").Field("path", s.socketPath).Log(ctx)
 	}
 
 	// Close the listener to refuse new connections
