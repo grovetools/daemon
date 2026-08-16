@@ -1919,9 +1919,10 @@ func rotateOversizedLogs(logsDir string, maxBytes int64, now time.Time) (rotated
 
 // sweepOldLogs walks logsDir recursively and deletes every *.log (and
 // *.log.gz part archive) file that logFileExpired judges older than
-// retentionDays. Best-effort: unreadable entries are skipped; the first
-// removal error is reported alongside whatever was deleted. A missing logsDir
-// is a no-op.
+// retentionDays. It then removes empty directories below logs/workspaces,
+// bottom-up; the logs and workspaces roots are never removed. Best-effort:
+// unreadable entries are skipped; the first removal error is reported alongside
+// whatever was deleted. A missing logsDir is a no-op.
 func sweepOldLogs(logsDir string, retentionDays int, now time.Time) (deleted int, freed int64, firstErr error) {
 	if _, err := os.Stat(logsDir); err != nil {
 		return 0, 0, nil
@@ -1947,6 +1948,26 @@ func sweepOldLogs(logsDir string, retentionDays int, now time.Time) (deleted int
 		freed += info.Size()
 		return nil
 	})
+
+	workspaceLogs := filepath.Join(logsDir, "workspaces")
+	var dirs []string
+	_ = filepath.WalkDir(workspaceLogs, func(path string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() && path != workspaceLogs {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+	// WalkDir is pre-order, so reversing it visits every child before its
+	// parent. A parent that becomes empty during this pass is then removable.
+	for i := len(dirs) - 1; i >= 0; i-- {
+		entries, err := os.ReadDir(dirs[i])
+		if err != nil || len(entries) != 0 {
+			continue
+		}
+		if err := os.Remove(dirs[i]); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
 	return deleted, freed, firstErr
 }
 

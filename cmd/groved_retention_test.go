@@ -122,6 +122,39 @@ func TestRotateOversizedLogsCopyTruncatesActiveFile(t *testing.T) {
 	}
 }
 
+func TestSweepOldLogsRemovesOnlyEmptyWorkspaceDirectories(t *testing.T) {
+	now := mustDate(t, "2026-07-01")
+	dir := t.TempDir()
+	workspaceRoot := filepath.Join(dir, "workspaces")
+	emptyLeaf := filepath.Join(workspaceRoot, "grove-tend-empty", "nested")
+	nonEmpty := filepath.Join(workspaceRoot, "keep")
+	if err := os.MkdirAll(emptyLeaf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nonEmpty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nonEmpty, "README.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := sweepOldLogs(dir, 14, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(workspaceRoot, "grove-tend-empty")); !os.IsNotExist(err) {
+		t.Fatalf("empty directory tree survived: %v", err)
+	}
+	if _, err := os.Stat(nonEmpty); err != nil {
+		t.Fatalf("non-empty directory removed: %v", err)
+	}
+	if _, err := os.Stat(workspaceRoot); err != nil {
+		t.Fatalf("workspaces root removed: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("logs root removed: %v", err)
+	}
+}
+
 func TestSweepOldLogs(t *testing.T) {
 	now := mustDate(t, "2026-07-01").Add(10 * time.Hour)
 	dir := t.TempDir()

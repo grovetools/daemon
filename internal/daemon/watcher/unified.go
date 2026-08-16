@@ -79,6 +79,7 @@ type UnifiedWatcher struct {
 	refreshInterval time.Duration
 	ulog            *logging.UnifiedLogger
 	stats           WatchStats
+	failedPaths     map[string]bool
 	mu              sync.Mutex
 }
 
@@ -100,6 +101,7 @@ func newUnifiedWatcherWithBackend(st *store.Store, batchInterval time.Duration, 
 		store:           st,
 		handlers:        make([]DomainHandler, 0),
 		watchCounts:     make(map[string]int),
+		failedPaths:     make(map[string]bool),
 		batchInterval:   batchInterval,
 		refreshInterval: 15 * time.Second,
 		ulog:            logging.NewUnifiedLogger("groved.watcher.unified"),
@@ -282,7 +284,16 @@ func (w *UnifiedWatcher) refreshWatches() {
 	for _, h := range w.handlers {
 		paths := h.ComputeWatchPaths(workspaces)
 		for _, p := range paths {
-			desiredCounts[filepath.Clean(p)]++
+			p = filepath.Clean(p)
+			// Lstat first so a dangling symlink is distinguishable from an
+			// ordinary missing path and never reaches fsnotify.Add. The fsnotify
+			// version pinned by this module likewise skips dangling children
+			// while installing a watch for their parent directory.
+			if dangling, err := isDanglingSymlink(p); err == nil && dangling {
+				w.ulog.Debug("Skipping watch for dangling symlink").Field("path", p).Log(ctx)
+				continue
+			}
+			desiredCounts[p]++
 		}
 	}
 
@@ -316,7 +327,8 @@ func (w *UnifiedWatcher) refreshWatches() {
 
 	// Add missing watches. "Missing" is judged against the backend list, so a
 	// dropped watch is re-added even though watchCounts still holds it.
-	added, recovered, failed := 0, 0, 0
+	added, recovered := 0, 0
+	newFailedPaths := make(map[string]bool)
 	for p, count := range desiredCounts {
 		if _, ok := installed[p]; ok {
 			w.watchCounts[p] = count
@@ -348,8 +360,12 @@ func (w *UnifiedWatcher) refreshWatches() {
 				w.ulog.Debug("Failed to clean up partial watch").Err(rmErr).Field("path", p).Log(ctx)
 			}
 			delete(w.watchCounts, p)
-			failed++
-			w.ulog.Warn("Failed to watch path").Err(err).Field("path", p).Log(ctx)
+			newFailedPaths[p] = true
+			entry := w.ulog.Debug("Failed to watch path")
+			if !w.failedPaths[p] {
+				entry = w.ulog.Warn("Failed to watch path")
+			}
+			entry.Err(err).Field("path", p).Log(ctx)
 			continue
 		}
 		w.watchCounts[p] = count
@@ -373,35 +389,78 @@ func (w *UnifiedWatcher) refreshWatches() {
 			if added > 0 {
 				added--
 			}
-			failed++
-			w.ulog.Warn("Watch add reported success but backend does not list it").Field("path", p).Log(ctx)
+			newFailedPaths[p] = true
+			entry := w.ulog.Debug("Watch add reported success but backend does not list it")
+			if !w.failedPaths[p] {
+				entry = w.ulog.Warn("Watch add reported success but backend does not list it")
+			}
+			entry.Field("path", p).Log(ctx)
 		}
 	}
 
+	for p := range w.failedPaths {
+		if !newFailedPaths[p] && w.watchCounts[p] > 0 {
+			w.ulog.Info("Watch path recovered").Field("path", p).Log(ctx)
+		}
+	}
+
+	previousStats := w.stats
 	w.stats = WatchStats{
 		Desired:   len(desiredCounts),
 		Watched:   len(w.watchCounts),
 		Added:     added,
 		Removed:   removed,
 		Recovered: recovered,
-		Failed:    failed,
+		Failed:    len(newFailedPaths),
 		Refreshes: w.stats.Refreshes + 1,
 	}
+	w.failedPaths = newFailedPaths
 
 	// Watch-registration boundary: one aggregate line per refresh keeps the
 	// evidence of fsnotify coverage in the live log without a per-path line
 	// for every workspace rescan (which ran to thousands of lines a day).
 	// `failed`/`recovered` are what make a degraded watch set visible in the
 	// log at all — the symptom is silence everywhere else.
-	if added > 0 || removed > 0 || failed > 0 || recovered > 0 {
+	if watchSetChanged(previousStats, w.stats) {
 		w.ulog.Info("Watch set updated").
 			Field("added", added).
 			Field("removed", removed).
 			Field("recovered", recovered).
-			Field("failed", failed).
+			Field("failed", len(newFailedPaths)).
 			Field("total", len(w.watchCounts)).
 			Log(ctx)
 	}
+}
+
+// isDanglingSymlink reports only symlinks whose target is absent. Lstat is
+// intentional: Stat alone collapses this case into the ordinary missing-path
+// branch and lets the broken link reach fsnotify on the next refresh.
+func isDanglingSymlink(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	_, err = os.Stat(path)
+	if err == nil {
+		return false, nil
+	}
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+// watchSetChanged is the aggregate-log delta gate. Added/removed/recovered are
+// edge counters, while Desired/Watched/Failed are levels. Comparing the levels
+// prevents a pinned failure count from producing an info line every refresh;
+// the edge counters preserve real reconciliation work that leaves levels equal.
+func watchSetChanged(previous, current WatchStats) bool {
+	return current.Added > 0 || current.Removed > 0 || current.Recovered > 0 ||
+		current.Desired != previous.Desired || current.Watched != previous.Watched ||
+		current.Failed != previous.Failed
 }
 
 // backendWatches snapshots the backend's watch list as a set of cleaned paths.

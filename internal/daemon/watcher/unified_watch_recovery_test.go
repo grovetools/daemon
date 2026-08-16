@@ -194,6 +194,61 @@ func newTestWatcher(t *testing.T, backend watchBackend, h DomainHandler) *Unifie
 	return uw
 }
 
+func TestRefreshSkipsDanglingSymlinkCandidate(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "dangling")
+	if err := os.Symlink(filepath.Join(dir, "missing-target"), link); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := newFakeBackend()
+	h := &stubHandler{}
+	h.setPaths(link)
+	uw := newTestWatcher(t, backend, h)
+	uw.refreshWatches()
+
+	adds, _ := backend.callLog()
+	if len(adds) != 0 {
+		t.Fatalf("dangling symlink reached backend Add: %v", adds)
+	}
+	if stats := uw.WatchStats(); stats.Desired != 0 || stats.Failed != 0 {
+		t.Fatalf("stats = %+v, want dangling candidate omitted without a failure", stats)
+	}
+}
+
+// TestRealFsnotifyAcceptsDirectoryContainingDanglingSymlink covers the macOS
+// kqueue failure behind the log storm. fsnotify v1.10+ skips the broken child
+// while retaining coverage for the parent directory.
+func TestRealFsnotifyAcceptsDirectoryContainingDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Symlink(filepath.Join(dir, "missing-target"), filepath.Join(dir, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	backend, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+
+	if err := backend.Add(dir); err != nil {
+		t.Fatalf("Add(parent with dangling child) = %v", err)
+	}
+}
+
+func TestWatchSetChangedUsesLevelDeltasAndReconciliationEdges(t *testing.T) {
+	failed := WatchStats{Desired: 2, Watched: 1, Failed: 1, Refreshes: 1}
+	stableFailure := WatchStats{Desired: 2, Watched: 1, Failed: 1, Refreshes: 2}
+	if watchSetChanged(failed, stableFailure) {
+		t.Fatal("refresh count or pinned failure level re-armed aggregate log")
+	}
+	if !watchSetChanged(stableFailure, WatchStats{Desired: 2, Watched: 2, Added: 1, Refreshes: 3}) {
+		t.Fatal("failure recovery did not produce an aggregate delta")
+	}
+	if !watchSetChanged(WatchStats{Desired: 1, Watched: 1}, WatchStats{Desired: 1, Watched: 1, Recovered: 1}) {
+		t.Fatal("backend recovery edge did not produce an aggregate delta")
+	}
+}
+
 // TestRefreshCleansUpPartialAddAndRetriesCleanly is the regression for the
 // permanent directory-only watch state: a failed Add must be torn down, so the
 // next refresh re-registers from scratch instead of hitting the backend's
