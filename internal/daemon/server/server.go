@@ -1588,7 +1588,7 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			// registry entry. The daemon's normal session collector
 			// will pick up the dead PID on its next sweep and emit
 			// the appropriate SSE update.
-			if err := s.killSession(sessionID); err != nil {
+			if err := s.killSession(sessionID, r.URL.Query().Get("attempt_id")); err != nil {
 				http.Error(w, err.Error(), http.StatusNotFound)
 				return
 			}
@@ -1874,10 +1874,13 @@ func lookupRegistryPID(jobID, attemptID string) *sessions.SessionMetadata {
 // Returns an error if the session is unknown or has no PID. Killing a
 // process that has already exited is treated as success — the goal is to
 // guarantee the session disappears from active tracking.
-func (s *Server) killSession(sessionID string) error {
+func (s *Server) killSession(sessionID, attemptID string) error {
 	session := s.engine.Store().GetSession(sessionID)
 	if session == nil {
 		return fmt.Errorf("session not found: %s", sessionID)
+	}
+	if !lifecycleRequestMatches(session.AttemptID, attemptID) {
+		return fmt.Errorf("session attempt mismatch for %s: current %q, requested %q", sessionID, session.AttemptID, attemptID)
 	}
 
 	// Never signal a PID off a federated session (C8). GetSession is a bare-ID

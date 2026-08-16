@@ -38,7 +38,7 @@ func TestServerMutationGuardsRefuseRemoteSessions(t *testing.T) {
 	// The composite key GetSession resolves the remote row under.
 	key := "sat\x00R"
 
-	if err := s.killSession(key); err == nil || !strings.Contains(err.Error(), "satellite") {
+	if err := s.killSession(key, ""); err == nil || !strings.Contains(err.Error(), "satellite") {
 		t.Fatalf("killSession on a remote session: err = %v, want a satellite-refusal error", err)
 	}
 

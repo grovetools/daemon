@@ -83,7 +83,7 @@ func TestKillSessionEndsRealPendingIntentWithAttempt(t *testing.T) {
 	}})
 	s := New(false)
 	s.SetEngine(engine.New(st))
-	if err := s.killSession("pending-job"); err != nil {
+	if err := s.killSession("pending-job", "attempt-pending"); err != nil {
 		t.Fatalf("kill pending PID-0 intent: %v", err)
 	}
 	got := st.GetSession("pending-job")
@@ -154,6 +154,21 @@ func TestSessionEndHTTPPayloadCarriesAttemptIdentity(t *testing.T) {
 	}
 }
 
+func TestKillSessionRejectsStaleAttempt(t *testing.T) {
+	st := store.New()
+	st.ApplyUpdate(store.Update{Type: store.UpdateSessionIntent, Payload: &store.SessionIntentPayload{
+		JobID: "job", AttemptID: "attempt-current", Type: models.SessionTypeInteractiveAgent,
+	}})
+	s := New(false)
+	s.SetEngine(engine.New(st))
+	if err := s.killSession("job", "attempt-old"); err == nil || !strings.Contains(err.Error(), "attempt mismatch") {
+		t.Fatalf("stale attempt kill error = %v", err)
+	}
+	if got := st.GetSession("job"); got == nil || got.Status != "pending" || got.EndedAt != nil {
+		t.Fatalf("stale kill mutated current attempt: %+v", got)
+	}
+}
+
 func TestKillSessionRejectsSyntheticRow(t *testing.T) {
 	st := store.New()
 	st.ApplyUpdate(store.Update{Type: store.UpdateSessions, Payload: []*models.Session{{
@@ -161,7 +176,7 @@ func TestKillSessionRejectsSyntheticRow(t *testing.T) {
 	}}})
 	s := New(false)
 	s.SetEngine(engine.New(st))
-	if err := s.killSession("synthetic"); err == nil {
+	if err := s.killSession("synthetic", ""); err == nil {
 		t.Fatal("kill accepted a synthetic row")
 	}
 }
