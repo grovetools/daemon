@@ -63,7 +63,10 @@ func TestSessionCollectorFlagsDeathAfterGraceWithoutSeenAlive(t *testing.T) {
 
 func TestSessionCollectorFlagsPIDZeroDeadRegistry(t *testing.T) {
 	t.Setenv("GROVE_HOME", t.TempDir())
-	old := time.Now().Add(-time.Hour)
+	// Past classifier grace but still inside the headless activity lease: this
+	// isolates the Phase-2 stale verdict from Phase-4 expiry (which intentionally
+	// retracts to unverified).
+	old := time.Now().Add(-time.Minute)
 	st := store.New()
 	st.ApplyUpdate(store.Update{Type: store.UpdateSessions, Payload: []*models.Session{{
 		ID: "pid-zero", PID: 0, Type: "headless_agent", Status: "running",

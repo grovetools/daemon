@@ -60,6 +60,23 @@ import (
 
 // configWatchEnabled returns true if config watching is enabled in config.
 // Defaults to true if not explicitly set to false.
+func sessionLeasePolicy(cfg *config.Config) health.LeasePolicy {
+	policy := health.DefaultLeasePolicy()
+	if cfg == nil || cfg.Daemon == nil || cfg.Daemon.SessionLeases == nil {
+		return policy
+	}
+	leases := cfg.Daemon.SessionLeases
+	apply := func(raw string, target *time.Duration) {
+		if parsed, err := time.ParseDuration(raw); raw != "" && err == nil && parsed > 0 {
+			*target = parsed
+		}
+	}
+	apply(leases.Interactive, &policy.Interactive)
+	apply(leases.Headless, &policy.Headless)
+	apply(leases.TurnBased, &policy.TurnBased)
+	return policy
+}
+
 func configWatchEnabled(cfg *config.Config) bool {
 	if cfg.Daemon == nil || cfg.Daemon.ConfigWatch == nil {
 		return true // Default enabled
@@ -662,6 +679,7 @@ func newGrovedStartCmd() *cobra.Command {
 			var sessionColl *collector.SessionCollector
 			if isEnabled("session") {
 				sessionColl = collector.NewSessionCollector(sessionInterval, scope)
+				sessionColl.SetLeasePolicy(sessionLeasePolicy(cfg))
 				eng.Register(sessionColl)
 			}
 			if isEnabled("plan") {
@@ -925,6 +943,7 @@ func newGrovedStartCmd() *cobra.Command {
 				// PTYs when it detects a dead session PID (daemon-side reaper).
 				if sessionColl != nil && tuimuxClient != nil {
 					sessionColl.SetPtyKiller(tuimuxClient)
+					sessionColl.SetPtyActivitySource(tuimuxClient)
 				}
 
 				advanceBoot(1) // jobrunner

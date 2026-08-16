@@ -431,6 +431,12 @@ func (s *Store) ApplyUpdate(u Update) {
 				return
 			}
 		}
+	case UpdateSessionActivity:
+		if payload, ok := u.Payload.(*SessionActivityPayload); ok {
+			if !s.applySessionActivity(payload) {
+				return
+			}
+		}
 	case UpdateSessionTokens:
 		if payload, ok := u.Payload.(*SessionTokensPayload); ok {
 			s.applySessionTokens(payload)
@@ -931,6 +937,7 @@ func lifecycleReason(reason string) string {
 }
 
 func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string) {
+	now := s.now()
 	session := &models.Session{
 		ID:               payload.JobID,
 		Type:             models.SessionTypeOrDefault(payload.Type),
@@ -938,8 +945,8 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string)
 		PID:              0, // Not yet known
 		WorkingDirectory: payload.WorkDir,
 		Status:           "pending", // Waiting for confirmation
-		StartedAt:        time.Now(),
-		LastActivity:     time.Now(),
+		StartedAt:        now,
+		LastActivity:     now,
 		PlanName:         payload.PlanName,
 		JobTitle:         payload.Title,
 		ParentJobID:      payload.ParentJobID,
@@ -961,13 +968,14 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string)
 
 // applySessionConfirmation updates a pending session with actual process info.
 func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, source string) {
+	now := s.now()
 	session, exists := s.state.Sessions[payload.JobID]
 	if !exists {
 		// Create a new session if intent was missed
 		session = &models.Session{
 			ID:        payload.JobID,
 			Type:      "interactive_agent",
-			StartedAt: time.Now(),
+			StartedAt: now,
 		}
 		s.state.Sessions[payload.JobID] = session
 	}
@@ -976,7 +984,7 @@ func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, so
 	session.ClaudeSessionID = payload.NativeID
 	session.PID = payload.PID
 	session.Status = "running"
-	session.LastActivity = time.Now()
+	maxSessionActivity(session, now)
 	if payload.TranscriptPath != "" {
 		session.TranscriptPath = payload.TranscriptPath
 	}
@@ -1010,6 +1018,7 @@ func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, so
 // If the session doesn't exist, creates a minimal record so status transitions
 // (e.g., idle→running from hooks PreToolUse) work even without prior registration.
 func (s *Store) applySessionStatus(payload *SessionStatusPayload) {
+	now := s.now()
 	session, exists := s.state.Sessions[payload.JobID]
 	if !exists {
 		// Create a minimal session record — hooks may be calling UpdateSessionStatus
@@ -1017,8 +1026,8 @@ func (s *Store) applySessionStatus(payload *SessionStatusPayload) {
 		session = &models.Session{
 			ID:           payload.JobID,
 			Status:       payload.Status,
-			StartedAt:    time.Now(),
-			LastActivity: time.Now(),
+			StartedAt:    now,
+			LastActivity: now,
 		}
 		s.state.Sessions[payload.JobID] = session
 		return
@@ -1029,7 +1038,10 @@ func (s *Store) applySessionStatus(payload *SessionStatusPayload) {
 	if isTerminalSessionStatus(payload.Status) {
 		session.Verified = ""
 	}
-	session.LastActivity = time.Now()
+	// Session status updates originate at hook arrivals. Even when the status is
+	// unchanged they are genuine activity, but the clock is monotonic so a late
+	// callback can never move the lease backwards.
+	maxSessionActivity(session, now)
 
 	// Interactive (tmux-detached) agents have no foreground runtime loop to
 	// persist a mid-session status change into their job markdown — unlike chat
@@ -1128,6 +1140,39 @@ func (s *Store) syncSessionStatusToJobMarkdown(session *models.Session, prevStat
 // applySessionVerdict changes only the derived verdict for an existing active
 // local session. It deliberately does not touch LastActivity: observation by a
 // health poller is not evidence of agent activity.
+func maxSessionActivity(session *models.Session, observedAt time.Time) bool {
+	if session == nil || observedAt.IsZero() || !observedAt.After(session.LastActivity) {
+		return false
+	}
+	session.LastActivity = observedAt
+	return true
+}
+
+// applySessionActivity renews a lease only from the closed set of authoritative
+// real-activity writers. It is monotonic and never changes status or verdict.
+func (s *Store) applySessionActivity(payload *SessionActivityPayload) bool {
+	if payload == nil {
+		return false
+	}
+	switch payload.Source {
+	case "hook", "transcript", "pty":
+	default:
+		return false
+	}
+	session, exists := s.state.Sessions[payload.JobID]
+	if !exists || session.Origin != "" || !health.IsActiveSessionStatus(session.Status) {
+		return false
+	}
+	if !payload.ExpectedStartedAt.IsZero() && !payload.ExpectedStartedAt.Equal(session.StartedAt) {
+		return false
+	}
+	observedAt := payload.ObservedAt
+	if now := s.now(); observedAt.After(now) {
+		observedAt = now
+	}
+	return maxSessionActivity(session, observedAt)
+}
+
 func (s *Store) applySessionVerdict(payload *SessionVerdictPayload) bool {
 	if payload == nil {
 		return false

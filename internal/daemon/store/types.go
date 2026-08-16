@@ -77,6 +77,7 @@ const (
 	UpdateSessionStatus       UpdateType = "session_status"       // Update session status (running/idle/pending_user)
 	UpdateSessionEnd          UpdateType = "session_end"          // Mark session as completed/interrupted/failed/exited
 	UpdateSessionVerdict      UpdateType = "session_verdict"      // Derived health verdict; never session activity
+	UpdateSessionActivity     UpdateType = "session_activity"     // Monotonic real activity evidence (hook/transcript/pty)
 	UpdateSessionsPruned      UpdateType = "sessions_pruned"      // Retention-bounded deletion of old terminal rows
 	UpdateSessionTokens       UpdateType = "session_tokens"       // In-place live token/cost/context fields (daemon-computed)
 
@@ -251,7 +252,7 @@ var allUpdateTypes = []UpdateType{
 	UpdateWorkspaces, UpdateSessions, UpdateFocus, UpdateConfigReload,
 	UpdateThemeChanged, UpdateSkillSync, UpdateWatcherStatus,
 	UpdateSessionIntent, UpdateSessionConfirmation, UpdateSessionStatus,
-	UpdateSessionEnd, UpdateSessionVerdict, UpdateSessionsPruned, UpdateSessionTokens,
+	UpdateSessionEnd, UpdateSessionVerdict, UpdateSessionActivity, UpdateSessionsPruned, UpdateSessionTokens,
 	UpdateJobSubmitted, UpdateJobStarted, UpdateJobCompleted, UpdateJobFailed,
 	UpdateJobCancelled, UpdateJobPendingUser, UpdateJobOrphaned,
 	UpdateJobsDiscovered,
@@ -444,6 +445,16 @@ type SessionEndPayload struct {
 type SessionVerdictPayload struct {
 	JobID    string `json:"job_id"`
 	Verified string `json:"verified"` // alive|unverified|stale
+}
+
+// SessionActivityPayload carries genuine observed activity. ObservedAt is
+// applied monotonically and Source is a closed vocabulary; idle pings, token
+// recomputation, focus, and attachment are intentionally not accepted.
+type SessionActivityPayload struct {
+	JobID             string    `json:"job_id"`
+	ExpectedStartedAt time.Time `json:"expected_started_at,omitempty"` // Phase-4 optimistic attempt guard
+	ObservedAt        time.Time `json:"observed_at"`
+	Source            string    `json:"source"` // hook|transcript|pty
 }
 
 // SessionsPrunedPayload announces retention-based removal of terminal rows.

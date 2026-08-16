@@ -18,12 +18,19 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/telemetry"
 	"github.com/grovetools/flow/pkg/orchestration"
+	tuimuxpty "github.com/grovetools/tuimux/pty"
 )
 
 // PtyKiller is satisfied by any type that can terminate an out-of-process PTY
 // by ID. The tuimux ApiClient implements this interface.
 type PtyKiller interface {
 	KillPty(ptyID string) error
+}
+
+// PtyActivitySource supplies the existing read-only tuimux PTY metadata
+// snapshot. Joining is exact by Session.PtyID; listing/focus is never activity.
+type PtyActivitySource interface {
+	ListPtys() ([]tuimuxpty.SessionMetadata, error)
 }
 
 const (
@@ -108,9 +115,14 @@ func sessionVerdictUpdate(jobID, verified string) store.Update {
 // 2. Periodically verifies that active sessions' PIDs are still alive
 // 3. Cleans up dead sessions (marks as interrupted, removes crash-recovery files)
 type SessionCollector struct {
-	interval  time.Duration
-	ulog      *logging.UnifiedLogger
-	ptyKiller PtyKiller
+	interval          time.Duration
+	ulog              *logging.UnifiedLogger
+	ptyKiller         PtyKiller
+	ptyActivitySource PtyActivitySource
+	leasePolicy       health.LeasePolicy
+	// reapEnabled separates reversible lease verdicts from conviction/kill
+	// machinery and gives acceptance tests an explicit off switch.
+	reapEnabled bool
 	// scope is this daemon's owning scope ("" == unscoped/global). The collector
 	// only ever seeds and reaps sessions whose owning scope matches, so a
 	// daemon can never reap another scope's agents.
@@ -122,6 +134,9 @@ type SessionCollector struct {
 	// transcript mtime) so an unchanged transcript skips re-parsing. Only
 	// accessed from the single Run goroutine.
 	tokenCache map[string]liveTokenSummary
+	// transcriptActivity tracks the last mtime observed independently of the
+	// token parser cache: activity observation must not suppress token parsing.
+	transcriptActivity map[string]time.Time
 	// lastTokenRefresh throttles the live-token pass to liveTokenRefreshInterval,
 	// decoupling expensive transcript parsing from the 2s liveness tick.
 	lastTokenRefresh time.Time
@@ -139,12 +154,15 @@ func NewSessionCollector(interval time.Duration, scope string) *SessionCollector
 		interval = 2 * time.Second
 	}
 	return &SessionCollector{
-		interval:   interval,
-		ulog:       logging.NewUnifiedLogger("groved.collector.session"),
-		scope:      scope,
-		liveness:   make(map[string]*pidLiveness),
-		tokenCache: make(map[string]liveTokenSummary),
-		now:        time.Now,
+		interval:           interval,
+		ulog:               logging.NewUnifiedLogger("groved.collector.session"),
+		scope:              scope,
+		liveness:           make(map[string]*pidLiveness),
+		tokenCache:         make(map[string]liveTokenSummary),
+		transcriptActivity: make(map[string]time.Time),
+		leasePolicy:        health.DefaultLeasePolicy(),
+		reapEnabled:        true,
+		now:                time.Now,
 		probeHealth: func(ctx context.Context, rows []*models.Session, now time.Time) []*health.Probe {
 			// Resolve the client lazily: at collector construction the daemon's
 			// socket is not listening yet. On poll ticks this reaches our own PTY
@@ -177,6 +195,29 @@ func NewSessionCollector(interval time.Duration, scope string) *SessionCollector
 // Must be called before the engine starts the collector's Run goroutine.
 func (c *SessionCollector) SetPtyKiller(killer PtyKiller) {
 	c.ptyKiller = killer
+}
+
+// SetPtyActivitySource wires the same tuimux client as a read-only activity
+// source. Kept separate from PtyKiller so tests and degraded boots can inject
+// either capability independently.
+func (c *SessionCollector) SetPtyActivitySource(source PtyActivitySource) {
+	c.ptyActivitySource = source
+}
+
+// SetLeasePolicy overrides conservative defaults. Invalid/non-positive fields
+// retain their defaults so a partial config cannot accidentally disable expiry.
+func (c *SessionCollector) SetLeasePolicy(policy health.LeasePolicy) {
+	defaults := health.DefaultLeasePolicy()
+	if policy.Interactive <= 0 {
+		policy.Interactive = defaults.Interactive
+	}
+	if policy.Headless <= 0 {
+		policy.Headless = defaults.Headless
+	}
+	if policy.TurnBased <= 0 {
+		policy.TurnBased = defaults.TurnBased
+	}
+	c.leasePolicy = policy
 }
 
 // Name returns the collector's name.
@@ -228,14 +269,17 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 		case <-ticker.C:
 			start := c.now()
 
-			// Get all active sessions from the canonical store
+			// Get all active sessions from the canonical store. Activity ingestion
+			// returns shallow copies with this tick's transcript/PTY evidence folded
+			// in, so lease evaluation cannot race the asynchronous store writer.
 			activeSessions := st.GetSessions()
+			now := c.now()
+			evaluationSessions := c.ingestActivity(ctx, activeSessions, now, updates)
 
 			// Gather the complete shared health ladder once for this tick. The
 			// batch shares the PTY query and registry scan across every row.
-			now := c.now()
-			probeRows := make([]*models.Session, 0, len(activeSessions))
-			for _, session := range activeSessions {
+			probeRows := make([]*models.Session, 0, len(evaluationSessions))
+			for _, session := range evaluationSessions {
 				if session == nil || session.Origin != "" {
 					continue
 				}
@@ -256,9 +300,9 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 
 			// Track which sessions are still active this tick so we can prune
 			// liveness bookkeeping for sessions that have since ended.
-			activeIDs := make(map[string]struct{}, len(activeSessions))
+			activeIDs := make(map[string]struct{}, len(evaluationSessions))
 
-			for _, session := range activeSessions {
+			for _, session := range evaluationSessions {
 				if session == nil {
 					continue
 				}
@@ -293,24 +337,16 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				}
 
 				// The batch probe includes registry, PTY proxy, job file and the
-				// correctly-scoped tmux server. Missing perspectives classify as
-				// unverified, never stale.
+				// correctly-scoped tmux server. Lease and classifier verdicts are
+				// decided together below so independent writers cannot oscillate.
 				probe := probesByID[session.ID]
-				if probe == nil {
-					continue
-				}
-				if probe.Evidence.HasMetadata && probe.Evidence.MetaScope != c.scope {
+				if probe != nil && probe.Evidence.HasMetadata && probe.Evidence.MetaScope != c.scope {
 					continue
 				}
 
 				pid := session.PID
 				var recovered *sessions.SessionMetadata
-				if pid == 0 {
-					if probe.Evidence.RegistryPID <= 0 {
-						// A true unstarted intent has no process evidence and remains
-						// untouched. PID-0 is flaggable only with a confirmed registry PID.
-						continue
-					}
+				if pid == 0 && probe != nil && probe.Evidence.RegistryPID > 0 {
 					pid = probe.Evidence.RegistryPID
 					if registry != nil {
 						recovered, _ = registry.Find(session.ID)
@@ -325,22 +361,35 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 					c.liveness[session.ID] = ls
 				}
 
-				if process.IsProcessAlive(pid) || probe.Verdict.State == health.Alive {
+				classifierAlive := probe != nil && probe.Verdict.State == health.Alive
+				processAlive := pid > 0 && process.IsProcessAlive(pid)
+				if processAlive || classifierAlive {
 					ls.seenAlive = true
 					ls.deadStrikes = 0
 					updates <- sessionVerdictUpdate(session.ID, "alive")
 					continue
 				}
 
-				// Flagging is intentionally independent of seenAlive. Classification
-				// can therefore expose startup deaths and dead PID-0 registry rows,
-				// but this path never kills or ends a session.
+				// One verdict writer owns both classification and leases. Positive
+				// life won above; an expired lease next retracts verification only.
+				// Before expiry the Phase-2 stale verdict remains available for
+				// conservative cleanup. No branch here changes status or ends a row.
 				if health.IsActiveSessionStatus(session.Status) {
-					verified := "unverified"
-					if probe.Verdict.State == health.Stale {
+					expired := health.LeaseExpired(session, now, c.leasePolicy)
+					verified := "alive" // a still-valid activity lease is a live claim
+					if expired {
+						verified = "unverified"
+					} else if probe != nil && probe.Verdict.State == health.Stale &&
+						!(health.IsTurnBasedType(session.Type) && session.Status == "pending_user") {
 						verified = "stale"
 					}
 					updates <- sessionVerdictUpdate(session.ID, verified)
+				}
+
+				// A true unstarted PID-0 intent has no process evidence. It may lose
+				// verification through its lease, but it is never kill-eligible.
+				if !c.reapEnabled || pid <= 0 || probe == nil {
+					continue
 				}
 
 				// Killing remains conservative: only a classifier-stale PID that was
@@ -515,6 +564,80 @@ func isLiveAgentSession(s *models.Session) bool {
 	default:
 		return false
 	}
+}
+
+func sessionActivityUpdate(jobID, source string, startedAt, observedAt time.Time) store.Update {
+	return store.Update{
+		Type:   store.UpdateSessionActivity,
+		Source: "session_collector",
+		Payload: &store.SessionActivityPayload{
+			JobID: jobID, ExpectedStartedAt: startedAt, Source: source, ObservedAt: observedAt,
+		},
+	}
+}
+
+// ingestActivity folds the two polled authoritative activity sources into
+// shallow session copies for this tick and emits monotonic store updates.
+// Hook arrivals already renew at applySessionStatus. Transcript mtime and PTY
+// noteActivity are observations of real writes; polling itself is not activity.
+func (c *SessionCollector) ingestActivity(ctx context.Context, rows []*models.Session, now time.Time, updates chan<- store.Update) []*models.Session {
+	ptyByID := make(map[string]time.Time)
+	if c.ptyActivitySource != nil {
+		metas, err := c.ptyActivitySource.ListPtys()
+		if err != nil {
+			c.ulog.Debug("Failed to read PTY activity snapshot").Err(err).Log(ctx)
+		} else {
+			for _, meta := range metas {
+				if meta.ID != "" && !meta.LastActivity.IsZero() && !meta.LastActivity.After(now) && meta.LastActivity.After(ptyByID[meta.ID]) {
+					ptyByID[meta.ID] = meta.LastActivity
+				}
+			}
+		}
+	}
+
+	out := make([]*models.Session, 0, len(rows))
+	live := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			out = append(out, nil)
+			continue
+		}
+		copy := *row
+		out = append(out, &copy)
+		if row.Origin != "" || !health.IsActiveSessionStatus(row.Status) {
+			continue
+		}
+		live[row.ID] = struct{}{}
+
+		knownPath := row.TranscriptPath
+		if knownPath == "" {
+			knownPath = c.tokenCache[row.ID].resolvedTranscript
+		}
+		mtime := transcriptMtime(knownPath)
+		previous, observedBefore := c.transcriptActivity[row.ID]
+		if !mtime.IsZero() {
+			c.transcriptActivity[row.ID] = mtime
+			advanced := observedBefore && mtime.After(previous)
+			recoveredNewer := !observedBefore && mtime.After(copy.LastActivity)
+			if (advanced || recoveredNewer) && !mtime.After(now) {
+				updates <- sessionActivityUpdate(row.ID, "transcript", row.StartedAt, mtime)
+				if mtime.After(copy.LastActivity) {
+					copy.LastActivity = mtime
+				}
+			}
+		}
+
+		if activity := ptyByID[row.PtyID]; !activity.IsZero() && activity.After(copy.LastActivity) {
+			updates <- sessionActivityUpdate(row.ID, "pty", row.StartedAt, activity)
+			copy.LastActivity = activity
+		}
+	}
+	for id := range c.transcriptActivity {
+		if _, ok := live[id]; !ok {
+			delete(c.transcriptActivity, id)
+		}
+	}
+	return out
 }
 
 // transcriptMtime returns the modification time of a session's parent transcript,

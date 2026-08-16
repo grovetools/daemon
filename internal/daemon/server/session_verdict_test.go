@@ -6,6 +6,14 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/store"
 )
 
+func TestSessionActivityUpdateRefreshesSessionConsumers(t *testing.T) {
+	payload := &store.SessionActivityPayload{JobID: "job", Source: "pty"}
+	got := convertUpdatePayload(store.Update{Type: store.UpdateSessionActivity, Source: "collector", Payload: payload})
+	if got == nil || got.UpdateType != "session" || got.Payload != payload {
+		t.Fatalf("wire update = %#v, want collapsed session activity update", got)
+	}
+}
+
 func TestSessionVerdictUpdateRefreshesSessionConsumers(t *testing.T) {
 	payload := &store.SessionVerdictPayload{JobID: "job", Verified: "stale"}
 	got := convertUpdatePayload(store.Update{Type: store.UpdateSessionVerdict, Source: "collector", Payload: payload})
