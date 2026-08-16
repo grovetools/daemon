@@ -1083,9 +1083,12 @@ func lifecycleAttemptIsNewer(incoming string, current ...string) bool {
 	return true
 }
 
+// isTerminalLifecycleJobStatus classifies evidence that an attempt is no
+// longer active. Orphaned remains non-terminal for completion/retention, but
+// it is retryable and therefore permits a strictly newer UUIDv7 attempt.
 func isTerminalLifecycleJobStatus(status string) bool {
 	switch status {
-	case "completed", "failed", "cancelled", "abandoned", "interrupted":
+	case "completed", "failed", "cancelled", "abandoned", "interrupted", "orphaned":
 		return true
 	default:
 		return false

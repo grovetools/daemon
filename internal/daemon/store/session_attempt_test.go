@@ -194,6 +194,51 @@ func TestRetriedAttemptSupersedesStaleTerminalProjections(t *testing.T) {
 	}
 }
 
+func TestRetriedAttemptSupersedesOrphanedJobProjection(t *testing.T) {
+	st := newTestStore(t)
+	const olderAttempt = "018f0000-0000-7000-8000-000000000001"
+	const newerAttempt = "018f0000-0001-7000-8000-000000000001"
+	st.mu.Lock()
+	st.state.Jobs["orphaned-job"] = &models.JobInfo{
+		ID: "orphaned-job", AttemptID: olderAttempt, Type: models.JobType("interactive_agent"),
+		Status: "orphaned", PID: 101, Error: "daemon lost track of this job",
+	}
+	st.mu.Unlock()
+
+	st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
+		JobID: "orphaned-job", AttemptID: newerAttempt, Type: models.SessionTypeInteractiveAgent,
+	}})
+	if got := st.GetSession("orphaned-job"); got == nil || got.AttemptID != newerAttempt || got.Status != "pending" || got.PID != 0 {
+		t.Fatalf("new intent did not replace orphaned job projection: %+v", got)
+	}
+	if got := st.GetJob("orphaned-job"); got.AttemptID != newerAttempt || got.Status != "running" || got.PID != 0 || got.Error != "" {
+		t.Fatalf("new intent did not repair orphaned job projection: %+v", got)
+	}
+
+	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
+		JobID: "orphaned-job", AttemptID: newerAttempt, NativeID: "native-new", PID: 202,
+	}})
+	if got := st.GetSession("orphaned-job"); got.AttemptID != newerAttempt || got.Status != "running" || got.PID != 202 || got.ClaudeSessionID != "native-new" {
+		t.Fatalf("new confirmation did not advance retry: %+v", got)
+	}
+	if got := st.GetJob("orphaned-job"); got.AttemptID != newerAttempt || got.Status != "running" || got.PID != 202 {
+		t.Fatalf("new confirmation did not update job projection: %+v", got)
+	}
+
+	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
+		JobID: "orphaned-job", AttemptID: olderAttempt, NativeID: "native-old", PID: 303,
+	}})
+	st.ApplyUpdate(Update{Type: UpdateSessionEnd, Payload: &SessionEndPayload{
+		JobID: "orphaned-job", AttemptID: olderAttempt, Outcome: "failed",
+	}})
+	if got := st.GetSession("orphaned-job"); got.AttemptID != newerAttempt || got.Status != "running" || got.PID != 202 || got.ClaudeSessionID != "native-new" || got.EndedAt != nil {
+		t.Fatalf("older callbacks mutated active retry session: %+v", got)
+	}
+	if got := st.GetJob("orphaned-job"); got.AttemptID != newerAttempt || got.Status != "running" || got.PID != 202 || got.CompletedAt != nil {
+		t.Fatalf("older callbacks mutated active retry job: %+v", got)
+	}
+}
+
 func TestRetriedAttemptCannotTakeOverActiveProjection(t *testing.T) {
 	st := newTestStore(t)
 	st.mu.Lock()
