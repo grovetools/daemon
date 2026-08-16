@@ -15,6 +15,7 @@ import (
 	"github.com/grovetools/daemon/internal/daemon/jobattr"
 	"github.com/grovetools/daemon/internal/daemon/store"
 	"github.com/grovetools/daemon/internal/daemon/telemetry"
+	"github.com/grovetools/flow/pkg/orchestration"
 	"github.com/sirupsen/logrus"
 )
 
@@ -210,8 +211,13 @@ func discoverJobsFromFilesystem(ctx context.Context, ulog *logging.UnifiedLogger
 						Log(ctx)
 				}
 
+				attemptID := ""
+				if flowJob, loadErr := orchestration.LoadJob(jobPath); loadErr == nil {
+					attemptID = flowJob.AttemptID
+				}
 				job := &models.JobInfo{
 					ID:          meta.ID,
+					AttemptID:   attemptID,
 					Title:       meta.Title,
 					Type:        models.JobType(meta.Type),
 					Status:      meta.Status,

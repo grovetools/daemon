@@ -37,12 +37,12 @@ func TestIngestActivityUsesAdvancingTranscriptAndExactPtyID(t *testing.T) {
 	ptyAt := now.Add(-30 * time.Second)
 	source := &fakePtyActivitySource{metas: []tuimuxpty.SessionMetadata{
 		{ID: "wrong", Tags: map[string]string{"job_id": "job"}, LastActivity: now},
-		{ID: "pty-exact", LastActivity: ptyAt},
+		{ID: "pty-exact", Tags: map[string]string{"job_id": "job", "attempt_id": "attempt-1"}, LastActivity: ptyAt},
 	}}
 	c := NewSessionCollector(time.Second, "")
 	c.SetPtyActivitySource(source)
 	rows := []*models.Session{{
-		ID: "job", Type: "interactive_agent", Status: "running", PtyID: "pty-exact",
+		ID: "job", AttemptID: "attempt-1", Type: "interactive_agent", Status: "running", PtyID: "pty-exact",
 		StartedAt: now.Add(-time.Hour), LastActivity: now.Add(-2 * time.Minute), TranscriptPath: transcript,
 	}}
 	updates := make(chan store.Update, 4)
@@ -84,6 +84,20 @@ func TestIngestActivityUsesAdvancingTranscriptAndExactPtyID(t *testing.T) {
 	}
 	if !foundTranscript {
 		t.Fatal("strict transcript mtime advance did not renew activity")
+	}
+}
+
+func TestPtyActivityRequiresExactJobAndAttemptTags(t *testing.T) {
+	now := time.Now().Round(0)
+	c := NewSessionCollector(time.Second, "")
+	c.SetPtyActivitySource(&fakePtyActivitySource{metas: []tuimuxpty.SessionMetadata{{
+		ID: "pty", Tags: map[string]string{"job_id": "job", "attempt_id": "stale-attempt"}, LastActivity: now,
+	}}})
+	row := &models.Session{ID: "job", AttemptID: "current-attempt", Type: "interactive_agent", Status: "running", PtyID: "pty", StartedAt: now.Add(-time.Hour), LastActivity: now.Add(-time.Minute)}
+	updates := make(chan store.Update, 2)
+	effective := c.ingestActivity(context.Background(), []*models.Session{row}, now, updates)
+	if !effective[0].LastActivity.Equal(row.LastActivity) || len(updates) != 0 {
+		t.Fatalf("stale-attempt PTY activity renewed current row: effective=%v updates=%d", effective[0].LastActivity, len(updates))
 	}
 }
 

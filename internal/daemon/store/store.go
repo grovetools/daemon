@@ -410,11 +410,15 @@ func (s *Store) ApplyUpdate(u Update) {
 		}
 	case UpdateSessionConfirmation:
 		if payload, ok := u.Payload.(*SessionConfirmationPayload); ok {
-			s.applySessionConfirmation(payload, u.Source)
+			if !s.applySessionConfirmation(payload, u.Source) {
+				return
+			}
 		}
 	case UpdateSessionStatus:
 		if payload, ok := u.Payload.(*SessionStatusPayload); ok {
-			s.applySessionStatus(payload)
+			if !s.applySessionStatus(payload) {
+				return
+			}
 		}
 	case UpdateSessionEnd:
 		if payload, ok := u.Payload.(*SessionEndPayload); ok {
@@ -940,6 +944,7 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string)
 	now := s.now()
 	session := &models.Session{
 		ID:               payload.JobID,
+		AttemptID:        payload.AttemptID,
 		Type:             models.SessionTypeOrDefault(payload.Type),
 		Provider:         payload.Provider,
 		PID:              0, // Not yet known
@@ -958,26 +963,84 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string)
 		Mux:              payload.Mux,
 	}
 	s.state.Sessions[payload.JobID] = session
+	if job := s.state.Jobs[payload.JobID]; job != nil {
+		if job.AttemptID != payload.AttemptID {
+			job.PID = 0
+		}
+		job.AttemptID = payload.AttemptID
+	}
 	s.ulog.Info("Session lifecycle: intent registered").
 		Field("event", "session.lifecycle.intent").
 		Field("job_id", payload.JobID).
+		Field("attempt_id", payload.AttemptID).
+		Field("legacy_attempt", payload.AttemptID == "").
 		Field("reason", lifecycleReason(source)).
 		StructuredOnly().
 		Log(context.Background())
 }
 
+// lifecycleAttemptMatches preserves pre-AttemptID compatibility while ensuring
+// two identified attempts for the same reusable JobID can never mutate each
+// other. Only an unidentified current row accepts an identified upgrade; an
+// unidentified incoming callback can never target an identified current row.
+func lifecycleAttemptMatches(current, incoming string) bool {
+	// An unidentified legacy row may be upgraded by an identified callback.
+	// The reverse is forbidden: an empty callback is legacy, not an alias for
+	// whichever current attempt happens to share its reusable JobID.
+	return current == "" || current == incoming
+}
+
+func (s *Store) logLegacyLifecycle(event, jobID, currentAttempt, incomingAttempt string) {
+	if currentAttempt != "" && incomingAttempt != "" {
+		return
+	}
+	s.ulog.Warn("Applying legacy session lifecycle update without exact attempt identity").
+		Field("event", event).
+		Field("job_id", jobID).
+		Field("current_attempt_id", currentAttempt).
+		Field("incoming_attempt_id", incomingAttempt).
+		StructuredOnly().
+		Log(context.Background())
+}
+
 // applySessionConfirmation updates a pending session with actual process info.
-func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, source string) {
+func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, source string) bool {
 	now := s.now()
 	session, exists := s.state.Sessions[payload.JobID]
+	if exists && !lifecycleAttemptMatches(session.AttemptID, payload.AttemptID) {
+		s.ulog.Warn("Ignored session confirmation for stale attempt").
+			Field("event", "session.lifecycle.confirmation_mismatch").
+			Field("job_id", payload.JobID).
+			Field("current_attempt_id", session.AttemptID).
+			Field("incoming_attempt_id", payload.AttemptID).
+			StructuredOnly().
+			Log(context.Background())
+		return false
+	}
 	if !exists {
-		// Create a new session if intent was missed
+		// Confirmation is allowed to recover a missed intent only when it also
+		// targets the current identified Flow attempt.
+		typ := models.SessionTypeInteractiveAgent
+		if job := s.state.Jobs[payload.JobID]; job != nil {
+			if !lifecycleAttemptMatches(job.AttemptID, payload.AttemptID) {
+				return false
+			}
+			if job.Type != "" {
+				typ = string(job.Type)
+			}
+		}
 		session = &models.Session{
 			ID:        payload.JobID,
-			Type:      "interactive_agent",
+			AttemptID: payload.AttemptID,
+			Type:      typ,
 			StartedAt: now,
 		}
 		s.state.Sessions[payload.JobID] = session
+	} else {
+		s.logLegacyLifecycle("session.lifecycle.confirmation_legacy", payload.JobID, session.AttemptID, payload.AttemptID)
+		if session.AttemptID == "" {
+			session.AttemptID = payload.AttemptID
+		}
 	}
 
 	// Update with confirmation data
@@ -996,7 +1059,8 @@ func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, so
 	// The jobrunner persists this to disk via its UpdateSessionConfirmation
 	// listener, which runs after this broadcast.
 	job, jobExists := s.state.Jobs[payload.JobID]
-	if jobExists {
+	jobAttemptMatched := jobExists && lifecycleAttemptMatches(job.AttemptID, payload.AttemptID)
+	if jobAttemptMatched {
 		job.PID = payload.PID
 	}
 
@@ -1006,31 +1070,58 @@ func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, so
 	s.ulog.Info("Session lifecycle: process confirmed").
 		Field("event", "session.lifecycle.confirmed").
 		Field("job_id", payload.JobID).
+		Field("attempt_id", session.AttemptID).
 		Field("native_id", payload.NativeID).
 		Field("pid", payload.PID).
 		Field("reason", lifecycleReason(source)).
 		Field("job_exists_in_store", jobExists).
+		Field("job_attempt_matched", jobAttemptMatched).
 		StructuredOnly().
 		Log(context.Background())
+	return true
 }
 
-// applySessionStatus updates the status of an active session.
-// If the session doesn't exist, creates a minimal record so status transitions
-// (e.g., idle→running from hooks PreToolUse) work even without prior registration.
-func (s *Store) applySessionStatus(payload *SessionStatusPayload) {
+// applySessionStatus updates the status of an active session. A missed intent
+// may be recovered only when the Job collector supplies a real type; otherwise
+// the hook update is rejected rather than manufacturing a kind-less row.
+func (s *Store) applySessionStatus(payload *SessionStatusPayload) bool {
 	now := s.now()
 	session, exists := s.state.Sessions[payload.JobID]
 	if !exists {
-		// Create a minimal session record — hooks may be calling UpdateSessionStatus
-		// before flow has registered the session via RegisterSessionIntent.
+		job := s.state.Jobs[payload.JobID]
+		if job == nil || job.Type == "" || !lifecycleAttemptMatches(job.AttemptID, payload.AttemptID) {
+			s.ulog.Warn("Ignored session status without matching typed intent or job").
+				Field("event", "session.lifecycle.status_missing_type").
+				Field("job_id", payload.JobID).
+				Field("attempt_id", payload.AttemptID).
+				StructuredOnly().
+				Log(context.Background())
+			return false
+		}
 		session = &models.Session{
 			ID:           payload.JobID,
+			AttemptID:    payload.AttemptID,
+			Type:         string(job.Type),
 			Status:       payload.Status,
 			StartedAt:    now,
 			LastActivity: now,
 		}
 		s.state.Sessions[payload.JobID] = session
-		return
+		return true
+	}
+	if !lifecycleAttemptMatches(session.AttemptID, payload.AttemptID) {
+		s.ulog.Warn("Ignored session status for stale attempt").
+			Field("event", "session.lifecycle.status_mismatch").
+			Field("job_id", payload.JobID).
+			Field("current_attempt_id", session.AttemptID).
+			Field("incoming_attempt_id", payload.AttemptID).
+			StructuredOnly().
+			Log(context.Background())
+		return false
+	}
+	s.logLegacyLifecycle("session.lifecycle.status_legacy", payload.JobID, session.AttemptID, payload.AttemptID)
+	if session.AttemptID == "" {
+		session.AttemptID = payload.AttemptID
 	}
 
 	prevStatus := session.Status
@@ -1051,6 +1142,7 @@ func (s *Store) applySessionStatus(payload *SessionStatusPayload) {
 	// this returns) → flow TUI refreshPlan chain surfaces the blocked state with
 	// zero flow-side changes.
 	s.syncSessionStatusToJobMarkdown(session, prevStatus, payload.Status)
+	return true
 }
 
 // isTerminalJobStatus reports whether a job markdown status represents a
@@ -1105,6 +1197,9 @@ func (s *Store) syncSessionStatusToJobMarkdown(session *models.Session, prevStat
 	}
 	// LoadJob leaves FilePath empty (its callers set it); UpdateJobStatus needs it.
 	job.FilePath = session.JobFilePath
+	if job.AttemptID != "" && job.AttemptID != session.AttemptID {
+		return
+	}
 
 	// Never downgrade a terminal status (completed/failed/abandoned).
 	if isTerminalJobStatus(job.Status) {
@@ -1198,11 +1293,28 @@ func (s *Store) applySessionVerdict(payload *SessionVerdictPayload) bool {
 func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) bool {
 	now := s.now()
 	nativeID := ""
+	attemptID := payload.AttemptID
+	session, sessionExists := s.state.Sessions[payload.JobID]
 
-	if session, exists := s.state.Sessions[payload.JobID]; exists {
+	if sessionExists {
+		if !lifecycleAttemptMatches(session.AttemptID, payload.AttemptID) {
+			s.ulog.Warn("Ignored session end for stale attempt").
+				Field("event", "session.lifecycle.end_mismatch").
+				Field("job_id", payload.JobID).
+				Field("current_attempt_id", session.AttemptID).
+				Field("incoming_attempt_id", payload.AttemptID).
+				StructuredOnly().
+				Log(context.Background())
+			return false
+		}
 		if session.EndedAt != nil || isTerminalSessionStatus(session.Status) {
 			return false
 		}
+		s.logLegacyLifecycle("session.lifecycle.end_legacy", payload.JobID, session.AttemptID, payload.AttemptID)
+		if session.AttemptID == "" {
+			session.AttemptID = payload.AttemptID
+		}
+		attemptID = session.AttemptID
 		nativeID = session.ClaudeSessionID
 		session.Status = payload.Outcome
 		session.Verified = ""
@@ -1213,7 +1325,11 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) bool 
 	// Also update the job if it exists in the Jobs map (from JobCollector
 	// discovery). "exited" is deliberately session-only: a supervised process
 	// can exit successfully before Flow's completion gate decides the job result.
-	if job, exists := s.state.Jobs[payload.JobID]; exists && payload.Outcome != "exited" {
+	job, jobExists := s.state.Jobs[payload.JobID]
+	if !sessionExists && jobExists && !lifecycleAttemptMatches(job.AttemptID, payload.AttemptID) {
+		return false
+	}
+	if jobExists && payload.Outcome != "exited" && lifecycleAttemptMatches(job.AttemptID, payload.AttemptID) {
 		job.Status = payload.Outcome
 		job.CompletedAt = &now
 	}
@@ -1226,6 +1342,7 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) bool 
 	s.ulog.Info("Session lifecycle: terminal").
 		Field("event", "session.lifecycle.terminal").
 		Field("job_id", payload.JobID).
+		Field("attempt_id", attemptID).
 		Field("native_id", nativeID).
 		Field("outcome", payload.Outcome).
 		Field("reason", reason).

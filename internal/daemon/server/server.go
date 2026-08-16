@@ -1615,13 +1615,14 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 				// Persist to filesystem registry for restart resilience
 				if registry, err := sessions.NewFileSystemRegistry(); err == nil {
 					session := s.engine.Store().GetSession(sessionID)
-					dirName := sessionID
-					if session != nil && session.ClaudeSessionID != "" {
-						dirName = session.ClaudeSessionID
+					if session != nil {
+						dirName := registryDirectoryForSession(session)
+						_ = registry.UpdateFields(dirName, func(m *sessions.SessionMetadata) {
+							if registryAttemptMatches(m.AttemptID, session.AttemptID) {
+								m.TmuxTarget = req.TmuxTarget
+							}
+						})
 					}
-					_ = registry.UpdateFields(dirName, func(m *sessions.SessionMetadata) {
-						m.TmuxTarget = req.TmuxTarget
-					})
 				}
 			}
 			if req.LastSender != "" || req.LastSenderGroup != "" {
@@ -1659,7 +1660,8 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			Status string `json:"status"`
+			AttemptID string `json:"attempt_id,omitempty"`
+			Status    string `json:"status"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -1669,21 +1671,20 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			Type:   store.UpdateSessionStatus,
 			Source: "api",
 			Payload: &store.SessionStatusPayload{
-				JobID:  sessionID,
-				Status: req.Status,
+				JobID:     sessionID,
+				AttemptID: req.AttemptID,
+				Status:    req.Status,
 			},
 		})
 
 		// Write-through to filesystem crash-recovery metadata so status
 		// survives daemon restarts (e.g., "idle" is preserved, not lost).
 		if registry, err := sessions.NewFileSystemRegistry(); err == nil {
-			// Look up the native session ID for the filesystem directory name
 			session := s.engine.Store().GetSession(sessionID)
-			dirName := sessionID
-			if session != nil && session.ClaudeSessionID != "" {
-				dirName = session.ClaudeSessionID
+			if session != nil && lifecycleRequestMatches(session.AttemptID, req.AttemptID) {
+				dirName := registryDirectoryForSession(session)
+				_ = registry.UpdateStatus(dirName, req.Status)
 			}
-			_ = registry.UpdateStatus(dirName, req.Status)
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -1696,7 +1697,8 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			Outcome string `json:"outcome"`
+			AttemptID string `json:"attempt_id,omitempty"`
+			Outcome   string `json:"outcome"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -1706,9 +1708,10 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 			Type:   store.UpdateSessionEnd,
 			Source: "api",
 			Payload: &store.SessionEndPayload{
-				JobID:   sessionID,
-				Outcome: req.Outcome,
-				Reason:  "api_end",
+				JobID:     sessionID,
+				AttemptID: req.AttemptID,
+				Outcome:   req.Outcome,
+				Reason:    "api_end",
 			},
 		})
 		w.WriteHeader(http.StatusOK)
@@ -1820,13 +1823,43 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 // bridge that lets a daemon act on a session it did not itself launch — the
 // registry is global while session stores are per-scope. Returns nil when no
 // entry exists or the registry is unavailable.
-func lookupRegistryPID(jobID string) *sessions.SessionMetadata {
+func lifecycleRequestMatches(current, incoming string) bool {
+	return current == "" || current == incoming
+}
+
+func registryAttemptMatches(current, incoming string) bool {
+	return current == incoming
+}
+
+func registryDirectoryForSession(session *models.Session) string {
+	if session == nil {
+		return ""
+	}
+	if session.AttemptID != "" {
+		return session.AttemptID
+	}
+	if session.ClaudeSessionID != "" {
+		return session.ClaudeSessionID
+	}
+	return session.ID
+}
+
+func lookupRegistryPID(jobID, attemptID string) *sessions.SessionMetadata {
 	registry, err := sessions.NewFileSystemRegistry()
 	if err != nil {
 		return nil
 	}
-	md, err := registry.Find(jobID)
+	key := jobID
+	if attemptID != "" {
+		key = attemptID
+	}
+	md, err := registry.Find(key)
 	if err != nil {
+		return nil
+	}
+	// New-format rows never broad-fallback from a point lookup and retain an
+	// exact field check as armor against corrupt or legacy alias collisions.
+	if attemptID != "" && (md.AttemptID != attemptID || md.JobID != jobID) {
 		return nil
 	}
 	return md
@@ -1855,6 +1888,9 @@ func (s *Server) killSession(sessionID string) error {
 	if session.Origin != "" {
 		return fmt.Errorf("session %s belongs to satellite %q; remote control is not supported (dispatch is laptop→satellite only)", sessionID, session.Origin)
 	}
+	if session.Synthetic {
+		return fmt.Errorf("session %s is synthetic (%s) and has no real process intent to end", sessionID, session.Provenance)
+	}
 
 	// Resolve the PID to signal. This daemon's record may carry PID 0 when the
 	// session was synthesized by the filesystem job-watcher and the agent was
@@ -1864,7 +1900,7 @@ func (s *Server) killSession(sessionID string) error {
 	// and leaves the agent process orphaned.
 	pid := session.PID
 	if pid <= 0 {
-		if md := lookupRegistryPID(sessionID); md != nil {
+		if md := lookupRegistryPID(sessionID, session.AttemptID); md != nil {
 			pid = md.PID
 		}
 	}
@@ -1898,12 +1934,7 @@ func (s *Server) killSession(sessionID string) error {
 	// back to the job ID. When this daemon's record lacks the native ID
 	// (filesystem-watcher synthesized record), recover it from the registry so
 	// we act on the real directory rather than a non-existent job-ID-named one.
-	dirName := sessionID
-	if session.ClaudeSessionID != "" {
-		dirName = session.ClaudeSessionID
-	} else if md := lookupRegistryPID(sessionID); md != nil && md.ClaudeSessionID != "" {
-		dirName = md.ClaudeSessionID
-	}
+	dirName := registryDirectoryForSession(session)
 	if registry, err := sessions.NewFileSystemRegistry(); err == nil {
 		_, _ = registry.RemoveRecoveryFilesForJobInScope(sessionID, dirName, s.scope)
 	}
@@ -1916,9 +1947,10 @@ func (s *Server) killSession(sessionID string) error {
 		Type:   store.UpdateSessionEnd,
 		Source: "api",
 		Payload: &store.SessionEndPayload{
-			JobID:   sessionID,
-			Outcome: "interrupted",
-			Reason:  "api_kill",
+			JobID:     sessionID,
+			AttemptID: session.AttemptID,
+			Outcome:   "interrupted",
+			Reason:    "api_kill",
 		},
 	})
 	return nil
@@ -2001,12 +2033,17 @@ func (s *Server) writePtyWithRetry(ctx context.Context, jobID, ptyID string, dat
 			Field("job_id", jobID).
 			Field("pty_id", ptyID).
 			Log(ctx)
+		attemptID := ""
+		if session := s.engine.Store().GetSession(jobID); session != nil {
+			attemptID = session.AttemptID
+		}
 		s.engine.Store().ApplyUpdate(store.Update{
 			Type:   store.UpdateSessionEnd,
 			Source: "api",
 			Payload: &store.SessionEndPayload{
-				JobID:   jobID,
-				Outcome: "interrupted",
+				JobID:     jobID,
+				AttemptID: attemptID,
+				Outcome:   "interrupted",
 			},
 		})
 		return fmt.Errorf("tuimux daemon unreachable for session %s: %w", jobID, err)
@@ -2347,6 +2384,12 @@ func (s *Server) handleSessionConfirm(w http.ResponseWriter, r *http.Request) {
 		Payload: &confirmation,
 	})
 
+	// Persist only when the store accepted this exact (or legacy-empty)
+	// lifecycle join. A late confirmation from attempt N must not upgrade the
+	// projected row or registry record for attempt N+1.
+	current := s.engine.Store().GetSession(confirmation.JobID)
+	accepted := current != nil && lifecycleRequestMatches(current.AttemptID, confirmation.AttemptID)
+
 	// Persist the confirmed PID to the GLOBAL filesystem registry
 	// (~/.grove/hooks/sessions). Grove runs one daemon per scope, but the
 	// daemon that later serves `flow agent list` / `flow plan finish` /
@@ -2357,7 +2400,9 @@ func (s *Server) handleSessionConfirm(w http.ResponseWriter, r *http.Request) {
 	// registry is global, so writing it here lets any scoped daemon recover the
 	// real PID via registry.Find(jobID). Best-effort: tracking degrades to the
 	// previous behavior on error.
-	s.persistConfirmedSessionToRegistry(&confirmation)
+	if accepted {
+		s.persistConfirmedSessionToRegistry(&confirmation)
+	}
 
 	s.ulog.Debug("Session confirmed").
 		Field("job_id", confirmation.JobID).
@@ -2382,6 +2427,7 @@ func (s *Server) persistConfirmedSessionToRegistry(c *store.SessionConfirmationP
 
 	md := sessions.SessionMetadata{
 		SessionID:       c.JobID,
+		AttemptID:       c.AttemptID,
 		JobID:           c.JobID,
 		ClaudeSessionID: c.NativeID,
 		PID:             c.PID,
@@ -2396,7 +2442,9 @@ func (s *Server) persistConfirmedSessionToRegistry(c *store.SessionConfirmationP
 	}
 	// Enrich from the in-memory session record when available (plan, workdir,
 	// title, pty, mux) so a daemon restart's crash recovery restores full state.
-	if sess := s.engine.Store().GetSession(c.JobID); sess != nil {
+	if sess := s.engine.Store().GetSession(c.JobID); sess != nil && lifecycleRequestMatches(sess.AttemptID, c.AttemptID) {
+		md.AttemptID = sess.AttemptID
+		md.StartedAt = sess.StartedAt
 		md.PlanName = sess.PlanName
 		md.JobTitle = sess.JobTitle
 		md.ParentJobID = sess.ParentJobID
@@ -2414,6 +2462,7 @@ func (s *Server) persistConfirmedSessionToRegistry(c *store.SessionConfirmationP
 		s.ulog.Debug("Failed to persist confirmed session to registry").
 			Err(err).
 			Field("job_id", c.JobID).
+			Field("attempt_id", c.AttemptID).
 			Log(context.Background())
 	}
 }
@@ -2956,6 +3005,7 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		attemptID := payload.Env["GROVE_FLOW_ATTEMPT_ID"]
 		createPty := func(c *tuimux.ApiClient) (string, error) {
 			return c.CreatePty(
 				wrapper,
@@ -2964,6 +3014,7 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 				40, 120,
 				map[string]string{
 					"job_id":     payload.JobID,
+					"attempt_id": attemptID,
 					"plan_name":  payload.PlanName,
 					"type":       "agent",
 					"origin":     "agent:" + payload.JobID,
@@ -3015,13 +3066,14 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 			// Persist PtyID to filesystem registry for restart resilience.
 			if reg, err := sessions.NewFileSystemRegistry(); err == nil {
 				session := s.engine.Store().GetSession(payload.JobID)
-				dirName := payload.JobID
-				if session != nil && session.ClaudeSessionID != "" {
-					dirName = session.ClaudeSessionID
+				if session != nil && lifecycleRequestMatches(session.AttemptID, attemptID) {
+					dirName := registryDirectoryForSession(session)
+					_ = reg.UpdateFields(dirName, func(m *sessions.SessionMetadata) {
+						if registryAttemptMatches(m.AttemptID, attemptID) {
+							m.PtyID = ptyID
+						}
+					})
 				}
-				_ = reg.UpdateFields(dirName, func(m *sessions.SessionMetadata) {
-					m.PtyID = ptyID
-				})
 			}
 
 			// Send attach event to groveterm via SSE.

@@ -349,7 +349,15 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				if pid == 0 && probe != nil && probe.Evidence.RegistryPID > 0 {
 					pid = probe.Evidence.RegistryPID
 					if registry != nil {
-						recovered, _ = registry.Find(session.ID)
+						registryKey := session.ID
+						if session.AttemptID != "" {
+							registryKey = session.AttemptID
+						}
+						recovered, _ = registry.Find(registryKey)
+						if recovered != nil && session.AttemptID != "" &&
+							(recovered.AttemptID != session.AttemptID || recovered.JobID != session.ID) {
+							recovered = nil
+						}
 					}
 				}
 
@@ -427,9 +435,10 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 					Type:   store.UpdateSessionEnd,
 					Source: "session_collector",
 					Payload: &store.SessionEndPayload{
-						JobID:   session.ID,
-						Outcome: "interrupted",
-						Reason:  "process_dead",
+						JobID:     session.ID,
+						AttemptID: session.AttemptID,
+						Outcome:   "interrupted",
+						Reason:    "process_dead",
 					},
 				}
 
@@ -450,11 +459,14 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				// launcher rather than the agent — is not licence to delete the
 				// index. Age-based cleanup is sessions.PurgeStaleSessions' job.
 				if registry != nil {
-					nativeID := session.ClaudeSessionID
-					if nativeID == "" && recovered != nil && recovered.ClaudeSessionID != "" {
-						nativeID = recovered.ClaudeSessionID
+					registryAlias := session.AttemptID
+					if registryAlias == "" {
+						registryAlias = session.ClaudeSessionID
+						if registryAlias == "" && recovered != nil && recovered.ClaudeSessionID != "" {
+							registryAlias = recovered.ClaudeSessionID
+						}
 					}
-					_, _ = registry.RemoveRecoveryFilesForJobInScope(session.ID, nativeID, c.scope)
+					_, _ = registry.RemoveRecoveryFilesForJobInScope(session.ID, registryAlias, c.scope)
 				}
 
 				delete(c.liveness, session.ID)
@@ -581,15 +593,25 @@ func sessionActivityUpdate(jobID, source string, startedAt, observedAt time.Time
 // Hook arrivals already renew at applySessionStatus. Transcript mtime and PTY
 // noteActivity are observations of real writes; polling itself is not activity.
 func (c *SessionCollector) ingestActivity(ctx context.Context, rows []*models.Session, now time.Time, updates chan<- store.Update) []*models.Session {
-	ptyByID := make(map[string]time.Time)
+	type ptyActivity struct {
+		observedAt time.Time
+		jobID      string
+		attemptID  string
+	}
+	ptyByID := make(map[string]ptyActivity)
 	if c.ptyActivitySource != nil {
 		metas, err := c.ptyActivitySource.ListPtys()
 		if err != nil {
 			c.ulog.Debug("Failed to read PTY activity snapshot").Err(err).Log(ctx)
 		} else {
 			for _, meta := range metas {
-				if meta.ID != "" && !meta.LastActivity.IsZero() && !meta.LastActivity.After(now) && meta.LastActivity.After(ptyByID[meta.ID]) {
-					ptyByID[meta.ID] = meta.LastActivity
+				previous := ptyByID[meta.ID]
+				if meta.ID != "" && !meta.LastActivity.IsZero() && !meta.LastActivity.After(now) && meta.LastActivity.After(previous.observedAt) {
+					ptyByID[meta.ID] = ptyActivity{
+						observedAt: meta.LastActivity,
+						jobID:      meta.Tags["job_id"],
+						attemptID:  meta.Tags["attempt_id"],
+					}
 				}
 			}
 		}
@@ -627,9 +649,11 @@ func (c *SessionCollector) ingestActivity(ctx context.Context, rows []*models.Se
 			}
 		}
 
-		if activity := ptyByID[row.PtyID]; !activity.IsZero() && activity.After(copy.LastActivity) {
-			updates <- sessionActivityUpdate(row.ID, "pty", row.StartedAt, activity)
-			copy.LastActivity = activity
+		if activity := ptyByID[row.PtyID]; !activity.observedAt.IsZero() &&
+			activity.jobID == row.ID && activity.attemptID == row.AttemptID &&
+			activity.observedAt.After(copy.LastActivity) {
+			updates <- sessionActivityUpdate(row.ID, "pty", row.StartedAt, activity.observedAt)
+			copy.LastActivity = activity.observedAt
 		}
 	}
 	for id := range c.transcriptActivity {

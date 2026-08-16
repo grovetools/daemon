@@ -234,7 +234,7 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 	// lookups. Fall back to a synthesized key only when the job file can't be
 	// read, and carry the type either way so no record is shaped like the
 	// duplicates were.
-	jobID, jobType, jobTitle, jobWorktree := jr.flowJobIdentity(req.PlanDir, req.JobFile)
+	jobID, jobType, jobTitle, jobWorktree, attemptID := jr.flowJobIdentity(req.PlanDir, req.JobFile)
 	if jobID == "" {
 		baseName := strings.TrimSuffix(req.JobFile, ".md")
 		jobID = fmt.Sprintf("%s-%s", baseName, uuid.New().String()[:6])
@@ -247,6 +247,7 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 
 	info := &models.JobInfo{
 		ID:          jobID,
+		AttemptID:   attemptID,
 		Title:       jobTitle,
 		Type:        jobType,
 		PlanDir:     req.PlanDir,
@@ -265,6 +266,9 @@ func (jr *JobRunner) Submit(ctx context.Context, req models.JobSubmitRequest) (*
 	// workspace fields only the scan knows, so submitting a job doesn't blank
 	// the repo/branch columns until the next scan restores them.
 	if existing := jr.store.GetJob(jobID); existing != nil {
+		if info.AttemptID == "" {
+			info.AttemptID = existing.AttemptID
+		}
 		if info.Title == "" {
 			info.Title = existing.Title
 		}
@@ -372,19 +376,18 @@ func (jr *JobRunner) lastKnownAgentTarget(jobID string) string {
 	return ""
 }
 
-// flowJobIdentity reads the Flow job's own identity — ID, type, title and the
-// `worktree:` name its workspace attribution resolves through — from the plan.
-// All four are empty when the plan or job file can't be read.
-func (jr *JobRunner) flowJobIdentity(planDir, jobFile string) (id string, jobType models.JobType, title, worktree string) {
+// flowJobIdentity reads the Flow job's own identity — ID, type, title,
+// worktree, and current execution attempt — from the plan.
+func (jr *JobRunner) flowJobIdentity(planDir, jobFile string) (id string, jobType models.JobType, title, worktree, attemptID string) {
 	plan, err := orchestration.LoadPlan(planDir)
 	if err != nil {
-		return "", "", "", ""
+		return "", "", "", "", ""
 	}
 	job, found := plan.GetJobByFilename(jobFile)
 	if !found || job == nil {
-		return "", "", "", ""
+		return "", "", "", "", ""
 	}
-	return job.ID, models.JobType(job.Type), job.Title, job.Worktree
+	return job.ID, models.JobType(job.Type), job.Title, job.Worktree, job.AttemptID
 }
 
 // resolveWorkspace computes the WorkDir/Repo/Branch trio for a job the store

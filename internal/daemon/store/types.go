@@ -366,6 +366,7 @@ type SkillSyncPayload struct {
 // SessionIntentPayload contains data for pre-registering a session.
 type SessionIntentPayload struct {
 	JobID       string `json:"job_id"`
+	AttemptID   string `json:"attempt_id,omitempty"`
 	ParentJobID string `json:"parent_job_id,omitempty"`
 	Provider    string `json:"provider"`
 	JobFilePath string `json:"job_file_path"`
@@ -422,6 +423,7 @@ type SessionLastSenderPayload struct {
 // SessionConfirmationPayload contains data for confirming a session after agent startup.
 type SessionConfirmationPayload struct {
 	JobID          string `json:"job_id"`
+	AttemptID      string `json:"attempt_id,omitempty"`
 	NativeID       string `json:"native_id"`
 	PID            int    `json:"pid"`
 	TranscriptPath string `json:"transcript_path"`
@@ -429,15 +431,17 @@ type SessionConfirmationPayload struct {
 
 // SessionStatusPayload contains data for updating a session's status.
 type SessionStatusPayload struct {
-	JobID  string `json:"job_id"`
-	Status string `json:"status"` // "running", "idle", "pending_user"
+	JobID     string `json:"job_id"`
+	AttemptID string `json:"attempt_id,omitempty"`
+	Status    string `json:"status"` // "running", "idle", "pending_user"
 }
 
 // SessionEndPayload contains data for ending a session.
 type SessionEndPayload struct {
-	JobID   string `json:"job_id"`
-	Outcome string `json:"outcome"`          // "completed", "interrupted", "failed", "exited" (neutral; job gate remains authoritative)
-	Reason  string `json:"reason,omitempty"` // lifecycle evidence, e.g. process_dead or api_kill
+	JobID     string `json:"job_id"`
+	AttemptID string `json:"attempt_id,omitempty"`
+	Outcome   string `json:"outcome"`          // "completed", "interrupted", "failed", "exited" (neutral; job gate remains authoritative)
+	Reason    string `json:"reason,omitempty"` // lifecycle evidence, e.g. process_dead or api_kill
 }
 
 // SessionVerdictPayload carries the daemon's derived health classification.
