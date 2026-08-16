@@ -19,14 +19,19 @@ func TestPhase5FixturesProduceOneProjectedDaemonRowPerCurrentAttempt(t *testing.
 		{name: "b pi startup failure", attempts: []string{"attempt-b"}, terminal: "failed", wantStatus: "failed"},
 		{name: "c sigkill mid-turn", attempts: []string{"attempt-c"}, confirm: true, terminal: "interrupted", wantStatus: "interrupted"},
 		{name: "d daemon restart mid-session", attempts: []string{"attempt-d"}, confirm: true, wantStatus: "running"},
-		{name: "e retry reusing job id", attempts: []string{"attempt-e-old", "attempt-e-current"}, confirm: true, wantStatus: "running"},
+		{name: "e retry reusing job id", attempts: []string{"018f0000-0002-7000-8000-000000000001", "018f0000-0003-7000-8000-000000000001"}, confirm: true, wantStatus: "running"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newTestStore(t)
 			for i, attemptID := range tc.attempts {
-				// The job watcher is authoritative for which reusable-ID attempt is
-				// current before its intent may replace the projected session row.
+				if i > 0 {
+					st.ApplyUpdate(Update{Type: UpdateSessionEnd, Payload: &SessionEndPayload{
+						JobID: "reused-job", AttemptID: tc.attempts[i-1], Outcome: "interrupted",
+					}})
+				}
+				// Model the collector having observed this attempt; the retry case
+				// still exercises replacement of the prior terminal session row.
 				st.mu.Lock()
 				st.state.Jobs["reused-job"] = &models.JobInfo{ID: "reused-job", AttemptID: attemptID, Type: models.JobType("interactive_agent"), Status: "running"}
 				st.mu.Unlock()
@@ -128,6 +133,181 @@ func TestSessionLifecycleRejectsStalePriorAttempt(t *testing.T) {
 	}
 }
 
+func TestRetriedAttemptSupersedesStaleTerminalProjections(t *testing.T) {
+	st := newTestStore(t)
+	ended := time.Now().Add(-time.Minute)
+	st.mu.Lock()
+	st.state.Jobs["retry-job"] = &models.JobInfo{
+		ID: "retry-job", AttemptID: "018f0000-0000-7000-8000-000000000001", Type: models.JobType("interactive_agent"),
+		Status: "completed", PID: 101, CompletedAt: &ended, Error: "old failure",
+	}
+	st.state.Sessions["retry-job"] = &models.Session{
+		ID: "retry-job", AttemptID: "018f0000-0000-7000-8000-000000000001", Type: models.SessionTypeInteractiveAgent,
+		Status: "interrupted", PID: 101, StartedAt: ended.Add(-time.Minute), LastActivity: ended, EndedAt: &ended,
+	}
+	st.mu.Unlock()
+
+	st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
+		JobID: "retry-job", AttemptID: "018f0000-0001-7000-8000-000000000001", Provider: "claude", Type: models.SessionTypeInteractiveAgent,
+	}})
+	if got := st.GetSession("retry-job"); got == nil || got.AttemptID != "018f0000-0001-7000-8000-000000000001" || got.Status != "pending" || got.PID != 0 {
+		t.Fatalf("new intent did not replace terminal session projection: %+v", got)
+	}
+	if got := st.GetJob("retry-job"); got.AttemptID != "018f0000-0001-7000-8000-000000000001" || got.Status != "running" || got.PID != 0 || got.CompletedAt != nil || got.Error != "" {
+		t.Fatalf("new intent did not repair stale terminal job projection: %+v", got)
+	}
+
+	// The collector can lag between every lifecycle edge and restore the old
+	// terminal Jobs row. Confirmation must still advance the already-visible
+	// retry without treating that stale projection as an active duplicate.
+	st.mu.Lock()
+	st.state.Jobs["retry-job"] = &models.JobInfo{
+		ID: "retry-job", AttemptID: "018f0000-0000-7000-8000-000000000001", Type: models.JobType("interactive_agent"),
+		Status: "completed", PID: 101, CompletedAt: &ended, Error: "old failure",
+	}
+	st.mu.Unlock()
+	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
+		JobID: "retry-job", AttemptID: "018f0000-0001-7000-8000-000000000001", NativeID: "native-new", PID: 202,
+	}})
+	if got := st.GetSession("retry-job"); got.AttemptID != "018f0000-0001-7000-8000-000000000001" || got.Status != "running" || got.PID != 202 || got.ClaudeSessionID != "native-new" {
+		t.Fatalf("new confirmation did not advance replacement attempt: %+v", got)
+	}
+	if got := st.GetJob("retry-job"); got.AttemptID != "018f0000-0001-7000-8000-000000000001" || got.Status != "running" || got.PID != 202 || got.CompletedAt != nil || got.Error != "" {
+		t.Fatalf("new confirmation did not repair stale terminal job projection: %+v", got)
+	}
+
+	// Exercise the same lag immediately before the terminal edge.
+	st.mu.Lock()
+	st.state.Jobs["retry-job"] = &models.JobInfo{
+		ID: "retry-job", AttemptID: "018f0000-0000-7000-8000-000000000001", Type: models.JobType("interactive_agent"),
+		Status: "completed", PID: 101, CompletedAt: &ended, Error: "old failure",
+	}
+	st.mu.Unlock()
+	st.ApplyUpdate(Update{Type: UpdateSessionEnd, Payload: &SessionEndPayload{
+		JobID: "retry-job", AttemptID: "018f0000-0001-7000-8000-000000000001", Outcome: "completed",
+	}})
+	if got := st.GetSession("retry-job"); got.AttemptID != "018f0000-0001-7000-8000-000000000001" || got.Status != "completed" || got.EndedAt == nil {
+		t.Fatalf("new end did not terminate replacement attempt: %+v", got)
+	}
+	if got := st.GetJob("retry-job"); got.AttemptID != "018f0000-0001-7000-8000-000000000001" || got.Status != "completed" || got.PID != 0 || got.CompletedAt == nil {
+		t.Fatalf("new end did not terminate replacement job projection: %+v", got)
+	}
+}
+
+func TestRetriedAttemptCannotTakeOverActiveProjection(t *testing.T) {
+	st := newTestStore(t)
+	st.mu.Lock()
+	st.state.Jobs["active-job"] = &models.JobInfo{
+		ID: "active-job", AttemptID: "attempt-active", Type: models.JobType("interactive_agent"), Status: "running", PID: 101,
+	}
+	st.state.Sessions["active-job"] = &models.Session{
+		ID: "active-job", AttemptID: "attempt-active", Type: models.SessionTypeInteractiveAgent,
+		Status: "running", PID: 101, ClaudeSessionID: "native-active", StartedAt: time.Now(), LastActivity: time.Now(),
+	}
+	st.mu.Unlock()
+
+	st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
+		JobID: "active-job", AttemptID: "018f0000-0001-7000-8000-000000000001", Type: models.SessionTypeInteractiveAgent,
+	}})
+	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
+		JobID: "active-job", AttemptID: "018f0000-0001-7000-8000-000000000001", NativeID: "native-new", PID: 202,
+	}})
+	st.ApplyUpdate(Update{Type: UpdateSessionEnd, Payload: &SessionEndPayload{
+		JobID: "active-job", AttemptID: "018f0000-0001-7000-8000-000000000001", Outcome: "completed",
+	}})
+
+	if got := st.GetSession("active-job"); got.AttemptID != "attempt-active" || got.Status != "running" || got.PID != 101 || got.ClaudeSessionID != "native-active" || got.EndedAt != nil {
+		t.Fatalf("new attempt took over active session projection: %+v", got)
+	}
+	if got := st.GetJob("active-job"); got.AttemptID != "attempt-active" || got.Status != "running" || got.PID != 101 || got.CompletedAt != nil {
+		t.Fatalf("new attempt took over active job projection: %+v", got)
+	}
+}
+
+func TestOlderAttemptCannotRetakeTerminalProjection(t *testing.T) {
+	st := newTestStore(t)
+	ended := time.Now().Add(-time.Minute)
+	const newerAttempt = "018f0000-0001-7000-8000-000000000001"
+	const olderAttempt = "018f0000-0000-7000-8000-000000000001"
+	st.mu.Lock()
+	st.state.Jobs["terminal-job"] = &models.JobInfo{
+		ID: "terminal-job", AttemptID: newerAttempt, Type: models.JobType("interactive_agent"), Status: "completed", CompletedAt: &ended,
+	}
+	st.state.Sessions["terminal-job"] = &models.Session{
+		ID: "terminal-job", AttemptID: newerAttempt, Type: models.SessionTypeInteractiveAgent,
+		Status: "completed", StartedAt: ended.Add(-time.Minute), LastActivity: ended, EndedAt: &ended,
+	}
+	st.mu.Unlock()
+
+	st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
+		JobID: "terminal-job", AttemptID: olderAttempt, Type: models.SessionTypeInteractiveAgent,
+	}})
+	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
+		JobID: "terminal-job", AttemptID: olderAttempt, NativeID: "old-native", PID: 101,
+	}})
+	st.ApplyUpdate(Update{Type: UpdateSessionEnd, Payload: &SessionEndPayload{
+		JobID: "terminal-job", AttemptID: olderAttempt, Outcome: "failed",
+	}})
+
+	if got := st.GetSession("terminal-job"); got.AttemptID != newerAttempt || got.Status != "completed" || got.PID != 0 || got.EndedAt == nil {
+		t.Fatalf("older callbacks retook terminal session projection: %+v", got)
+	}
+	if got := st.GetJob("terminal-job"); got.AttemptID != newerAttempt || got.Status != "completed" || got.PID != 0 || got.CompletedAt == nil {
+		t.Fatalf("older callbacks retook terminal job projection: %+v", got)
+	}
+}
+
+func TestRetriedAttemptSupersedesStaleSessionAndLaggingActiveJob(t *testing.T) {
+	st := newTestStore(t)
+	st.mu.Lock()
+	st.state.Jobs["stale-job"] = &models.JobInfo{ID: "stale-job", AttemptID: "018f0000-0000-7000-8000-000000000001", Type: models.JobType("interactive_agent"), Status: "running", PID: 101}
+	st.state.Sessions["stale-job"] = &models.Session{
+		ID: "stale-job", AttemptID: "018f0000-0000-7000-8000-000000000001", Type: models.SessionTypeInteractiveAgent,
+		Status: "running", Verified: "stale", PID: 101, StartedAt: time.Now(), LastActivity: time.Now(),
+	}
+	st.mu.Unlock()
+
+	st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
+		JobID: "stale-job", AttemptID: "018f0000-0001-7000-8000-000000000001", Type: models.SessionTypeInteractiveAgent,
+	}})
+	if got := st.GetSession("stale-job"); got == nil || got.AttemptID != "018f0000-0001-7000-8000-000000000001" || got.Status != "pending" || got.Verified != "" {
+		t.Fatalf("new intent did not replace stale session projection: %+v", got)
+	}
+	if got := st.GetJob("stale-job"); got.AttemptID != "018f0000-0001-7000-8000-000000000001" || got.Status != "running" || got.PID != 0 {
+		t.Fatalf("new intent did not repair lagging active job projection: %+v", got)
+	}
+}
+
+func TestTerminalProjectionAcceptsMissedRetryEdges(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		update Update
+		status string
+		pid    int
+	}{
+		{name: "confirmation", update: Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{JobID: "job", AttemptID: "018f0000-0001-7000-8000-000000000001", NativeID: "native-new", PID: 202}}, status: "running", pid: 202},
+		{name: "end", update: Update{Type: UpdateSessionEnd, Payload: &SessionEndPayload{JobID: "job", AttemptID: "018f0000-0001-7000-8000-000000000001", Outcome: "failed"}}, status: "failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			ended := time.Now().Add(-time.Minute)
+			st.mu.Lock()
+			st.state.Jobs["job"] = &models.JobInfo{ID: "job", AttemptID: "018f0000-0000-7000-8000-000000000001", Type: models.JobType("headless_agent"), Status: "completed", CompletedAt: &ended}
+			st.state.Sessions["job"] = &models.Session{ID: "job", AttemptID: "018f0000-0000-7000-8000-000000000001", Type: models.SessionTypeHeadlessAgent, Status: "completed", StartedAt: ended, LastActivity: ended, EndedAt: &ended}
+			st.mu.Unlock()
+
+			st.ApplyUpdate(tc.update)
+			got := st.GetSession("job")
+			if got == nil || got.AttemptID != "018f0000-0001-7000-8000-000000000001" || got.Type != models.SessionTypeHeadlessAgent || got.Status != tc.status || got.PID != tc.pid {
+				t.Fatalf("missed %s edge did not replace terminal projection: %+v", tc.name, got)
+			}
+			if job := st.GetJob("job"); job.AttemptID != "018f0000-0001-7000-8000-000000000001" || job.Status != tc.status {
+				t.Fatalf("missed %s edge did not repair job projection: %+v", tc.name, job)
+			}
+		})
+	}
+}
+
 func TestSessionLifecyclePreservesLegacyEmptyAttempt(t *testing.T) {
 	st := newTestStore(t)
 	st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
@@ -157,15 +337,15 @@ func TestDerivedSessionWritersRejectStaleAttempt(t *testing.T) {
 	later := before.Add(time.Minute)
 
 	st.ApplyUpdate(Update{Type: UpdateSessionActivity, Payload: &SessionActivityPayload{
-		JobID: "job", AttemptID: "attempt-old", ObservedAt: later, Source: "transcript",
+		JobID: "job", AttemptID: "018f0000-0000-7000-8000-000000000001", ObservedAt: later, Source: "transcript",
 	}})
 	st.ApplyUpdate(Update{Type: UpdateSessionVerdict, Payload: &SessionVerdictPayload{
-		JobID: "job", AttemptID: "attempt-old", Verified: "stale",
+		JobID: "job", AttemptID: "018f0000-0000-7000-8000-000000000001", Verified: "stale",
 	}})
 	st.ApplyUpdate(Update{Type: UpdateSessionTokens, Payload: &SessionTokensPayload{Updates: []SessionTokenUpdate{{
-		JobID: "job", AttemptID: "attempt-old", LiveTokens: 99,
+		JobID: "job", AttemptID: "018f0000-0000-7000-8000-000000000001", LiveTokens: 99,
 	}}}})
-	st.SetSessionPtyID("job", "attempt-old", "pty-old")
+	st.SetSessionPtyID("job", "018f0000-0000-7000-8000-000000000001", "pty-old")
 
 	got := st.GetSession("job")
 	if !got.LastActivity.Equal(before) || got.Verified != "" || got.LiveTokens != 0 || got.PtyID != "" {

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	grovelogging "github.com/grovetools/core/logging"
 	coredaemon "github.com/grovetools/core/pkg/daemon"
 	"github.com/grovetools/core/pkg/models"
@@ -948,28 +949,23 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string)
 	}
 
 	job := s.state.Jobs[payload.JobID]
-	if job != nil && job.AttemptID != "" && job.AttemptID != payload.AttemptID {
-		s.ulog.Warn("Ignored session intent for stale attempt").
+	current := s.state.Sessions[payload.JobID]
+	if current != nil && current.AttemptID == payload.AttemptID {
+		// Intent is an at-most-once edge. A delayed duplicate must not demote
+		// an already confirmed current attempt back to pending.
+		return false
+	}
+	if lifecycleHasAttemptMismatch(current, job, payload.AttemptID) &&
+		!lifecycleCanReplaceTerminalAttempt(current, job, payload.AttemptID) {
+		s.ulog.Warn("Ignored session intent for conflicting active attempt").
 			Field("event", "session.lifecycle.intent_mismatch").
 			Field("job_id", payload.JobID).
-			Field("current_attempt_id", job.AttemptID).
+			Field("session_attempt_id", lifecycleSessionAttempt(current)).
+			Field("job_attempt_id", lifecycleJobAttempt(job)).
 			Field("incoming_attempt_id", payload.AttemptID).
 			StructuredOnly().
 			Log(context.Background())
 		return false
-	}
-	if current := s.state.Sessions[payload.JobID]; current != nil {
-		if current.AttemptID == payload.AttemptID {
-			// Intent is an at-most-once edge. A delayed duplicate must not demote
-			// an already confirmed current attempt back to pending.
-			return false
-		}
-		// Replacing the projected row requires the job collector's authoritative
-		// current attempt. Without it, two identified callbacks cannot decide
-		// which attempt is newer merely from arrival order.
-		if payload.AttemptID == "" || job == nil || job.AttemptID != payload.AttemptID {
-			return false
-		}
 	}
 
 	now := s.now()
@@ -997,6 +993,9 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string)
 	if job != nil {
 		if job.AttemptID != payload.AttemptID {
 			job.PID = 0
+			job.Status = "running"
+			job.CompletedAt = nil
+			job.Error = ""
 		}
 		job.AttemptID = payload.AttemptID
 	}
@@ -1022,6 +1021,77 @@ func lifecycleAttemptMatches(current, incoming string) bool {
 	return current == "" || current == incoming
 }
 
+func lifecycleSessionAttempt(session *models.Session) string {
+	if session == nil {
+		return ""
+	}
+	return session.AttemptID
+}
+
+func lifecycleJobAttempt(job *models.JobInfo) string {
+	if job == nil {
+		return ""
+	}
+	return job.AttemptID
+}
+
+func lifecycleHasAttemptMismatch(session *models.Session, job *models.JobInfo, incoming string) bool {
+	return session != nil && session.AttemptID != "" && session.AttemptID != incoming ||
+		job != nil && job.AttemptID != "" && job.AttemptID != incoming
+}
+
+// lifecycleCanReplaceTerminalAttempt lets an edge for a retried attempt repair
+// a lagging Jobs projection. Flow attempt IDs are UUIDv7s, so a newer incoming
+// attempt can safely replace terminal prior projections. Requiring that order
+// prevents a delayed callback from an older attempt from taking the reusable
+// JobID back after the newer attempt has itself terminated.
+func lifecycleCanReplaceTerminalAttempt(session *models.Session, job *models.JobInfo, incoming string) bool {
+	if !lifecycleAttemptIsNewer(incoming, lifecycleSessionAttempt(session), lifecycleJobAttempt(job)) {
+		return false
+	}
+	if session != nil && session.AttemptID != "" && session.AttemptID != incoming &&
+		!isTerminalSessionStatus(session.Status) && session.Verified != "stale" {
+		return false
+	}
+	if job != nil && job.AttemptID != "" && job.AttemptID != incoming && !isTerminalLifecycleJobStatus(job.Status) {
+		// A running Jobs row can itself be the lagging projection. The matching
+		// session's terminal/stale verdict is sufficient evidence that it no
+		// longer represents an active duplicate.
+		jobAttemptIsStale := session != nil && session.AttemptID == job.AttemptID &&
+			(isTerminalSessionStatus(session.Status) || session.Verified == "stale")
+		if !jobAttemptIsStale {
+			return false
+		}
+	}
+	return true
+}
+
+func lifecycleAttemptIsNewer(incoming string, current ...string) bool {
+	incomingUUID, err := uuid.Parse(incoming)
+	if err != nil || incomingUUID.Version() != 7 {
+		return false
+	}
+	for _, attemptID := range current {
+		if attemptID == "" || attemptID == incoming {
+			continue
+		}
+		currentUUID, err := uuid.Parse(attemptID)
+		if err != nil || currentUUID.Version() != 7 || strings.Compare(incomingUUID.String(), currentUUID.String()) <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func isTerminalLifecycleJobStatus(status string) bool {
+	switch status {
+	case "completed", "failed", "cancelled", "abandoned", "interrupted":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Store) logLegacyLifecycle(event, jobID, currentAttempt, incomingAttempt string) {
 	if currentAttempt != "" && incomingAttempt != "" {
 		return
@@ -1039,27 +1109,26 @@ func (s *Store) logLegacyLifecycle(event, jobID, currentAttempt, incomingAttempt
 func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, source string) bool {
 	now := s.now()
 	session, exists := s.state.Sessions[payload.JobID]
-	if exists && !lifecycleAttemptMatches(session.AttemptID, payload.AttemptID) {
-		s.ulog.Warn("Ignored session confirmation for stale attempt").
+	job := s.state.Jobs[payload.JobID]
+	mismatch := lifecycleHasAttemptMismatch(session, job, payload.AttemptID)
+	if mismatch && !lifecycleCanReplaceTerminalAttempt(session, job, payload.AttemptID) {
+		s.ulog.Warn("Ignored session confirmation for conflicting active attempt").
 			Field("event", "session.lifecycle.confirmation_mismatch").
 			Field("job_id", payload.JobID).
-			Field("current_attempt_id", session.AttemptID).
+			Field("session_attempt_id", lifecycleSessionAttempt(session)).
+			Field("job_attempt_id", lifecycleJobAttempt(job)).
 			Field("incoming_attempt_id", payload.AttemptID).
 			StructuredOnly().
 			Log(context.Background())
 		return false
 	}
-	if !exists {
-		// Confirmation is allowed to recover a missed intent only when it also
-		// targets the current identified Flow attempt.
+	sessionMismatch := exists && !lifecycleAttemptMatches(session.AttemptID, payload.AttemptID)
+	if !exists || sessionMismatch {
+		// Confirmation can recover either a missed intent or an intent rejected
+		// while the collector still projected a terminal prior attempt.
 		typ := models.SessionTypeInteractiveAgent
-		if job := s.state.Jobs[payload.JobID]; job != nil {
-			if !lifecycleAttemptMatches(job.AttemptID, payload.AttemptID) {
-				return false
-			}
-			if job.Type != "" {
-				typ = string(job.Type)
-			}
+		if job != nil && job.Type != "" {
+			typ = string(job.Type)
 		}
 		session = &models.Session{
 			ID:        payload.JobID,
@@ -1091,8 +1160,14 @@ func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, so
 	// The jobrunner persists this to disk via its UpdateSessionConfirmation
 	// listener, which runs after this broadcast.
 	job, jobExists := s.state.Jobs[payload.JobID]
-	jobAttemptMatched := jobExists && lifecycleAttemptMatches(job.AttemptID, payload.AttemptID)
+	jobAttemptMatched := jobExists && (lifecycleAttemptMatches(job.AttemptID, payload.AttemptID) || mismatch)
 	if jobAttemptMatched {
+		if job.AttemptID != payload.AttemptID {
+			job.Status = "running"
+			job.CompletedAt = nil
+			job.Error = ""
+		}
+		job.AttemptID = payload.AttemptID
 		job.PID = payload.PID
 	}
 
@@ -1329,18 +1404,42 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) bool 
 	nativeID := ""
 	attemptID := payload.AttemptID
 	session, sessionExists := s.state.Sessions[payload.JobID]
+	job, jobExists := s.state.Jobs[payload.JobID]
+	mismatch := lifecycleHasAttemptMismatch(session, job, payload.AttemptID)
+	if mismatch && !lifecycleCanReplaceTerminalAttempt(session, job, payload.AttemptID) {
+		s.ulog.Warn("Ignored session end for conflicting active attempt").
+			Field("event", "session.lifecycle.end_mismatch").
+			Field("job_id", payload.JobID).
+			Field("session_attempt_id", lifecycleSessionAttempt(session)).
+			Field("job_attempt_id", lifecycleJobAttempt(job)).
+			Field("incoming_attempt_id", payload.AttemptID).
+			StructuredOnly().
+			Log(context.Background())
+		return false
+	}
 
-	if sessionExists {
-		if !lifecycleAttemptMatches(session.AttemptID, payload.AttemptID) {
-			s.ulog.Warn("Ignored session end for stale attempt").
-				Field("event", "session.lifecycle.end_mismatch").
-				Field("job_id", payload.JobID).
-				Field("current_attempt_id", session.AttemptID).
-				Field("incoming_attempt_id", payload.AttemptID).
-				StructuredOnly().
-				Log(context.Background())
-			return false
+	sessionMismatch := sessionExists && !lifecycleAttemptMatches(session.AttemptID, payload.AttemptID)
+	if mismatch && (!sessionExists || sessionMismatch) {
+		// Preserve a terminal edge for a retried attempt even when both in-memory
+		// projections still name the terminal prior attempt.
+		typ := models.SessionTypeInteractiveAgent
+		if job != nil && job.Type != "" {
+			typ = string(job.Type)
+		} else if session != nil && session.Type != "" {
+			typ = session.Type
 		}
+		session = &models.Session{
+			ID:           payload.JobID,
+			AttemptID:    payload.AttemptID,
+			Type:         typ,
+			Status:       payload.Outcome,
+			StartedAt:    now,
+			LastActivity: now,
+			EndedAt:      &now,
+		}
+		s.state.Sessions[payload.JobID] = session
+		sessionExists = true
+	} else if sessionExists {
 		if session.EndedAt != nil || isTerminalSessionStatus(session.Status) {
 			return false
 		}
@@ -1359,13 +1458,13 @@ func (s *Store) applySessionEnd(payload *SessionEndPayload, source string) bool 
 	// Also update the job if it exists in the Jobs map (from JobCollector
 	// discovery). "exited" is deliberately session-only: a supervised process
 	// can exit successfully before Flow's completion gate decides the job result.
-	job, jobExists := s.state.Jobs[payload.JobID]
-	if !sessionExists && jobExists && !lifecycleAttemptMatches(job.AttemptID, payload.AttemptID) {
-		return false
-	}
-	if jobExists && payload.Outcome != "exited" && lifecycleAttemptMatches(job.AttemptID, payload.AttemptID) {
-		job.Status = payload.Outcome
-		job.CompletedAt = &now
+	if jobExists && (lifecycleAttemptMatches(job.AttemptID, payload.AttemptID) || mismatch) {
+		job.AttemptID = payload.AttemptID
+		job.PID = 0
+		if payload.Outcome != "exited" {
+			job.Status = payload.Outcome
+			job.CompletedAt = &now
+		}
 	}
 
 	reason := payload.Reason
