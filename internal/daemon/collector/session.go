@@ -92,6 +92,7 @@ type liveTokenSummary struct {
 // (seenAlive) — a never-confirmed-alive PID is more likely a slow/handoff
 // startup than a crashed agent, so reaping it would race the starting agent.
 type pidLiveness struct {
+	attemptID   string
 	seenAlive   bool
 	deadStrikes int
 }
@@ -250,7 +251,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 	// below reaps them. Runtime-registered sessions start seenAlive=false and
 	// must be observed alive before they become reap-eligible (startup guard).
 	for _, s := range recoveredSessions {
-		c.liveness[s.ID] = &pidLiveness{seenAlive: true}
+		c.liveness[s.ID] = &pidLiveness{attemptID: s.AttemptID, seenAlive: true}
 	}
 
 	// 2. PID Verification Loop
@@ -362,10 +363,12 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				}
 
 				ls := c.liveness[session.ID]
-				if ls == nil {
-					// A confirmed registry record proves this attempt was alive even
-					// when its process died before this collector's first observation.
-					ls = &pidLiveness{seenAlive: recovered != nil}
+				if ls == nil || ls.attemptID != session.AttemptID {
+					// Liveness conviction belongs to an execution attempt, not the
+					// reusable Flow job ID. A retry must not inherit seenAlive or a
+					// dead strike from the prior provider. A confirmed registry record
+					// can independently seed the current attempt as observed alive.
+					ls = &pidLiveness{attemptID: session.AttemptID, seenAlive: recovered != nil}
 					c.liveness[session.ID] = ls
 				}
 

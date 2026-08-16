@@ -416,6 +416,39 @@ func TestSessionCollector_SkipsPIDZeroWithoutRegistry(t *testing.T) {
 	}
 }
 
+// TestSessionCollector_RetryDoesNotInheritPriorAttemptLiveness verifies that
+// attempt N+1 cannot inherit reaper conviction from attempt N under a reused ID.
+func TestSessionCollector_RetryDoesNotInheritPriorAttemptLiveness(t *testing.T) {
+	t.Setenv("GROVE_HOME", t.TempDir()) // no current-attempt registry evidence
+
+	st := store.New()
+	const sessionID = "test-reused-job"
+	oldTime := time.Now().Add(-5 * time.Minute)
+	st.ApplyUpdate(store.Update{
+		Type:   store.UpdateSessions,
+		Source: "test",
+		Payload: []*models.Session{{
+			ID: sessionID, AttemptID: "attempt-new", PID: 99999999,
+			Status: "running", StartedAt: oldTime, LastActivity: oldTime,
+		}},
+	})
+
+	c := NewSessionCollector(50*time.Millisecond, "")
+	// Simulate the reusable job ID's prior attempt having reached the first
+	// dead strike after it had genuinely been observed alive.
+	c.liveness[sessionID] = &pidLiveness{
+		attemptID: "attempt-old", seenAlive: true, deadStrikes: reapDeadStrikes - 1,
+	}
+
+	if drainForSessionEnd(t, c, st, sessionID, 600*time.Millisecond) {
+		t.Fatal("replacement attempt inherited prior attempt liveness conviction")
+	}
+	got := c.liveness[sessionID]
+	if got == nil || got.attemptID != "attempt-new" || got.seenAlive || got.deadStrikes != 0 {
+		t.Fatalf("replacement liveness = %+v, want fresh attempt-new state", got)
+	}
+}
+
 // TestSessionCollector_SkipsGracePeriod verifies sessions within the startup
 // grace window are never reaped, even with a dead PID.
 func TestSessionCollector_SkipsGracePeriod(t *testing.T) {
