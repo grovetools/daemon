@@ -255,6 +255,45 @@ func waitState(t *testing.T, st *store.Store, name, want string, timeout time.Du
 
 // --- tests ------------------------------------------------------------------
 
+func TestDialFailureTransitionsGateRetryAndCapLogs(t *testing.T) {
+	const (
+		base = 10 * time.Millisecond
+		cap  = 40 * time.Millisecond
+	)
+	prior := stateDisconnected
+	backoff := time.Duration(base)
+	capReported := false
+	var enteredCount, saturatedCount int
+	for range 6 {
+		entered, saturated := dialFailureTransitions(prior, backoff, cap, capReported)
+		if entered {
+			enteredCount++
+		}
+		if saturated {
+			saturatedCount++
+			capReported = true
+		}
+		prior = stateBackoff
+		backoff *= 2
+		if backoff > cap {
+			backoff = cap
+		}
+	}
+	if enteredCount != 1 {
+		t.Fatalf("backoff entries = %d, want 1 across repeated retries", enteredCount)
+	}
+	if saturatedCount != 1 {
+		t.Fatalf("cap transitions = %d, want 1 across repeated capped retries", saturatedCount)
+	}
+
+	// A successful recovery resets both pieces of streak state: the next base
+	// failure is a fresh backoff entry, not a cap event.
+	entered, saturated := dialFailureTransitions(stateConnected, base, cap, false)
+	if !entered || saturated {
+		t.Fatalf("post-recovery failure = entered:%v saturated:%v, want fresh entry only", entered, saturated)
+	}
+}
+
 // TestChannelForwarding proves DialSatelliteSocket opens a direct-streamlocal
 // channel that round-trips a raw HTTP request to the remote unix socket.
 func TestChannelForwarding(t *testing.T) {

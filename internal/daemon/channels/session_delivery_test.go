@@ -117,6 +117,27 @@ func TestEnableChannelRecordsDeliveryRoute(t *testing.T) {
 	}
 }
 
+func TestRemoveInboundRouteReportsOnlyTheRemovalTransition(t *testing.T) {
+	m := newDeliveryTestManager(t)
+	state := &ChannelState{
+		InboundRoutes:   map[string]string{"job-down": "scope.sock"},
+		QuoteRoutes:     map[int64]string{},
+		SessionDelivery: map[string]SessionDeliveryInfo{},
+	}
+	if err := saveStateAtomic(state); err != nil {
+		t.Fatalf("seed channel state: %v", err)
+	}
+
+	removed, err := m.removeInboundRoute("job-down")
+	if err != nil || !removed {
+		t.Fatalf("first removal = (%v, %v), want (true, nil)", removed, err)
+	}
+	removed, err = m.removeInboundRoute("job-down")
+	if err != nil || removed {
+		t.Fatalf("repeated removal = (%v, %v), want (false, nil)", removed, err)
+	}
+}
+
 // SyncSessionDelivery heals a stale record — a PTY created or re-adopted after
 // the record was written — but never invents one for a session with no channel.
 func TestSyncSessionDeliveryRefreshesOnlyExistingRecords(t *testing.T) {

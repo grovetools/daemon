@@ -484,8 +484,12 @@ func (m *Manager) enableHA(jobID string) error {
 // (started in Start, stopped in Stop). Ref-counting was wrong under
 // cross-daemon because scoped claws live in routing.json, not in the
 // global daemon's activeSessions.
-func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
-	m.ulog.Info("DisableChannel invoked").
+func (m *Manager) DisableChannel(ctx context.Context, jobID string, outcomes ...string) {
+	outcome := "requested"
+	if len(outcomes) > 0 && outcomes[0] != "" {
+		outcome = outcomes[0]
+	}
+	m.ulog.Debug("DisableChannel invoked").
 		Field("job_id", jobID).
 		Field("scope", m.scope).
 		Log(ctx)
@@ -498,8 +502,9 @@ func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
 	// Remove inbound route unconditionally — on scoped daemons this clears
 	// the route we registered; on the global daemon this clears stale routes
 	// left by scoped daemons that have since stopped.
-	if err := m.removeInboundRoute(jobID); err != nil {
-		m.ulog.Warn("Failed to remove inbound route").Err(err).Field("job_id", jobID).Log(ctx)
+	routeRemoved, routeErr := m.removeInboundRoute(jobID)
+	if routeErr != nil {
+		m.ulog.Warn("Failed to remove inbound route").Err(routeErr).Field("job_id", jobID).Log(ctx)
 	}
 
 	// Clean up persisted delivery info
@@ -509,6 +514,14 @@ func (m *Manager) DisableChannel(ctx context.Context, jobID string) {
 	// ecosystem still has an assistant, and knowing that is what routes the
 	// next inbound message into ensure-on-inbound instead of dropping it.
 	m.clearDefaultClawJob(jobID)
+
+	m.ulog.Info("Channel disabled for session").
+		Field("event", "channel.down").
+		Field("job_id", jobID).
+		Field("scope", m.scope).
+		Field("outcome", outcome).
+		Field("route_removed", routeRemoved).
+		Log(ctx)
 }
 
 // Send sends a message via the appropriate channel and records the route.
@@ -953,7 +966,7 @@ func (m *Manager) deliverInbound(ctx context.Context, targetJobID, resolvedVia s
 			// recorded mux is wrong, its PTY is gone) is a delivery problem;
 			// dropping the route on top of it would also lose the address.
 			if staleRoute {
-				_ = m.removeInboundRoute(targetJobID)
+				_, _ = m.removeInboundRoute(targetJobID)
 			}
 			m.recordInbound(msg.Source, resolvedVia, targetJobID, err.Error(), false)
 			m.onUndeliverable(targetJobID, msg, text, fromQueue, err)
@@ -1281,7 +1294,7 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 					isTerminal := payload.Outcome == "completed" || payload.Outcome == "failed" ||
 						payload.Outcome == "interrupted" || payload.Outcome == "abandoned"
 
-					m.ulog.Info("watchStoreUpdates: received UpdateSessionEnd").
+					m.ulog.Debug("watchStoreUpdates: received UpdateSessionEnd").
 						Field("job_id", payload.JobID).
 						Field("outcome", payload.Outcome).
 						Field("is_terminal", isTerminal).
@@ -1296,10 +1309,10 @@ func (m *Manager) watchStoreUpdates(ctx context.Context) {
 						continue
 					}
 
-					m.ulog.Info("watchStoreUpdates: disabling channel due to session end").
+					m.ulog.Debug("watchStoreUpdates: disabling channel due to session end").
 						Field("job_id", payload.JobID).
 						Log(ctx)
-					m.DisableChannel(ctx, payload.JobID)
+					m.DisableChannel(ctx, payload.JobID, payload.Outcome)
 					m.cleanupRoutesForJob(payload.JobID)
 					if isTerminal && session != nil && session.JobFilePath != "" {
 						stripClawFrontmatter(session.JobFilePath)
@@ -1537,7 +1550,7 @@ func (m *Manager) cleanupRoutesForJob(jobID string) {
 	m.mu.Unlock()
 	go m.saveRoutes()
 	if isProxy {
-		_ = m.removeInboundRoute(jobID)
+		_, _ = m.removeInboundRoute(jobID)
 	}
 }
 
@@ -1699,21 +1712,24 @@ func (m *Manager) addInboundRoute(jobID string) error {
 	return saveStateAtomic(state)
 }
 
-func (m *Manager) removeInboundRoute(jobID string) error {
-	m.ulog.Info("removeInboundRoute executing").
+func (m *Manager) removeInboundRoute(jobID string) (bool, error) {
+	m.ulog.Debug("removeInboundRoute executing").
 		Field("job_id", jobID).
 		Log(m.ctx)
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	state, err := loadChannelState()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, ok := state.InboundRoutes[jobID]; !ok {
-		return nil
+		return false, nil
 	}
 	delete(state.InboundRoutes, jobID)
-	return saveStateAtomic(state)
+	if err := saveStateAtomic(state); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (m *Manager) lookupInboundRoute(jobID string) (string, bool) {

@@ -126,6 +126,10 @@ type FlowHandler struct {
 	// lastStatsInput is the digest statsSeq was last bumped for. Guarded by
 	// refreshRunMu — only runRefresh reads or writes it.
 	lastStatsInput uint64
+
+	// refreshSlow remembers the latency-threshold state. It is guarded by
+	// refreshRunMu with the rest of runRefresh's publication bookkeeping.
+	refreshSlow bool
 }
 
 // defaultPlanStatsMinInterval is the rate floor applied when the daemon config
@@ -1041,8 +1045,11 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 
 	elapsed := time.Since(start)
 	entry := h.ulog.Debug("Plan index refresh")
-	if elapsed > time.Second {
+	switch h.refreshLatencyTransition(elapsed) {
+	case refreshBecameSlow:
 		entry = h.ulog.Info("Slow plan index refresh")
+	case refreshRecovered:
+		entry = h.ulog.Info("Plan index refresh recovered")
 	}
 	entry.Field("rows", len(summaries)).
 		Field("dirs", len(targets)).
@@ -1053,6 +1060,31 @@ func (h *FlowHandler) runRefresh(all bool, scopeDirs map[string]struct{}) {
 		Field("publish_ms", publishDone.Sub(scanDone).Milliseconds()).
 		Field("total_ms", elapsed.Milliseconds()).
 		Log(ctx)
+}
+
+type refreshLatencyState uint8
+
+const (
+	refreshLatencySteady refreshLatencyState = iota
+	refreshBecameSlow
+	refreshRecovered
+)
+
+// refreshLatencyTransition gates the one-second threshold on state edges. A
+// prolonged slow machine therefore produces one info line, while the return to
+// normal remains visible once; steady samples stay at debug.
+func (h *FlowHandler) refreshLatencyTransition(elapsed time.Duration) refreshLatencyState {
+	slow := elapsed > time.Second
+	switch {
+	case slow && !h.refreshSlow:
+		h.refreshSlow = true
+		return refreshBecameSlow
+	case !slow && h.refreshSlow:
+		h.refreshSlow = false
+		return refreshRecovered
+	default:
+		return refreshLatencySteady
+	}
 }
 
 // kickPlanStats starts (or queues onto) the async aggregated-PlanStats pass.

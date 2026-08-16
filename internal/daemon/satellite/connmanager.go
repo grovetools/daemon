@@ -299,6 +299,7 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 	cm.ensureSyncForward(ctx, cfg)
 
 	backoff := cm.backoffBase
+	capReported := false
 	for {
 		if ctx.Err() != nil {
 			return
@@ -306,9 +307,20 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 
 		client, derr := cm.dial(cfg, hostKeyCB, hostKeyAlgos)
 		if derr != nil {
-			cm.setState(cfg, stateBackoff, derr)
-			cm.ulog.Warn("Satellite dial failed; backing off").
-				Field("satellite", cfg.Name).Field("backoff", backoff.String()).Err(derr).Log(ctx)
+			prior := cm.setState(cfg, stateBackoff, derr)
+			enteredBackoff, saturated := dialFailureTransitions(prior, backoff, cm.backoffCap, capReported)
+			entry := cm.ulog.Debug("Satellite dial retry failed")
+			switch {
+			case enteredBackoff:
+				entry = cm.ulog.Warn("Satellite dial failed; backing off")
+			case saturated:
+				entry = cm.ulog.Error("Satellite dial backoff saturated")
+				capReported = true
+			}
+			entry.Field("satellite", cfg.Name).
+				Field("backoff", backoff.String()).
+				Field("backoff_cap", cm.backoffCap.String()).
+				Err(derr).Log(ctx)
 			if !sleepCtx(ctx, backoff) {
 				return
 			}
@@ -316,12 +328,13 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 			continue
 		}
 
-		// Connected: reset backoff and report health.
+		// Connected: reset backoff/cap reporting and make recovery visible.
 		backoff = cm.backoffBase
+		capReported = false
 		cm.setClient(cfg, client)
-		cm.setState(cfg, stateConnected, nil)
+		prior := cm.setState(cfg, stateConnected, nil)
 		cm.ulog.Info("Satellite connected").
-			Field("satellite", cfg.Name).Field("addr", cfg.SSHAddr).Log(ctx)
+			Field("satellite", cfg.Name).Field("addr", cfg.SSHAddr).Field("prior_state", prior).Log(ctx)
 
 		// Retry the sync-forward bind if the port was busy earlier (no-op when
 		// already bound or the feature is off).
@@ -338,7 +351,11 @@ func (cm *ConnManager) runSatellite(ctx context.Context, cfg *SatelliteConfig) {
 			return
 		}
 
-		cm.setState(cfg, stateBackoff, errKeepaliveLost)
+		prior = cm.setState(cfg, stateBackoff, errKeepaliveLost)
+		if prior != stateBackoff {
+			cm.ulog.Warn("Satellite connection lost; backing off").
+				Field("satellite", cfg.Name).Field("backoff", backoff.String()).Err(errKeepaliveLost).Log(ctx)
+		}
 		if !sleepCtx(ctx, backoff) {
 			return
 		}
@@ -459,11 +476,12 @@ func (cm *ConnManager) setClient(cfg *SatelliteConfig, client *ssh.Client) {
 	sc.client = client
 }
 
-// setState records a satellite's connection state and emits a satellite_status
-// store update (C17) so the treemux badge and grove status see the transition.
-// Stale-goroutine calls neither mutate nor emit (see setClient) — a removed
-// satellite's tombstone must not be overwritten by its unwinding goroutine.
-func (cm *ConnManager) setState(cfg *SatelliteConfig, state string, err error) {
+// setState records a satellite's connection state, returns its prior state,
+// and emits a satellite_status store update (C17) so the treemux badge and
+// grove status see the transition. Stale-goroutine calls neither mutate nor
+// emit (see setClient) — a removed satellite's tombstone must not be
+// overwritten by its unwinding goroutine.
+func (cm *ConnManager) setState(cfg *SatelliteConfig, state string, err error) string {
 	lastErr := ""
 	if err != nil {
 		lastErr = err.Error()
@@ -474,8 +492,9 @@ func (cm *ConnManager) setState(cfg *SatelliteConfig, state string, err error) {
 	sc := cm.conns[cfg.Name]
 	if sc == nil || sc.cfg != cfg {
 		cm.mu.Unlock()
-		return // stale goroutine (removed/replaced by Reload)
+		return "" // stale goroutine (removed/replaced by Reload)
 	}
+	prior := sc.state
 	sc.state = state
 	sc.lastErr = lastErr
 	sc.since = now
@@ -483,6 +502,14 @@ func (cm *ConnManager) setState(cfg *SatelliteConfig, state string, err error) {
 	cm.mu.Unlock()
 
 	cm.emitStatus(cfg, state, lastErr, forward, now)
+	return prior
+}
+
+// dialFailureTransitions classifies the two actionable edges in a failed-dial
+// streak. The caller keeps capReported until a successful connection so a
+// satellite pinned at the cap emits one error rather than one per retry.
+func dialFailureTransitions(prior string, backoff, cap time.Duration, capReported bool) (enteredBackoff, saturated bool) {
+	return prior != stateBackoff, !capReported && backoff >= cap
 }
 
 // setForward records the sync-forward status string (syncforward.go) and

@@ -20,6 +20,27 @@ import (
 	"github.com/grovetools/flow/pkg/orchestration"
 )
 
+func TestRefreshLatencyTransitionGatesRepeatedSlowSamples(t *testing.T) {
+	h := &FlowHandler{}
+	steps := []struct {
+		elapsed time.Duration
+		want    refreshLatencyState
+	}{
+		{500 * time.Millisecond, refreshLatencySteady},
+		{2 * time.Second, refreshBecameSlow},
+		{3 * time.Second, refreshLatencySteady},
+		{4 * time.Second, refreshLatencySteady},
+		{900 * time.Millisecond, refreshRecovered},
+		{800 * time.Millisecond, refreshLatencySteady},
+		{2 * time.Second, refreshBecameSlow},
+	}
+	for i, step := range steps {
+		if got := h.refreshLatencyTransition(step.elapsed); got != step.want {
+			t.Fatalf("step %d (%s): transition = %d, want %d", i, step.elapsed, got, step.want)
+		}
+	}
+}
+
 func writeIndexedPlan(t *testing.T, dir string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
