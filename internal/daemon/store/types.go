@@ -265,7 +265,7 @@ var allUpdateTypes = []UpdateType{
 	UpdateTaskResult, UpdateTestReport,
 	UpdateSpawnAgentPane, UpdateAttachAgentPane, UpdateAgentInput, UpdateCaptureRequest,
 	UpdateSyncConflict, UpdateForgeState,
-	UpdateSatelliteStatus, UpdateSatelliteSnapshot,
+	UpdateSatelliteStatus, UpdateAssistantStatus, UpdateSatelliteSnapshot,
 	UpdateWorkflowRunDiscovered, UpdateWorkflowAgentStarted,
 	UpdateWorkflowAgentCompleted, UpdateWorkflowRunStale,
 	UpdateWorkflowRunCompleted, UpdateWorkflowChildrenSnapshot,
