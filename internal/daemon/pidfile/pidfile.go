@@ -27,7 +27,6 @@ package pidfile
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -81,12 +80,13 @@ func IsAlreadyRunning(err error) bool {
 	return errors.As(err, &are)
 }
 
-// held maps a pidfile path to the open, flock'd file this process is holding
-// it with. The lock lives on the open file description, so it is released by
-// closing this handle — or by the process dying, which is what makes a
-// crashed daemon's pidfile immediately reusable without any stale-PID
-// heuristic. The handle is opened O_CLOEXEC (Go's default), so the signal-cli
-// and tuimux subprocesses groved spawns never inherit the lock.
+// held maps a pidfile path to its open, flock'd stable lock artifact. The
+// lock is deliberately on path+".lock", not on the pidfile inode: pidfiles are
+// routinely unlinked during pruning and upgrade, and unlinking a locked inode
+// would otherwise let a second process create and lock a different inode at
+// the same pathname. The lock artifact is never unlinked; closing the handle
+// (or process death) releases it. Go opens it O_CLOEXEC, so children do not
+// inherit the election.
 var (
 	heldMu sync.Mutex
 	held   = map[string]*os.File{}
@@ -101,6 +101,10 @@ func Acquire(path string) error {
 // AcquireWait is Acquire with an explicit bound on how long to wait for an
 // occupant to leave. Zero makes it strictly non-blocking.
 func AcquireWait(path string, wait time.Duration) error {
+	return acquireWait(path, wait, process.List)
+}
+
+func acquireWait(path string, wait time.Duration, listProcesses func() ([]process.Entry, error)) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // G301: daemon runtime directory
 		return fmt.Errorf("failed to create pid directory: %w", err)
 	}
@@ -119,13 +123,13 @@ func AcquireWait(path string, wait time.Duration) error {
 			return err
 		}
 		if f != nil {
-			// The lock is ours. An occupant can still be here: a groved from
-			// before this file holds no lock, and an upgrade predecessor is
-			// alive until its teardown finishes. Both are "wait for them to
-			// go", never "take it from under them".
-			occupant, occupied := liveOccupant(f)
+			// The stable lock is ours. A groved predating the lock protocol can
+			// still be named by the pidfile. Wait only for a process positively
+			// identified as groved; a recycled PID naming an unrelated process is
+			// stale and must not block startup forever.
+			occupant, occupied := liveGrovedOccupant(path, listProcesses)
 			if !occupied {
-				if err := writeOwnPID(f); err != nil {
+				if err := writeOwnPID(path); err != nil {
 					_ = f.Close()
 					return err
 				}
@@ -149,16 +153,12 @@ func AcquireWait(path string, wait time.Duration) error {
 	}
 }
 
-// lockPidFile opens path and takes the exclusive lock, returning (nil, nil)
-// when another process holds it — the caller's cue to retry or give up.
-//
-// The identity re-check at the end closes the unlink race: Release removes the
-// file before dropping the lock, so a starter can end up holding the lock on an
-// inode that is no longer at path. Writing our PID into that ghost inode would
-// leave the path free for a third starter, i.e. two daemons again. Re-opening
-// is the fix, and it is why this returns "contended" rather than an error.
+// lockPidFile takes the exclusive election lock on a stable sibling artifact,
+// returning (nil, nil) when another process holds it. The artifact is never
+// unlinked, so deleting or replacing the informational pidfile cannot create a
+// second lock domain.
 func lockPidFile(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644) //nolint:gosec // G302/G304: pid file readable by other processes, path from daemon config
+	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644) //nolint:gosec // G302/G304: daemon lock path from config
 	if err != nil {
 		return nil, fmt.Errorf("failed to open pid file: %w", err)
 	}
@@ -171,67 +171,50 @@ func lockPidFile(path string) (*os.File, error) {
 		return nil, fmt.Errorf("failed to lock pid file: %w", err)
 	}
 
-	same, err := sameFileAtPath(f, path)
-	if err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	if !same {
-		_ = f.Close()
-		return nil, nil
-	}
 	return f, nil
 }
 
-// liveOccupant reports a PID other than ours that the pidfile names and that is
-// still alive. It exists only for holders that do not participate in the lock:
-// a groved built before this file, or one whose teardown has not finished.
-func liveOccupant(f *os.File) (int, bool) {
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
+// liveGrovedOccupant recognizes only an old, non-locking groved process. A
+// merely-live PID is insufficient because stale pidfiles survive crashes and
+// PIDs are recycled.
+func liveGrovedOccupant(path string, listProcesses func() ([]process.Entry, error)) (int, bool) {
+	pid, err := Read(path)
+	if err != nil || pid <= 0 || pid == os.Getpid() || !process.IsProcessAlive(pid) {
 		return 0, false
 	}
-	data, err := io.ReadAll(f)
+	procs, err := listProcesses()
 	if err != nil {
 		return 0, false
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 || pid == os.Getpid() {
-		return 0, false
+	for _, p := range procs {
+		if p.PID != pid {
+			continue
+		}
+		return pid, isGrovedStartCommand(p.Args)
 	}
-	if !process.IsProcessAlive(pid) {
-		return 0, false
-	}
-	return pid, true
+	return 0, false
 }
 
-// writeOwnPID replaces the file's contents with this process's PID.
-func writeOwnPID(f *os.File) error {
-	if err := f.Truncate(0); err != nil {
-		return fmt.Errorf("failed to truncate pid file: %w", err)
+func isGrovedStartCommand(cmdline string) bool {
+	fields := strings.Fields(cmdline)
+	if len(fields) < 2 || filepath.Base(fields[0]) != "groved" {
+		return false
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("failed to rewind pid file: %w", err)
+	for _, field := range fields[1:] {
+		if field == "start" {
+			return true
+		}
 	}
-	if _, err := f.WriteString(strconv.Itoa(os.Getpid())); err != nil {
+	return false
+}
+
+// writeOwnPID replaces the informational pidfile while the stable election
+// lock is held.
+func writeOwnPID(path string) error {
+	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil { //nolint:gosec // G304: daemon pid path from config
 		return fmt.Errorf("failed to write pid file: %w", err)
 	}
-	return f.Sync()
-}
-
-// sameFileAtPath reports whether the open file is still the file at path.
-func sameFileAtPath(f *os.File, path string) (bool, error) {
-	fi, err := f.Stat()
-	if err != nil {
-		return false, fmt.Errorf("failed to stat pid file handle: %w", err)
-	}
-	pi, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("failed to stat pid file: %w", err)
-	}
-	return os.SameFile(fi, pi), nil
+	return nil
 }
 
 // Release removes the PID file and drops the lock.
@@ -252,20 +235,10 @@ func Release(path string) error {
 		// check alone.
 		return removeIfOurs(path)
 	}
-	// Unlink BEFORE closing: closing drops the lock, and a starter waiting on
-	// it would otherwise take ownership and write its PID into a file we then
-	// delete. The reverse order leaves the (harmless) case of a starter that
-	// locked the now-unlinked inode, which its identity re-check rejects.
+	// Remove our informational pidfile before dropping the stable lock. A
+	// waiter cannot proceed until Close, so it cannot write a successor PID
+	// that this cleanup then removes.
 	defer func() { _ = f.Close() }()
-
-	same, err := sameFileAtPath(f, path)
-	if err != nil {
-		return err
-	}
-	if !same {
-		// Replaced or already gone — not ours to remove.
-		return nil
-	}
 	return removeIfOurs(path)
 }
 
@@ -300,15 +273,6 @@ func Owns(path string) (bool, string) {
 		return false, fmt.Sprintf("pid file %s names pid %d, not us", path, pid)
 	}
 
-	heldMu.Lock()
-	f := held[path]
-	heldMu.Unlock()
-	if f != nil {
-		same, err := sameFileAtPath(f, path)
-		if err == nil && !same {
-			return false, fmt.Sprintf("pid file %s was replaced by a different file", path)
-		}
-	}
 	return true, ""
 }
 

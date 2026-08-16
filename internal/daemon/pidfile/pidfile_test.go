@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/grovetools/core/pkg/process"
 )
 
 // helperEnv makes a test binary re-exec itself as a pidfile contender. The
@@ -111,6 +113,27 @@ func TestConcurrentStartersElectExactlyOneWinner(t *testing.T) {
 	}
 }
 
+// TestUnlinkedPidfileCannotBypassElection proves the lock domain survives
+// deletion of the informational pathname. This is the cross-process regression
+// for a prune/old Release racing a live daemon.
+func TestUnlinkedPidfileCannotBypassElection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "groved.pid")
+	holder := contender(t, path, 3*time.Second, "0")
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Process.Kill() }()
+	waitForPID(t, path)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	err := AcquireWait(path, 200*time.Millisecond)
+	if !IsAlreadyRunning(err) {
+		t.Fatalf("deleting pidfile bypassed the holder's election lock: %v", err)
+	}
+}
+
 // TestAcquireRejectsLiveHolder covers the steady state: a running daemon holds
 // the lock, and a second starter is told so instead of proceeding to boot.
 func TestAcquireRejectsLiveHolder(t *testing.T) {
@@ -187,6 +210,51 @@ func TestAcquireTakesOverStalePidfile(t *testing.T) {
 	}
 }
 
+// TestAcquireDefersToLiveOldGroved preserves compatibility with a genuine
+// predecessor that predates the stable lock protocol.
+func TestAcquireDefersToLiveOldGroved(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "groved.pid")
+	old := exec.Command("sh", "-c", "sleep 5")
+	if err := old.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = old.Process.Kill() }()
+	if err := os.WriteFile(path, []byte(strconv.Itoa(old.Process.Pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	list := func() ([]process.Entry, error) {
+		return []process.Entry{{PID: old.Process.Pid, Args: "/old/bin/groved start"}}, nil
+	}
+
+	err := acquireWait(path, 0, list)
+	var running *AlreadyRunningError
+	if !errors.As(err, &running) || running.PID != old.Process.Pid {
+		t.Fatalf("live old groved should protect its pidfile, got %v", err)
+	}
+}
+
+// TestAcquireIgnoresLiveUnrelatedRecycledPID proves a stale pidfile cannot
+// defer forever merely because its numeric PID was reused.
+func TestAcquireIgnoresLiveUnrelatedRecycledPID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "groved.pid")
+	unrelated := exec.Command("sh", "-c", "sleep 5")
+	if err := unrelated.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unrelated.Process.Kill() }()
+	if err := os.WriteFile(path, []byte(strconv.Itoa(unrelated.Process.Pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AcquireWait(path, 0); err != nil {
+		t.Fatalf("live unrelated recycled PID blocked acquisition: %v", err)
+	}
+	defer func() { _ = Release(path) }()
+	if pid, _ := Read(path); pid != os.Getpid() {
+		t.Fatalf("pidfile names %d, want this process", pid)
+	}
+}
+
 // TestReleaseLeavesAnotherProcessesPidfileAlone protects the upgrade overlap:
 // the predecessor's teardown must not delete the successor's pidfile, which
 // would leave a live daemon that no census, no `groved stop`, and no auto-start
@@ -222,7 +290,10 @@ func TestReleaseRemovesOurOwnPidfile(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected the pidfile to be gone, got %v", err)
 	}
-	// And the lock must be gone with it.
+	// The stable lock artifact remains, but its kernel lock must be gone.
+	if _, err := os.Stat(path + ".lock"); err != nil {
+		t.Fatalf("stable lock artifact should remain: %v", err)
+	}
 	if err := AcquireWait(path, 0); err != nil {
 		t.Fatalf("re-acquire after release: %v", err)
 	}
@@ -267,6 +338,22 @@ func TestIsRunningToleratesAnEmptyPidfile(t *testing.T) {
 	running, pid, err := IsRunning(path)
 	if err != nil || running || pid != 0 {
 		t.Fatalf("empty pidfile: got running=%v pid=%d err=%v", running, pid, err)
+	}
+}
+
+func TestRecognizesOldGrovedStartCommand(t *testing.T) {
+	for _, tc := range []struct {
+		cmd  string
+		want bool
+	}{
+		{"/usr/local/bin/groved start", true},
+		{"groved --scope /w start", true},
+		{"groved status", false},
+		{"sleep start", false},
+	} {
+		if got := isGrovedStartCommand(tc.cmd); got != tc.want {
+			t.Errorf("isGrovedStartCommand(%q) = %v, want %v", tc.cmd, got, tc.want)
+		}
 	}
 }
 

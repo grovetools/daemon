@@ -67,8 +67,9 @@ func DaemonPidfileRaceScenario() *harness.Scenario {
 					return err
 				}
 				pidPath := filepath.Join(groveStateDir, "groved.pid")
+				socketPath := filepath.Join(groveRunDir, "groved.sock")
 				ctx.Set("pid_path", pidPath)
-				ctx.Set("socket_path", filepath.Join(groveRunDir, "groved.sock"))
+				ctx.Set("socket_path", socketPath)
 
 				if fs.Exists(pidPath) {
 					return fmt.Errorf("scratch pidfile %s already exists; the race must start from nothing", pidPath)
@@ -94,7 +95,7 @@ func DaemonPidfileRaceScenario() *harness.Scenario {
 					wg.Add(1)
 					go func(i int) {
 						defer wg.Done()
-						p, err := command.New(binary, "start", "--collectors=workspace").
+						p, err := command.New(binary, "start", "--collectors=workspace", "--pidfile", pidPath, "--socket", socketPath).
 							Dir(ctx.RootDir).
 							Env(env...).
 							Start()

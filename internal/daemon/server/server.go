@@ -919,6 +919,18 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 		return fmt.Errorf("failed to listen on socket: %w", err)
 	}
 
+	// Capture identity from the bound listener FD, never by looking the path up
+	// again. Another process may unlink/rebind the pathname immediately after
+	// bind; a path stat in that race would record the thief's inode as ours.
+	info, err := boundListenerInfo(listener)
+	if err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("failed to record bound socket identity: %w", err)
+	}
+	s.boundSocketMu.Lock()
+	s.boundSocket = info
+	s.boundSocketMu.Unlock()
+
 	// PHASE 2: Store listener for drain mode socket unlink
 	s.listener = listener
 
@@ -926,16 +938,6 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("failed to set socket permissions: %w", err)
-	}
-
-	// Remember which file we bound, before anyone else can replace it.
-	if info, err := os.Stat(socketPath); err == nil {
-		s.boundSocketMu.Lock()
-		s.boundSocket = info
-		s.boundSocketMu.Unlock()
-	} else {
-		s.ulog.Warn("Could not record bound socket identity; steal detection disabled").
-			Field("socket", socketPath).Err(err).Log(context.Background())
 	}
 
 	// The socket is bound and chmod'd — clients can connect now even though
@@ -1031,6 +1033,22 @@ func (s *Server) IsDraining() bool {
 	s.drainMu.Lock()
 	defer s.drainMu.Unlock()
 	return s.isDraining
+}
+
+// boundListenerInfo returns the identity of the socket attached to listener's
+// FD. UnixListener.File duplicates the descriptor; closing the duplicate does
+// not affect the listener.
+func boundListenerInfo(listener net.Listener) (os.FileInfo, error) {
+	ul, ok := listener.(*net.UnixListener)
+	if !ok {
+		return nil, fmt.Errorf("listener is %T, want *net.UnixListener", listener)
+	}
+	f, err := ul.File()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return f.Stat()
 }
 
 // SocketIdentityLost reports whether the socket path this server bound is now

@@ -148,17 +148,12 @@ func watchForShadowing(ctx context.Context, p shadowCheckParams) {
 
 // pidfileLost adapts pidfile.Owns to the watchdog's probe shape.
 //
-// A pidfile that has simply VANISHED is not treated as a loss on its own: an
-// operator can delete one, `groved status --prune` can race a stat, and taking
-// a live daemon down over a missing file would trade one failure mode for a
-// worse one. Somebody else's PID in it is a different matter — that is proof
-// another process is being routed to.
+// Missing and replaced pidfiles both count as lost election metadata. The
+// stable sibling lock still prevents a second workload during confirmation,
+// while retiring here ensures the surviving daemon never remains invisible.
 func pidfileLost(path string) (bool, string) {
 	owns, why := pidfile.Owns(path)
-	if owns || strings.Contains(why, "no longer exists") {
-		return false, ""
-	}
-	return true, why
+	return !owns, why
 }
 
 // probeShadowed runs both probes, reporting which artifact was lost.

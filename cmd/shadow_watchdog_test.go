@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -115,12 +116,13 @@ func TestPidfileLost(t *testing.T) {
 		t.Error("a pidfile naming another process should count as lost")
 	}
 
-	// Simply deleted: not a takeover, and not worth taking a live daemon down.
+	// Simply deleted: stable election still prevents overlap, and the daemon
+	// must retire after confirmation rather than remain invisible.
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if lost, why := pidfileLost(path); lost {
-		t.Errorf("a missing pidfile should not count as lost, got %q", why)
+	if lost, why := pidfileLost(path); !lost || !strings.Contains(why, "no longer exists") {
+		t.Errorf("missing pidfile should count as lost, got lost=%v why=%q", lost, why)
 	}
 	_ = pidfile.Release(path)
 }
