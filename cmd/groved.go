@@ -190,6 +190,9 @@ func newGrovedHealthCmd() *cobra.Command {
 
 			if !client.IsRunning() {
 				fmt.Println("Daemon is not running")
+				// "No daemon of record" plus "a groved is burning CPU" is the
+				// most alarming shape this census has, so it runs here too.
+				printShadowHealth()
 				os.Exit(1)
 			}
 
@@ -244,10 +247,34 @@ func newGrovedHealthCmd() *cobra.Command {
 			}
 
 			printAssistantHealth(ctx, client)
+			printShadowHealth()
 
 			return nil
 		},
 	}
+}
+
+// printShadowHealth reports groved processes that are running without owning a
+// pidfile.
+//
+// Every other line this command prints comes from asking THE daemon — the one
+// the pidfile names — so a second daemon running alongside it is precisely the
+// thing this output cannot otherwise show. On 2026-08-15 that gap hid a full
+// duplicate daemon, with its own sweeps, its own watchers and a second
+// signal-cli receiver on the same account, for 2h22m: `status`, `health` and
+// `stats` all reported one healthy daemon. One `ps` read closes it.
+func printShadowHealth() {
+	shadows, err := daemon.FindShadowDaemons()
+	fmt.Println()
+	if err != nil {
+		fmt.Printf("Shadow daemons:     (process census failed: %v)\n", err)
+		return
+	}
+	if len(shadows) == 0 {
+		fmt.Println("Shadow daemons:     none")
+		return
+	}
+	fmt.Printf("⚠ Shadow daemons:   %s", daemon.FormatShadowDaemons(shadows))
 }
 
 // printAssistantHealth renders the assistant supervisor section of
@@ -444,7 +471,16 @@ func newGrovedStartCmd() *cobra.Command {
 				return false
 			}
 
-			// 1. Acquire Lock
+			// 1. Acquire Lock.
+			//
+			// This is the election, and everything below it — collectors,
+			// fsnotify watchers, the signal-cli subprocess, the socket bind —
+			// is the daemon workload that exactly one process may run. It used
+			// to be a read-check-write, so two clients auto-starting groved in
+			// the same instant (the normal shape of a fleet restart) both
+			// passed it and the machine ran two full daemons, the second one
+			// invisible to every census but `ps`. It is now an exclusive flock
+			// held for the life of the process; see the pidfile package.
 			if err := pidfile.Acquire(pidPath); err != nil {
 				return fmt.Errorf("failed to start: %w", err)
 			}
@@ -453,6 +489,12 @@ func newGrovedStartCmd() *cobra.Command {
 					ulog.Error("Failed to release pidfile").Err(err).Log(context.Background())
 				}
 			}()
+
+			// shadowed fires if this daemon later loses the socket or the
+			// pidfile to another process — see shadow_watchdog.go. Declared
+			// here so both the readiness hook that arms the watcher and the
+			// signal handler that acts on it can see it.
+			shadowed := make(chan struct{})
 
 			// Record the exact resolved scope in a sidecar next to the pidfile so
 			// `groved upgrade` can hand the successor the identical GROVE_SCOPE.
@@ -508,7 +550,7 @@ func newGrovedStartCmd() *cobra.Command {
 			if err != nil {
 				ulog.Error("Failed to load config; serving status only until restart").Err(err).Log(context.Background())
 				httpPort, _ := cmd.Flags().GetInt("http-port")
-				return serveConfigDegraded(cmd.Context(), autoShutdown, scope, sockPath, httpPort, readyFd, pairPID, hostReg, err, ulog)
+				return serveConfigDegraded(cmd.Context(), autoShutdown, scope, sockPath, pidPath, httpPort, readyFd, pairPID, hostReg, shadowed, err, ulog)
 			}
 
 			// Parse intervals from config with defaults
@@ -770,6 +812,18 @@ func newGrovedStartCmd() *cobra.Command {
 				if err := hostReg.MarkReady(); err != nil {
 					ulog.Warn("Failed to mark daemon host ready; scoped clients may wait out the boot grace").
 						Err(err).Log(ctx)
+				}
+				// Start policing our own identity. Bind is the earliest moment
+				// either artifact can be stolen, and this hook is the only
+				// point both boot orderings pass through. See
+				// shadow_watchdog.go.
+				if shadowCheckEnabled() {
+					go watchForShadowing(ctx, shadowCheckParams{
+						socketLost:  srv.SocketIdentityLost,
+						pidfileLost: func() (bool, string) { return pidfileLost(pidPath) },
+						shadowed:    shadowed,
+						ulog:        ulog,
+					})
 				}
 			}
 
@@ -1200,6 +1254,16 @@ func newGrovedStartCmd() *cobra.Command {
 					case <-yieldReq:
 						ulog.Info("Yielding scope to host daemon").
 							Field("event", "daemon.stopped").Field("scope", scope).Log(bgCtx)
+					case <-shadowed:
+						// Another process owns our socket or our pidfile. No
+						// client can reach us and no census can see us, so the
+						// only thing left to do is stop burning CPU. The
+						// teardown below is the right one: it stops OUR
+						// signal-cli (the duplicate receiver on the account),
+						// OUR watchers and collectors, and releases the pidfile
+						// only if it still names us.
+						ulog.Error("Shutting down: this daemon has been shadowed").
+							Field("event", "daemon.stopped").Field("pid", os.Getpid()).Log(bgCtx)
 					}
 					// Reap the agent PTYs this daemon owns. With PTYs out-of-process,
 					// a plain stop (this SIGTERM/auto-shutdown path — NOT the SIGUSR1
@@ -1657,9 +1721,10 @@ func newGrovedStartCmd() *cobra.Command {
 func serveConfigDegraded(
 	ctx context.Context,
 	autoShutdown bool,
-	scope, socketPath string,
+	scope, socketPath, pidPath string,
 	httpPort, readyFd, pairPID int,
 	hostReg *daemon.HostRegistration,
+	shadowed chan struct{},
 	configErr error,
 	ulog *grovelogging.UnifiedLogger,
 ) error {
@@ -1681,6 +1746,16 @@ func serveConfigDegraded(
 		}
 		if err := hostReg.MarkReady(); err != nil {
 			ulog.Warn("Failed to mark degraded daemon host ready").Err(err).Log(ctx)
+		}
+		// A status-only daemon holds the same pidfile and answers on the same
+		// socket as a healthy one, so it polices its identity the same way.
+		if shadowCheckEnabled() {
+			go watchForShadowing(ctx, shadowCheckParams{
+				socketLost:  srv.SocketIdentityLost,
+				pidfileLost: func() (bool, string) { return pidfileLost(pidPath) },
+				shadowed:    shadowed,
+				ulog:        ulog,
+			})
 		}
 	}
 
@@ -1705,6 +1780,9 @@ func serveConfigDegraded(
 		case <-ctx.Done():
 		case <-stop:
 		case <-srv.TerminalHubShutdownReq():
+		case <-shadowed:
+			ulog.Error("Shutting down: this degraded daemon has been shadowed").
+				Field("event", "daemon.stopped").Field("pid", os.Getpid()).Log(ctx)
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

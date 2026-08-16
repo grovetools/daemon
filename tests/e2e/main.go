@@ -17,6 +17,7 @@ func main() {
 
 		// Daemon Lifecycle Tests
 		DaemonLifecycleScenario(),
+		DaemonPidfileRaceScenario(),
 
 		// Skill Watcher Tests
 		DaemonSkillWatcherScenario(),

@@ -274,6 +274,16 @@ type Server struct {
 	drainMu    sync.Mutex
 	isDraining bool
 	requestsWg sync.WaitGroup
+
+	// boundSocket is the stat of the socket file as it existed the instant
+	// Listen bound it. Listen unlinks whatever is already at the path before
+	// binding, so any process that starts after us replaces our inode with its
+	// own while our listener keeps accepting on a socket nothing can reach.
+	// Keeping the identity lets a daemon notice that it has been unbound from
+	// the world instead of running on as an invisible duplicate. Guarded by
+	// boundSocketMu; written once in Listen, read by SocketIdentityLost.
+	boundSocketMu sync.Mutex
+	boundSocket   os.FileInfo
 }
 
 // New creates a new Server instance.
@@ -918,6 +928,16 @@ func (s *Server) Listen(socketPath string, httpPort ...int) error {
 		return fmt.Errorf("failed to set socket permissions: %w", err)
 	}
 
+	// Remember which file we bound, before anyone else can replace it.
+	if info, err := os.Stat(socketPath); err == nil {
+		s.boundSocketMu.Lock()
+		s.boundSocket = info
+		s.boundSocketMu.Unlock()
+	} else {
+		s.ulog.Warn("Could not record bound socket identity; steal detection disabled").
+			Field("socket", socketPath).Err(err).Log(context.Background())
+	}
+
 	// The socket is bound and chmod'd — clients can connect now even though
 	// Serve hasn't been called yet (kernel holds accept-queue entries until
 	// we start accepting). Signal readiness before the mux/server setup so
@@ -1002,6 +1022,56 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return s.server.Shutdown(ctx)
 	}
 	return nil
+}
+
+// IsDraining reports whether a graceful drain (SIGUSR1 → EnterDrainMode) is in
+// progress. During a drain this daemon has deliberately given its socket up, so
+// callers that police socket ownership must stand down.
+func (s *Server) IsDraining() bool {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
+	return s.isDraining
+}
+
+// SocketIdentityLost reports whether the socket path this server bound is now
+// occupied by a DIFFERENT file than the one it bound, plus a detail line for
+// the log.
+//
+// This is the belt-and-suspenders half of single-daemon enforcement. The
+// pidfile lock is what stops two cold starts, but Listen's unlink-then-bind
+// means any process that reaches a bind on our path — an older binary that
+// never took the lock, an operator running `groved start --socket` by hand —
+// silently steals every future client while our listener goes on accepting on
+// an inode with no name. A daemon in that state serves nobody, yet still runs
+// collectors, watchers and its own signal-cli.
+//
+// Two states deliberately report "not lost":
+//
+//   - draining: we unlinked the socket ourselves and the successor binding it
+//     is the whole point of `groved upgrade`.
+//   - the path is missing entirely: an unlink is not a steal, and `groved
+//     status --prune` (or a human) removing a socket file must not take the
+//     live daemon behind it down with it.
+func (s *Server) SocketIdentityLost() (bool, string) {
+	if s.IsDraining() {
+		return false, ""
+	}
+
+	s.boundSocketMu.Lock()
+	bound := s.boundSocket
+	s.boundSocketMu.Unlock()
+	if bound == nil || s.socketPath == "" {
+		return false, ""
+	}
+
+	current, err := os.Stat(s.socketPath)
+	if err != nil {
+		return false, ""
+	}
+	if os.SameFile(bound, current) {
+		return false, ""
+	}
+	return true, fmt.Sprintf("socket %s is no longer the file this daemon bound", s.socketPath)
 }
 
 // EnterDrainMode implements zero-downtime upgrade: unlink the socket, refuse new requests,
