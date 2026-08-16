@@ -194,6 +194,70 @@ func TestRetriedAttemptSupersedesStaleTerminalProjections(t *testing.T) {
 	}
 }
 
+func TestCurrentAttemptConfirmationRepairsLaggingActiveJobProjection(t *testing.T) {
+	st := newTestStore(t)
+	const olderAttempt = "018f0000-0000-7000-8000-000000000001"
+	const newerAttempt = "018f0000-0001-7000-8000-000000000001"
+	ended := time.Now().Add(-time.Minute)
+	st.mu.Lock()
+	st.state.Jobs["retry-job"] = &models.JobInfo{
+		ID: "retry-job", AttemptID: olderAttempt, Type: models.JobType("interactive_agent"),
+		Status: "completed", PID: 101, CompletedAt: &ended,
+	}
+	st.state.Sessions["retry-job"] = &models.Session{
+		ID: "retry-job", AttemptID: olderAttempt, Type: models.SessionTypeInteractiveAgent,
+		Status: "completed", PID: 101, StartedAt: ended.Add(-time.Minute), LastActivity: ended, EndedAt: &ended,
+	}
+	st.mu.Unlock()
+
+	st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
+		JobID: "retry-job", AttemptID: newerAttempt, Type: models.SessionTypeInteractiveAgent,
+	}})
+	if got := st.GetSession("retry-job"); got == nil || got.AttemptID != newerAttempt || got.Status != "pending" {
+		t.Fatalf("new intent was not accepted before projection lag: %+v", got)
+	}
+
+	// Model the collector restoring a still-running row from the older attempt
+	// after intent but before process confirmation.
+	st.mu.Lock()
+	st.state.Jobs["retry-job"] = &models.JobInfo{
+		ID: "retry-job", AttemptID: olderAttempt, Type: models.JobType("interactive_agent"), Status: "running", PID: 101,
+	}
+	st.mu.Unlock()
+
+	// Even though the stale callback agrees with Jobs, the current Session is
+	// authoritative and must keep the older attempt from being revived.
+	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
+		JobID: "retry-job", AttemptID: olderAttempt, NativeID: "native-old", PID: 303,
+	}})
+	if got := st.GetSession("retry-job"); got.AttemptID != newerAttempt || got.Status != "pending" || got.PID != 0 || got.ClaudeSessionID != "" {
+		t.Fatalf("older confirmation mutated current session before repair: %+v", got)
+	}
+	if got := st.GetJob("retry-job"); got.AttemptID != olderAttempt || got.Status != "running" || got.PID != 101 {
+		t.Fatalf("rejected older confirmation mutated lagging job projection: %+v", got)
+	}
+
+	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
+		JobID: "retry-job", AttemptID: newerAttempt, NativeID: "native-new", PID: 202,
+	}})
+	if got := st.GetSession("retry-job"); got.AttemptID != newerAttempt || got.Status != "running" || got.PID != 202 || got.ClaudeSessionID != "native-new" {
+		t.Fatalf("matching confirmation did not advance current session: %+v", got)
+	}
+	if got := st.GetJob("retry-job"); got.AttemptID != newerAttempt || got.Status != "running" || got.PID != 202 || got.CompletedAt != nil {
+		t.Fatalf("matching confirmation did not repair lagging active job projection: %+v", got)
+	}
+
+	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
+		JobID: "retry-job", AttemptID: olderAttempt, NativeID: "native-old", PID: 303,
+	}})
+	if got := st.GetSession("retry-job"); got.AttemptID != newerAttempt || got.Status != "running" || got.PID != 202 || got.ClaudeSessionID != "native-new" {
+		t.Fatalf("older confirmation mutated current session: %+v", got)
+	}
+	if got := st.GetJob("retry-job"); got.AttemptID != newerAttempt || got.Status != "running" || got.PID != 202 {
+		t.Fatalf("older confirmation mutated repaired job projection: %+v", got)
+	}
+}
+
 func TestRetriedAttemptSupersedesOrphanedJobProjection(t *testing.T) {
 	st := newTestStore(t)
 	const olderAttempt = "018f0000-0000-7000-8000-000000000001"

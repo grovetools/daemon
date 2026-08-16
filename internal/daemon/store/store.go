@@ -1040,6 +1040,16 @@ func lifecycleHasAttemptMismatch(session *models.Session, job *models.JobInfo, i
 		job != nil && job.AttemptID != "" && job.AttemptID != incoming
 }
 
+// lifecycleConfirmationMatchesCurrentSession lets confirmation repair Jobs when
+// a collector overwrite has made that projection lag behind an accepted intent.
+// Require a live, identified equality: a legacy empty callback is never evidence
+// for the current attempt, and a delayed confirmation cannot revive a terminal
+// session from the same attempt.
+func lifecycleConfirmationMatchesCurrentSession(session *models.Session, incoming string) bool {
+	return session != nil && incoming != "" && session.AttemptID == incoming &&
+		!isTerminalSessionStatus(session.Status)
+}
+
 // lifecycleCanReplaceTerminalAttempt lets an edge for a retried attempt repair
 // a lagging Jobs projection. Flow attempt IDs are UUIDv7s, so a newer incoming
 // attempt can safely replace terminal prior projections. Requiring that order
@@ -1114,7 +1124,8 @@ func (s *Store) applySessionConfirmation(payload *SessionConfirmationPayload, so
 	session, exists := s.state.Sessions[payload.JobID]
 	job := s.state.Jobs[payload.JobID]
 	mismatch := lifecycleHasAttemptMismatch(session, job, payload.AttemptID)
-	if mismatch && !lifecycleCanReplaceTerminalAttempt(session, job, payload.AttemptID) {
+	matchesCurrentSession := lifecycleConfirmationMatchesCurrentSession(session, payload.AttemptID)
+	if mismatch && !matchesCurrentSession && !lifecycleCanReplaceTerminalAttempt(session, job, payload.AttemptID) {
 		s.ulog.Warn("Ignored session confirmation for conflicting active attempt").
 			Field("event", "session.lifecycle.confirmation_mismatch").
 			Field("job_id", payload.JobID).
