@@ -3060,7 +3060,7 @@ func (s *Server) handleAgentSpawn(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			// Update the session registry with the PTY ID so re-attachment works.
 			if st := s.engine.Store(); st != nil {
-				st.SetSessionPtyID(payload.JobID, ptyID)
+				st.SetSessionPtyID(payload.JobID, attemptID, ptyID)
 			}
 
 			// Persist PtyID to filesystem registry for restart resilience.

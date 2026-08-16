@@ -96,12 +96,12 @@ type pidLiveness struct {
 	deadStrikes int
 }
 
-func sessionVerdictUpdate(jobID, verified string) store.Update {
+func sessionVerdictUpdate(jobID, attemptID, verified string) store.Update {
 	return store.Update{
 		Type:   store.UpdateSessionVerdict,
 		Source: "session_collector",
 		Payload: &store.SessionVerdictPayload{
-			JobID: jobID, Verified: verified,
+			JobID: jobID, AttemptID: attemptID, Verified: verified,
 		},
 	}
 }
@@ -374,7 +374,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 				if processAlive || classifierAlive {
 					ls.seenAlive = true
 					ls.deadStrikes = 0
-					updates <- sessionVerdictUpdate(session.ID, "alive")
+					updates <- sessionVerdictUpdate(session.ID, session.AttemptID, "alive")
 					continue
 				}
 
@@ -391,7 +391,7 @@ func (c *SessionCollector) Run(ctx context.Context, st *store.Store, updates cha
 						!(health.IsTurnBasedType(session.Type) && session.Status == "pending_user") {
 						verified = "stale"
 					}
-					updates <- sessionVerdictUpdate(session.ID, verified)
+					updates <- sessionVerdictUpdate(session.ID, session.AttemptID, verified)
 				}
 
 				// A true unstarted PID-0 intent has no process evidence. It may lose
@@ -578,12 +578,12 @@ func isLiveAgentSession(s *models.Session) bool {
 	}
 }
 
-func sessionActivityUpdate(jobID, source string, startedAt, observedAt time.Time) store.Update {
+func sessionActivityUpdate(jobID, attemptID, source string, startedAt, observedAt time.Time) store.Update {
 	return store.Update{
 		Type:   store.UpdateSessionActivity,
 		Source: "session_collector",
 		Payload: &store.SessionActivityPayload{
-			JobID: jobID, ExpectedStartedAt: startedAt, Source: source, ObservedAt: observedAt,
+			JobID: jobID, AttemptID: attemptID, ExpectedStartedAt: startedAt, Source: source, ObservedAt: observedAt,
 		},
 	}
 }
@@ -642,7 +642,7 @@ func (c *SessionCollector) ingestActivity(ctx context.Context, rows []*models.Se
 			advanced := observedBefore && mtime.After(previous)
 			recoveredNewer := !observedBefore && mtime.After(copy.LastActivity)
 			if (advanced || recoveredNewer) && !mtime.After(now) {
-				updates <- sessionActivityUpdate(row.ID, "transcript", row.StartedAt, mtime)
+				updates <- sessionActivityUpdate(row.ID, row.AttemptID, "transcript", row.StartedAt, mtime)
 				if mtime.After(copy.LastActivity) {
 					copy.LastActivity = mtime
 				}
@@ -652,7 +652,7 @@ func (c *SessionCollector) ingestActivity(ctx context.Context, rows []*models.Se
 		if activity := ptyByID[row.PtyID]; !activity.observedAt.IsZero() &&
 			activity.jobID == row.ID && activity.attemptID == row.AttemptID &&
 			activity.observedAt.After(copy.LastActivity) {
-			updates <- sessionActivityUpdate(row.ID, "pty", row.StartedAt, activity.observedAt)
+			updates <- sessionActivityUpdate(row.ID, row.AttemptID, "pty", row.StartedAt, activity.observedAt)
 			copy.LastActivity = activity.observedAt
 		}
 	}
@@ -778,6 +778,7 @@ func (c *SessionCollector) refreshLiveTokens(ctx context.Context, activeSessions
 
 		tokenUpdates = append(tokenUpdates, store.SessionTokenUpdate{
 			JobID:       s.ID,
+			AttemptID:   s.AttemptID,
 			LiveTokens:  liveTokens,
 			LiveCostUSD: summary.CostUSD,
 			ContextSize: summary.ContextSize,

@@ -202,14 +202,25 @@ func TestJobAgentAliveUsesSessionRegistryPID(t *testing.T) {
 }
 
 // A live PTY carrying the job's id is direct evidence the agent survived.
+func TestJobAgentAliveUsesExactLivePTYAttemptTag(t *testing.T) {
+	jr, _ := newRecoveryRunner(t)
+	job := &models.JobInfo{ID: "pty-job", AttemptID: "attempt-current", Type: "interactive_agent", PID: deadPID}
+	if jr.jobAgentAlive(job, map[string]bool{sessionAttemptKey("pty-job", "attempt-old"): true}) {
+		t.Fatal("a stale prior-attempt PTY must not keep the current retry alive")
+	}
+	if !jr.jobAgentAlive(job, map[string]bool{sessionAttemptKey("pty-job", "attempt-current"): true}) {
+		t.Fatal("the exact current attempt PTY is direct liveness evidence")
+	}
+}
+
 func TestJobAgentAliveUsesLivePTYTag(t *testing.T) {
 	jr, _ := newRecoveryRunner(t)
 
 	job := &models.JobInfo{ID: "pty-job", Type: "interactive_agent", PID: deadPID}
-	if !jr.jobAgentAlive(job, map[string]bool{"pty-job": true}) {
+	if !jr.jobAgentAlive(job, map[string]bool{sessionAttemptKey("pty-job", ""): true}) {
 		t.Fatal("a live PTY tagged with the job id means the agent is alive")
 	}
-	if jr.jobAgentAlive(job, map[string]bool{"other-job": true}) {
+	if jr.jobAgentAlive(job, map[string]bool{sessionAttemptKey("other-job", ""): true}) {
 		t.Fatal("a PTY belonging to another job says nothing about this one")
 	}
 }

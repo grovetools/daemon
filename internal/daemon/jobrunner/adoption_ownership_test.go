@@ -133,10 +133,26 @@ func TestRebuildAgentSessionsSkipsUnknownJobIDs(t *testing.T) {
 	jr.rebuildAgentSessions(context.Background(), []tuimuxpty.SessionMetadata{
 		agentPtyMeta("pty-1", "foreign-job"),
 		agentPtyMeta("pty-2", ""),
-	}, map[string]bool{"our-job": true})
+	}, map[string]*models.JobInfo{"our-job": {ID: "our-job"}})
 
 	if sessions := jr.store.GetSessions(); len(sessions) != 0 {
 		t.Fatalf("PTYs with unknown or missing job_id must be left alone, got %d sessions", len(sessions))
+	}
+}
+
+func TestRebuildAgentSessionsRejectsStalePriorAttemptPTY(t *testing.T) {
+	jr := newTestRunner(store.New())
+	stale := agentPtyMeta("pty-old", "reused-job")
+	stale.Tags["attempt_id"] = "attempt-old"
+	current := agentPtyMeta("pty-current", "reused-job")
+	current.Tags["attempt_id"] = "attempt-current"
+
+	jr.rebuildAgentSessions(context.Background(), []tuimuxpty.SessionMetadata{stale, current},
+		map[string]*models.JobInfo{"reused-job": {ID: "reused-job", AttemptID: "attempt-current"}})
+
+	sess := jr.store.GetSession("reused-job")
+	if sess == nil || sess.AttemptID != "attempt-current" || sess.PtyID != "pty-current" {
+		t.Fatalf("adopted session = %+v, want exact current attempt PTY", sess)
 	}
 }
 
@@ -145,7 +161,7 @@ func TestRebuildAgentSessionsSynthesizesOwnedSession(t *testing.T) {
 
 	jr.rebuildAgentSessions(context.Background(), []tuimuxpty.SessionMetadata{
 		agentPtyMeta("pty-1", "our-job"),
-	}, map[string]bool{"our-job": true})
+	}, map[string]*models.JobInfo{"our-job": {ID: "our-job"}})
 
 	sess := jr.store.GetSession("our-job")
 	if sess == nil {
@@ -156,10 +172,8 @@ func TestRebuildAgentSessionsSynthesizesOwnedSession(t *testing.T) {
 	}
 }
 
-// A session already in the store was recovered for THIS scope
-// (RecoverSessionsForScope filters by scope), so its PTY binding is updated
-// even though the ownership set doesn't list it — store presence is itself
-// evidence of ownership.
+// A recovered session still needs the persisted job's exact attempt identity;
+// store presence alone cannot authorize a stale PTY from a prior retry.
 func TestRebuildAgentSessionsUpdatesStoreRecoveredSession(t *testing.T) {
 	st := store.New()
 	st.ApplyUpdate(store.Update{
@@ -173,7 +187,7 @@ func TestRebuildAgentSessionsUpdatesStoreRecoveredSession(t *testing.T) {
 
 	jr.rebuildAgentSessions(context.Background(), []tuimuxpty.SessionMetadata{
 		agentPtyMeta("pty-new", "recovered-job"),
-	}, map[string]bool{})
+	}, map[string]*models.JobInfo{"recovered-job": {ID: "recovered-job"}})
 
 	sess := jr.store.GetSession("recovered-job")
 	if sess == nil || sess.PtyID != "pty-new" {

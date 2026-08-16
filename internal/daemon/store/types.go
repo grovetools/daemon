@@ -447,8 +447,9 @@ type SessionEndPayload struct {
 // SessionVerdictPayload carries the daemon's derived health classification.
 // Applying it changes only Session.Verified; it must never renew LastActivity.
 type SessionVerdictPayload struct {
-	JobID    string `json:"job_id"`
-	Verified string `json:"verified"` // alive|unverified|stale
+	JobID     string `json:"job_id"`
+	AttemptID string `json:"attempt_id,omitempty"`
+	Verified  string `json:"verified"` // alive|unverified|stale
 }
 
 // SessionActivityPayload carries genuine observed activity. ObservedAt is
@@ -456,7 +457,8 @@ type SessionVerdictPayload struct {
 // recomputation, focus, and attachment are intentionally not accepted.
 type SessionActivityPayload struct {
 	JobID             string    `json:"job_id"`
-	ExpectedStartedAt time.Time `json:"expected_started_at,omitempty"` // Phase-4 optimistic attempt guard
+	AttemptID         string    `json:"attempt_id,omitempty"`
+	ExpectedStartedAt time.Time `json:"expected_started_at,omitempty"` // legacy Phase-4 optimistic guard
 	ObservedAt        time.Time `json:"observed_at"`
 	Source            string    `json:"source"` // hook|transcript|pty
 }
@@ -472,6 +474,7 @@ type SessionsPrunedPayload struct {
 // The fields mirror the derived models.Session token fields.
 type SessionTokenUpdate struct {
 	JobID       string  `json:"job_id"`
+	AttemptID   string  `json:"attempt_id,omitempty"`
 	LiveTokens  int64   `json:"live_tokens"`
 	LiveCostUSD float64 `json:"live_cost_usd"`
 	ContextSize int64   `json:"context_size"`

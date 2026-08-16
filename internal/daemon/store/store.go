@@ -1255,7 +1255,8 @@ func (s *Store) applySessionActivity(payload *SessionActivityPayload) bool {
 		return false
 	}
 	session, exists := s.state.Sessions[payload.JobID]
-	if !exists || session.Origin != "" || !health.IsActiveSessionStatus(session.Status) {
+	if !exists || session.Origin != "" || !health.IsActiveSessionStatus(session.Status) ||
+		!lifecycleAttemptMatches(session.AttemptID, payload.AttemptID) {
 		return false
 	}
 	if !payload.ExpectedStartedAt.IsZero() && !payload.ExpectedStartedAt.Equal(session.StartedAt) {
@@ -1273,7 +1274,8 @@ func (s *Store) applySessionVerdict(payload *SessionVerdictPayload) bool {
 		return false
 	}
 	session, exists := s.state.Sessions[payload.JobID]
-	if !exists || session.Origin != "" || !health.IsActiveSessionStatus(session.Status) {
+	if !exists || session.Origin != "" || !health.IsActiveSessionStatus(session.Status) ||
+		!lifecycleAttemptMatches(session.AttemptID, payload.AttemptID) {
 		return false
 	}
 	switch payload.Verified {
@@ -1367,7 +1369,7 @@ func isTerminalSessionStatus(status string) bool {
 func (s *Store) applySessionTokens(payload *SessionTokensPayload) {
 	for _, u := range payload.Updates {
 		session, exists := s.state.Sessions[u.JobID]
-		if !exists {
+		if !exists || !lifecycleAttemptMatches(session.AttemptID, u.AttemptID) {
 			continue
 		}
 		session.LiveTokens = u.LiveTokens
@@ -1428,10 +1430,10 @@ func (s *Store) persistAsync() {
 
 // SetSessionPtyID associates a daemon PTY session ID with a session entry.
 // Called by handleAgentSpawn after creating the daemon-owned PTY.
-func (s *Store) SetSessionPtyID(jobID, ptyID string) {
+func (s *Store) SetSessionPtyID(jobID, attemptID, ptyID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if session, exists := s.state.Sessions[jobID]; exists {
+	if session, exists := s.state.Sessions[jobID]; exists && lifecycleAttemptMatches(session.AttemptID, attemptID) {
 		session.PtyID = ptyID
 	}
 }

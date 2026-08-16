@@ -62,8 +62,8 @@ func (jr *JobRunner) adoptRunningAgents(ctx context.Context) {
 	// fail live sessions, so we retry a few times and, if it still fails, set
 	// tuimuxAvailable=false and fall back to the PID-only path (fail-open).
 	livePtys := map[string]bool{}
-	// Same list indexed by the job_id tag: a live PTY carrying this job's id is
-	// the most direct evidence its agent survived the restart.
+	// Same list indexed by exact (job_id, attempt_id) tags: a PTY from a prior
+	// retry must never count as evidence that the current attempt survived.
 	livePtyJobs := map[string]bool{}
 	var liveMetas []tuimuxpty.SessionMetadata
 	tuimuxAvailable := false
@@ -75,7 +75,7 @@ func (jr *JobRunner) adoptRunningAgents(ctx context.Context) {
 				for _, m := range metas {
 					livePtys[m.ID] = true
 					if jobID := m.Tags["job_id"]; jobID != "" {
-						livePtyJobs[jobID] = true
+						livePtyJobs[sessionAttemptKey(jobID, m.Tags["attempt_id"])] = true
 					}
 				}
 				tuimuxAvailable = true
@@ -106,9 +106,9 @@ func (jr *JobRunner) adoptRunningAgents(ctx context.Context) {
 	// PTYs owned by another groved (a misconfigured scope, a smoke-test daemon
 	// resolving to the global socket) — importing those would let the plain-stop
 	// shutdown reaper kill agents this daemon never started.
-	ownedJobs := make(map[string]bool, len(jobs))
+	ownedJobs := make(map[string]*models.JobInfo, len(jobs))
 	for _, job := range jobs {
-		ownedJobs[job.ID] = true
+		ownedJobs[job.ID] = job
 	}
 	if tuimuxAvailable {
 		jr.rebuildAgentSessions(ctx, liveMetas, ownedJobs)
@@ -286,7 +286,7 @@ func jobRecentlyActive(job *models.JobInfo) bool {
 // This is the fix for the 2026-07-28 incident where a scope-less smoke daemon
 // imported two foreign agent PTYs ("rebuilt:2") from the global tuimuxd and
 // killed both live agents on its own SIGTERM.
-func (jr *JobRunner) rebuildAgentSessions(ctx context.Context, metas []tuimuxpty.SessionMetadata, ownedJobs map[string]bool) {
+func (jr *JobRunner) rebuildAgentSessions(ctx context.Context, metas []tuimuxpty.SessionMetadata, ownedJobs map[string]*models.JobInfo) {
 	// Start from what's already in the store (disk-recovered sessions) so we
 	// don't clobber them when we re-apply the full set.
 	merged := map[string]*models.Session{}
@@ -309,15 +309,9 @@ func (jr *JobRunner) rebuildAgentSessions(ctx context.Context, metas []tuimuxpty
 				Log(ctx)
 			continue
 		}
-		if sess, ok := merged[jobID]; ok {
-			// Already in the store — recovered for this scope, so it is ours.
-			if sess.PtyID != m.ID {
-				sess.PtyID = m.ID
-				updated++
-			}
-			continue
-		}
-		if !ownedJobs[jobID] {
+		attemptID := m.Tags["attempt_id"]
+		ownedJob := ownedJobs[jobID]
+		if ownedJob == nil {
 			// A live agent PTY for a job this daemon has never persisted: it
 			// belongs to another daemon. Leave it alone — do not adopt, do not
 			// kill.
@@ -328,9 +322,31 @@ func (jr *JobRunner) rebuildAgentSessions(ctx context.Context, metas []tuimuxpty
 				Log(ctx)
 			continue
 		}
+		if ownedJob.AttemptID != attemptID {
+			jr.ulog.Warn("Adoption: skipping PTY from a different job attempt").
+				Field("pty_id", m.ID).
+				Field("job_id", jobID).
+				Field("job_attempt_id", ownedJob.AttemptID).
+				Field("pty_attempt_id", attemptID).
+				StructuredOnly().Log(ctx)
+			continue
+		}
+		if sess, ok := merged[jobID]; ok {
+			// Already in the store — only the exact recovered attempt may adopt
+			// this PTY. Missing attempt identity is legacy, never "current".
+			if sess.AttemptID != attemptID {
+				continue
+			}
+			if sess.PtyID != m.ID {
+				sess.PtyID = m.ID
+				updated++
+			}
+			continue
+		}
 		merged[jobID] = &models.Session{
-			ID:   jobID,
-			Type: "interactive_agent",
+			ID:        jobID,
+			AttemptID: attemptID,
+			Type:      "interactive_agent",
 			// WorkingDirectory must be set from the PTY's CWD: scoped surfaces
 			// (treemux's rail rehydrate and the agents drawer) filter sessions
 			// by workspace via IsSessionInWorkspace(WorkingDirectory, ...). An
@@ -399,10 +415,10 @@ func (jr *JobRunner) jobAgentAlive(job *models.JobInfo, livePtyJobs map[string]b
 	if livePtyJobs == nil {
 		livePtyJobs = jr.livePtyJobIDs()
 	}
-	if livePtyJobs[job.ID] {
+	if livePtyJobs[sessionAttemptKey(job.ID, job.AttemptID)] {
 		return true
 	}
-	if pid := jr.registryAgentPID(job.ID); pid > 0 && jr.isPIDAlive(pid) {
+	if pid := jr.registryAgentPID(job.ID, job.AttemptID); pid > 0 && jr.isPIDAlive(pid) {
 		return true
 	}
 	return job.PID > 0 && jr.isPIDAlive(job.PID)
@@ -412,7 +428,7 @@ func (jr *JobRunner) jobAgentAlive(job *models.JobInfo, livePtyJobs map[string]b
 // registry, or 0 when there is none. PIDs of 1 or less are ignored: they are
 // placeholders written before the real PID was known, and PID 1 is always
 // "alive", which would make every such job permanently unreconcilable.
-func (jr *JobRunner) registryAgentPID(jobID string) int {
+func (jr *JobRunner) registryAgentPID(jobID, attemptID string) int {
 	if jobID == "" {
 		return 0
 	}
@@ -420,8 +436,14 @@ func (jr *JobRunner) registryAgentPID(jobID string) int {
 	if err != nil || registry == nil {
 		return 0
 	}
-	metadata, err := registry.Find(jobID)
-	if err != nil || metadata == nil || metadata.PID <= 1 {
+	var metadata *sessions.SessionMetadata
+	if attemptID != "" {
+		metadata, err = registry.FindAttempt(attemptID)
+	} else {
+		metadata, err = registry.Find(jobID)
+	}
+	if err != nil || metadata == nil || metadata.PID <= 1 || metadata.AttemptID != attemptID ||
+		(metadata.JobID != jobID && metadata.SessionID != jobID) {
 		return 0
 	}
 	return metadata.PID
@@ -439,10 +461,14 @@ func (jr *JobRunner) livePtyJobIDs() map[string]bool {
 	}
 	for _, meta := range metas {
 		if jobID := meta.Tags["job_id"]; jobID != "" {
-			live[jobID] = true
+			live[sessionAttemptKey(jobID, meta.Tags["attempt_id"])] = true
 		}
 	}
 	return live
+}
+
+func sessionAttemptKey(jobID, attemptID string) string {
+	return jobID + "\x00" + attemptID
 }
 
 // reconcileLostJob decides what a job whose agent is not alive should become.

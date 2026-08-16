@@ -2,6 +2,7 @@ package store
 
 import (
 	"testing"
+	"time"
 
 	"github.com/grovetools/core/pkg/models"
 )
@@ -81,6 +82,49 @@ func TestSessionLifecyclePreservesLegacyEmptyAttempt(t *testing.T) {
 	got := st.GetSession("legacy")
 	if got == nil || got.AttemptID != "" || got.PID != 303 || got.Status != "interrupted" || got.EndedAt == nil {
 		t.Fatalf("legacy empty-attempt lifecycle changed semantics: %+v", got)
+	}
+}
+
+func TestDerivedSessionWritersRejectStaleAttempt(t *testing.T) {
+	st := newTestStore(t)
+	st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
+		JobID: "job", AttemptID: "attempt-current", Type: models.SessionTypeInteractiveAgent,
+	}})
+	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
+		JobID: "job", AttemptID: "attempt-current", NativeID: "native", PID: 42,
+	}})
+	before := st.GetSession("job").LastActivity
+	later := before.Add(time.Minute)
+
+	st.ApplyUpdate(Update{Type: UpdateSessionActivity, Payload: &SessionActivityPayload{
+		JobID: "job", AttemptID: "attempt-old", ObservedAt: later, Source: "transcript",
+	}})
+	st.ApplyUpdate(Update{Type: UpdateSessionVerdict, Payload: &SessionVerdictPayload{
+		JobID: "job", AttemptID: "attempt-old", Verified: "stale",
+	}})
+	st.ApplyUpdate(Update{Type: UpdateSessionTokens, Payload: &SessionTokensPayload{Updates: []SessionTokenUpdate{{
+		JobID: "job", AttemptID: "attempt-old", LiveTokens: 99,
+	}}}})
+	st.SetSessionPtyID("job", "attempt-old", "pty-old")
+
+	got := st.GetSession("job")
+	if !got.LastActivity.Equal(before) || got.Verified != "" || got.LiveTokens != 0 || got.PtyID != "" {
+		t.Fatalf("stale derived writers mutated current attempt: %+v", got)
+	}
+
+	st.ApplyUpdate(Update{Type: UpdateSessionActivity, Payload: &SessionActivityPayload{
+		JobID: "job", AttemptID: "attempt-current", ObservedAt: later, Source: "transcript",
+	}})
+	st.ApplyUpdate(Update{Type: UpdateSessionVerdict, Payload: &SessionVerdictPayload{
+		JobID: "job", AttemptID: "attempt-current", Verified: "alive",
+	}})
+	st.ApplyUpdate(Update{Type: UpdateSessionTokens, Payload: &SessionTokensPayload{Updates: []SessionTokenUpdate{{
+		JobID: "job", AttemptID: "attempt-current", LiveTokens: 100,
+	}}}})
+	st.SetSessionPtyID("job", "attempt-current", "pty-current")
+	got = st.GetSession("job")
+	if !got.LastActivity.After(before) || got.Verified != "alive" || got.LiveTokens != 100 || got.PtyID != "pty-current" {
+		t.Fatalf("exact derived writers did not update current attempt: %+v", got)
 	}
 }
 
