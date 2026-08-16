@@ -25,6 +25,11 @@ func TestPhase5FixturesProduceOneProjectedDaemonRowPerCurrentAttempt(t *testing.
 		t.Run(tc.name, func(t *testing.T) {
 			st := newTestStore(t)
 			for i, attemptID := range tc.attempts {
+				// The job watcher is authoritative for which reusable-ID attempt is
+				// current before its intent may replace the projected session row.
+				st.mu.Lock()
+				st.state.Jobs["reused-job"] = &models.JobInfo{ID: "reused-job", AttemptID: attemptID, Type: models.JobType("interactive_agent"), Status: "running"}
+				st.mu.Unlock()
 				st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
 					JobID: "reused-job", AttemptID: attemptID, Provider: "pi", Type: models.SessionTypeInteractiveAgent,
 				}})
@@ -60,6 +65,12 @@ func TestSessionLifecycleRejectsStalePriorAttempt(t *testing.T) {
 	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
 		JobID: "reused-job", AttemptID: "attempt-1", NativeID: "native-1", PID: 101,
 	}})
+	if got := st.GetJob("reused-job"); got.AttemptID != "attempt-2" {
+		t.Fatalf("stale intent rewrote authoritative job attempt: %+v", got)
+	}
+	if got := st.GetSession("reused-job"); got != nil {
+		t.Fatalf("stale intent created projected row: %+v", got)
+	}
 
 	// A retry reuses the Flow JobID but establishes a fresh projected attempt.
 	st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
@@ -97,6 +108,14 @@ func TestSessionLifecycleRejectsStalePriorAttempt(t *testing.T) {
 	st.ApplyUpdate(Update{Type: UpdateSessionConfirmation, Payload: &SessionConfirmationPayload{
 		JobID: "reused-job", AttemptID: "attempt-2", NativeID: "native-2", PID: 202,
 	}})
+	// A duplicate current intent arriving after confirmation is a no-op; it
+	// cannot demote running back to pending or discard the provider identity.
+	st.ApplyUpdate(Update{Type: UpdateSessionIntent, Payload: &SessionIntentPayload{
+		JobID: "reused-job", AttemptID: "attempt-2", Provider: "claude", Type: models.SessionTypeInteractiveAgent,
+	}})
+	if got := st.GetSession("reused-job"); got.Status != "running" || got.PID != 202 || got.ClaudeSessionID != "native-2" {
+		t.Fatalf("duplicate current intent demoted confirmed row: %+v", got)
+	}
 	st.ApplyUpdate(Update{Type: UpdateSessionStatus, Payload: &SessionStatusPayload{
 		JobID: "reused-job", AttemptID: "attempt-2", Status: "idle",
 	}})

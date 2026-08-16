@@ -406,7 +406,9 @@ func (s *Store) ApplyUpdate(u Update) {
 	// Session lifecycle updates
 	case UpdateSessionIntent:
 		if payload, ok := u.Payload.(*SessionIntentPayload); ok {
-			s.applySessionIntent(payload, u.Source)
+			if !s.applySessionIntent(payload, u.Source) {
+				return
+			}
 		}
 	case UpdateSessionConfirmation:
 		if payload, ok := u.Payload.(*SessionConfirmationPayload); ok {
@@ -940,7 +942,36 @@ func lifecycleReason(reason string) string {
 	return reason
 }
 
-func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string) {
+func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string) bool {
+	if payload == nil || payload.JobID == "" {
+		return false
+	}
+
+	job := s.state.Jobs[payload.JobID]
+	if job != nil && job.AttemptID != "" && job.AttemptID != payload.AttemptID {
+		s.ulog.Warn("Ignored session intent for stale attempt").
+			Field("event", "session.lifecycle.intent_mismatch").
+			Field("job_id", payload.JobID).
+			Field("current_attempt_id", job.AttemptID).
+			Field("incoming_attempt_id", payload.AttemptID).
+			StructuredOnly().
+			Log(context.Background())
+		return false
+	}
+	if current := s.state.Sessions[payload.JobID]; current != nil {
+		if current.AttemptID == payload.AttemptID {
+			// Intent is an at-most-once edge. A delayed duplicate must not demote
+			// an already confirmed current attempt back to pending.
+			return false
+		}
+		// Replacing the projected row requires the job collector's authoritative
+		// current attempt. Without it, two identified callbacks cannot decide
+		// which attempt is newer merely from arrival order.
+		if payload.AttemptID == "" || job == nil || job.AttemptID != payload.AttemptID {
+			return false
+		}
+	}
+
 	now := s.now()
 	session := &models.Session{
 		ID:               payload.JobID,
@@ -963,7 +994,7 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string)
 		Mux:              payload.Mux,
 	}
 	s.state.Sessions[payload.JobID] = session
-	if job := s.state.Jobs[payload.JobID]; job != nil {
+	if job != nil {
 		if job.AttemptID != payload.AttemptID {
 			job.PID = 0
 		}
@@ -977,6 +1008,7 @@ func (s *Store) applySessionIntent(payload *SessionIntentPayload, source string)
 		Field("reason", lifecycleReason(source)).
 		StructuredOnly().
 		Log(context.Background())
+	return true
 }
 
 // lifecycleAttemptMatches preserves pre-AttemptID compatibility while ensuring
